@@ -1,0 +1,8 @@
+Package: hrmconfigurefixture
+Type: Package
+Title: heRmetic post-configure staging fixture
+Version: 0.0.1
+Authors@R: person("H", "R", email = "hrm@example.invalid", role = c("aut", "cre"))
+Description: Package used only to verify post-configure source capture.
+License: MIT
+Encoding: UTF-8
