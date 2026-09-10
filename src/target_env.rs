@@ -3,10 +3,17 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::{RToolchain, Target, ToolchainError};
+use crate::{RToolchain, ToolchainError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TargetProvidedPackage {
+pub struct Target {
+    pub r_version: String,
+    pub os: String,
+    pub arch: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledPackage {
     pub name: String,
     pub version: String,
     pub library: PathBuf,
@@ -16,11 +23,11 @@ pub struct TargetProvidedPackage {
 pub struct TargetEnvironment {
     pub target: Target,
     pub libraries: Vec<PathBuf>,
-    pub packages: Vec<TargetProvidedPackage>,
+    pub packages: Vec<InstalledPackage>,
 }
 
 impl TargetEnvironment {
-    pub fn package(&self, name: &str) -> Option<&TargetProvidedPackage> {
+    pub fn package(&self, name: &str) -> Option<&InstalledPackage> {
         self.packages.iter().find(|package| package.name == name)
     }
 }
@@ -28,8 +35,9 @@ impl TargetEnvironment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetEnvironmentRequest {
     pub work_dir: PathBuf,
-    /// Ordered exactly like `.libPaths()`. An empty vector asks the target R
-    /// process to capture its own sanitized `.libPaths()`.
+    /// Ordered non-base library paths. An empty vector asks the target R
+    /// process for its normal `--vanilla` `.libPaths()`. With explicit paths,
+    /// base R's `.Library` is appended automatically.
     pub libraries: Vec<PathBuf>,
 }
 
@@ -62,7 +70,7 @@ impl RToolchain {
         for library in &request.libraries {
             args.push(library.as_os_str());
         }
-        self.run_rscript(args).map_err(TargetEnvironmentError::Toolchain)?;
+        self.run_rscript_host(args).map_err(TargetEnvironmentError::Toolchain)?;
 
         let text = fs::read_to_string(&output).map_err(TargetEnvironmentError::Io)?;
         parse_target_environment(&text)
@@ -72,7 +80,7 @@ impl RToolchain {
 fn parse_target_environment(text: &str) -> Result<TargetEnvironment, TargetEnvironmentError> {
     let mut target: Option<Target> = None;
     let mut libraries = BTreeMap::<usize, PathBuf>::new();
-    let mut packages = Vec::<TargetProvidedPackage>::new();
+    let mut packages = Vec::<InstalledPackage>::new();
 
     for (line_no, line) in text.lines().enumerate() {
         if line.is_empty() { continue; }
@@ -101,7 +109,7 @@ fn parse_target_environment(text: &str) -> Result<TargetEnvironment, TargetEnvir
             }
             "PACKAGE" => {
                 require_len(kind, &values, 3, line_no)?;
-                packages.push(TargetProvidedPackage {
+                packages.push(InstalledPackage {
                     name: values[0].clone(),
                     version: values[1].clone(),
                     library: PathBuf::from(&values[2]),

@@ -12,8 +12,14 @@ emit <- function(kind, ...) {
   cat(paste(c(kind, fields), collapse = "\t"), "\n", file = output, append = TRUE, sep = "")
 }
 
-if (file.exists(output)) file.remove(output)
-libs <- if (length(requested)) requested else .libPaths()
+if (file.exists(output)) invisible(file.remove(output))
+libs <- if (length(requested)) {
+  # Explicit --lib paths define the non-base target universe. Base R's
+  # installation library is always present because R itself requires it.
+  c(requested, .Library)
+} else {
+  .libPaths()
+}
 libs <- vapply(libs, normalizePath, character(1L), winslash = "/", mustWork = TRUE)
 lib_keys <- if (.Platform$OS.type == "windows") tolower(libs) else libs
 libs <- libs[!duplicated(lib_keys)]

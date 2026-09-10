@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     ExportedBinding, ImportDirective, InspectError, RToolchain, SemanticSnapshot, Target,
-    TargetEnvironment, TargetProvidedPackage, ToolchainError,
+    InstalledPackage, ToolchainError,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,9 +58,6 @@ impl PackageMaterialization {
         retained_bindings.sort();
         retained_bindings.dedup();
 
-        if !snapshot.state.activation_clean {
-            return Err(MaterializeError::DirtySnapshot(snapshot.state.package.clone()));
-        }
         if !snapshot.state.package_issues.is_empty() {
             return Err(MaterializeError::UnsupportedPackage {
                 package: snapshot.state.package.clone(),
@@ -162,7 +159,7 @@ pub struct MaterializationRequest {
     /// R/OS/architecture identity this artifact is allowed to target.
     pub target: Option<Target>,
     /// Exact external package identities permitted at runtime.
-    pub target_provided: Vec<TargetProvidedPackage>,
+    pub target_provided: Vec<InstalledPackage>,
 }
 
 impl MaterializationRequest {
@@ -176,11 +173,6 @@ impl MaterializationRequest {
             target: None,
             target_provided: Vec::new(),
         }
-    }
-
-    pub fn use_target_environment(&mut self, target: &TargetEnvironment) {
-        self.target = Some(target.target.clone());
-        self.target_provided = target.packages.clone();
     }
 }
 
@@ -202,7 +194,6 @@ pub enum MaterializeError {
     UnsupportedBinding { package: String, binding: String, issues: Vec<String> },
     UnknownDataset { package: String, dataset: String },
     UnsupportedDataset { package: String, dataset: String, issues: Vec<String> },
-    DirtySnapshot(String),
     UnsupportedPackage { package: String, issues: Vec<String> },
     UnmodeledOnLoad(String),
     NativePackageUnsupported { package: String, dynlibs: Vec<String> },
@@ -424,7 +415,6 @@ impl fmt::Display for MaterializeError {
             Self::UnsupportedBinding { package, binding, issues } => write!(f, "cannot materialize {package}::{binding}: {}", issues.join("; ")),
             Self::UnknownDataset { package, dataset } => write!(f, "dataset {package}::{dataset} is not present in inspected baseline state"),
             Self::UnsupportedDataset { package, dataset, issues } => write!(f, "cannot materialize dataset {package}::{dataset}: {}", issues.join("; ")),
-            Self::DirtySnapshot(package) => write!(f, "pre-activation inspection of {package} observed activation contamination"),
             Self::UnsupportedPackage { package, issues } => write!(f, "cannot materialize package {package}: {}", issues.join("; ")),
             Self::UnmodeledOnLoad(package) => write!(f, "cannot materialize {package}: .onLoad has no modeled runtime activation semantics"),
             Self::NativePackageUnsupported { package, dynlibs } => write!(f, "cannot materialize native package {package} before native identity/build planning: {}", dynlibs.join(", ")),
@@ -458,7 +448,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::{
-        MaterializationRequest, ObjectState, SemanticSnapshot, SemanticState, TargetProvidedPackage,
+        MaterializationRequest, ObjectState, SemanticSnapshot, SemanticState, InstalledPackage,
     };
 
     use super::{append_extension, r_string, render_spec, MaterializeError, PackageMaterialization};
@@ -481,7 +471,7 @@ mod tests {
     #[test]
     fn renders_exact_target_identity() {
         let mut request = MaterializationRequest::new("out/baseline.rds");
-        request.target_provided.push(TargetProvidedPackage {
+        request.target_provided.push(InstalledPackage {
             name: "stats".into(),
             version: "4.6.1".into(),
             library: PathBuf::from("/opt/R/library"),
@@ -494,10 +484,10 @@ mod tests {
     fn snapshot(has_on_load: bool, dynlibs: Vec<String>) -> SemanticSnapshot {
         SemanticSnapshot {
             recipes_rds: PathBuf::from("recipes.rds"),
+            analysis_root: PathBuf::from("analysis"),
             state: SemanticState {
                 package: "foo".into(),
                 version: "1.0.0".into(),
-                activation_clean: true,
                 has_on_load,
                 exports: Vec::new(),
                 imports: Vec::new(),

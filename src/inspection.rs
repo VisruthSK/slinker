@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::ffi::OsStr;
 
-use crate::{RToolchain, StagedPackage, ToolchainError};
+use crate::{RToolchain, ToolchainError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingOrigin {
@@ -64,13 +64,13 @@ pub struct S3Registration {
 pub struct SemanticSnapshot {
     pub state: SemanticState,
     pub recipes_rds: PathBuf,
+    pub analysis_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticState {
     pub package: String,
     pub version: String,
-    pub activation_clean: bool,
     pub has_on_load: bool,
     pub exports: Vec<ExportedBinding>,
     pub imports: Vec<ImportDirective>,
@@ -90,68 +90,6 @@ pub enum InspectError {
 }
 
 impl RToolchain {
-    fn build_inspection_probe(&self, output_path: &Path) -> Result<PathBuf, InspectError> {
-        let build_dir = output_path.with_extension("inspect-native");
-        fs::create_dir_all(&build_dir).map_err(InspectError::Io)?;
-        let source = build_dir.join("hrm_inspect.c");
-        fs::write(&source, include_str!("r/inspect_native.c")).map_err(InspectError::Io)?;
-
-        let ext_probe = build_dir.join("dynlib-ext.R");
-        fs::write(&ext_probe, "cat(.Platform$dynlib.ext)\n").map_err(InspectError::Io)?;
-        let ext_output = self
-            .run_rscript([ext_probe.as_os_str()])
-            .map_err(InspectError::Toolchain)?;
-        let extension = String::from_utf8_lossy(&ext_output.stdout).trim().to_owned();
-        if extension.is_empty() || !extension.starts_with('.') {
-            return Err(InspectError::Protocol(format!("invalid target dynamic-library extension {extension:?}")));
-        }
-        let library = build_dir.join(format!("hrm_inspect{extension}"));
-
-        // R CMD SHLIB delegates to make/the compiler. On Windows, passing
-        // absolute paths containing backslashes through that toolchain can
-        // lose the path separators (for example `C:\Users\...` becomes
-        // `C:Users...`). We already run in `build_dir`, so pass only local
-        // file names and keep filesystem paths out of make's command line.
-        let source_name = source.file_name().ok_or_else(|| {
-            InspectError::Protocol(format!("inspection source has no file name: {}", source.display()))
-        })?;
-        let library_name = library.file_name().ok_or_else(|| {
-            InspectError::Protocol(format!("inspection library has no file name: {}", library.display()))
-        })?;
-
-        let mut command = self.command();
-        command
-            .current_dir(&build_dir)
-            .arg("CMD")
-            .arg("SHLIB")
-            .arg("-o")
-            .arg(library_name)
-            .arg(source_name);
-        crate::toolchain::checked_output(&mut command).map_err(InspectError::Toolchain)?;
-        if !library.is_file() {
-            return Err(InspectError::Protocol(format!(
-                "target R did not produce inspection probe {}",
-                library.display()
-            )));
-        }
-        Ok(library)
-    }
-
-    pub fn inspect_staged(&self, staged: &StagedPackage) -> Result<SemanticState, InspectError> {
-        Ok(self.inspect_staged_snapshot(staged)?.state)
-    }
-
-    pub fn inspect_staged_snapshot(&self, staged: &StagedPackage) -> Result<SemanticSnapshot, InspectError> {
-        let output_path = staged.configured.root.parent().unwrap_or(&staged.configured.root)
-            .join(format!("{}.semantic.hrm", staged.name));
-        self.inspect_package_snapshot_with_libraries(
-            &staged.library,
-            &staged.name,
-            &output_path,
-            &staged.semantic_libraries,
-        )
-    }
-
     pub fn inspect_package(
         &self,
         library: &Path,
@@ -167,7 +105,12 @@ impl RToolchain {
         package: &str,
         output_path: &Path,
     ) -> Result<SemanticSnapshot, InspectError> {
-        self.inspect_package_snapshot_with_libraries(library, package, output_path, &[library.to_path_buf()])
+        self.inspect_package_snapshot_with_libraries(
+            library,
+            package,
+            output_path,
+            &[library.to_path_buf()],
+        )
     }
 
     pub fn inspect_package_snapshot_with_libraries(
@@ -179,22 +122,29 @@ impl RToolchain {
     ) -> Result<SemanticSnapshot, InspectError> {
         let helper = output_path.with_extension("inspect.R");
         let recipes_rds = output_path.with_extension("recipes.rds");
-        let native_probe = self.build_inspection_probe(output_path)?;
+        let analysis_root = output_path.with_extension("analysis");
         fs::write(&helper, include_str!("r/inspect.R")).map_err(InspectError::Io)?;
 
-        let mut args = Vec::with_capacity(6 + libraries.len());
+        let mut args = Vec::with_capacity(5 + libraries.len());
         args.push(helper.as_os_str());
         args.push(library.as_os_str());
         args.push(OsStr::new(package));
         args.push(output_path.as_os_str());
         args.push(recipes_rds.as_os_str());
-        args.push(native_probe.as_os_str());
-        for visible in libraries { args.push(visible.as_os_str()); }
+        args.push(analysis_root.as_os_str());
+        for visible in libraries {
+            args.push(visible.as_os_str());
+        }
         self.run_rscript(args).map_err(InspectError::Toolchain)?;
 
         let text = fs::read_to_string(output_path).map_err(InspectError::Io)?;
-        Ok(SemanticSnapshot { state: parse_semantic_state(&text)?, recipes_rds })
+        Ok(SemanticSnapshot {
+            state: parse_semantic_state(&text)?,
+            recipes_rds,
+            analysis_root,
+        })
     }
+
 }
 
 fn parse_semantic_state(text: &str) -> Result<SemanticState, InspectError> {
@@ -215,12 +165,11 @@ fn parse_semantic_state(text: &str) -> Result<SemanticState, InspectError> {
 
         match kind {
             "HEADER" => {
-                require_len(kind, &values, 4, line_no)?;
+                require_len(kind, &values, 3, line_no)?;
                 state = Some(SemanticState {
                     package: values[0].clone(),
                     version: values[1].clone(),
-                    activation_clean: parse_bool(&values[2], line_no)?,
-                    has_on_load: parse_bool(&values[3], line_no)?,
+                    has_on_load: parse_bool(&values[2], line_no)?,
                     exports: Vec::new(),
                     imports: Vec::new(),
                     bindings: Vec::new(),
@@ -437,8 +386,8 @@ mod tests {
     #[test]
     fn parses_protocol() {
         let text = format!(
-            "HEADER\t{}\t{}\t{}\t{}\nEXPORT\t{}\t{}\nIMPORT_FROM\t{}\t{}\t{}\nBINDING\t{}\t{}\t{}\t{}\nISSUE\t{}\t{}\t{}\n",
-            h("foo"), h("1.2.3"), h("1"), h("0"), h("run"), h("run"), h("bar"), h("x"), h("local_x"),
+            "HEADER\t{}\t{}\t{}\nEXPORT\t{}\t{}\nIMPORT_FROM\t{}\t{}\t{}\nBINDING\t{}\t{}\t{}\t{}\nISSUE\t{}\t{}\t{}\n",
+            h("foo"), h("1.2.3"), h("0"), h("run"), h("run"), h("bar"), h("x"), h("local_x"),
             h("run"), h("code"), h("closure"), h("0"), h("$.attr"), h("environment"), h("embedded environment")
         );
         let state = parse_semantic_state(&text).unwrap();

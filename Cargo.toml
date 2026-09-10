@@ -3,8 +3,13 @@ name = "hrm"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Conservative staging, inspection, linking, and materialization primitives for heRmetic"
+description = "Target-specific linker for installed R package images"
 publish = false
+
+[[bin]]
+name = "hrm"
+path = "src/main.rs"
+required-features = ["air"]
 
 [features]
 default = ["air"]
@@ -12,8 +17,8 @@ air = ["dep:air_r_parser", "dep:air_r_syntax", "dep:biome_rowan"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 air_r_parser = { git = "https://github.com/posit-dev/air", tag = "0.11.0", optional = true }
 air_r_syntax = { git = "https://github.com/posit-dev/air", tag = "0.11.0", optional = true }
 
 biome_rowan = { git = "https://github.com/lionel-/biome", rev = "a1296ea6ba363d8b8d8f02181b2a4ce9315c5ef9", optional = true }
+

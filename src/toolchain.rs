@@ -5,11 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::Target;
+use crate::target_env::Target;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RToolchain {
-    r: PathBuf,
     rscript: PathBuf,
 }
 
@@ -26,13 +25,6 @@ pub enum ToolchainError {
 }
 
 impl RToolchain {
-    pub fn new(r: impl Into<PathBuf>, rscript: impl Into<PathBuf>) -> Self {
-        Self {
-            r: r.into(),
-            rscript: rscript.into(),
-        }
-    }
-
     pub fn from_r(r: impl Into<PathBuf>) -> Self {
         let r = r.into();
         let name = if cfg!(windows) { "Rscript.exe" } else { "Rscript" };
@@ -40,11 +32,7 @@ impl RToolchain {
             .parent()
             .map(|parent| parent.join(name))
             .unwrap_or_else(|| PathBuf::from(name));
-        Self { r, rscript }
-    }
-
-    pub fn r(&self) -> &Path {
-        &self.r
+        Self { rscript }
     }
 
     pub fn rscript(&self) -> &Path {
@@ -88,15 +76,19 @@ cat(R.version$arch, "\n", sep = "")
         Ok(Target { r_version, os, arch })
     }
 
-    pub(crate) fn command(&self) -> Command {
-        let mut command = Command::new(&self.r);
-        sanitize_r_environment(&mut command);
-        command
-    }
-
     pub(crate) fn rscript_command(&self) -> Command {
         let mut command = Command::new(&self.rscript);
         sanitize_r_environment(&mut command);
+        command.arg("--vanilla");
+        command
+    }
+
+    /// Run an R helper in the host library environment while still disabling
+    /// user startup files. This is reserved for target discovery, where the installed library
+    /// universe is itself the input being inspected.
+    pub(crate) fn host_rscript_command(&self) -> Command {
+        let mut command = Command::new(&self.rscript);
+        sanitize_r_startup(&mut command);
         command.arg("--vanilla");
         command
     }
@@ -110,14 +102,31 @@ cat(R.version$arch, "\n", sep = "")
         command.args(args);
         checked_output(&mut command)
     }
+
+    pub(crate) fn run_rscript_host<I, S>(&self, args: I) -> Result<Output, ToolchainError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut command = self.host_rscript_command();
+        command.args(args);
+        checked_output(&mut command)
+    }
 }
 
-pub(crate) fn sanitize_r_environment(command: &mut Command) {
+pub(crate) fn sanitize_r_startup(command: &mut Command) {
     command
         .env("R_ENVIRON_USER", "")
         .env("R_PROFILE_USER", "")
-        .env("R_LIBS_USER", "")
         .env("R_DEFAULT_PACKAGES", "NULL");
+}
+
+pub(crate) fn sanitize_r_environment(command: &mut Command) {
+    sanitize_r_startup(command);
+    command
+        .env("R_LIBS", "")
+        .env("R_LIBS_SITE", "")
+        .env("R_LIBS_USER", "");
 }
 
 pub(crate) fn checked_output(command: &mut Command) -> Result<Output, ToolchainError> {

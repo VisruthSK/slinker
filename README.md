@@ -1,190 +1,69 @@
-# hrm
+# heRmetic
 
-`hrm` is the Rust core of heRmetic: stage R packages with the real target toolchain, analyze their configured source with Air, inspect installed state before package activation, then materialize the retained closure into ordinary synthetic environments.
+heRmetic (`hrm`) links an R package against an installed R library and computes the smallest installed runtime closure it can safely preserve.
 
-This crate implements the first executable slice of the build model. It does not emulate R package loading in Rust. R remains the semantic authority for installation, namespace metadata, serialization, and lazy-load databases.
+Version `0.1.0` is intentionally target-specific. It does not rebuild dependency packages from source and does not resolve dependency package sources from repositories, Git, or local checkouts. The installed package image selected by R's library search order is the linker input.
 
-## Implemented pipeline
-
-### 1. Capture the semantic target
-
-`RToolchain::capture_target_environment` runs the selected target `Rscript` in a sanitized process and records:
-
-- R version, OS, and architecture
-- ordered target library paths
-- the first-resolved installed package name, version, and library path for every target-provided package
-
-The exact package identity is carried into staging and materialization. A different R/OS/architecture is rejected instead of being treated as equivalent.
-
-### 2. Stage through the real target R toolchain
-
-`RToolchain::stage` copies a package source tree into an isolated work area and runs the selected target `R CMD INSTALL` against that copy.
-
-The staging process:
-
-- exposes only the staging dependency libraries and declared target libraries
-- disables test loading, so the package's own `.onLoad` is not run as an installation check
-- preserves the post-`configure` source tree
-- defaults to source-level closures with byte compilation and source retention disabled
-- captures the effective post-`configure` `DESCRIPTION` and `NAMESPACE`
-- retains installed `Meta/package.rds` and `Meta/nsInfo.rds` as the semantic metadata view
-- inventories generated headers, build files, resources, and transformed R sources
-
-`StageRequest::use_target_environment` binds the stage request to the captured target and its library resolution.
-
-### 3. Analyze the configured R source with Air
-
-With the default `air` feature, `RToolchain::prepare_package` parses only the configured source view. `hrm::air` extracts syntax facts such as package-qualified access, dynamic package discovery, `system.file(..., package=...)`, and syntax-observation sites.
-
-Air owns syntax. Package identity, activation, reachability, and policy stay in heRmetic's typed semantic graph.
-
-### 4. Inspect installed state before session activation
-
-Each package is inspected in a fresh target `Rscript` process. The helper calls `loadNamespace(..., partial = TRUE)`, which loads imports and package code but returns before the package's sysdata, lazy data, S3 registration, DLL loading, `.onLoad`, export sealing, and namespace locking.
-
-The helper then loads only persistent sysdata and lazy datasets and records:
-
-- namespace bindings and their origin
-- public-to-backing export mappings
-- import-all/import-from directives, including renamed imports
-- S3 registration metadata
-- native library declarations
-- installed resources
-- whether `.onLoad` exists
-- object support failures and closure environment identities
-
-The inspector rejects active bindings, embedded environments, external pointers, weak references, S4/S7 objects, unsupported local closure environments, and non-base ALTREP. ALTREP classification comes from a tiny C probe compiled by the target R toolchain, not from string heuristics.
-
-Supported object recipes have namespace identities removed before serialization. Closures keep an explicit environment recipe such as `namespace:foo`; they do not serialize the real loaded namespace.
-
-### 5. Materialize canonical synthetic package state
-
-`RToolchain::materialize` consumes inspected recipes plus the retained binding set and creates one canonical namespace/imports pair per internalized package:
+## Analyze
 
 ```text
-.hermetic
-    foo_ns
-        .packageName = "foo"
-        .__S3MethodsTable__.
-        retained bindings
-        parent = foo_imports
-                     parent = .BaseNamespaceEnv
+hrm analyze voucher
+hrm analyze voucher --lib C:/project/renv/library --lib C:/Users/me/AppData/Local/R/win-library/4.6
+hrm analyze voucher --target-provided cli
 ```
 
-No `.__NAMESPACE__.` binding is created and synthetic namespaces are never registered in R's namespace registry.
+`PACKAGE` is an installed package name. heRmetic never installs or rebuilds packages. Install a development checkout into the library you want to analyze before running `hrm`.
 
-Materialization:
+`--lib` is repeatable and ordered. The first installed occurrence of a package wins, matching R library precedence. If no `--lib` is supplied, the target R process's normal `--vanilla` `.libPaths()` is used. Base R's library is always present.
 
-- creates every synthetic namespace/imports environment before reconstructing objects
-- rebinds retained closures to the canonical synthetic namespace or an exact target-provided real namespace
-- reconstructs lists, pairlists, language objects, expressions, attributes, sysdata, and retained datasets recursively
-- populates imports using synthetic exports or R's own namespace import machinery for real target namespaces
-- verifies exact target-provided package version and library path before accepting a real namespace
-- rejects undeclared namespaces loaded transitively by a target-provided package
-- locks imports, namespace, data, and `.hermetic` environments after construction
-- writes an eager validation RDS and an R lazy-load `.rdb`/`.rdx` containing `.hermetic`
+Third-party runtime dependencies are internalized by default. `--target-provided` is an explicit opt-out. Base packages (`Priority: base`) are part of the R platform. `LinkingTo` is not a runtime dependency in this model because native libraries are already built.
 
-A package with `.onLoad` is rejected unless the analyzer explicitly marks that hook as modeled runtime activation. The hook is retained but never executed during baseline materialization. Native packages are rejected at this layer until the separate native identity/build planner exists; silently flattening their DLL semantics would be wrong.
+Set `HRM_R` when the target R executable is not available as `R`/`R.exe` on `PATH`:
 
-## Minimal use
-
-```rust
-use hrm::{
-    MaterializationRequest, PackageMaterialization, RToolchain,
-    StageRequest, TargetEnvironmentRequest,
-};
-
-fn build() -> Result<(), Box<dyn std::error::Error>> {
-    let r = RToolchain::from_r(std::env::var_os("HRM_R").expect("set HRM_R to the target R executable"));
-
-    let target = r.capture_target_environment(
-        &TargetEnvironmentRequest::new("target/hrm/target"),
-    )?;
-
-    let mut stage = StageRequest::new("vendor/foo", "target/hrm/foo");
-    stage.use_target_environment(&target);
-    let prepared = r.prepare_package(&stage)?;
-
-    let package = PackageMaterialization::from_snapshot(
-        &prepared.semantic,
-        ["needed", "helper"],
-    )?;
-
-    let mut request = MaterializationRequest::new("target/hrm/baseline.rds");
-    request.use_target_environment(&target);
-    request.packages.push(package);
-    r.materialize(&request)?;
-    Ok(())
-}
+```text
+HRM_R=C:/Program Files/R/R-4.6.1/bin/R.exe
 ```
 
-## Proof and metadata hardening
+## Installed-image model
 
-An adversarial comparison against a second implementation led to several changes without importing its weaker analysis shortcuts:
+For each package, heRmetic reads the exact installed directory selected by the target library universe:
 
-- graph edges can carry explicit proof reasons; `LinkPlan::why_detailed()` returns those reasons
-- rejections expose stable machine-readable codes through `RejectionCode`
-- `LinkReport` emits a versioned JSON proof report
-- Air facts can retain exact Air-owned byte ranges through `scan_located()`
-- effective `DESCRIPTION` files are parsed as folded DCF and retain dependency constraints
-- configured-source staging records package/R-source byte counts
-- native source gets a comment/string-aware hazardous-API prefilter
-- exact target-provider insertion carries package version and library path and rejects identity collisions
-
-The comparison also confirmed several approaches that should not be adopted: reparsing Air-owned source with a handwritten R lexer, treating a hand-written `NAMESPACE` parser as semantic authority, name-only target package checks, and raw native substring scanning. See [`ADVERSARIAL_REVIEW.md`](ADVERSARIAL_REVIEW.md).
-
-## Linker core
-
-The existing typed graph/linker remains responsible for minimal reachability and rejection:
-
-```rust
-let plan = Linker::new(&graph, &packages).link()?;
-let path = plan.why(binding);
+```text
+pkg/
+  DESCRIPTION
+  NAMESPACE
+  Meta/package.rds
+  Meta/nsInfo.rds
+  R/pkg.rdb
+  R/pkg.rdx
+  data/
+  extdata/
+  libs/*.dll | *.so
 ```
 
-It models R bindings, activation edges, initialization, S3, resources, serialized objects, native components, and build inputs. Native reachability widens the package to an atomic component. Unsupported behavior is rejected only when its package/semantic unit enters the retained closure, except for intrinsically package-wide activation/build constraints.
+The R lazy-load database is loaded directly into a private environment. heRmetic does not call `loadNamespace()` during inspection, so inspection does not run `.onLoad`, attach imports, register S3 methods, or load the package DLL.
 
-## Tests
+For reachability analysis, installed closures are deparsed into temporary synthetic analysis units. Non-closure installed values get binding stubs because their construction has already happened. Air parses those units and the typed graph tracks lexical references, imports, `pkg::fun`, resources, lifecycle/S3 requirements, and native calls.
 
-Pure Rust tests cover the graph, linker, Air scanning, protocol parsing, materialization specification, and policy checks.
+The temporary analysis source is an implementation detail. It is not treated as package source and source `Collate` does not apply to it.
 
-The ignored `runtime_pipeline` integration test requires a real target R and exercises a fixture whose `configure` script rewrites `DESCRIPTION` and `NAMESPACE`, generates a header, and defines an `.onLoad` that must remain unexecuted during inspection/materialization:
+## Native packages
 
-Unix:
+Native code is target-specific input too. heRmetic tree-shakes the package's R binding layer normally and retains a required installed DLL/SO whole. It does not rebuild C/C++ and does not make the entire R layer reachable merely because native code is present.
 
-```sh
-HRM_R=/opt/R/4.6.1/bin/R \
-  cargo test --test runtime_pipeline -- --ignored --nocapture
-```
+## Output
 
-Windows with Nushell:
+`hrm analyze` reports:
 
-```nu
-with-env { HRM_R: 'C:\\Program Files\\R\\R-4.6.1\\bin\\R.exe' } {
-  cargo test --test runtime_pipeline -- --ignored --nocapture
-}
-```
+- the exact selected installed package paths and versions;
+- retained and eliminated bindings for each internalized namespace;
+- reachable materialization blockers;
+- retained resources and native components;
+- package-identity and namespace rewrite work;
+- the concrete synthetic namespace plan (`foo_ns` + `foo_imports`).
 
-The inspection phase also requires the target R build toolchain to compile its small ALTREP probe with `R CMD SHLIB`.
+The command currently stops at the plan. The next build step is to feed that retained set into the existing materializer, perform the required identity/resource rewrites, copy retained resources and whole required DLLs, then validate the generated root package with internalized packages absent.
 
-Air is pinned to `0.11.0`. That release requires Rust `1.94`, which is the crate's declared minimum toolchain.
+## Design boundary
 
-## Still outside this slice
-
-The implemented baseline stops before per-session activation. Remaining work includes modeled `.onLoad` execution, package activation ordering, external S3 registration, root imports wiring during installation/runtime, native DLL identity/build compatibility, provenance/licensing output, and differential validation.
-
-## Real-package runtime integration test
-
-The main runtime integration test deliberately uses a real R package source tree rather than a synthetic package that rewrites itself during `configure`. It currently targets [`VisruthSK/voucher`](https://github.com/VisruthSK/voucher), a pure-R package with ordinary `DESCRIPTION` and `NAMESPACE` files.
-
-Clone or otherwise unpack `voucher`, ensure its runtime imports (`cli` and `fs`) are installed in the target R library, then point the test at that exact source tree.
-
-Nushell on Windows:
-
-```nu
-$env.HRM_R = 'C:\Program Files\R\R-4.6.1\bin\R.exe'
-$env.HRM_VOUCHER_SOURCE = 'C:\path\to\voucher'
-cargo test --test runtime_pipeline -- --ignored --nocapture
-```
-
-The separate `postconfigure_staging` test exists only to verify the distinct case where an upstream R package actually ships `configure`/`configure.win` and changes its source tree before installation. heRmetic does not invent configuration scripts for normal packages.
+heRmetic is a linker over installed R package images. The selected R library universe is the dependency input. Changing `--lib` changes the exact package versions and binaries heRmetic analyzes.

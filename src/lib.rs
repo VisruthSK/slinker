@@ -1,46 +1,60 @@
-//! Conservative staging, inspection, linking, and materialization primitives for heRmetic.
+//! Installed-image analysis and materialization primitives for heRmetic.
 //!
-//! Air owns R syntax. `hrm` owns target-toolchain staging, the typed semantic
-//! graph, pre-activation installed-state inspection, reachability, rejection,
+//! `hrm` links the exact package images selected by an R library universe. Air
+//! analyzes installed closure bodies; heRmetic owns reachability, rewrite planning,
 //! and construction of canonical synthetic package environments.
 
-mod graph;
+#[derive(Debug)]
+pub enum Error {
+    Io { path: std::path::PathBuf, source: std::io::Error },
+    Metadata { path: std::path::PathBuf, source: MetadataError },
+    Parse { path: String, message: String },
+    Analysis(String),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { path, source } => write!(f, "I/O error at {}: {source}", path.display()),
+            Self::Metadata { path, source } => write!(f, "metadata error at {}: {source}", path.display()),
+            Self::Parse { path, message } => write!(f, "parse error in {path}: {message}"),
+            Self::Analysis(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Metadata { source, .. } => Some(source),
+            Self::Parse { .. } | Self::Analysis(_) => None,
+        }
+    }
+}
+
 mod inspection;
-mod linker;
 mod materialize;
 mod metadata;
-mod model;
-mod native;
-#[cfg(feature = "air")]
-mod pipeline;
-mod report;
-mod staging;
 mod target_env;
 mod toolchain;
 
-#[cfg(feature = "air")]
-pub mod air;
 
-pub use graph::{Edge, EdgeKind, Graph, Node, NodeId, NodeKind, RetentionStep};
+#[cfg(feature = "air")]
+pub mod analysis;
+
+
 pub use inspection::{
     BindingOrigin, ClosureEnvironment, ExportedBinding, ImportDirective, ImportedBinding, InspectError,
     ObjectIssue, ObjectState, S3Registration, SemanticSnapshot, SemanticState,
 };
-pub use linker::{Diagnostic, LinkError, LinkPlan, Linker, Rejection, RejectionCode};
 pub use materialize::{
     MaterializationRequest, MaterializeError, MaterializedArtifact, PackageMaterialization,
 };
 pub use metadata::{Dependency, Description, MetadataError};
-pub use model::{Capability, Package, PackageId, PackageRole, PackageSet, PackageSetError, Target};
-pub use native::{NativeHazard, NativeScanError, scan_native_tree};
-pub use report::{LinkReport, ReportWriteError, REPORT_SCHEMA_VERSION};
-#[cfg(feature = "air")]
-pub use pipeline::{PrepareError, PreparedPackage};
-pub use staging::{
-    ConfiguredSourceView, EffectiveMetadata, InstalledSemanticView, StageError, StageRequest,
-    StagedPackage,
-};
 pub use target_env::{
-    TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest, TargetProvidedPackage,
+    InstalledPackage, Target, TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest,
 };
 pub use toolchain::{RToolchain, ToolchainError};

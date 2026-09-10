@@ -1,24 +1,22 @@
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) < 5L) stop("usage: inspect.R LIBRARY PACKAGE OUTPUT RECIPES NATIVE_PROBE [VISIBLE_LIBRARY ...]", call. = FALSE)
+if (length(args) < 5L) {
+  stop("usage: inspect.R LIBRARY PACKAGE OUTPUT RECIPES ANALYSIS_DIR [VISIBLE_LIBRARY ...]", call. = FALSE)
+}
+
 library <- normalizePath(args[[1L]], winslash = "/", mustWork = TRUE)
 package <- args[[2L]]
 output <- args[[3L]]
 recipes_output <- args[[4L]]
-native_probe <- normalizePath(args[[5L]], winslash = "/", mustWork = TRUE)
+analysis_dir <- args[[5L]]
 visible_libraries <- if (length(args) > 5L) args[6L:length(args)] else library
 normalize_library <- function(path) normalizePath(path, winslash = "/", mustWork = TRUE)
 path_key <- function(path) {
   normalized <- normalizePath(path, winslash = "/", mustWork = FALSE)
   if (.Platform$OS.type == "windows") tolower(normalized) else normalized
 }
-dedupe_paths <- function(paths) {
-  normalized <- vapply(paths, normalize_library, character(1L))
-  normalized[!duplicated(vapply(normalized, path_key, character(1L)))]
-}
-visible_libraries <- dedupe_paths(c(library, visible_libraries))
-.libPaths(dedupe_paths(c(visible_libraries, .Library)))
-native_probe_dll <- dyn.load(native_probe, local = TRUE, now = TRUE)
-native_probe_altrep <- getNativeSymbolInfo("hrm_altrep_info", PACKAGE = native_probe_dll)$address
+visible_libraries <- vapply(c(library, visible_libraries, .Library), normalize_library, character(1L))
+visible_libraries <- visible_libraries[!duplicated(vapply(visible_libraries, path_key, character(1L)))]
+.libPaths(visible_libraries)
 
 hex <- function(x) {
   x <- enc2utf8(as.character(x))
@@ -33,21 +31,101 @@ emit <- function(kind, ...) {
 issue <- function(path, kind, detail = "") list(path = path, kind = kind, detail = detail)
 env_record <- function(path, kind, name = "") list(path = path, kind = kind, name = name)
 
+if (file.exists(output)) invisible(file.remove(output))
+if (dir.exists(analysis_dir)) unlink(analysis_dir, recursive = TRUE, force = TRUE)
+dir.create(file.path(analysis_dir, "R"), recursive = TRUE, showWarnings = FALSE)
+invisible(file.create(file.path(analysis_dir, ".hrm-installed-image")))
+
+pkgpath <- file.path(library, package)
+if (!dir.exists(pkgpath)) stop(sprintf("installed package not found: %s", pkgpath), call. = FALSE)
+pkgpath <- normalizePath(pkgpath, winslash = "/", mustWork = TRUE)
+
+description_path <- file.path(pkgpath, "DESCRIPTION")
+namespace_path <- file.path(pkgpath, "NAMESPACE")
+ns_info_path <- file.path(pkgpath, "Meta", "nsInfo.rds")
+package_rds_path <- file.path(pkgpath, "Meta", "package.rds")
+for (path in c(description_path, ns_info_path, package_rds_path)) {
+  if (!file.exists(path)) stop(sprintf("installed package metadata missing: %s", path), call. = FALSE)
+}
+
+invisible(file.copy(description_path, file.path(analysis_dir, "DESCRIPTION"), overwrite = TRUE))
+if (file.exists(namespace_path)) {
+  invisible(file.copy(namespace_path, file.path(analysis_dir, "NAMESPACE"), overwrite = TRUE))
+} else {
+  invisible(file.create(file.path(analysis_dir, "NAMESPACE")))
+}
+
+ns_info <- readRDS(ns_info_path)
+pkg_info <- readRDS(package_rds_path)
+version <- unname(pkg_info$DESCRIPTION[["Version"]])
+
+# Load the installed lazy-load image directly into a private environment. This
+# does not directly call loadNamespace() for this package, attach the package,
+# run its .onLoad, register its S3 methods, or load its DLLs. The installed
+# image is the semantic input heRmetic links from.
+image_env <- new.env(hash = TRUE, parent = .BaseNamespaceEnv)
+code_db <- file.path(pkgpath, "R", package)
+if (!file.exists(paste0(code_db, ".rdx")) || !file.exists(paste0(code_db, ".rdb"))) {
+  stop(sprintf("installed R lazy-load database missing for %s", package), call. = FALSE)
+}
+base::lazyLoad(code_db, envir = image_env)
+code_names <- ls(image_env, all.names = TRUE)
+
+sysdata_base <- file.path(pkgpath, "R", "sysdata")
+if (file.exists(paste0(sysdata_base, ".rdx")) && file.exists(paste0(sysdata_base, ".rdb"))) {
+  before <- ls(image_env, all.names = TRUE)
+  base::lazyLoad(sysdata_base, envir = image_env)
+  after <- ls(image_env, all.names = TRUE)
+  sysdata_names <- setdiff(after, before)
+} else {
+  sysdata_names <- character()
+}
+all_names <- ls(image_env, all.names = TRUE)
+
+missing_arg_box <- as.list(alist(.hrm_missing = ))
+names(missing_arg_box) <- NULL
+
+is_missing_slot <- function(values, i) {
+  slot <- values[i]
+  names(slot) <- NULL
+  identical(slot, missing_arg_box)
+}
+
+scrub_slots <- function(x) {
+  values <- as.list(x)
+  out <- vector("list", length(values))
+  if (length(values)) {
+    for (i in seq_along(values)) {
+      if (is_missing_slot(values, i)) {
+        # Preserve R_MissingArg without passing it as an R function argument.
+        out[i] <- values[i]
+      } else {
+        out[i] <- list(scrub_recipe(values[[i]]))
+      }
+    }
+  }
+  names(out) <- names(values)
+  out
+}
+
 closure_environment <- function(env, path) {
+  if (identical(env, image_env)) {
+    return(list(issue = NULL, env = env_record(path, "namespace", package)))
+  }
   if (isNamespace(env)) {
     return(list(issue = NULL, env = env_record(path, "namespace", getNamespaceName(env))))
-  }
-  if (identical(env, .GlobalEnv)) {
-    return(list(issue = issue(path, "environment_identity", ".GlobalEnv"), env = env_record(path, "global", ".GlobalEnv")))
   }
   if (identical(env, baseenv())) {
     return(list(issue = NULL, env = env_record(path, "base", "base")))
   }
-  if (identical(env, emptyenv())) {
-    return(list(issue = issue(path, "environment_identity", "emptyenv"), env = env_record(path, "empty", "")))
+  if (identical(env, .GlobalEnv)) {
+    return(list(issue = issue(path, "environment_identity", ".GlobalEnv"), env = env_record(path, "global", ".GlobalEnv")))
   }
   name <- environmentName(env)
-  list(issue = issue(path, "environment_identity", if (nzchar(name)) name else "local environment"), env = env_record(path, "local", name))
+  list(
+    issue = issue(path, "environment_identity", if (nzchar(name)) name else "local environment"),
+    env = env_record(path, "local", name)
+  )
 }
 
 inspect_object <- function(x, path = "$", depth = 0L) {
@@ -66,10 +144,6 @@ inspect_object <- function(x, path = "$", depth = 0L) {
   }
 
   type <- typeof(x)
-  altrep <- .Call(native_probe_altrep, x)
-  if (identical(altrep[[1L]], "1") && !identical(altrep[[3L]], "base")) {
-    add_issue(issue(path, "unsupported_altrep", paste0(altrep[[3L]], "::", altrep[[2L]])))
-  }
   if (isS4(x)) add_issue(issue(path, "s4", paste(class(x), collapse = "/")))
   classes <- class(x)
   if (length(classes) && any(grepl("^S7", classes))) {
@@ -92,7 +166,12 @@ inspect_object <- function(x, path = "$", depth = 0L) {
     values <- as.list(x)
     if (length(values)) {
       for (i in seq_along(values)) {
-        merge_child(inspect_object(values[[i]], paste0(path, "[[", i, "]]"), depth + 1L))
+        # Required function formals and omitted call arguments are represented
+        # by R_MissingArg. Passing that sentinel to inspect_object() would make
+        # its argument appear missing, so inspect only non-missing slots.
+        if (!is_missing_slot(values, i)) {
+          merge_child(inspect_object(values[[i]], paste0(path, "[[", i, "]]"), depth + 1L))
+        }
       }
     }
   } else if (!(type %in% c("NULL", "logical", "integer", "double", "complex", "character", "raw", "symbol", "builtin", "special"))) {
@@ -109,8 +188,8 @@ inspect_object <- function(x, path = "$", depth = 0L) {
   list(type = type, issues = issues, envs = envs)
 }
 
-
 recipe_env_ref <- function(env) {
+  if (identical(env, image_env)) return(paste0("namespace:", package))
   if (isNamespace(env)) return(paste0("namespace:", getNamespaceName(env)))
   if (identical(env, baseenv())) return("base:base")
   stop("unsupported closure environment reached recipe generation", call. = FALSE)
@@ -124,7 +203,7 @@ scrub_recipe <- function(x) {
     environment(out) <- emptyenv()
     attrs <- attributes(out)
     if (length(attrs)) {
-      for (name in names(attrs)) attrs[[name]] <- scrub_recipe(attrs[[name]])
+      for (name in names(attrs)) attrs[name] <- list(scrub_recipe(attrs[[name]]))
       attributes(out) <- attrs
     }
     attr(out, ".__hrm_recipe_env__.") <- ref
@@ -132,26 +211,41 @@ scrub_recipe <- function(x) {
   }
 
   if (type == "list") {
-    out <- vector("list", length(x))
-    if (length(x)) for (i in seq_along(x)) out[[i]] <- scrub_recipe(x[[i]])
-    names(out) <- names(x)
+    out <- scrub_slots(x)
   } else if (type == "expression") {
-    out <- as.expression(lapply(as.list(x), scrub_recipe))
+    out <- as.expression(scrub_slots(x))
   } else if (type == "pairlist") {
-    out <- as.pairlist(lapply(as.list(x), scrub_recipe))
-    names(out) <- names(x)
+    out <- as.pairlist(scrub_slots(x))
   } else if (type == "language") {
-    out <- as.call(lapply(as.list(x), scrub_recipe))
+    out <- as.call(scrub_slots(x))
   } else {
     out <- x
   }
 
   attrs <- attributes(x)
   if (length(attrs)) {
-    for (name in names(attrs)) attrs[[name]] <- scrub_recipe(attrs[[name]])
+    for (name in names(attrs)) attrs[name] <- list(scrub_recipe(attrs[[name]]))
     attributes(out) <- attrs
   }
   out
+}
+
+quote_binding <- function(name) {
+  if (grepl("^[A-Za-z.][A-Za-z0-9._]*$", name) && !grepl("^\\.[0-9]", name)) return(name)
+  paste0("`", gsub("`", "\\\\`", name, fixed = TRUE), "`")
+}
+
+write_analysis_binding <- function(index, name, value) {
+  lhs <- quote_binding(name)
+  rhs <- if (typeof(value) == "closure") {
+    paste(deparse(value, width.cutoff = 500L, control = c("keepInteger", "keepNA", "niceNames")), collapse = "\n")
+  } else {
+    # Non-closure installed objects are already materialized values. For
+    # reachability they need identity, not reconstruction code.
+    "NULL"
+  }
+  path <- file.path(analysis_dir, "R", sprintf("%06d.R", index))
+  writeLines(paste0(lhs, " <- ", rhs), path, useBytes = TRUE)
 }
 
 emit_object <- function(kind, name, value, origin = NULL) {
@@ -165,47 +259,14 @@ emit_object <- function(kind, name, value, origin = NULL) {
   NULL
 }
 
-if (file.exists(output)) file.remove(output)
 recipes <- list(bindings = list(), datasets = list())
-pkgpath <- find.package(package, lib.loc = library, quiet = TRUE)
-if (!length(pkgpath)) stop("package not found in staged library", call. = FALSE)
-pkgpath <- normalizePath(pkgpath, winslash = "/", mustWork = TRUE)
+has_on_load <- ".onLoad" %in% all_names
+emit("HEADER", package, version, if (has_on_load) "1" else "0")
 
-if (package %in% loadedNamespaces()) stop("package already loaded before inspection", call. = FALSE)
-before_dll <- vapply(getLoadedDLLs(), function(x) x[["path"]], character(1L), USE.NAMES = FALSE)
-
-ns_info_path <- file.path(pkgpath, "Meta", "nsInfo.rds")
-ns_info <- if (file.exists(ns_info_path)) readRDS(ns_info_path) else parseNamespaceFile(package, dirname(pkgpath), mustExist = FALSE)
-pkg_info <- readRDS(file.path(pkgpath, "Meta", "package.rds"))
-version <- unname(pkg_info$DESCRIPTION[["Version"]])
-
-ns <- loadNamespace(package, lib.loc = library, partial = TRUE)
-metadata_names <- c(".__NAMESPACE__.", ".__S3MethodsTable__.", ".packageName")
-code_names <- setdiff(ls(ns, all.names = TRUE), metadata_names)
-
-sysdata_base <- file.path(pkgpath, "R", "sysdata")
-if (file.exists(paste0(sysdata_base, ".rdb"))) lazyLoad(sysdata_base, ns)
-after_sysdata_names <- setdiff(ls(ns, all.names = TRUE), metadata_names)
-sysdata_names <- setdiff(after_sysdata_names, code_names)
-
-data_env <- new.env(hash = TRUE, parent = emptyenv())
-data_base <- file.path(pkgpath, "data", "Rdata")
-if (file.exists(paste0(data_base, ".rdb"))) lazyLoad(data_base, data_env)
-
-after_dll <- vapply(getLoadedDLLs(), function(x) x[["path"]], character(1L), USE.NAMES = FALSE)
-new_dll <- setdiff(after_dll, before_dll)
-normalized_pkgpath <- normalizePath(pkgpath, winslash = "/", mustWork = TRUE)
-pkgpath_key <- path_key(normalized_pkgpath)
-new_dll_keys <- if (length(new_dll)) vapply(new_dll, path_key, character(1L)) else character()
-own_dll <- any(startsWith(new_dll_keys, paste0(pkgpath_key, "/")))
-activation_clean <- !own_dll && !environmentIsLocked(ns)
-has_on_load <- exists(".onLoad", envir = ns, inherits = FALSE)
-emit("HEADER", package, version, if (activation_clean) "1" else "0", if (has_on_load) "1" else "0")
-
-if (length(ns_info$importClasses)) emit("PACKAGE_ISSUE", "NAMESPACE", "s4_import_classes", "importClasses is outside the MVP object model")
-if (length(ns_info$importMethods)) emit("PACKAGE_ISSUE", "NAMESPACE", "s4_import_methods", "importMethods is outside the MVP object model")
-if (length(ns_info$exportClasses)) emit("PACKAGE_ISSUE", "NAMESPACE", "s4_export_classes", "exportClasses is outside the MVP object model")
-if (length(ns_info$exportMethods)) emit("PACKAGE_ISSUE", "NAMESPACE", "s4_export_methods", "exportMethods is outside the MVP object model")
+if (length(ns_info$importClasses)) emit("PACKAGE_ISSUE", "NAMESPACE", "s4_import_classes", "importClasses is outside the v0.1 object model")
+if (length(ns_info$importMethods)) emit("PACKAGE_ISSUE", "NAMESPACE", "s4_import_methods", "importMethods is outside the v0.1 object model")
+if (length(ns_info$exportClasses)) emit("PACKAGE_ISSUE", "NAMESPACE", "s4_export_classes", "exportClasses is outside the v0.1 object model")
+if (length(ns_info$exportMethods)) emit("PACKAGE_ISSUE", "NAMESPACE", "s4_export_methods", "exportMethods is outside the v0.1 object model")
 
 exports <- as.character(ns_info$exports)
 export_names <- names(ns_info$exports)
@@ -214,7 +275,7 @@ empty_export_names <- !nzchar(export_names)
 export_names[empty_export_names] <- exports[empty_export_names]
 export_pairs <- Map(function(name, binding) c(name = name, binding = binding), export_names, exports)
 for (pattern in ns_info$exportPatterns) {
-  matches <- ls(ns, pattern = pattern, all.names = TRUE)
+  matches <- ls(image_env, pattern = pattern, all.names = TRUE)
   export_pairs <- c(export_pairs, Map(function(name) c(name = name, binding = name), matches))
 }
 if (length(export_pairs)) {
@@ -242,23 +303,25 @@ for (entry in ns_info$imports) {
   }
 }
 
-for (name in sort(after_sysdata_names)) {
+for (i in seq_along(all_names)) {
+  name <- all_names[[i]]
+  value <- tryCatch(get(name, envir = image_env, inherits = FALSE), error = identity)
   origin <- if (name %in% sysdata_names) "sysdata" else "code"
-  if (bindingIsActive(name, ns)) {
-    emit("BINDING", name, origin, "active_binding", "0")
-    emit("ISSUE", "$", "active_binding", "active binding in persistent namespace state")
-  } else {
-    value <- tryCatch(get(name, envir = ns, inherits = FALSE), error = identity)
-    if (inherits(value, "error")) {
-      emit("BINDING", name, origin, "unavailable", "0")
-      emit("ISSUE", "$", "force_error", conditionMessage(value))
-    } else {
-      recipe <- emit_object("BINDING", name, value, origin)
-      if (!is.null(recipe)) recipes$bindings[[name]] <- recipe
-    }
+  if (inherits(value, "error")) {
+    emit("BINDING", name, origin, "unavailable", "0")
+    emit("ISSUE", "$", "force_error", conditionMessage(value))
+    next
   }
+  write_analysis_binding(i, name, value)
+  recipe <- emit_object("BINDING", name, value, origin)
+  if (!is.null(recipe)) recipes$bindings[[name]] <- recipe
 }
 
+data_env <- new.env(hash = TRUE, parent = emptyenv())
+data_base <- file.path(pkgpath, "data", "Rdata")
+if (file.exists(paste0(data_base, ".rdx")) && file.exists(paste0(data_base, ".rdb"))) {
+  base::lazyLoad(data_base, envir = data_env)
+}
 for (name in sort(ls(data_env, all.names = TRUE))) {
   value <- tryCatch(get(name, envir = data_env, inherits = FALSE), error = identity)
   if (inherits(value, "error")) {
@@ -282,10 +345,6 @@ if (length(s3)) {
 for (dll in as.character(ns_info$dynlibs)) emit("DYNLIB", dll)
 
 all_files <- list.files(pkgpath, recursive = TRUE, all.files = TRUE, full.names = FALSE, include.dirs = FALSE, no.. = TRUE)
-for (rel in sort(all_files)) {
-  # Protocol paths are package-relative and always use forward slashes,
-  # independent of the target host's native separator.
-  emit("RESOURCE", chartr("\\", "/", rel))
-}
+for (rel in sort(all_files)) emit("RESOURCE", chartr("\\", "/", rel))
 
 saveRDS(recipes, recipes_output, version = 3L)

@@ -1,8 +1,0 @@
-#!/bin/sh
-set -eu
-cat > NAMESPACE <<'NS'
-export(public)
-NS
-printf '%s\n' 'Config/hrm: configured' >> DESCRIPTION
-mkdir -p inst
-printf '%s\n' 'configured' > inst/hrm-configured.txt

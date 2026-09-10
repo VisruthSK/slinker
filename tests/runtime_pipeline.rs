@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hrm::analysis::{Analyzer, AnalyzerConfig, TargetPackage};
 use hrm::{
-    MaterializationRequest, PackageMaterialization, RToolchain, StageRequest,
-    TargetEnvironmentRequest,
+    MaterializationRequest, PackageMaterialization, RToolchain, TargetEnvironmentRequest,
 };
 
 fn scratch() -> PathBuf {
@@ -15,23 +15,15 @@ fn scratch() -> PathBuf {
 }
 
 #[test]
-#[ignore = "requires HRM_R and HRM_VOUCHER_SOURCE pointing at a real voucher checkout"]
-fn stages_inspects_and_materializes_real_voucher_source() -> Result<(), Box<dyn std::error::Error>> {
+#[ignore = "requires HRM_R and voucher installed in the selected target library"]
+fn inspects_and_materializes_installed_voucher_image() -> Result<(), Box<dyn std::error::Error>> {
     let r = PathBuf::from(env::var("HRM_R")?);
-    let voucher_source = PathBuf::from(env::var("HRM_VOUCHER_SOURCE")?);
     let toolchain = RToolchain::from_r(&r);
     let work = scratch();
     fs::create_dir_all(&work)?;
 
-    if !voucher_source.join("DESCRIPTION").is_file() || !voucher_source.join("NAMESPACE").is_file() {
-        return Err(format!(
-            "HRM_VOUCHER_SOURCE must point at an unpacked voucher source tree; missing DESCRIPTION/NAMESPACE under {}",
-            voucher_source.display()
-        )
-        .into());
-    }
-
     let target = toolchain.capture_target_environment(&TargetEnvironmentRequest::new(work.join("target")))?;
+    let voucher = target.package("voucher").ok_or("voucher must be installed in the target R library")?;
     for dependency in ["cli", "fs"] {
         if target.package(dependency).is_none() {
             return Err(format!(
@@ -41,20 +33,32 @@ fn stages_inspects_and_materializes_real_voucher_source() -> Result<(), Box<dyn 
         }
     }
 
-    let mut stage_request = StageRequest::new(&voucher_source, work.join("stage"));
-    stage_request.use_target_environment(&target);
-    let prepared = toolchain.prepare_package(&stage_request)?;
-    let staged = &prepared.staged;
+    let output = work.join("voucher-image.hrm");
+    let snapshot = toolchain.inspect_package_snapshot_with_libraries(
+        &voucher.library,
+        "voucher",
+        &output,
+        &target.libraries,
+    )?;
 
-    assert_eq!(staged.name, "voucher");
-    assert!(staged.configured.effective.description.contains("Package: voucher"));
-    assert!(staged.configured.effective.namespace.contains("export(check)"));
-    assert!(prepared.source.iter().any(|file| !file.facts.is_empty()));
-
-    let snapshot = &prepared.semantic;
     assert_eq!(snapshot.state.package, "voucher");
-    assert!(snapshot.state.activation_clean);
     assert!(!snapshot.state.has_on_load);
+
+    let analysis = Analyzer::default().analyze(&AnalyzerConfig {
+        root: snapshot.analysis_root.clone(),
+        dependencies: Vec::new(),
+        target_packages: target
+            .packages
+            .iter()
+            .map(|package| TargetPackage {
+                name: package.name.clone(),
+                version: package.version.clone(),
+            })
+            .collect(),
+    })?;
+    assert!(!analysis.graph.nodes.is_empty());
+    assert!(analysis.reachable.iter().any(|reachable| *reachable));
+    assert!(analysis.diagnostics.iter().all(|diagnostic| !diagnostic.reachable));
 
     for binding in ["vouch_split_handle", "vouch_parse_line", "vouch_entry_matches_target"] {
         assert!(
@@ -67,16 +71,16 @@ fn stages_inspects_and_materializes_real_voucher_source() -> Result<(), Box<dyn 
         );
     }
 
-    // This is intentionally a small, real closed-world slice of voucher. The
-    // automatic reachability builder is not implemented yet, so the retained
-    // set is stated explicitly for this vertical-slice integration test.
+    // Materialization is still exercised on a small explicit slice here. The
+    // analyzer above now builds real reachability; wiring the retained analysis graph directly
+    // into materialization is the next layer.
     let package = PackageMaterialization::from_snapshot(
-        snapshot,
+        &snapshot,
         ["vouch_split_handle", "vouch_parse_line", "vouch_entry_matches_target"],
     )?;
     let mut materialization = MaterializationRequest::new(work.join("baseline.rds"));
     materialization.packages.push(package);
-    materialization.use_target_environment(&target);
+    materialization.target = Some(target.target.clone());
     let artifact = toolchain.materialize(&materialization)?;
     assert!(artifact.baseline_rds.is_file());
     assert!(artifact.lazy_rdb.as_ref().is_some_and(|path| path.is_file()));

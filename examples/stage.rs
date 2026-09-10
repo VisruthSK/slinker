@@ -16,7 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))?;
 
     let mut stage_request = StageRequest::new("vendor/foo", "target/hrm/stage");
-    stage_request.use_target_environment(&target);
+    stage_request.expected_target = Some(target.target.clone());
+    stage_request.external_libraries = target.libraries.clone();
     let staged = toolchain.stage(&stage_request)?;
     let snapshot = toolchain.inspect_staged_snapshot(&staged)?;
 
@@ -24,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut request = MaterializationRequest::new(PathBuf::from("target/hrm/baseline.rds"));
     request.packages.push(package);
-    request.use_target_environment(&target);
+    request.target = Some(target.target.clone());
     let artifact = toolchain.materialize(&request)?;
 
     println!("{}", artifact.baseline_rds.display());
