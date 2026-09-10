@@ -1,12 +1,12 @@
 #![cfg(feature = "air")]
 
-use hrm::analysis::{DiscoveryPolicy, EdgeKind, LinkPolicy, Linker, Need, NodeKind, RejectCode};
-use hrm::package::{
+use slinker::analysis::{DiscoveryPolicy, EdgeKind, LinkPolicy, Linker, Need, NodeKind, RejectCode};
+use slinker::package::{
     BindingImage, BindingOrigin, ClosureSource, Digest, ExportMap, ImportBinding, ImportSpec,
     InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeSafety, ObjectKind, PackageId, PackageImage,
     PackageIndex, PackageProvider, S3Registration, SyntaxValidation,
 };
-use hrm::{Description, Error, Result};
+use slinker::{Description, Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,7 @@ struct FakeProvider {
     packages: HashMap<String, Arc<PackageImage>>,
     target: HashSet<String>,
     image_counts: Arc<Mutex<HashMap<String, usize>>>,
+    optional_locate_counts: Arc<Mutex<HashMap<String, usize>>>,
     validation: SyntaxValidation,
     base: HashSet<String>,
 }
@@ -26,12 +27,14 @@ impl FakeProvider {
             packages: images.into_iter().map(|image| (image.index.package.id.name.clone(), Arc::new(image))).collect(),
             target: HashSet::new(),
             image_counts: Arc::new(Mutex::new(HashMap::new())),
+            optional_locate_counts: Arc::new(Mutex::new(HashMap::new())),
             validation: SyntaxValidation::Accepted,
             base: [
                 "library", "require", "requireNamespace", "loadNamespace", "getNamespace", "asNamespace",
                 "packageVersion", "find.package", "system.file", ".Call", ".C", ".Fortran", ".External",
                 "deparse", "substitute", "match.call", "print", "identity", "c", "list", "paste",
-                "+", "-", "*", "/", "[", "[[", "$", "<-", "{", "if", "for", "return",
+                "isNamespaceLoaded", "getNamespaceExports", "setHook", "packageEvent",
+                "+", "-", "*", "/", "[", "[[", "$", "<-", "{", "if", "for", "return", "%in%", "&&",
             ].into_iter().map(str::to_owned).collect(),
         }
     }
@@ -43,6 +46,10 @@ impl FakeProvider {
 
     fn count_handle(&self) -> Arc<Mutex<HashMap<String, usize>>> {
         Arc::clone(&self.image_counts)
+    }
+
+    fn optional_locate_count_handle(&self) -> Arc<Mutex<HashMap<String, usize>>> {
+        Arc::clone(&self.optional_locate_counts)
     }
 
     fn validation(mut self, validation: SyntaxValidation) -> Self {
@@ -60,6 +67,7 @@ impl PackageProvider for FakeProvider {
     }
 
     fn locate_optional(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
+        *self.optional_locate_counts.lock().unwrap().entry(name.to_owned()).or_default() += 1;
         Ok(self.packages.get(name).map(|image| image.index.package.clone()))
     }
 
@@ -93,7 +101,11 @@ impl PackageProvider for FakeProvider {
 }
 
 fn package(name: &str, bindings: &[(&str, Option<&str>)]) -> PackageImage {
-    package_with(name, bindings, Vec::new(), ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "")
+    let exports = bindings
+        .iter()
+        .map(|(binding, _)| ((*binding).to_owned(), (*binding).to_owned()))
+        .collect::<ExportMap>();
+    package_with(name, bindings, Vec::new(), exports, Vec::new(), Vec::new(), Vec::new(), "")
 }
 
 fn package_with(
@@ -120,8 +132,6 @@ fn package_with(
     let mut images = HashMap::new();
     for (binding, source) in bindings {
         let closure = source.map(|source| ClosureSource {
-            formals: Arc::from("pairlist()"),
-            body: Arc::from(source),
             source: Arc::from(source),
             environment: format!("namespace:{name}"),
         });
@@ -158,10 +168,105 @@ fn export(name: &str) -> ExportMap {
     ExportMap::from([(name.to_owned(), name.to_owned())])
 }
 
-fn retained_binding(plan: &hrm::analysis::LinkPlan, package: &str, binding: &str) -> bool {
+fn retained_binding(plan: &slinker::analysis::LinkPlan, package: &str, binding: &str) -> bool {
     plan.retained.iter().any(|need| matches!(need,
         Need::Binding { package: owner, binding: name } if owner.name == package && name == binding
     ))
+}
+
+#[test]
+fn root_starts_from_exports_and_recurses_only_into_referenced_internal_bindings() {
+    let root = package_with(
+        "root",
+        &[
+            ("public", Some("public <- function() helper()")),
+            ("helper", Some("helper <- function() 1")),
+            ("unused_optional", Some("unused_optional <- function() foo::bar()")),
+        ],
+        Vec::new(),
+        export("public"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package_with(
+        "foo",
+        &[("bar", Some("bar <- function() hidden()")), ("hidden", Some("hidden <- function() 1"))],
+        Vec::new(),
+        export("bar"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let provider = FakeProvider::new(vec![root, foo]);
+    let counts = provider.count_handle();
+    let plan = Linker::new(provider, 2).analyze("root").unwrap();
+
+    assert!(retained_binding(&plan, "root", "public"));
+    assert!(retained_binding(&plan, "root", "helper"));
+    assert!(!retained_binding(&plan, "root", "unused_optional"));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn root_lifecycle_remains_an_entrypoint_even_when_not_exported() {
+    let mut root = package_with(
+        "root",
+        &[
+            ("public", Some("public <- function() 1")),
+            (".onLoad", Some(".onLoad <- function(...) initialize_state()")),
+            ("initialize_state", Some("initialize_state <- function() 1")),
+            ("unused", Some("unused <- function() 2")),
+        ],
+        Vec::new(),
+        export("public"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    root.index.lifecycle.on_load = true;
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1).analyze("root").unwrap();
+
+    assert!(retained_binding(&plan, "root", ".onLoad"));
+    assert!(retained_binding(&plan, "root", "initialize_state"));
+    assert!(!retained_binding(&plan, "root", "unused"));
+}
+
+#[test]
+fn root_reexported_import_is_demanded_without_local_binding() {
+    let root = package_with(
+        "root",
+        &[],
+        vec![ImportSpec::From {
+            package: "utils".into(),
+            bindings: vec![ImportBinding { local: "head".into(), remote: "head".into() }],
+        }],
+        export("head"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Imports: utils\n",
+    );
+    let utils = package_with(
+        "utils",
+        &[("head", Some("head <- function(x) x")), ("unused", Some("unused <- function() 1"))],
+        Vec::new(),
+        export("head"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, utils]), 1).analyze("root").unwrap();
+
+    assert!(retained_binding(&plan, "root", "head"));
+    assert!(retained_binding(&plan, "utils", "head"));
+    assert!(!retained_binding(&plan, "utils", "unused"));
+    assert!(!plan.diagnostics.iter().any(|diagnostic| diagnostic.code == RejectCode::UnresolvedBinding));
 }
 
 #[test]
@@ -190,16 +295,16 @@ fn foreign_binding_can_pull_another_package_without_rounds() {
 }
 
 #[test]
-fn activation_follows_effective_imports_without_rooting_exports() {
+fn unused_root_import_metadata_does_not_create_reachability() {
     let root = package_with(
         "root",
         &[("f", Some("f <- function() 1"))],
         vec![ImportSpec::All { package: "foo".into(), except: Vec::new() }],
-        ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "",
+        export("f"), Vec::new(), Vec::new(), Vec::new(), "",
     );
     let foo = package_with("foo", &[("a", Some("a <- function() 1")), ("b", Some("b <- function() 2"))], Vec::new(), ExportMap::from([("a".into(), "a".into()), ("b".into(), "b".into())]), Vec::new(), Vec::new(), Vec::new(), "");
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
-    assert!(plan.retained.iter().any(|need| matches!(need, Need::Activation { package } if package.name == "foo")));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
     assert!(!retained_binding(&plan, "foo", "a"));
     assert!(!retained_binding(&plan, "foo", "b"));
 }
@@ -210,7 +315,7 @@ fn renamed_import_from_resolves_remote_binding() {
         "root",
         &[("f", Some("f <- function() local_x()"))],
         vec![ImportSpec::From { package: "foo".into(), bindings: vec![ImportBinding { local: "local_x".into(), remote: "x".into() }] }],
-        ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "",
+        export("f"), Vec::new(), Vec::new(), Vec::new(), "",
     );
     let foo = package_with("foo", &[("x", Some("x <- function() 1")), ("unused", Some("unused <- function() 2"))], Vec::new(), export("x"), Vec::new(), Vec::new(), Vec::new(), "");
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
@@ -220,7 +325,7 @@ fn renamed_import_from_resolves_remote_binding() {
 
 #[test]
 fn import_all_resolves_reachable_export_only() {
-    let root = package_with("root", &[("f", Some("f <- function() x()"))], vec![ImportSpec::All { package: "foo".into(), except: Vec::new() }], ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "");
+    let root = package_with("root", &[("f", Some("f <- function() x()"))], vec![ImportSpec::All { package: "foo".into(), except: Vec::new() }], export("f"), Vec::new(), Vec::new(), Vec::new(), "");
     let foo = package_with("foo", &[("x", Some("x <- function() 1")), ("y", Some("y <- function() 2"))], Vec::new(), ExportMap::from([("x".into(), "x".into()), ("y".into(), "y".into())]), Vec::new(), Vec::new(), Vec::new(), "");
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
     assert!(retained_binding(&plan, "foo", "x"));
@@ -228,11 +333,11 @@ fn import_all_resolves_reachable_export_only() {
 }
 
 #[test]
-fn non_target_depends_rejects_without_internalizing_depends_package() {
-    let root = package_with("root", &[("f", Some("f <- function() 1"))], Vec::new(), ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "Depends: foo\n");
+fn depends_metadata_alone_does_not_create_reachability() {
+    let root = package_with("root", &[("f", Some("f <- function() 1"))], Vec::new(), export("f"), Vec::new(), Vec::new(), Vec::new(), "Depends: foo\n");
     let foo = package("foo", &[("x", Some("x <- function() 1"))]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
-    assert!(plan.diagnostics.iter().any(|diagnostic| diagnostic.code == RejectCode::DependsAttachmentUnsupported));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
     assert!(!retained_binding(&plan, "foo", "x"));
 }
 
@@ -509,19 +614,19 @@ fn reachable_dependency_import_reports_missing_package_with_provenance() {
 }
 
 #[test]
-fn root_effective_import_is_first_order_runtime_obligation() {
+fn missing_unused_root_import_is_not_reported() {
     let root = package_with(
         "root",
         &[("f", Some("f <- function() 1"))],
         vec![ImportSpec::All { package: "required_at_root_load".into(), except: Vec::new() }],
-        ExportMap::new(),
+        export("f"),
         Vec::new(),
         Vec::new(),
         Vec::new(),
         "",
     );
     let plan = Linker::new(FakeProvider::new(vec![root]), 1).analyze("root").unwrap();
-    assert!(plan.graph.nodes.iter().any(|node| node.package == "required_at_root_load" && matches!(&node.kind, NodeKind::MissingPackage)));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "required_at_root_load"));
 }
 
 #[test]
@@ -545,7 +650,7 @@ fn suggests_alone_never_enters_the_graph() {
     let root = package_with(
         "root",
         &[("f", Some("f <- function() 1"))],
-        Vec::new(), ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "Suggests: foo\n",
+        Vec::new(), export("f"), Vec::new(), Vec::new(), Vec::new(), "Suggests: foo\n",
     );
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
     let provider = FakeProvider::new(vec![root, foo]);
@@ -556,11 +661,455 @@ fn suggests_alone_never_enters_the_graph() {
 }
 
 #[test]
+fn selecting_extra_does_not_root_an_unused_optional_package() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() 1"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
+    let provider = FakeProvider::new(vec![root, foo]);
+    let counts = provider.count_handle();
+    let plan = Linker::new(provider, 1)
+        .with_extra_packages(["foo".to_owned()])
+        .analyze("root")
+        .unwrap();
+
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn effective_namespace_import_is_required_even_if_description_also_suggests_it() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() imported_bar()"))],
+        vec![ImportSpec::From {
+            package: "foo".into(),
+            bindings: vec![ImportBinding { local: "imported_bar".into(), remote: "bar".into() }],
+        }],
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package_with(
+        "foo",
+        &[("bar", Some("bar <- function() 1")), ("unused", Some("unused <- function() 2"))],
+        Vec::new(),
+        export("bar"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
+
+    assert!(retained_binding(&plan, "foo", "bar"));
+    assert!(!retained_binding(&plan, "foo", "unused"));
+}
+
+#[test]
+fn config_needs_does_not_enable_a_suggested_runtime_package() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() foo::bar()"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\nConfig/Needs/website: foo, bar\n",
+    );
+    let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
+    let provider = FakeProvider::new(vec![root, foo]);
+    let counts = provider.count_handle();
+    let locate_counts = provider.optional_locate_count_handle();
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+    assert_eq!(locate_counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn required_description_relationship_wins_over_duplicate_suggests_when_source_uses_package() {
+    for required_field in ["Imports", "Depends"] {
+        let root = package_with(
+            "root",
+            &[("f", Some("f <- function() foo::bar()"))],
+            Vec::new(),
+            export("f"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &format!("{required_field}: foo\nSuggests: foo\n"),
+        );
+        let foo = package_with(
+            "foo",
+            &[("bar", Some("bar <- function() 1")), ("unused", Some("unused <- function() 2"))],
+            Vec::new(),
+            export("bar"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "",
+        );
+        let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
+
+        assert!(retained_binding(&plan, "foo", "bar"), "{required_field} should make foo required when source uses it");
+        assert!(!retained_binding(&plan, "foo", "unused"));
+    }
+}
+
+#[test]
+fn direct_suggested_namespace_access_is_ignored_without_extra_pkgs() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() foo::bar()"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package_with(
+        "foo",
+        &[("bar", Some("bar <- function() helper()")), ("helper", Some("helper <- function() 1"))],
+        Vec::new(),
+        export("bar"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let provider = FakeProvider::new(vec![root, foo]);
+    let counts = provider.count_handle();
+    let locate_counts = provider.optional_locate_count_handle();
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    assert!(!plan.rewrites.iter().any(|rewrite| matches!(rewrite,
+        slinker::build::Rewrite::NamespaceAccess { package, .. } if package.name == "foo"
+    )));
+    assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+    assert_eq!(locate_counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn direct_suggested_namespace_access_is_internalized_when_selected() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() foo::bar()"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package_with(
+        "foo",
+        &[
+            ("bar", Some("bar <- function() helper()")),
+            ("helper", Some("helper <- function() 1")),
+            ("unused", Some("unused <- function() 2")),
+        ],
+        Vec::new(),
+        export("bar"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        .with_extra_packages(["foo".to_owned()])
+        .analyze("root")
+        .unwrap();
+
+    assert!(retained_binding(&plan, "foo", "bar"));
+    assert!(retained_binding(&plan, "foo", "helper"));
+    assert!(!retained_binding(&plan, "foo", "unused"));
+}
+
+#[test]
+fn selecting_one_extra_does_not_enable_its_suggests() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() foo::bar()"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package_with(
+        "foo",
+        &[("bar", Some("bar <- function() baz::qux()"))],
+        Vec::new(),
+        export("bar"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: baz\n",
+    );
+    let baz = package("baz", &[("qux", Some("qux <- function() 1"))]);
+    let provider = FakeProvider::new(vec![root, foo, baz]);
+    let counts = provider.count_handle();
+    let locate_counts = provider.optional_locate_count_handle();
+    let plan = Linker::new(provider, 2)
+        .with_extra_packages(["foo".to_owned()])
+        .analyze("root")
+        .unwrap();
+
+    assert!(retained_binding(&plan, "foo", "bar"));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "baz"));
+    assert_eq!(counts.lock().unwrap().get("baz").copied().unwrap_or(0), 0);
+    assert_eq!(locate_counts.lock().unwrap().get("baz").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn cli_like_unreachable_optional_helpers_do_not_expand_suggests() {
+    let root = package_with(
+        "cli",
+        &[
+            ("cli_alert", Some("cli_alert <- function() format_alert()")),
+            ("format_alert", Some("format_alert <- function() paste('ok')")),
+            ("knitr_helper", Some("knitr_helper <- function() knitr::knit()")),
+            ("testthat_helper", Some("testthat_helper <- function() testthat::test_that('x', function() 1)")),
+            ("rmarkdown_helper", Some("rmarkdown_helper <- function() rmarkdown::render('x.Rmd')")),
+        ],
+        Vec::new(),
+        export("cli_alert"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests:\n    knitr,\n    testthat,\n    rmarkdown\n",
+    );
+    let knitr = package("knitr", &[("knit", Some("knit <- function() 1"))]);
+    let testthat = package("testthat", &[("test_that", Some("test_that <- function(...) 1"))]);
+    let rmarkdown = package("rmarkdown", &[("render", Some("render <- function(...) 1"))]);
+    let provider = FakeProvider::new(vec![root, knitr, testthat, rmarkdown]);
+    let counts = provider.count_handle();
+    let plan = Linker::new(provider, 4).analyze("cli").unwrap();
+
+    assert!(retained_binding(&plan, "cli", "cli_alert"));
+    assert!(retained_binding(&plan, "cli", "format_alert"));
+    assert!(!retained_binding(&plan, "cli", "knitr_helper"));
+    assert!(!retained_binding(&plan, "cli", "testthat_helper"));
+    assert!(!retained_binding(&plan, "cli", "rmarkdown_helper"));
+    for optional in ["knitr", "testthat", "rmarkdown"] {
+        assert!(!plan.graph.nodes.iter().any(|node| node.package == optional));
+        assert_eq!(counts.lock().unwrap().get(optional).copied().unwrap_or(0), 0);
+    }
+}
+
+#[test]
+fn cli_like_required_import_is_demanded_while_suggests_stay_out() {
+    let root = package_with(
+        "cli",
+        &[
+            ("cli_head", Some("cli_head <- function(x) head(x)")),
+            ("knitr_helper", Some("knitr_helper <- function() knitr::knit()")),
+            ("rlang_helper", Some("rlang_helper <- function() rlang::env()")),
+            ("testthat_helper", Some("testthat_helper <- function() testthat::test_that('x', function() 1)")),
+        ],
+        vec![ImportSpec::From {
+            package: "utils".into(),
+            bindings: vec![ImportBinding { local: "head".into(), remote: "head".into() }],
+        }],
+        export("cli_head"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Imports:\n    utils\nSuggests:\n    knitr,\n    rlang,\n    testthat\n",
+    );
+    let utils = package_with(
+        "utils",
+        &[("head", Some("head <- function(x) x")), ("unused", Some("unused <- function() 1"))],
+        Vec::new(),
+        export("head"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let knitr = package("knitr", &[("knit", Some("knit <- function() 1"))]);
+    let rlang = package("rlang", &[("env", Some("env <- function() 1"))]);
+    let testthat = package("testthat", &[("test_that", Some("test_that <- function(...) 1"))]);
+    let provider = FakeProvider::new(vec![root, utils, knitr, rlang, testthat]);
+    let counts = provider.count_handle();
+    let plan = Linker::new(provider, 4).analyze("cli").unwrap();
+
+    assert!(retained_binding(&plan, "utils", "head"));
+    assert!(!retained_binding(&plan, "utils", "unused"));
+    for optional in ["knitr", "rlang", "testthat"] {
+        assert!(!plan.graph.nodes.iter().any(|node| node.package == optional));
+        assert_eq!(counts.lock().unwrap().get(optional).copied().unwrap_or(0), 0);
+    }
+}
+
+#[test]
+fn unselected_suggested_resource_does_not_discover_package() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() system.file('data', 'x.json', package = 'foo')"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package_with(
+        "foo",
+        &[],
+        Vec::new(),
+        ExportMap::new(),
+        Vec::new(),
+        Vec::new(),
+        vec!["data/x.json".into()],
+        "",
+    );
+    let provider = FakeProvider::new(vec![root, foo]);
+    let counts = provider.count_handle();
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    assert!(!plan.rewrites.iter().any(|rewrite| matches!(rewrite,
+        slinker::build::Rewrite::ResourceAccess { package, .. } if package.name == "foo"
+    )));
+    assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn unselected_suggested_attachment_call_is_ignored() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() require(foo)"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
+
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    assert!(!plan.diagnostics.iter().any(|diagnostic| diagnostic.code == RejectCode::PackageAttachmentUnsupported));
+}
+
+#[test]
+fn unselected_suggested_s3_generic_does_not_retain_optional_registration_method() {
+    let root = package_with(
+        "root",
+        &[
+            ("public", Some("public <- function() 1")),
+            ("print.foo", Some("print.foo <- function(x, ...) x")),
+        ],
+        Vec::new(),
+        export("public"),
+        vec![S3Registration {
+            generic: "foo::print".into(),
+            class: "foo".into(),
+            method: "print.foo".into(),
+        }],
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package("foo", &[("print", Some("print <- function(x, ...) x"))]);
+    let provider = FakeProvider::new(vec![root, foo]);
+    let counts = provider.count_handle();
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert!(!retained_binding(&plan, "root", "print.foo"));
+    assert!(!plan.retained.iter().any(|need| matches!(need,
+        Need::S3Registration { registration, .. } if registration.generic == "foo::print"
+    )));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn retained_dependency_method_does_not_pull_unselected_suggested_generic() {
+    let root = package("root", &[("f", Some("f <- function() dep::method()"))]);
+    let dep = package_with(
+        "dep",
+        &[("method", Some("method <- function(x = NULL, ...) x"))],
+        Vec::new(),
+        export("method"),
+        vec![S3Registration {
+            generic: "foo::generic".into(),
+            class: "dep_class".into(),
+            method: "method".into(),
+        }],
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package("foo", &[("generic", Some("generic <- function(x, ...) x"))]);
+    let provider = FakeProvider::new(vec![root, dep, foo]);
+    let counts = provider.count_handle();
+    let plan = Linker::new(provider, 2).analyze("root").unwrap();
+
+    assert!(retained_binding(&plan, "dep", "method"));
+    assert!(!plan.retained.iter().any(|need| matches!(need,
+        Need::S3Registration { package, registration }
+            if package.name == "dep" && registration.generic == "foo::generic"
+    )));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn selected_extra_enables_retained_dependency_s3_generic() {
+    let root = package("root", &[("f", Some("f <- function() dep::method()"))]);
+    let dep = package_with(
+        "dep",
+        &[("method", Some("method <- function(x = NULL, ...) x"))],
+        Vec::new(),
+        export("method"),
+        vec![S3Registration {
+            generic: "foo::generic".into(),
+            class: "dep_class".into(),
+            method: "method".into(),
+        }],
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    let foo = package("foo", &[("generic", Some("generic <- function(x, ...) x"))]);
+    let plan = Linker::new(FakeProvider::new(vec![root, dep, foo]), 2)
+        .with_extra_packages(["foo".to_owned()])
+        .analyze("root")
+        .unwrap();
+
+    assert!(plan.retained.iter().any(|need| matches!(need,
+        Need::S3Registration { package, registration }
+            if package.name == "dep" && registration.generic == "foo::generic"
+    )));
+    assert!(plan.retained.iter().any(|need| matches!(need,
+        Need::Activation { package } if package.name == "foo"
+    )));
+}
+
+#[test]
 fn unselected_suggested_guard_prunes_optional_branch() {
     let root = package_with(
         "root",
         &[("f", Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()"))],
-        Vec::new(), ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "Suggests: foo\n",
+        Vec::new(), export("f"), Vec::new(), Vec::new(), Vec::new(), "Suggests: foo\n",
     );
     let foo = package_with(
         "foo",
@@ -573,8 +1122,8 @@ fn unselected_suggested_guard_prunes_optional_branch() {
     assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
     assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
     assert!(plan.rewrites.iter().any(|rewrite| matches!(rewrite,
-        hrm::build::Rewrite::PackageOperation {
-            operation: hrm::build::PackageOperation::RequireNamespace { result: false }, ..
+        slinker::build::Rewrite::PackageOperation {
+            operation: slinker::build::PackageOperation::RequireNamespace { result: false }, ..
         }
     )));
 }
@@ -584,7 +1133,7 @@ fn selected_extra_enables_guarded_optional_branch_without_rooting_whole_package(
     let root = package_with(
         "root",
         &[("f", Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()"))],
-        Vec::new(), ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "Suggests: foo\n",
+        Vec::new(), export("f"), Vec::new(), Vec::new(), Vec::new(), "Suggests: foo\n",
     );
     let foo = package_with(
         "foo",
@@ -605,11 +1154,114 @@ fn selected_missing_extra_is_reported_as_missing_dependency() {
     let root = package_with(
         "root",
         &[("f", Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()"))],
-        Vec::new(), ExportMap::new(), Vec::new(), Vec::new(), Vec::new(), "Suggests: foo\n",
+        Vec::new(), export("f"), Vec::new(), Vec::new(), Vec::new(), "Suggests: foo\n",
     );
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .with_extra_packages(["foo".to_owned()])
         .analyze("root")
         .unwrap();
     assert!(plan.graph.nodes.iter().any(|node| node.package == "foo" && matches!(&node.kind, NodeKind::MissingPackage)));
+}
+
+#[test]
+fn optional_onload_hook_does_not_activate_suggested_namespace() {
+    let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
+    let mut glue = package_with(
+        "glue",
+        &[
+            ("glue", Some("glue <- function(x) x")),
+            (
+                ".onLoad",
+                Some(
+                    ".onLoad <- function(...) { if (isNamespaceLoaded(\"knitr\") && \"knit_engines\" %in% getNamespaceExports(\"knitr\")) { knitr::knit_engines$set(glue = glue) } else { setHook(packageEvent(\"knitr\", \"onLoad\"), function(...) knitr::knit_engines$set(glue = glue)) } }",
+                ),
+            ),
+        ],
+        Vec::new(),
+        export("glue"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: knitr\n",
+    );
+    glue.index.lifecycle.on_load = true;
+    let plan = Linker::new(FakeProvider::new(vec![root, glue]), 4).analyze("root").unwrap();
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "knitr"));
+    assert!(!plan.diagnostics.iter().any(|diagnostic| diagnostic.code == RejectCode::MissingDependency));
+}
+
+#[test]
+fn selected_extra_enables_optional_onload_hook_namespace() {
+    let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
+    let mut glue = package_with(
+        "glue",
+        &[
+            ("glue", Some("glue <- function(x) x")),
+            (
+                ".onLoad",
+                Some(
+                    ".onLoad <- function(...) { if (isNamespaceLoaded(\"knitr\")) knitr::knit_engines$set(glue = glue) else setHook(packageEvent(\"knitr\", \"onLoad\"), function(...) knitr::knit_engines$set(glue = glue)) }",
+                ),
+            ),
+        ],
+        Vec::new(),
+        export("glue"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: knitr\n",
+    );
+    glue.index.lifecycle.on_load = true;
+    let knitr = package_with(
+        "knitr",
+        &[("knit_engines", None), ("unused", Some("unused <- function() 1"))],
+        Vec::new(),
+        export("knit_engines"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, glue, knitr]), 4)
+        .with_extra_packages(["knitr".to_owned()])
+        .analyze("root")
+        .unwrap();
+    assert!(retained_binding(&plan, "knitr", "knit_engines"));
+    assert!(!retained_binding(&plan, "knitr", "unused"));
+}
+
+#[test]
+fn target_provided_namespace_is_not_assumed_loaded_for_onload_guard() {
+    let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
+    let mut glue = package_with(
+        "glue",
+        &[
+            ("glue", Some("glue <- function(x) x")),
+            (
+                ".onLoad",
+                Some(".onLoad <- function(...) if (isNamespaceLoaded(\"knitr\")) knitr::knit_engines$set(glue = glue)"),
+            ),
+        ],
+        Vec::new(),
+        export("glue"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: knitr\n",
+    );
+    glue.index.lifecycle.on_load = true;
+    let knitr = package_with(
+        "knitr",
+        &[("knit_engines", None)],
+        Vec::new(),
+        export("knit_engines"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Priority: base\n",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, glue, knitr]).target("knitr"), 4)
+        .analyze("root")
+        .unwrap();
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "knitr"));
 }

@@ -1,13 +1,14 @@
 [package]
-name = "hrm"
+name = "slinker"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Target-specific linker for installed R package images"
+license = "BSD-3-Clause"
 publish = false
 
 [[bin]]
-name = "hrm"
+name = "slinker"
 path = "src/main.rs"
 required-features = ["air"]
 

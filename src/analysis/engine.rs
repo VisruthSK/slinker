@@ -1,8 +1,8 @@
 use crate::analysis::{Diagnostic, EdgeKind, Graph, Need, NodeId, NodeKind, RejectCode, S3Id};
 use crate::analysis::policy::{DiscoveryPolicy, LinkPolicy};
 use crate::build::{PackageOperation, Rewrite};
-use crate::package::{BindingImage, ImportSpec, InstalledPackage, ObjectKind, PackageId, PackageImage, PackageProvider, SyntaxValidation, NativeSafety};
-use crate::syntax::{AirParser, CallSite, ParsedRFile, ResolvedName, SourceId, Sources, Span, StaticArg, SyntaxEffectKind};
+use crate::package::{BindingImage, ImportSpec, InstalledPackage, ObjectKind, PackageId, PackageImage, PackageIndex, PackageProvider, SyntaxValidation, NativeSafety};
+use crate::syntax::{AirParser, CallSite, PackageGuard, ParsedRFile, ResolvedName, SourceId, Sources, Span, StaticArg, SyntaxEffectKind};
 use crate::{Error, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -25,7 +25,7 @@ pub struct LinkPlan {
 
 #[derive(Clone, Debug)]
 enum ParseState {
-    Parsed(ParsedRFile),
+    Parsed(Arc<ParsedRFile>),
     Blocked,
 }
 
@@ -34,6 +34,7 @@ pub struct Linker<P: PackageProvider> {
     policy: LinkPolicy,
     extra_packages: HashSet<String>,
     jobs: usize,
+    parse_pool: Option<Arc<rayon::ThreadPool>>,
     graph: Graph,
     roots: Vec<NodeId>,
     pending: VecDeque<Need>,
@@ -48,6 +49,7 @@ pub struct Linker<P: PackageProvider> {
     sources: Sources,
     source_ids: HashMap<(PackageId, String), SourceId>,
     root: Option<PackageId>,
+    suggested_only: HashMap<PackageId, HashSet<String>>,
     observations: Vec<SyntaxObservation>,
     diagnostic_keys: HashSet<(NodeId, RejectCode, String)>,
 }
@@ -67,6 +69,7 @@ impl<P: PackageProvider> Linker<P> {
             policy: LinkPolicy::default(),
             extra_packages: HashSet::new(),
             jobs: jobs.max(1),
+            parse_pool: None,
             graph: Graph::default(),
             roots: Vec::new(),
             pending: VecDeque::new(),
@@ -81,6 +84,7 @@ impl<P: PackageProvider> Linker<P> {
             sources: Sources::default(),
             source_ids: HashMap::new(),
             root: None,
+            suggested_only: HashMap::new(),
             observations: Vec::new(),
             diagnostic_keys: HashSet::new(),
         }
@@ -104,22 +108,24 @@ impl<P: PackageProvider> Linker<P> {
         self.root = Some(root.id.clone());
         self.encountered.insert(root.id.clone());
         let root_image = self.image(&root)?;
-        self.preparse_root(&root, &root_image)?;
 
+        // Package activation and the public/runtime entry points form the root
+        // contract. Internal namespace bindings are reached only when retained
+        // code, lifecycle hooks, S3 registrations, or native obligations demand
+        // them. DESCRIPTION/NAMESPACE dependency metadata informs resolution;
+        // it does not make every declared package or every root binding live.
         self.require_root(Need::Activation { package: root.id.clone() });
-        for binding in &root_image.index.binding_names {
-            self.require_root(Need::Binding { package: root.id.clone(), binding: binding.clone() });
+        self.process_frontier()?;
+
+        let mut entry_bindings = root_image.index.exports.values().cloned().collect::<Vec<_>>();
+        entry_bindings.sort();
+        entry_bindings.dedup();
+        for binding in entry_bindings {
+            self.require_root(Need::Binding { package: root.id.clone(), binding });
         }
 
         while !self.pending.is_empty() {
-            self.prefetch_pending_indexes()?;
-            self.prefetch_pending_images()?;
-            let need = self.pending.pop_front().expect("pending queue is non-empty");
-            self.queued.remove(&need);
-            if !self.processed.insert(need.clone()) {
-                continue;
-            }
-            self.process_need(need)?;
+            self.process_frontier()?;
         }
 
         self.finalize_syntax_observations();
@@ -144,6 +150,33 @@ impl<P: PackageProvider> Linker<P> {
         })
     }
 
+    fn process_frontier(&mut self) -> Result<()> {
+        let frontier = self.pending.len();
+        if frontier == 0 {
+            return Ok(());
+        }
+
+        // New needs discovered while this frontier is processed are deferred
+        // to the next frontier. Every item was already justified by a semantic
+        // edge; batching changes scheduling only, never reachability.
+        // A full demanded image already contains its PackageIndex. Fetch images
+        // first so activation/native needs for the same package do not trigger a
+        // redundant metadata-only R inspection in this frontier.
+        self.prefetch_frontier_images(frontier)?;
+        self.prefetch_frontier_indexes(frontier)?;
+        self.preparse_frontier_bindings(frontier)?;
+
+        for _ in 0..frontier {
+            let Some(need) = self.pending.pop_front() else { break };
+            self.queued.remove(&need);
+            if !self.processed.insert(need.clone()) {
+                continue;
+            }
+            self.process_need(need)?;
+        }
+        Ok(())
+    }
+
     fn image(&mut self, package: &InstalledPackage) -> Result<Arc<PackageImage>> {
         if let Some(image) = self.images.get(&package.id) {
             return Ok(Arc::clone(image));
@@ -153,105 +186,151 @@ impl<P: PackageProvider> Linker<P> {
         Ok(image)
     }
 
-    fn preparse_root(&mut self, root: &InstalledPackage, image: &PackageImage) -> Result<()> {
-        let mut work = Vec::new();
-        for binding in image.bindings.values() {
-            let Some(closure) = &binding.closure else { continue };
-            let key = (root.id.clone(), binding.name.clone());
-            let source_id = self.sources.add_binding(
-                root.id.name.clone(),
-                binding.name.clone(),
-                Arc::clone(&closure.source),
-            );
-            self.source_ids.insert(key.clone(), source_id.clone());
-            work.push((key, source_id, Arc::clone(&closure.source)));
+    fn parse_pool(&mut self) -> Result<Option<Arc<rayon::ThreadPool>>> {
+        if self.jobs <= 1 {
+            return Ok(None);
         }
-        if work.is_empty() {
-            return Ok(());
-        }
-
-        let parse = || {
-            work.par_iter()
-                .map(|(key, source, text)| {
-                    (key.clone(), AirParser.parse_binding(source.clone(), text.as_ref()))
-                })
-                .collect::<Vec<_>>()
-        };
-        let results = if self.jobs > 1 && work.len() > 1 {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(self.jobs.min(work.len()))
+        if self.parse_pool.is_none() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(self.jobs)
+                .thread_name(|index| format!("slinker-air-{index}"))
                 .build()
-                .map_err(|error| Error::Analysis(format!("failed to create Rayon pool: {error}")))?
-                .install(parse)
-        } else {
-            work.iter()
-                .map(|(key, source, text)| {
-                    (key.clone(), AirParser.parse_binding(source.clone(), text.as_ref()))
-                })
-                .collect()
-        };
-
-        for (key, result) in results {
-            match result {
-                Ok(parsed) => {
-                    self.parsed_bindings.insert(key, ParseState::Parsed(parsed));
-                }
-                Err(error) => {
-                    let node = self.need_node(&Need::Binding { package: key.0.clone(), binding: key.1.clone() });
-                    self.handle_air_rejection(&key.0, &key.1, &key.1, node, error)?;
-                }
-            }
+                .map_err(|error| Error::Analysis(format!("failed to create Rayon pool: {error}")))?;
+            self.parse_pool = Some(Arc::new(pool));
         }
-        Ok(())
+        Ok(self.parse_pool.as_ref().map(Arc::clone))
     }
 
-    fn prefetch_pending_indexes(&mut self) -> Result<()> {
-        if self.jobs <= 1 {
-            return Ok(());
-        }
+    fn prefetch_frontier_indexes(&mut self, frontier: usize) -> Result<()> {
         let mut seen = HashSet::new();
-        let mut packages = Vec::new();
-        for need in &self.pending {
-            if !matches!(need, Need::Activation { .. } | Need::Resource { .. } | Need::S3Registration { .. }) {
+        let mut names = Vec::new();
+        for need in self.pending.iter().take(frontier) {
+            if !matches!(need, Need::Activation { .. } | Need::Native { .. }) {
                 continue;
             }
             let id = need.package();
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let package = self.packages.locate(&id.name)?;
-            if !self.packages.is_target_provided(&package) {
-                packages.push(package);
+            if seen.insert(id.name.clone()) {
+                names.push(id.name.clone());
             }
         }
-        if packages.len() > 1 {
+        let mut packages = self.packages.locate_many(&names, self.jobs)?;
+        packages.retain(|package| !self.packages.is_target_provided(package));
+        if !packages.is_empty() {
             self.packages.prefetch_indexes(&packages, self.jobs)?;
         }
         Ok(())
     }
 
-    fn prefetch_pending_images(&mut self) -> Result<()> {
-        if self.jobs <= 1 {
-            return Ok(());
-        }
-
+    fn prefetch_frontier_images(&mut self, frontier: usize) -> Result<()> {
         let mut seen = HashSet::new();
-        let mut packages = Vec::new();
-        for need in &self.pending {
+        let mut names = Vec::new();
+        for need in self.pending.iter().take(frontier) {
             if !matches!(need, Need::Binding { .. } | Need::Dataset { .. }) {
                 continue;
             }
             let id = need.package();
-            if self.images.contains_key(id) || !seen.insert(id.clone()) {
-                continue;
-            }
-            let package = self.packages.locate(&id.name)?;
-            if !self.packages.is_target_provided(&package) {
-                packages.push(package);
+            if !self.images.contains_key(id) && seen.insert(id.name.clone()) {
+                names.push(id.name.clone());
             }
         }
-        if packages.len() > 1 {
+        let mut packages = self.packages.locate_many(&names, self.jobs)?;
+        packages.retain(|package| !self.packages.is_target_provided(package));
+        if !packages.is_empty() {
             self.packages.prefetch(&packages, self.jobs)?;
+        }
+        Ok(())
+    }
+
+    fn preparse_frontier_bindings(&mut self, frontier: usize) -> Result<()> {
+        struct Work {
+            key: (PackageId, String),
+            owner_binding: String,
+            source_key: String,
+            owner_node: NodeId,
+            source: SourceId,
+            text: Arc<str>,
+        }
+
+        let needs = self.pending.iter().take(frontier).cloned().collect::<Vec<_>>();
+        let mut work = Vec::<Work>::new();
+        let mut scheduled = HashSet::<(PackageId, String)>::new();
+        for need in needs {
+            let Need::Binding { package: id, binding } = need else { continue };
+            let package = self.packages.locate(&id.name)?;
+            if self.packages.is_target_provided(&package) {
+                continue;
+            }
+            let image = self.image(&package)?;
+            let Some(binding_image) = image.binding(&binding) else { continue };
+            let owner_node = self.need_node(&Need::Binding { package: id.clone(), binding: binding.clone() });
+
+            if let Some(closure) = &binding_image.closure {
+                let key = (id.clone(), binding.clone());
+                if !self.parsed_bindings.contains_key(&key) && scheduled.insert(key.clone()) {
+                    let source = self.sources.add_binding(id.name.clone(), binding.clone(), Arc::clone(&closure.source));
+                    self.source_ids.insert(key.clone(), source.clone());
+                    work.push(Work {
+                        key,
+                        owner_binding: binding.clone(),
+                        source_key: binding.clone(),
+                        owner_node,
+                        source,
+                        text: Arc::clone(&closure.source),
+                    });
+                }
+            }
+            for embedded in &binding_image.embedded_closures {
+                let source_key = format!("{binding}{}", embedded.path);
+                let key = (id.clone(), source_key.clone());
+                if self.parsed_bindings.contains_key(&key) || !scheduled.insert(key.clone()) {
+                    continue;
+                }
+                let source = self.sources.add_binding(id.name.clone(), source_key.clone(), Arc::clone(&embedded.source));
+                self.source_ids.insert(key.clone(), source.clone());
+                work.push(Work {
+                    key,
+                    owner_binding: binding.clone(),
+                    source_key,
+                    owner_node,
+                    source,
+                    text: Arc::clone(&embedded.source),
+                });
+            }
+        }
+        if work.is_empty() {
+            return Ok(());
+        }
+
+        let parse_all = || {
+            work.par_iter()
+                .map(|item| AirParser.parse_binding(item.source.clone(), item.text.as_ref()))
+                .collect::<Vec<_>>()
+        };
+        let results = if work.len() > 1 {
+            if let Some(pool) = self.parse_pool()? {
+                pool.install(parse_all)
+            } else {
+                work.iter().map(|item| AirParser.parse_binding(item.source.clone(), item.text.as_ref())).collect()
+            }
+        } else {
+            work.iter().map(|item| AirParser.parse_binding(item.source.clone(), item.text.as_ref())).collect()
+        };
+
+        for (item, result) in work.into_iter().zip(results) {
+            match result {
+                Ok(parsed) => {
+                    self.parsed_bindings.insert(item.key, ParseState::Parsed(Arc::new(parsed)));
+                }
+                Err(error) => {
+                    self.handle_air_rejection(
+                        &item.key.0,
+                        &item.owner_binding,
+                        &item.source_key,
+                        item.owner_node,
+                        error,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -269,7 +348,6 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn process_binding(&mut self, id: PackageId, binding: String) -> Result<()> {
-        eprintln!("[hrm] analyze {}::{binding}", id.name);
         let package = self.packages.locate(&id.name)?;
         let node = self.need_node(&Need::Binding { package: id.clone(), binding: binding.clone() });
         if self.packages.is_target_provided(&package) {
@@ -278,6 +356,63 @@ impl<P: PackageProvider> Linker<P> {
         }
         let image = self.image(&package)?;
         let Some(binding_image) = image.binding(&binding).cloned() else {
+            if self.is_root(&id)
+                && image.index.exports.values().any(|exported_binding| exported_binding == &binding)
+            {
+                let resolved = self.resolve_name(&package, &image, &binding)?;
+                match resolved {
+                    ResolvedName::Imported { package, binding: foreign_binding } => {
+                        self.require(
+                            node,
+                            Need::Activation { package: package.clone() },
+                            EdgeKind::Export,
+                            format!("root re-export `{binding}` requires namespace activation"),
+                        );
+                        self.require(
+                            node,
+                            Need::Binding { package, binding: foreign_binding.clone() },
+                            EdgeKind::Export,
+                            format!("root re-export `{binding}` resolves to imported binding `{foreign_binding}`"),
+                        );
+                        return Ok(());
+                    }
+                    ResolvedName::TargetProvided { package, binding: foreign_binding } => {
+                        let external = self.graph.add_node(
+                            package.name.clone(),
+                            NodeKind::ExternalBinding { name: foreign_binding.clone() },
+                            None,
+                        );
+                        self.graph.add_edge(
+                            node,
+                            external,
+                            EdgeKind::Export,
+                            format!("root re-export `{binding}` resolves to target-provided `{foreign_binding}`"),
+                        );
+                        return Ok(());
+                    }
+                    ResolvedName::Base(_) | ResolvedName::PackageMetadata { .. } => return Ok(()),
+                    ResolvedName::MissingPackage { package, binding: foreign_binding } => {
+                        let detail = foreign_binding
+                            .as_deref()
+                            .map(|name| format!("root re-export `{binding}` requires missing {package}::{name}"))
+                            .unwrap_or_else(|| format!("root re-export `{binding}` requires missing namespace {package}"));
+                        self.record_missing_package(node, &id, &package, EdgeKind::Export, detail, None);
+                        return Ok(());
+                    }
+                    ResolvedName::Unknown(name) => {
+                        self.diagnostic(
+                            node,
+                            &id,
+                            Some(&binding),
+                            RejectCode::UnresolvedBinding,
+                            format!("exported name `{binding}` resolves to unknown binding `{name}`"),
+                            None,
+                        );
+                        return Ok(());
+                    }
+                    ResolvedName::PackageBinding { .. } | ResolvedName::Local(_) => {}
+                }
+            }
             self.diagnostic(
                 node,
                 &id,
@@ -291,6 +426,13 @@ impl<P: PackageProvider> Linker<P> {
 
         if !self.is_root(&id) {
             for registration in image.index.s3.iter().filter(|registration| registration.method == binding) {
+                if let Some((package_name, _generic)) = registration.generic.split_once("::") {
+                    if self.package_is_suggested_only(&image.index, package_name)?
+                        && !self.optional_package_selected(package_name)
+                    {
+                        continue;
+                    }
+                }
                 self.require(
                     node,
                     Need::S3Registration {
@@ -357,7 +499,7 @@ impl<P: PackageProvider> Linker<P> {
                 );
             }
             if let Some(parsed) = self.parsed(&id, &binding, &binding_image)? {
-                self.process_parsed(node, &package, &image, &binding, &parsed)?;
+                self.process_parsed(node, &package, &image, &binding, parsed.as_ref())?;
             }
         }
 
@@ -387,7 +529,7 @@ impl<P: PackageProvider> Linker<P> {
                 node,
                 Arc::clone(&embedded.source),
             )? {
-                self.process_parsed(node, &package, &image, &binding, &parsed)?;
+                self.process_parsed(node, &package, &image, &binding, parsed.as_ref())?;
             }
         }
         Ok(())
@@ -396,29 +538,59 @@ impl<P: PackageProvider> Linker<P> {
     fn guards_active(
         &mut self,
         image: &PackageImage,
-        guards: &[String],
+        guards: &[PackageGuard],
     ) -> Result<bool> {
-        if !guards.is_empty()
-            && (image.bindings.contains_key("requireNamespace")
-                || image.index.import_from("requireNamespace").is_some()
-                || image.index.imports.iter().any(|import| matches!(import, ImportSpec::All { .. })))
-        {
+        if guards.is_empty() {
             return Ok(true);
         }
+
+        let helper_shadowed = |helper: &str, image: &PackageImage| {
+            image.bindings.contains_key(helper) || image.index.import_from(helper).is_some()
+        };
+        if guards.iter().any(|guard| {
+            let helper = match guard {
+                PackageGuard::Available(_) => "requireNamespace",
+                PackageGuard::Loaded(_) => "isNamespaceLoaded",
+                PackageGuard::Selected(_) => return false,
+            };
+            helper_shadowed(helper, image)
+        }) {
+            // The probe itself is shadowed by a package/importFrom binding, so
+            // the static availability interpretation is not sound.
+            return Ok(true);
+        }
+
         for guard in guards {
-            if self.optional_package_selected(guard) {
+            let package = guard.package();
+            if self.optional_package_selected(package) {
                 continue;
             }
-            if image.index.imports.iter().any(|import| match import {
-                ImportSpec::All { package, .. } | ImportSpec::From { package, .. } => package == guard,
-            }) {
-                continue;
+            if self.package_is_suggested_only(&image.index, package)? {
+                return Ok(false);
             }
-            match self.packages.locate_optional(guard)? {
-                Some(package) if self.packages.is_target_provided(&package) => {
-                    self.target_provided.insert(package.id);
+            let imported = image.index.imports.iter().any(|import| match import {
+                ImportSpec::All { package: imported, .. } | ImportSpec::From { package: imported, .. } => imported == package,
+            });
+            match guard {
+                PackageGuard::Selected(_) => return Ok(false),
+                PackageGuard::Loaded(_) => {
+                    // Imports are activated before `.onLoad`; ambient installed
+                    // packages are not assumed to be loaded.
+                    if !imported {
+                        return Ok(false);
+                    }
                 }
-                _ => return Ok(false),
+                PackageGuard::Available(_) => {
+                    if imported {
+                        continue;
+                    }
+                    match self.packages.locate_optional(package)? {
+                        Some(candidate) if self.packages.is_target_provided(&candidate) => {
+                            self.target_provided.insert(candidate.id);
+                        }
+                        _ => return Ok(false),
+                    }
+                }
             }
         }
         Ok(true)
@@ -440,11 +612,11 @@ impl<P: PackageProvider> Linker<P> {
             }
             for reference in &expression.package_refs {
                 if !self.guards_active(image, &reference.guards)? { continue; }
-                self.namespace_access(node, package, reference)?;
+                self.namespace_access(node, package, image, reference)?;
             }
             for resource in &expression.resource_refs {
                 if !self.guards_active(image, &resource.guards)? { continue; }
-                self.resource_access(node, package, resource)?;
+                self.resource_access(node, package, image, resource)?;
             }
             for call in &expression.calls {
                 if !self.guards_active(image, &call.guards)? { continue; }
@@ -471,7 +643,7 @@ impl<P: PackageProvider> Linker<P> {
         Ok(())
     }
 
-    fn parsed(&mut self, id: &PackageId, binding: &str, image: &BindingImage) -> Result<Option<ParsedRFile>> {
+    fn parsed(&mut self, id: &PackageId, binding: &str, image: &BindingImage) -> Result<Option<Arc<ParsedRFile>>> {
         let closure = image.closure.as_ref().ok_or_else(|| {
             Error::Analysis(format!("closure binding {}::{binding} has no source", id.name))
         })?;
@@ -495,11 +667,11 @@ impl<P: PackageProvider> Linker<P> {
         source_key: &str,
         owner_node: NodeId,
         source_text: Arc<str>,
-    ) -> Result<Option<ParsedRFile>> {
+    ) -> Result<Option<Arc<ParsedRFile>>> {
         let key = (id.clone(), source_key.to_owned());
         if let Some(state) = self.parsed_bindings.get(&key) {
             return Ok(match state {
-                ParseState::Parsed(parsed) => Some(parsed.clone()),
+                ParseState::Parsed(parsed) => Some(Arc::clone(parsed)),
                 ParseState::Blocked => None,
             });
         }
@@ -511,7 +683,8 @@ impl<P: PackageProvider> Linker<P> {
         self.source_ids.insert(key.clone(), source.clone());
         match AirParser.parse_binding(source, source_text.as_ref()) {
             Ok(parsed) => {
-                self.parsed_bindings.insert(key, ParseState::Parsed(parsed.clone()));
+                let parsed = Arc::new(parsed);
+                self.parsed_bindings.insert(key, ParseState::Parsed(Arc::clone(&parsed)));
                 Ok(Some(parsed))
             }
             Err(error) => {
@@ -579,56 +752,18 @@ impl<P: PackageProvider> Linker<P> {
         let index = self.packages.index(&package)?;
         let node = self.need_node(&Need::Activation { package: id.clone() });
 
-        for dependency in index.description.depends().map_err(|error| Error::Analysis(error.to_string()))? {
-            match self.packages.locate_optional(&dependency.name)? {
-                Some(dependency_package) if self.packages.is_target_provided(&dependency_package) => {}
-                Some(_) => self.diagnostic(
-                    node,
-                    &id,
-                    None,
-                    RejectCode::DependsAttachmentUnsupported,
-                    format!("internalized package has non-target-provided Depends: {}", dependency.name),
-                    None,
-                ),
-                None => self.record_missing_package(
-                    node,
-                    &id,
-                    &dependency.name,
-                    EdgeKind::Import,
-                    format!("Depends requires search-path attachment of {}", dependency.name),
-                    None,
-                ),
-            }
-        }
-
-        // Preserve the complete activation/import contract only for the real
-        // root package. Synthetic dependency imports are demanded by retained
-        // bindings and lifecycle code through name resolution, so unused
-        // imports do not recursively widen the semantic closure.
+        // Dependency declarations are lookup metadata, not reachability roots.
+        // A retained binding that resolves through an import will demand the
+        // exact foreign activation/binding. Unused Imports/Depends stay cold.
         if self.is_root(&id) {
-            for import in &index.imports {
-                let name = match import {
-                    ImportSpec::All { package, .. } | ImportSpec::From { package, .. } => package,
-                };
-                match self.packages.locate_optional(name)? {
-                    Some(foreign) => self.require(
-                        node,
-                        Need::Activation { package: foreign.id },
-                        EdgeKind::Import,
-                        format!("root activation requires imported namespace {name}"),
-                    ),
-                    None => self.record_missing_package(
-                        node,
-                        &id,
-                        name,
-                        EdgeKind::Import,
-                        format!("root effective NAMESPACE imports {name}"),
-                        None,
-                    ),
-                }
-            }
-
             for registration in &index.s3 {
+                if let Some((package_name, _generic)) = registration.generic.split_once("::") {
+                    if self.package_is_suggested_only(&index, package_name)?
+                        && !self.optional_package_selected(package_name)
+                    {
+                        continue;
+                    }
+                }
                 self.require(
                     node,
                     Need::S3Registration {
@@ -670,8 +805,7 @@ impl<P: PackageProvider> Linker<P> {
             self.target_provided.insert(package.id.clone());
             return Ok(());
         }
-        let index = self.packages.index(&package)?;
-        let _present = index.files.iter().any(|candidate| candidate == &resource);
+        let _present = self.packages.resource_exists(&package, &resource)?;
         // An absent system.file() path is a valid result when mustWork is false
         // (the default). The reference is retained only when the installed
         // image actually contains the requested path.
@@ -774,7 +908,22 @@ impl<P: PackageProvider> Linker<P> {
         Ok(())
     }
 
-    fn namespace_access(&mut self, from: NodeId, current: &InstalledPackage, reference: &crate::syntax::PackageRef) -> Result<()> {
+    fn namespace_access(
+        &mut self,
+        from: NodeId,
+        current: &InstalledPackage,
+        image: &PackageImage,
+        reference: &crate::syntax::PackageRef,
+    ) -> Result<()> {
+        if self.package_is_suggested_only(&image.index, &reference.package)?
+            && !self.optional_package_selected(&reference.package)
+        {
+            // Suggests-only packages are deliberately outside the selected
+            // link universe. Leave the optional operation in the retained R
+            // source, but do not discover, inspect, internalize, or rewrite
+            // that package unless the user enables it with --extra-pkgs.
+            return Ok(());
+        }
         let Some(foreign) = self.packages.locate_optional(&reference.package)? else {
             self.record_missing_package(
                 from,
@@ -805,15 +954,13 @@ impl<P: PackageProvider> Linker<P> {
         if self.packages.is_target_provided(&foreign) {
             self.target_provided.insert(foreign.id.clone());
             let external = self.graph.add_node(&foreign.id.name, NodeKind::ExternalBinding { name: reference.symbol.clone() }, Some(reference.span.clone()));
-            if self.graph.add_edge_at(
+            self.graph.add_edge_at(
                 from,
                 external,
                 EdgeKind::PackageQualified,
                 format!("{} access to target-provided binding", if reference.internal { ":::" } else { "::" }),
                 Some(reference.span.clone()),
-            ) {
-                eprintln!("[hrm] require {}{}{}", reference.package, if reference.internal { ":::" } else { "::" }, reference.symbol);
-            }
+            );
             return Ok(());
         }
         let index = self.packages.index(&foreign)?;
@@ -845,7 +992,13 @@ impl<P: PackageProvider> Linker<P> {
         Ok(())
     }
 
-    fn resource_access(&mut self, from: NodeId, current: &InstalledPackage, resource: &crate::syntax::ResourceRef) -> Result<()> {
+    fn resource_access(
+        &mut self,
+        from: NodeId,
+        current: &InstalledPackage,
+        image: &PackageImage,
+        resource: &crate::syntax::ResourceRef,
+    ) -> Result<()> {
         let Some(package_name) = &resource.package else {
             if resource.path.is_none() {
                 self.diagnostic(from, &current.id, None, RejectCode::DynamicLookup, "dynamic system.file() resource path", Some(resource.span.clone()));
@@ -857,6 +1010,12 @@ impl<P: PackageProvider> Linker<P> {
         // path/help/Meta semantics exactly; no synthetic resource rewrite is
         // required for system.file(..., package = <root>).
         if self.is_root(&current.id) && package_name == &current.id.name {
+            return Ok(());
+        }
+
+        if self.package_is_suggested_only(&image.index, package_name)?
+            && !self.optional_package_selected(package_name)
+        {
             return Ok(());
         }
 
@@ -879,8 +1038,7 @@ impl<P: PackageProvider> Linker<P> {
             self.diagnostic(from, &current.id, None, RejectCode::DynamicLookup, format!("dynamic system.file() path for package {package_name}"), Some(resource.span.clone()));
             return Ok(());
         };
-        let index = self.packages.index(&foreign)?;
-        if !index.files.iter().any(|candidate| candidate == path) {
+        if !self.packages.resource_exists(&foreign, path)? {
             match resource.must_work {
                 Some(false) => return Ok(()),
                 Some(true) => {
@@ -922,14 +1080,43 @@ impl<P: PackageProvider> Linker<P> {
         self.extra_packages.contains(name)
     }
 
-    fn package_is_suggested(image: &PackageImage, name: &str) -> Result<bool> {
-        Ok(image
-            .index
-            .description
-            .suggests()
-            .map_err(|error| Error::Analysis(error.to_string()))?
-            .iter()
-            .any(|dependency| dependency.name == name))
+    fn package_is_suggested_only(&mut self, index: &PackageIndex, name: &str) -> Result<bool> {
+        if !self.suggested_only.contains_key(&index.package.id) {
+            let mut required = HashSet::new();
+            for import in &index.imports {
+                let package = match import {
+                    ImportSpec::All { package, .. } | ImportSpec::From { package, .. } => package,
+                };
+                required.insert(package.clone());
+            }
+            for dependency in index
+                .description
+                .imports()
+                .map_err(|error| Error::Analysis(error.to_string()))?
+                .into_iter()
+                .chain(
+                    index
+                        .description
+                        .depends()
+                        .map_err(|error| Error::Analysis(error.to_string()))?,
+                )
+            {
+                required.insert(dependency.name);
+            }
+
+            let suggested = index
+                .description
+                .suggests()
+                .map_err(|error| Error::Analysis(error.to_string()))?
+                .into_iter()
+                .filter_map(|dependency| (!required.contains(&dependency.name)).then_some(dependency.name))
+                .collect::<HashSet<_>>();
+            self.suggested_only.insert(index.package.id.clone(), suggested);
+        }
+        Ok(self
+            .suggested_only
+            .get(&index.package.id)
+            .is_some_and(|packages| packages.contains(name)))
     }
 
     fn semantic_call(&mut self, from: NodeId, current: &InstalledPackage, image: &PackageImage, call: &CallSite) -> Result<()> {
@@ -943,6 +1130,13 @@ impl<P: PackageProvider> Linker<P> {
         match call.callee.as_str() {
             "library" | "require" => {
                 let package = static_package_arg(call);
+                if let Some(name) = package {
+                    if self.package_is_suggested_only(&image.index, name)?
+                        && !self.optional_package_selected(name)
+                    {
+                        return Ok(());
+                    }
+                }
                 self.diagnostic(from, &current.id, None, RejectCode::PackageAttachmentUnsupported,
                     match package { Some(name) => format!("search-path attachment of `{name}` is outside the current contract"), None => "dynamic package attachment is outside the current contract".into() },
                     Some(call.span.clone()));
@@ -969,21 +1163,18 @@ impl<P: PackageProvider> Linker<P> {
                     "asNamespace" => PackageOperation::AsNamespace,
                     _ => unreachable!(),
                 };
-                let suggested = Self::package_is_suggested(image, name)?;
+                let suggested = self.package_is_suggested_only(&image.index, name)?;
                 let discovery_policy = if self.optional_package_selected(name) {
                     DiscoveryPolicy::Internalize
                 } else if suggested && call.callee == "requireNamespace" {
-                    match self.packages.locate_optional(name)? {
-                        Some(foreign) if self.packages.is_target_provided(&foreign) => DiscoveryPolicy::TargetProvidedOnly,
-                        _ => {
-                            self.rewrites.push(Rewrite::PackageOperation {
-                                source: call.span.clone(),
-                                package: None,
-                                operation: PackageOperation::RequireNamespace { result: false },
-                            });
-                            return Ok(());
-                        }
-                    }
+                    self.rewrites.push(Rewrite::PackageOperation {
+                        source: call.span.clone(),
+                        package: None,
+                        operation: PackageOperation::RequireNamespace { result: false },
+                    });
+                    return Ok(());
+                } else if suggested {
+                    return Ok(());
                 } else {
                     self.policy.namespace_discovery
                 };
@@ -1060,8 +1251,8 @@ impl<P: PackageProvider> Linker<P> {
                     },
                 }
             }
-            "packageVersion" => self.identity_query(from, current, call, true)?,
-            "find.package" => self.identity_query(from, current, call, false)?,
+            "packageVersion" => self.identity_query(from, current, image, call, true)?,
+            "find.package" => self.identity_query(from, current, image, call, false)?,
             ".Call" | ".External" | ".C" | ".Fortran" => {
                 match image.index.dynlibs.as_slice() {
                     [] => self.diagnostic(
@@ -1100,7 +1291,14 @@ impl<P: PackageProvider> Linker<P> {
         Ok(())
     }
 
-    fn identity_query(&mut self, from: NodeId, current: &InstalledPackage, call: &CallSite, version: bool) -> Result<()> {
+    fn identity_query(
+        &mut self,
+        from: NodeId,
+        current: &InstalledPackage,
+        image: &PackageImage,
+        call: &CallSite,
+        version: bool,
+    ) -> Result<()> {
         let Some(name) = static_string_arg(call) else {
             self.diagnostic(
                 from,
@@ -1113,6 +1311,9 @@ impl<P: PackageProvider> Linker<P> {
             return Ok(());
         };
         if self.is_root(&current.id) && name == current.id.name {
+            return Ok(());
+        }
+        if self.package_is_suggested_only(&image.index, name)? && !self.optional_package_selected(name) {
             return Ok(());
         }
         let discovery_policy = if self.optional_package_selected(name) {

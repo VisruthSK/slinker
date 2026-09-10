@@ -1,6 +1,6 @@
-.hrm_namespace_metadata <- c(".__NAMESPACE__.", ".__S3MethodsTable__.", ".packageName")
+.slinker_namespace_metadata <- c(".__NAMESPACE__.", ".__S3MethodsTable__.", ".packageName")
 
-.hrm_closure_environment <- function(env, image_env, package) {
+.slinker_closure_environment <- function(env, image_env, package) {
   if (identical(env, image_env)) return(paste0("namespace:", package))
   if (isNamespace(env)) return(paste0("namespace:", getNamespaceName(env)))
   if (identical(env, baseenv())) return("base:base")
@@ -9,9 +9,9 @@
   paste0("unsupported:", if (nzchar(name)) name else "local")
 }
 
-.hrm_package_image_context <- function(library, package, visible_libraries = character()) {
-  library <- .hrm_normalize_library(library)
-  .libPaths(.hrm_dedupe_libraries(c(library, visible_libraries, .Library)))
+.slinker_package_image_context <- function(library, package, visible_libraries = character()) {
+  library <- .slinker_normalize_library(library)
+  .libPaths(.slinker_dedupe_libraries(c(library, visible_libraries, .Library)))
 
   pkgpath <- file.path(library, package)
   if (!dir.exists(pkgpath)) stop(sprintf("installed package not found: %s", pkgpath), call. = FALSE)
@@ -43,7 +43,7 @@
     sysdata_names <- character()
   }
 
-  all_names <- sort(setdiff(ls(image_env, all.names = TRUE), .hrm_namespace_metadata))
+  all_names <- sort(setdiff(ls(image_env, all.names = TRUE), .slinker_namespace_metadata))
 
   data_env <- new.env(hash = TRUE, parent = emptyenv())
   data_base <- file.path(pkgpath, "data", "Rdata")
@@ -65,7 +65,7 @@
   )
 }
 
-.hrm_emit_package_index <- function(context, emit, binding_record = "BINDING_NAME") {
+.slinker_emit_package_index <- function(context, emit, binding_record = "BINDING_NAME") {
   ns_info <- context$ns_info
   image_env <- context$image_env
 
@@ -89,7 +89,7 @@
   export_names[empty_export_names] <- exports[empty_export_names]
   export_pairs <- Map(function(name, binding) c(name = name, binding = binding), export_names, exports)
   for (pattern in ns_info$exportPatterns) {
-    matches <- setdiff(ls(image_env, pattern = pattern, all.names = TRUE), .hrm_namespace_metadata)
+    matches <- setdiff(ls(image_env, pattern = pattern, all.names = TRUE), .slinker_namespace_metadata)
     export_pairs <- c(export_pairs, Map(function(name) c(name = name, binding = name), matches))
   }
   if (length(export_pairs)) {
@@ -133,28 +133,19 @@
 
   for (dll in as.character(ns_info$dynlibs)) emit("DYNLIB", dll)
 
-  files <- list.files(
-    context$path,
-    recursive = TRUE,
-    all.files = TRUE,
-    full.names = FALSE,
-    include.dirs = TRUE,
-    no.. = TRUE
-  )
-  for (rel in sort(unique(files))) emit("FILE", chartr("\\", "/", rel))
 }
 
-hrm_inspect_index <- function(library, package, output, visible_libraries = character()) {
-  context <- .hrm_package_image_context(library, package, visible_libraries)
+slinker_inspect_index <- function(library, package, output, visible_libraries = character()) {
+  context <- .slinker_package_image_context(library, package, visible_libraries)
   if (file.exists(output)) invisible(file.remove(output))
   connection <- file(output, open = "wt", encoding = "UTF-8")
   on.exit(close(connection), add = TRUE)
-  emit <- function(kind, ...) .hrm_emit_connection(connection, kind, ...)
-  .hrm_emit_package_index(context, emit)
+  emit <- function(kind, ...) .slinker_emit_connection(connection, kind, ...)
+  .slinker_emit_package_index(context, emit)
   invisible(NULL)
 }
 
-.hrm_scan_retained_object <- function(value, image_env, package) {
+.slinker_scan_retained_object <- function(value, image_env, package) {
   issues <- list()
   closures <- list()
   seen_envs <- list()
@@ -191,7 +182,7 @@ hrm_inspect_index <- function(library, package, output, visible_libraries = char
       path = path,
       environment = env_ref,
       source = paste0(
-        ".hrm_embedded <- ",
+        ".slinker_embedded <- ",
         paste(deparse(value, width.cutoff = 500L, control = c("keepInteger", "keepNA", "niceNames")), collapse = "\n")
       )
     )
@@ -220,7 +211,7 @@ hrm_inspect_index <- function(library, package, output, visible_libraries = char
       values <- as.list(x)
       if (length(values)) {
         for (i in seq_along(values)) {
-          if (!.hrm_is_missing_slot(values, i)) {
+          if (!.slinker_is_missing_slot(values, i)) {
             walk(values[[i]], paste0(path, "[[", i, "]]"), depth + 1L, TRUE)
           }
         }
@@ -271,14 +262,14 @@ hrm_inspect_index <- function(library, package, output, visible_libraries = char
   )
 }
 
-hrm_inspect_image <- function(library, package, output, visible_libraries = character()) {
-  context <- .hrm_package_image_context(library, package, visible_libraries)
+slinker_inspect_image <- function(library, package, output, visible_libraries = character()) {
+  context <- .slinker_package_image_context(library, package, visible_libraries)
   if (file.exists(output)) invisible(file.remove(output))
   connection <- file(output, open = "wt", encoding = "UTF-8")
   on.exit(close(connection), add = TRUE)
-  emit <- function(kind, ...) .hrm_emit_connection(connection, kind, ...)
+  emit <- function(kind, ...) .slinker_emit_connection(connection, kind, ...)
 
-  .hrm_emit_package_index(context, emit, binding_record = NULL)
+  .slinker_emit_package_index(context, emit, binding_record = NULL)
 
   for (name in context$binding_names) {
     origin <- if (name %in% context$sysdata_names) "sysdata" else "code"
@@ -290,21 +281,19 @@ hrm_inspect_image <- function(library, package, output, visible_libraries = char
     }
     type <- typeof(value)
     emit("BINDING", name, origin, type)
-    scan <- .hrm_scan_retained_object(value, context$image_env, context$package)
+    scan <- .slinker_scan_retained_object(value, context$image_env, context$package)
     for (issue in scan$issues) emit("BINDING_ISSUE", name, issue$path, issue$kind, issue$detail)
     for (closure in scan$closures) emit("NESTED_CLOSURE", name, closure$path, closure$environment, closure$source)
     if (identical(type, "closure")) {
-      formals_text <- paste(deparse(formals(value), width.cutoff = 500L, control = c("keepInteger", "keepNA", "niceNames")), collapse = "\n")
-      body_text <- paste(deparse(body(value), width.cutoff = 500L, control = c("keepInteger", "keepNA", "niceNames")), collapse = "\n")
-      source <- .hrm_analysis_binding(name, value)
+      source <- .slinker_analysis_binding(name, value)
       environment_ref <- scan$root_environment
-      emit("CLOSURE", name, environment_ref, formals_text, body_text, source)
+      emit("CLOSURE", name, environment_ref, source)
     }
   }
   invisible(NULL)
 }
 
-.hrm_read_image_manifest <- function(path) {
+.slinker_read_image_manifest <- function(path) {
   records <- strsplit(readLines(path, warn = FALSE), "\t", fixed = TRUE)
   libraries <- character()
   jobs <- list()
@@ -312,7 +301,7 @@ hrm_inspect_image <- function(library, package, output, visible_libraries = char
   for (record in records) {
     if (!length(record)) next
     kind <- record[[1L]]
-    fields <- vapply(record[-1L], .hrm_unhex, character(1L), USE.NAMES = FALSE)
+    fields <- vapply(record[-1L], .slinker_unhex, character(1L), USE.NAMES = FALSE)
     if (identical(kind, "LIB")) {
       if (length(fields) != 1L) stop("invalid LIB record", call. = FALSE)
       libraries <- c(libraries, fields[[1L]])
@@ -331,32 +320,32 @@ hrm_inspect_image <- function(library, package, output, visible_libraries = char
   list(libraries = libraries, jobs = jobs)
 }
 
-.hrm_inspect_image_job <- function(job) {
-  hrm_inspect_image(job$library, job$package, job$output, job$visible_libraries)
+.slinker_inspect_image_job <- function(job) {
+  slinker_inspect_image(job$library, job$package, job$output, job$visible_libraries)
   invisible(job$output)
 }
 
-hrm_inspect_image_batch <- function(manifest, jobs = 1L) {
-  spec <- .hrm_read_image_manifest(manifest)
+slinker_inspect_image_batch <- function(manifest, jobs = 1L) {
+  spec <- .slinker_read_image_manifest(manifest)
   if (!length(spec$jobs)) return(invisible(NULL))
   work <- lapply(spec$jobs, function(job) {
     job$visible_libraries <- spec$libraries
     job
   })
-  invisible(.hrm_parallel_map(work, ".hrm_inspect_image_job", jobs))
+  invisible(.slinker_parallel_map(work, ".slinker_inspect_image_job", jobs))
 }
 
-.hrm_inspect_index_job <- function(job) {
-  hrm_inspect_index(job$library, job$package, job$output, job$visible_libraries)
+.slinker_inspect_index_job <- function(job) {
+  slinker_inspect_index(job$library, job$package, job$output, job$visible_libraries)
   invisible(job$output)
 }
 
-hrm_inspect_index_batch <- function(manifest, jobs = 1L) {
-  spec <- .hrm_read_image_manifest(manifest)
+slinker_inspect_index_batch <- function(manifest, jobs = 1L) {
+  spec <- .slinker_read_image_manifest(manifest)
   if (!length(spec$jobs)) return(invisible(NULL))
   work <- lapply(spec$jobs, function(job) {
     job$visible_libraries <- spec$libraries
     job
   })
-  invisible(.hrm_parallel_map(work, ".hrm_inspect_index_job", jobs))
+  invisible(.slinker_parallel_map(work, ".slinker_inspect_index_job", jobs))
 }

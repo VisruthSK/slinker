@@ -1,8 +1,8 @@
-//! Installed-image analysis and materialization primitives for heRmetic.
+//! Demand-driven linker for installed R package images.
 //!
-//! `hrm` links the exact package images selected by an R library universe. Air
-//! analyzes installed closure bodies; heRmetic owns reachability, rewrite planning,
-//! and construction of canonical synthetic package environments.
+//! `slinker` analyzes the exact installed package images selected by a target R
+//! library universe. Air supplies syntax; slinker owns semantic reachability,
+//! provenance, optional-package specialization, and rewrite planning.
 
 #[derive(Debug)]
 pub enum Error {
@@ -35,13 +35,10 @@ impl std::error::Error for Error {
     }
 }
 
-mod inspection;
-mod materialize;
 mod metadata;
 mod r_runtime;
 mod target_env;
 mod toolchain;
-
 
 #[cfg(feature = "air")]
 pub mod analysis;
@@ -50,21 +47,8 @@ pub mod build;
 #[cfg(feature = "air")]
 pub mod package;
 #[cfg(feature = "air")]
-pub mod semantics;
-#[cfg(feature = "air")]
 pub mod syntax;
 
-
-pub use inspection::{
-    BindingOrigin, ClosureEnvironment, ExportedBinding, ImportDirective, ImportedBinding, InspectError,
-    InspectionRequest,
-    ObjectIssue, ObjectState, S3Registration, SemanticSnapshot, SemanticState,
-};
-pub use materialize::{
-    MaterializationRequest, MaterializeError, MaterializedArtifact, PackageMaterialization,
-};
 pub use metadata::{Dependency, Description, MetadataError};
-pub use target_env::{
-    InstalledPackage, Target, TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest,
-};
+pub use target_env::{Target, TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest};
 pub use toolchain::{RToolchain, ToolchainError};

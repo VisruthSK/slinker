@@ -1,9 +1,10 @@
 use std::ffi::OsStr;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,11 +27,87 @@ pub enum ToolchainError {
         stderr: String,
     },
     InvalidProbe(String),
+    Runtime {
+        program: PathBuf,
+        message: String,
+    },
     Timeout {
         program: PathBuf,
         seconds: u64,
         context: String,
     },
+}
+
+pub(crate) struct RRuntimeServer {
+    program: PathBuf,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    responses: Receiver<String>,
+}
+
+impl RRuntimeServer {
+    pub(crate) fn request(
+        &mut self,
+        command: &str,
+        manifest: &Path,
+        seconds: u64,
+        context: impl Into<String>,
+    ) -> Result<(), ToolchainError> {
+        let context = context.into();
+        let stdin = self.stdin.as_mut().ok_or_else(|| ToolchainError::Runtime {
+            program: self.program.clone(),
+            message: "persistent R runtime stdin is closed".into(),
+        })?;
+        let path = manifest.to_string_lossy();
+        writeln!(stdin, "{command}\t{}", encode_hex(path.as_bytes())).map_err(ToolchainError::Io)?;
+        stdin.flush().map_err(ToolchainError::Io)?;
+
+        match self.responses.recv_timeout(Duration::from_secs(seconds)) {
+            Ok(response) if response == "OK" => Ok(()),
+            Ok(response) if response.starts_with("ERROR\t") => {
+                let encoded = &response[6..];
+                let message = decode_hex(encoded).unwrap_or_else(|| format!("invalid encoded R runtime error: {encoded}"));
+                Err(ToolchainError::Runtime { program: self.program.clone(), message })
+            }
+            Ok(response) => Err(ToolchainError::Runtime {
+                program: self.program.clone(),
+                message: format!("invalid persistent R runtime response: {response:?}"),
+            }),
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                self.stdin.take();
+                Err(ToolchainError::Timeout { program: self.program.clone(), seconds, context })
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let status = self.child.try_wait().ok().flatten().and_then(|status| status.code());
+                self.stdin.take();
+                Err(ToolchainError::Runtime {
+                    program: self.program.clone(),
+                    message: format!("persistent R runtime terminated unexpectedly with status {status:?}"),
+                })
+            }
+        }
+    }
+}
+
+impl Drop for RRuntimeServer {
+    fn drop(&mut self) {
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = writeln!(stdin, "STOP");
+            let _ = stdin.flush();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                _ => break,
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl RToolchain {
@@ -57,14 +134,14 @@ cat(R.version$arch, "\n", sep = "")
 
         // Avoid `-e` here. On Windows, the command-line expression path can be
         // materially less robust than executing a script file, while the rest
-        // of heRmetic already relies on file-backed R helpers. Keep probing in
+        // of slinker already relies on file-backed R helpers. Keep probing in
         // the same sanitized Rscript environment as those helpers.
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let probe_dir = std::env::temp_dir().join(format!(
-            "hrm-probe-{}-{nonce}",
+            "slinker-probe-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&probe_dir).map_err(ToolchainError::Io)?;
@@ -163,6 +240,45 @@ cat(R.version$arch, "\n", sep = "")
             .args(args);
         checked_output_timeout(&mut command, seconds, context.into())
     }
+
+    pub(crate) fn spawn_runtime_server(
+        &self,
+        work_dir: &Path,
+        jobs: usize,
+    ) -> Result<RRuntimeServer, ToolchainError> {
+        let runtime = r_runtime::prepare(work_dir).map_err(ToolchainError::Io)?;
+        let mut command = self.rscript_command();
+        command
+            .arg(&runtime.runner)
+            .arg(&runtime.package_root)
+            .arg("serve")
+            .arg(jobs.max(1).to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let program = PathBuf::from(command.get_program());
+        let mut child = command.spawn().map_err(ToolchainError::Io)?;
+        let stdin = child.stdin.take().ok_or_else(|| ToolchainError::Runtime {
+            program: program.clone(),
+            message: "failed to open persistent R runtime stdin".into(),
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| ToolchainError::Runtime {
+            program: program.clone(),
+            message: "failed to open persistent R runtime stdout".into(),
+        })?;
+        let (sender, responses) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(RRuntimeServer { program, child, stdin: Some(stdin), responses })
+    }
 }
 
 pub(crate) fn sanitize_r_startup(command: &mut Command) {
@@ -244,6 +360,39 @@ pub(crate) fn checked_output_timeout(
     }
 }
 
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_hex(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 impl fmt::Display for ToolchainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -260,6 +409,7 @@ impl fmt::Display for ToolchainError {
                 }
             }
             Self::InvalidProbe(stdout) => write!(f, "invalid R toolchain probe output: {stdout:?}"),
+            Self::Runtime { program, message } => write!(f, "{}: {message}", program.display()),
             Self::Timeout { program, seconds, context } => write!(f, "{} timed out after {seconds}s ({context})", program.display()),
         }
     }

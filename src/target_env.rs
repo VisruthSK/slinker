@@ -13,24 +13,10 @@ pub struct Target {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstalledPackage {
-    pub name: String,
-    pub version: String,
-    pub library: PathBuf,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetEnvironment {
     pub target: Target,
     pub libraries: Vec<PathBuf>,
-    pub packages: Vec<InstalledPackage>,
     pub base_bindings: BTreeSet<String>,
-}
-
-impl TargetEnvironment {
-    pub fn package(&self, name: &str) -> Option<&InstalledPackage> {
-        self.packages.iter().find(|package| package.name == name)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,7 +47,7 @@ impl RToolchain {
         request: &TargetEnvironmentRequest,
     ) -> Result<TargetEnvironment, TargetEnvironmentError> {
         fs::create_dir_all(&request.work_dir).map_err(TargetEnvironmentError::Io)?;
-        let output = request.work_dir.join("target-environment.hrm");
+        let output = request.work_dir.join("target-environment.slinker");
         let mut args = Vec::with_capacity(1 + request.libraries.len());
         args.push(output.as_os_str());
         for library in &request.libraries {
@@ -78,7 +64,6 @@ impl RToolchain {
 fn parse_target_environment(text: &str) -> Result<TargetEnvironment, TargetEnvironmentError> {
     let mut target: Option<Target> = None;
     let mut libraries = BTreeMap::<usize, PathBuf>::new();
-    let mut packages = Vec::<InstalledPackage>::new();
     let mut base_bindings = BTreeSet::new();
 
     for (line_no, line) in text.lines().enumerate() {
@@ -106,14 +91,6 @@ fn parse_target_environment(text: &str) -> Result<TargetEnvironment, TargetEnvir
                 })?;
                 libraries.insert(index, PathBuf::from(&values[1]));
             }
-            "PACKAGE" => {
-                require_len(kind, &values, 3, line_no)?;
-                packages.push(InstalledPackage {
-                    name: values[0].clone(),
-                    version: values[1].clone(),
-                    library: PathBuf::from(&values[2]),
-                });
-            }
             "BASE_BINDING" => {
                 require_len(kind, &values, 1, line_no)?;
                 base_bindings.insert(values[0].clone());
@@ -125,9 +102,7 @@ fn parse_target_environment(text: &str) -> Result<TargetEnvironment, TargetEnvir
     let target = target.ok_or_else(|| TargetEnvironmentError::Protocol("missing HEADER".into()))?;
     let libraries = libraries.into_values().collect::<Vec<_>>();
 
-    // The helper emits packages in library search order and suppresses shadowed
-    // duplicates. Preserve that order; it is part of the target resolution.
-    Ok(TargetEnvironment { target, libraries, packages, base_bindings })
+    Ok(TargetEnvironment { target, libraries, base_bindings })
 }
 
 fn require_len(kind: &str, values: &[String], expected: usize, line_no: usize) -> Result<(), TargetEnvironmentError> {
@@ -192,14 +167,12 @@ mod tests {
     #[test]
     fn parses_target_resolution_order() {
         let text = format!(
-            "HEADER\t{}\t{}\t{}\nLIB\t{}\t{}\nBASE_BINDING\t{}\nPACKAGE\t{}\t{}\t{}\n",
-            h("4.6.1"), h("linux-gnu"), h("x86_64"), h("0"), h("/target/lib"), h("library"),
-            h("stats"), h("4.6.1"), h("/target/lib")
+            "HEADER\t{}\t{}\t{}\nLIB\t{}\t{}\nBASE_BINDING\t{}\n",
+            h("4.6.1"), h("linux-gnu"), h("x86_64"), h("0"), h("/target/lib"), h("library")
         );
         let target = parse_target_environment(&text).unwrap();
         assert_eq!(target.target.r_version, "4.6.1");
         assert_eq!(target.libraries, vec![PathBuf::from("/target/lib")]);
-        assert_eq!(target.package("stats").unwrap().version, "4.6.1");
         assert!(target.base_bindings.contains("library"));
     }
 

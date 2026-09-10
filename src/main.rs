@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hrm::analysis::{Edge, LinkPlan, Linker, Need, NodeId, NodeKind};
-use hrm::build::Rewrite;
-use hrm::package::PackageStore;
-use hrm::{RToolchain, TargetEnvironment, TargetEnvironmentRequest};
+use slinker::analysis::{Edge, LinkPlan, Linker, Need, NodeId, NodeKind};
+use slinker::build::Rewrite;
+use slinker::package::PackageStore;
+use slinker::{RToolchain, TargetEnvironment, TargetEnvironmentRequest};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("hrm: {error}");
+            eprintln!("slinker: {error}");
             let mut source = error.source();
             while let Some(cause) = source {
                 eprintln!("  caused by: {cause}");
@@ -36,7 +36,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Version => {
-            println!("hrm {VERSION}");
+            println!("slinker {VERSION}");
             Ok(())
         }
         Command::Analyze(args) => analyze(&args),
@@ -208,7 +208,7 @@ fn parse_query_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Qu
 }
 
 fn link(args: &AnalyzeArgs) -> Result<(TargetEnvironment, LinkPlan), Box<dyn Error>> {
-    let r = env::var_os("HRM_R").map(PathBuf::from).unwrap_or_else(default_r_executable);
+    let r = env::var_os("SLINKER_R").map(PathBuf::from).unwrap_or_else(default_r_executable);
     let toolchain = RToolchain::from_r(r);
     let scratch = ScratchDir::new()?;
     let mut target_request = TargetEnvironmentRequest::new(scratch.path().join("target"));
@@ -219,6 +219,7 @@ fn link(args: &AnalyzeArgs) -> Result<(TargetEnvironment, LinkPlan), Box<dyn Err
         toolchain,
         target.clone(),
         args.target_provided.iter().cloned(),
+        args.jobs,
         scratch.path().join("linker"),
     )?;
     let plan = Linker::new(store, args.jobs)
@@ -407,10 +408,9 @@ fn print_analysis(target: &TargetEnvironment, root_name: &str, plan: &LinkPlan) 
     println!();
 
     println!("root image");
-    println!("  installed bytes: {}", directory_bytes(&root_id.root)?);
     println!("  bindings: {}", root_image.index.binding_names.len());
     println!("  exports: {}", root_image.index.exports.len());
-    println!("  installed files/directories indexed: {}", root_image.index.files.len());
+    println!("  runtime resources: resolved on demand");
     println!("  S3 registrations: {}", root_image.index.s3.len());
     println!("  dynamic libraries: {}", root_image.index.dynlibs.len());
     println!("  .onLoad present: {}", if root_image.index.lifecycle.on_load { "yes" } else { "no" });
@@ -484,7 +484,7 @@ fn print_analysis(target: &TargetEnvironment, root_name: &str, plan: &LinkPlan) 
     println!();
 
     println!("blockers");
-    let blockers = plan.diagnostics.iter().filter(|diagnostic| !matches!(diagnostic.code, hrm::analysis::RejectCode::MissingDependency)).collect::<Vec<_>>();
+    let blockers = plan.diagnostics.iter().filter(|diagnostic| !matches!(diagnostic.code, slinker::analysis::RejectCode::MissingDependency)).collect::<Vec<_>>();
     if blockers.is_empty() {
         println!("  none");
     } else {
@@ -499,9 +499,9 @@ fn print_analysis(target: &TargetEnvironment, root_name: &str, plan: &LinkPlan) 
     let namespace_rewrites = plan.rewrites.iter().filter(|rewrite| matches!(rewrite, Rewrite::NamespaceAccess { .. })).count();
     let resource_rewrites = plan.rewrites.iter().filter(|rewrite| matches!(rewrite, Rewrite::ResourceAccess { .. })).count();
     let discovery_rewrites = plan.rewrites.iter().filter(|rewrite| matches!(rewrite, Rewrite::PackageOperation { .. })).count();
-    println!("hermetification plan");
+    println!("link plan");
     println!("  root package: {} {}", root_id.name, root_id.version);
-    println!("  synthetic namespaces: {}", packages.len());
+    println!("  internalized packages: {}", packages.len());
     println!("  package-qualified rewrites: {namespace_rewrites}");
     println!("  resource rewrites: {resource_rewrites}");
     println!("  specialized discovery rewrites: {discovery_rewrites}");
@@ -509,7 +509,7 @@ fn print_analysis(target: &TargetEnvironment, root_name: &str, plan: &LinkPlan) 
     println!("  package discovery rounds: none");
     println!("  per-binding temporary R files: none");
     println!("  analysis status: {}", if plan.diagnostics.is_empty() { "link plan complete" } else { "blocked" });
-    println!("  build status: graph-driven materialization and rewriting not wired yet");
+    println!("  build status: analysis/rewrite plan only");
     Ok(())
 }
 
@@ -569,33 +569,19 @@ fn reject_extra(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<()
 
 fn print_help() {
     println!(
-        "hrm {VERSION}\n\n\
-         Usage:\n  hrm analyze PACKAGE [--lib PATH]... [--target-provided PKG[,PKG...]] [--extra-pkgs PKG...] [--jobs N]\n  hrm why ROOT TARGET [same options]\n  hrm path ROOT DOWNSTREAM [same options]\n\n\
+        "slinker {VERSION}\n\n\
+         Usage:\n  slinker analyze PACKAGE [--lib PATH]... [--target-provided PKG[,PKG...]] [--extra-pkgs PKG...] [--jobs N]\n  slinker why ROOT TARGET [same options]\n  slinker path ROOT DOWNSTREAM [same options]\n\n\
          Link an installed R package image by following reachable semantic bindings.\n  `why` prints a shortest provenance chain; `path` prints every cross-package use site.\n\
-         hrm never installs, rebuilds, or downloads packages, and never recursively resolves DESCRIPTION dependencies.\n\n\
+         slinker never installs, rebuilds, or downloads packages, and never recursively resolves DESCRIPTION dependencies.\n\n\
          Options:\n\
            --lib PATH                     select an installed R library (repeatable, ordered)\n\
            --target-provided PKG[,PKG...] leave these exact third-party namespaces external\n\
            --extra-pkgs PKG...             enable named optional packages when reachable\n\
            --jobs N                       analysis workers (default: min(CPUs, 8))\n\n\
          Environment:\n\
-           HRM_R          target R executable (defaults to R/R.exe from PATH)\n\
-           HRM_CACHE_DIR  persistent installed-image analysis cache"
+           SLINKER_R          target R executable (defaults to R/R.exe from PATH)\n\
+           SLINKER_CACHE_DIR  persistent installed-image analysis cache"
     );
-}
-
-fn directory_bytes(root: &Path) -> io::Result<u64> {
-    let mut total = 0u64;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() { pending.push(entry.path()); }
-            else if file_type.is_file() { total = total.saturating_add(entry.metadata()?.len()); }
-        }
-    }
-    Ok(total)
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
@@ -610,7 +596,7 @@ struct ScratchDir { path: PathBuf }
 impl ScratchDir {
     fn new() -> io::Result<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let path = env::temp_dir().join(format!("hrm-{}-{nonce}", std::process::id()));
+        let path = env::temp_dir().join(format!("slinker-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&path)?;
         Ok(Self { path })
     }
@@ -624,7 +610,7 @@ impl Drop for ScratchDir {
 enum CliError { Usage(&'static str) }
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::Usage(message) => write!(f, "{message}; run `hrm --help`") }
+        match self { Self::Usage(message) => write!(f, "{message}; run `slinker --help`") }
     }
 }
 impl Error for CliError {}

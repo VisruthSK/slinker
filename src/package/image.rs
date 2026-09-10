@@ -72,8 +72,6 @@ pub struct ObjectIssue {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClosureSource {
-    pub formals: Arc<str>,
-    pub body: Arc<str>,
     pub source: Arc<str>,
     pub environment: String,
 }
@@ -186,15 +184,13 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                 });
             }
             "CLOSURE" => {
-                require(kind, &values, 5, line_no)?;
+                require(kind, &values, 3, line_no)?;
                 let binding = bindings.get_mut(&values[0]).ok_or_else(|| {
                     Error::Analysis(format!("CLOSURE precedes BINDING for {}", values[0]))
                 })?;
                 binding.closure = Some(ClosureSource {
                     environment: values[1].clone(),
-                    formals: Arc::from(values[2].clone()),
-                    body: Arc::from(values[3].clone()),
-                    source: Arc::from(values[4].clone()),
+                    source: Arc::from(values[2].clone()),
                 });
             }
             "NESTED_CLOSURE" => {

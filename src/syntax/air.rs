@@ -32,7 +32,7 @@ pub enum BindingCertainty {
 pub struct NameRef {
     pub name: String,
     pub phase: EvalPhase,
-    pub guards: Vec<String>,
+    pub guards: Vec<PackageGuard>,
     pub span: Span,
 }
 
@@ -44,11 +44,30 @@ pub enum EvalPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "package", rename_all = "snake_case")]
+pub enum PackageGuard {
+    /// The package is available and may be loaded by `requireNamespace()`.
+    Available(String),
+    /// The package must already be loaded before the guarded branch can run.
+    Loaded(String),
+    /// Deferred integration is included only when explicitly selected.
+    Selected(String),
+}
+
+impl PackageGuard {
+    pub fn package(&self) -> &str {
+        match self {
+            Self::Available(package) | Self::Loaded(package) | Self::Selected(package) => package,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageRef {
     pub package: String,
     pub symbol: String,
     pub internal: bool,
-    pub guards: Vec<String>,
+    pub guards: Vec<PackageGuard>,
     pub span: Span,
 }
 
@@ -58,7 +77,7 @@ pub struct CallSite {
     pub callee_local: bool,
     pub args: Vec<Option<StaticArg>>,
     pub phase: EvalPhase,
-    pub guards: Vec<String>,
+    pub guards: Vec<PackageGuard>,
     pub span: Span,
 }
 
@@ -71,7 +90,7 @@ pub struct ResourceRef {
     /// `Some(false)` includes the ordinary default. `None` means a supplied
     /// `mustWork` expression is dynamic and cannot be specialized safely.
     pub must_work: Option<bool>,
-    pub guards: Vec<String>,
+    pub guards: Vec<PackageGuard>,
     pub span: Span,
 }
 
@@ -100,7 +119,7 @@ pub enum SyntaxEffectKind {
 pub struct SyntaxEffect {
     pub kind: SyntaxEffectKind,
     pub phase: EvalPhase,
-    pub guards: Vec<String>,
+    pub guards: Vec<PackageGuard>,
     pub span: Span,
 }
 
@@ -253,7 +272,7 @@ struct Collector {
     resource_refs: Vec<ResourceRef>,
     calls: Vec<CallSite>,
     effects: Vec<SyntaxEffect>,
-    guards: Vec<String>,
+    guards: Vec<PackageGuard>,
 }
 
 impl Collector {
@@ -428,11 +447,9 @@ impl Collector {
             }
             AnyRExpression::RIfStatement(node) => {
                 let condition = node.condition().map_err(|_| malformed("if condition"))?;
-                let optional_guard = if flow.is_definitely_local("requireNamespace") {
-                    None
-                } else {
-                    require_namespace_guard(&condition)
-                };
+                let optional_guard = package_guard(&condition).and_then(|(callee, guard)| {
+                    (!flow.is_definitely_local(&callee)).then_some(guard)
+                });
                 self.visit(
                     &condition,
                     flow,
@@ -589,7 +606,8 @@ impl Collector {
         let function = call.function().map_err(|_| malformed("call function"))?;
         let arguments = call.arguments().map_err(|_| malformed("call arguments"))?;
 
-        if let Some(callee) = callable_name(&function) {
+        let callee = callable_name(&function);
+        if let Some(callee) = callee.as_ref() {
             if callee == "system.file" {
                 self.resource_refs.push(ResourceRef {
                     package: named_string(&arguments.items(), "package"),
@@ -600,8 +618,8 @@ impl Collector {
                 });
             }
             self.calls.push(CallSite {
-                callee_local: flow.is_definitely_local(&callee),
-                callee,
+                callee_local: flow.is_definitely_local(callee),
+                callee: callee.clone(),
                 args: static_call_args(&arguments.items()),
                 phase: flow.phase(),
                 guards: self.guards.clone(),
@@ -610,7 +628,34 @@ impl Collector {
         }
 
         self.visit(&function, flow, EvalContext::Deferred)?;
+        if callee.as_deref() == Some("setHook") && !flow.is_definitely_local("setHook") {
+            if let Some(package) = package_event_package(&arguments.items()) {
+                return self.visit_hook_arguments(&arguments.items(), flow, &package);
+            }
+        }
         self.visit_arguments(&arguments.items(), flow)
+    }
+
+
+    fn visit_hook_arguments(
+        &mut self,
+        arguments: &RArgumentList,
+        flow: &mut Flow,
+        package: &str,
+    ) -> Result<()> {
+        for (index, argument) in arguments.into_iter().enumerate() {
+            let argument = argument.map_err(|_| malformed("argument"))?;
+            let Some(value) = argument.value() else { continue };
+            let is_callback = index > 0 && value.as_r_function_definition().is_some();
+            if is_callback {
+                self.guards.push(PackageGuard::Selected(package.to_owned()));
+            }
+            self.visit(&value, flow, EvalContext::Deferred)?;
+            if is_callback {
+                self.guards.pop();
+            }
+        }
+        Ok(())
     }
 
     fn visit_arguments(&mut self, arguments: &RArgumentList, flow: &mut Flow) -> Result<()> {
@@ -920,15 +965,45 @@ fn replacement_base(expression: &AnyRExpression) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn require_namespace_guard(expression: &AnyRExpression) -> Option<String> {
+fn package_guard(expression: &AnyRExpression) -> Option<(String, PackageGuard)> {
+    if let Some(paren) = expression.as_r_parenthesized_expression() {
+        return package_guard(&paren.body().ok()?);
+    }
+    if let Some(binary) = expression.as_r_binary_expression() {
+        let operator = binary.operator().ok()?.text_trimmed().to_string();
+        if matches!(operator.as_str(), "&&" | "&") {
+            return package_guard(&binary.left().ok()?).or_else(|| package_guard(&binary.right().ok()?));
+        }
+        return None;
+    }
     let call = expression.as_r_call()?;
     let function = call.function().ok()?;
-    if callable_name(&function).as_deref() != Some("requireNamespace") {
+    let callee = callable_name(&function)?;
+    if !matches!(callee.as_str(), "requireNamespace" | "isNamespaceLoaded") {
         return None;
     }
     let arguments = call.arguments().ok()?;
     let args = static_call_args(&arguments.items());
-    match args.first()?.as_ref()? {
+    let package = match args.first()?.as_ref()? {
+        StaticArg::String(package) | StaticArg::Symbol(package) => package.clone(),
+    };
+    let guard = if callee == "requireNamespace" {
+        PackageGuard::Available(package)
+    } else {
+        PackageGuard::Loaded(package)
+    };
+    Some((callee, guard))
+}
+
+fn package_event_package(arguments: &RArgumentList) -> Option<String> {
+    let first = arguments.into_iter().next()?.ok()?.value()?;
+    let call = first.as_r_call()?;
+    let function = call.function().ok()?;
+    if callable_name(&function).as_deref() != Some("packageEvent") {
+        return None;
+    }
+    let event_args = static_call_args(&call.arguments().ok()?.items());
+    match event_args.first()?.as_ref()? {
         StaticArg::String(package) | StaticArg::Symbol(package) => Some(package.clone()),
     }
 }
@@ -1185,9 +1260,27 @@ mod tests {
     fn require_namespace_if_consequence_carries_optional_guard() {
         let parsed = parse_one("f <- function() if (requireNamespace(\"foo\")) foo::bar()");
         let reference = parsed.package_refs.iter().find(|r| r.package == "foo" && r.symbol == "bar").unwrap();
-        assert_eq!(reference.guards, vec!["foo"]);
+        assert_eq!(reference.guards, vec![PackageGuard::Available("foo".into())]);
         let condition = parsed.calls.iter().find(|call| call.callee == "requireNamespace").unwrap();
         assert!(condition.guards.is_empty());
+    }
+
+    #[test]
+    fn loaded_namespace_guard_propagates_through_and_condition() {
+        let parsed = parse_one(
+            "f <- function() if (isNamespaceLoaded(\"knitr\") && \"x\" %in% getNamespaceExports(\"knitr\")) knitr::x()",
+        );
+        let reference = parsed.package_refs.iter().find(|r| r.package == "knitr" && r.symbol == "x").unwrap();
+        assert_eq!(reference.guards, vec![PackageGuard::Loaded("knitr".into())]);
+    }
+
+    #[test]
+    fn package_event_hook_callback_is_guarded() {
+        let parsed = parse_one(
+            "f <- function() setHook(packageEvent(\"knitr\", \"onLoad\"), function(...) knitr::knit_engines$set(glue = eng_glue))",
+        );
+        let reference = parsed.package_refs.iter().find(|r| r.package == "knitr" && r.symbol == "knit_engines").unwrap();
+        assert_eq!(reference.guards, vec![PackageGuard::Selected("knitr".into())]);
     }
     #[test]
     fn empty_function_for_loop_does_not_hide_outer_binding() {

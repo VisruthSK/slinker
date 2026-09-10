@@ -1,0 +1,11 @@
+Package: slinker
+Title: Internal R Runtime for Installed-Image Linking
+Version: 0.1.0
+Authors@R: person("slinker", "authors", email = "maintainers@slinker.invalid", role = c("aut", "cre"))
+Description: Internal base-R runtime used by slinker to capture target metadata,
+    inspect installed package images, validate target-R syntax, and schedule
+    independent package inspection work.
+License: BSD_3_clause + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.2.0)
+Imports: parallel
