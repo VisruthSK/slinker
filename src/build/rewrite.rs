@@ -1,6 +1,16 @@
 use crate::package::{BindingName, PackageId};
 use crate::syntax::Span;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PackageOperation {
+    RequireNamespace { result: bool },
+    LoadNamespace,
+    GetNamespace,
+    AsNamespace,
+    PackageVersion { version: String },
+    FindPackage,
+}
+
 #[derive(Clone, Debug)]
 pub enum Rewrite {
     NamespaceAccess {
@@ -14,9 +24,9 @@ pub enum Rewrite {
         package: PackageId,
         resource: String,
     },
-    SpecializedDiscovery {
+    PackageOperation {
         source: Span,
-        package: PackageId,
-        result: bool,
+        package: Option<PackageId>,
+        operation: PackageOperation,
     },
 }

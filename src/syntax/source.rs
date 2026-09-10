@@ -47,10 +47,7 @@ pub struct Sources {
 impl Sources {
     pub fn add(&mut self, origin: SourceOrigin, text: impl Into<Arc<str>>) -> SourceId {
         let id = SourceId(self.entries.len());
-        self.entries.push(SourceEntry {
-            origin,
-            text: text.into(),
-        });
+        self.entries.push(SourceEntry { origin, text: text.into() });
         id
     }
 

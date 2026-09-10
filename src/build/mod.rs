@@ -1,2 +1,2 @@
 pub mod rewrite;
-pub use rewrite::Rewrite;
+pub use rewrite::{PackageOperation, Rewrite};

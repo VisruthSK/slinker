@@ -16,6 +16,7 @@ pub enum RejectCode {
     EnvironmentMutation,
     LifecycleHook,
     MissingDependency,
+    MissingResource,
     ObjectSystem,
     PackageAttachmentUnsupported,
     SyntaxObservation,
@@ -37,11 +38,7 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub fn reject(
-        package: impl Into<String>,
-        code: RejectCode,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn reject(package: impl Into<String>, code: RejectCode, message: impl Into<String>) -> Self {
         Self {
             package: package.into(),
             binding: None,

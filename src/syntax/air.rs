@@ -5,10 +5,10 @@
 
 use crate::syntax::source::{SourceId, Span};
 use crate::{Error, Result};
-use air_r_parser::{RParserOptions, parse};
+use air_r_parser::{parse, RParserOptions};
 use air_r_syntax::{
-    AnyRArgumentName, AnyRExpression, AnyRParameterName, AnyRSelector, RArgumentList, RCall,
-    RParameterList, RStringValue,
+    AnyRArgumentName, AnyRExpression, AnyRParameterName, AnyRSelector, RArgumentList,
+    RCall, RParameterList, RStringValue,
 };
 use biome_rowan::AstNode;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,7 @@ pub enum BindingCertainty {
 pub struct NameRef {
     pub name: String,
     pub phase: EvalPhase,
+    pub guards: Vec<String>,
     pub span: Span,
 }
 
@@ -47,6 +48,7 @@ pub struct PackageRef {
     pub package: String,
     pub symbol: String,
     pub internal: bool,
+    pub guards: Vec<String>,
     pub span: Span,
 }
 
@@ -56,6 +58,7 @@ pub struct CallSite {
     pub callee_local: bool,
     pub args: Vec<Option<StaticArg>>,
     pub phase: EvalPhase,
+    pub guards: Vec<String>,
     pub span: Span,
 }
 
@@ -65,8 +68,13 @@ pub struct ResourceRef {
     /// Installed-package-relative resource path when every path component is
     /// statically known. An empty string means the package root itself.
     pub path: Option<String>,
+    /// `Some(false)` includes the ordinary default. `None` means a supplied
+    /// `mustWork` expression is dynamic and cannot be specialized safely.
+    pub must_work: Option<bool>,
+    pub guards: Vec<String>,
     pub span: Span,
 }
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -74,6 +82,7 @@ pub enum StaticArg {
     String(String),
     Symbol(String),
 }
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,6 +100,7 @@ pub enum SyntaxEffectKind {
 pub struct SyntaxEffect {
     pub kind: SyntaxEffectKind,
     pub phase: EvalPhase,
+    pub guards: Vec<String>,
     pub span: Span,
 }
 
@@ -117,9 +127,7 @@ pub struct ParsedRFile {
 
 impl ParsedRFile {
     pub fn bindings(&self) -> impl Iterator<Item = &BindingDef> {
-        self.expressions
-            .iter()
-            .flat_map(|expr| expr.definitions.iter())
+        self.expressions.iter().flat_map(|expr| expr.definitions.iter())
     }
 }
 
@@ -157,11 +165,10 @@ impl AirParser {
 
 impl RParser for AirParser {
     fn parse(&self, source: SourceId, text: &str) -> Result<ParsedRFile> {
-        self.parse_binding(source.clone(), text)
-            .map_err(|message| Error::Parse {
-                path: format!("source:{}", source.0),
-                message,
-            })
+        self.parse_binding(source.clone(), text).map_err(|message| Error::Parse {
+            path: format!("source:{}", source.0),
+            message,
+        })
     }
 }
 
@@ -207,10 +214,7 @@ impl Flow {
     }
 
     fn is_definitely_local(&self, name: &str) -> bool {
-        self.functions
-            .iter()
-            .rev()
-            .any(|scope| scope.contains(name))
+        self.functions.iter().rev().any(|scope| scope.contains(name))
     }
 
     fn define_local(&mut self, name: String) {
@@ -249,6 +253,7 @@ struct Collector {
     resource_refs: Vec<ResourceRef>,
     calls: Vec<CallSite>,
     effects: Vec<SyntaxEffect>,
+    guards: Vec<String>,
 }
 
 impl Collector {
@@ -261,6 +266,7 @@ impl Collector {
             resource_refs: Vec::new(),
             calls: Vec::new(),
             effects: Vec::new(),
+            guards: Vec::new(),
         }
     }
 
@@ -310,6 +316,7 @@ impl Collector {
                         self.effects.push(SyntaxEffect {
                             kind: SyntaxEffectKind::SuperAssignment,
                             phase: flow.phase(),
+                            guards: self.guards.clone(),
                             span: node_span(&self.source, node),
                         });
                     }
@@ -317,7 +324,11 @@ impl Collector {
                         // Operators are lexical function references in R. Missing
                         // this edge under-retains imported operators such as `%>%`
                         // and package-local operator overrides.
-                        self.reference_name(operator, node_span(&self.source, node), flow);
+                        self.reference_name(
+                            operator,
+                            node_span(&self.source, node),
+                            flow,
+                        );
 
                         // Operands may be promises for user-defined infix
                         // operators, so writes nested inside them are not direct.
@@ -372,7 +383,12 @@ impl Collector {
                     // bindings as non-exclusive so an imported fallback is also
                     // retained when one exists.
                     let loop_context = context.conditional();
-                    self.write_name(name, node_span(&self.source, &variable), flow, loop_context);
+                    self.write_name(
+                        name,
+                        node_span(&self.source, &variable),
+                        flow,
+                        loop_context,
+                    );
                     self.visit(
                         &node.body().map_err(|_| malformed("for body"))?,
                         flow,
@@ -393,9 +409,7 @@ impl Collector {
                     let parameter = parameter.map_err(|_| malformed("parameter"))?;
                     if let Some(default) = parameter.default() {
                         self.visit(
-                            &default
-                                .value()
-                                .map_err(|_| malformed("parameter default"))?,
+                            &default.value().map_err(|_| malformed("parameter default"))?,
                             flow,
                             EvalContext::Deferred,
                         )?;
@@ -413,8 +427,14 @@ impl Collector {
                 self.reference_name(name, node_span(&self.source, identifier), flow);
             }
             AnyRExpression::RIfStatement(node) => {
+                let condition = node.condition().map_err(|_| malformed("if condition"))?;
+                let optional_guard = if flow.is_definitely_local("requireNamespace") {
+                    None
+                } else {
+                    require_namespace_guard(&condition)
+                };
                 self.visit(
-                    &node.condition().map_err(|_| malformed("if condition"))?,
+                    &condition,
                     flow,
                     EvalContext::Deferred,
                 )?;
@@ -426,13 +446,17 @@ impl Collector {
                     context.conditional()
                 };
                 let mut yes = before.clone();
+                if let Some(package) = optional_guard.as_ref() {
+                    self.guards.push(package.clone());
+                }
                 self.visit(
-                    &node
-                        .consequence()
-                        .map_err(|_| malformed("if consequence"))?,
+                    &node.consequence().map_err(|_| malformed("if consequence"))?,
                     &mut yes,
                     branch_context,
                 )?;
+                if optional_guard.is_some() {
+                    self.guards.pop();
+                }
 
                 let mut no = before.clone();
                 if let Some(clause) = node.else_clause() {
@@ -447,10 +471,12 @@ impl Collector {
                 flow.merge_if(&yes, &no);
             }
             AnyRExpression::RNamespaceExpression(node) => {
-                let package =
-                    selector_text(&node.left().map_err(|_| malformed("namespace package"))?);
-                let symbol =
-                    selector_text(&node.right().map_err(|_| malformed("namespace symbol"))?);
+                let package = selector_text(
+                    &node.left().map_err(|_| malformed("namespace package"))?,
+                );
+                let symbol = selector_text(
+                    &node.right().map_err(|_| malformed("namespace symbol"))?,
+                );
                 let operator = node
                     .operator()
                     .map_err(|_| malformed("namespace operator"))?
@@ -461,6 +487,7 @@ impl Collector {
                         package,
                         symbol,
                         internal: operator == ":::",
+                        guards: self.guards.clone(),
                         span: node_span(&self.source, node),
                     });
                 }
@@ -496,9 +523,7 @@ impl Collector {
                     flow,
                     EvalContext::Deferred,
                 )?;
-                let arguments = node
-                    .arguments()
-                    .map_err(|_| malformed("subset arguments"))?;
+                let arguments = node.arguments().map_err(|_| malformed("subset arguments"))?;
                 self.visit_arguments(&arguments.items(), flow)?;
             }
             AnyRExpression::RSubset2(node) => {
@@ -508,9 +533,7 @@ impl Collector {
                     flow,
                     EvalContext::Deferred,
                 )?;
-                let arguments = node
-                    .arguments()
-                    .map_err(|_| malformed("subset2 arguments"))?;
+                let arguments = node.arguments().map_err(|_| malformed("subset2 arguments"))?;
                 self.visit_arguments(&arguments.items(), flow)?;
             }
             AnyRExpression::RUnaryExpression(node) => {
@@ -571,6 +594,8 @@ impl Collector {
                 self.resource_refs.push(ResourceRef {
                     package: named_string(&arguments.items(), "package"),
                     path: system_file_path(&arguments.items()),
+                    must_work: named_logical_or_default(&arguments.items(), "mustWork", false),
+                    guards: self.guards.clone(),
                     span: node_span(&self.source, call),
                 });
             }
@@ -579,6 +604,7 @@ impl Collector {
                 callee,
                 args: static_call_args(&arguments.items()),
                 phase: flow.phase(),
+                guards: self.guards.clone(),
                 span: node_span(&self.source, call),
             });
         }
@@ -602,6 +628,7 @@ impl Collector {
             self.references.push(NameRef {
                 name,
                 phase: flow.phase(),
+                guards: self.guards.clone(),
                 span,
             });
         }
@@ -628,6 +655,7 @@ impl Collector {
             self.effects.push(SyntaxEffect {
                 kind: SyntaxEffectKind::UnsupportedAssignmentTarget,
                 phase: flow.phase(),
+                guards: self.guards.clone(),
                 span: node_span(&self.source, target),
             });
             return Ok(());
@@ -639,7 +667,11 @@ impl Collector {
         Ok(())
     }
 
-    fn visit_replacement_inputs(&mut self, target: &AnyRExpression, flow: &mut Flow) -> Result<()> {
+    fn visit_replacement_inputs(
+        &mut self,
+        target: &AnyRExpression,
+        flow: &mut Flow,
+    ) -> Result<()> {
         if let Some(paren) = target.as_r_parenthesized_expression() {
             return self.visit_replacement_inputs(
                 &paren.body().map_err(|_| malformed("replacement paren"))?,
@@ -648,9 +680,7 @@ impl Collector {
         }
         if let Some(subset) = target.as_r_subset() {
             self.visit(
-                &subset
-                    .function()
-                    .map_err(|_| malformed("replacement subset object"))?,
+                &subset.function().map_err(|_| malformed("replacement subset object"))?,
                 flow,
                 EvalContext::Deferred,
             )?;
@@ -674,9 +704,7 @@ impl Collector {
         }
         if let Some(extract) = target.as_r_extract_expression() {
             return self.visit(
-                &extract
-                    .left()
-                    .map_err(|_| malformed("replacement extract object"))?,
+                &extract.left().map_err(|_| malformed("replacement extract object"))?,
                 flow,
                 EvalContext::Deferred,
             );
@@ -708,9 +736,7 @@ impl Collector {
         if let Some(subset) = target.as_r_subset() {
             self.reference_name("[<-".into(), node_span(&self.source, subset), flow);
             return self.reference_replacement_setters(
-                &subset
-                    .function()
-                    .map_err(|_| malformed("replacement subset object"))?,
+                &subset.function().map_err(|_| malformed("replacement subset object"))?,
                 flow,
             );
         }
@@ -735,9 +761,7 @@ impl Collector {
                 flow,
             );
             return self.reference_replacement_setters(
-                &extract
-                    .left()
-                    .map_err(|_| malformed("replacement extract object"))?,
+                &extract.left().map_err(|_| malformed("replacement extract object"))?,
                 flow,
             );
         }
@@ -749,11 +773,16 @@ impl Collector {
                 self.effects.push(SyntaxEffect {
                     kind: SyntaxEffectKind::UnsupportedAssignmentTarget,
                     phase: flow.phase(),
+                    guards: self.guards.clone(),
                     span: node_span(&self.source, call),
                 });
                 return Ok(());
             };
-            self.reference_name(format!("{callee}<-"), node_span(&self.source, call), flow);
+            self.reference_name(
+                format!("{callee}<-"),
+                node_span(&self.source, call),
+                flow,
+            );
 
             let arguments = call
                 .arguments()
@@ -783,6 +812,7 @@ impl Collector {
                 self.effects.push(SyntaxEffect {
                     kind: SyntaxEffectKind::IndirectPackageWrite,
                     phase: EvalPhase::Materialization,
+                    guards: self.guards.clone(),
                     span,
                 });
                 return;
@@ -861,9 +891,7 @@ fn replacement_base(expression: &AnyRExpression) -> Result<Option<String>> {
     }
     if let Some(subset) = expression.as_r_subset() {
         return replacement_base(
-            &subset
-                .function()
-                .map_err(|_| malformed("replacement subset"))?,
+            &subset.function().map_err(|_| malformed("replacement subset"))?,
         );
     }
     if let Some(subset) = expression.as_r_subset2() {
@@ -874,18 +902,12 @@ fn replacement_base(expression: &AnyRExpression) -> Result<Option<String>> {
         );
     }
     if let Some(extract) = expression.as_r_extract_expression() {
-        return replacement_base(
-            &extract
-                .left()
-                .map_err(|_| malformed("replacement extract"))?,
-        );
+        return replacement_base(&extract.left().map_err(|_| malformed("replacement extract"))?);
     }
     if let Some(call) = expression.as_r_call() {
         // `names(x) <- value` and other replacement functions rewrite the first
         // object argument. Only accept a statically recoverable base binding.
-        let args = call
-            .arguments()
-            .map_err(|_| malformed("replacement call"))?;
+        let args = call.arguments().map_err(|_| malformed("replacement call"))?;
         let Some(first) = args.items().into_iter().next() else {
             return Ok(None);
         };
@@ -896,6 +918,19 @@ fn replacement_base(expression: &AnyRExpression) -> Result<Option<String>> {
         return replacement_base(&value);
     }
     Ok(None)
+}
+
+fn require_namespace_guard(expression: &AnyRExpression) -> Option<String> {
+    let call = expression.as_r_call()?;
+    let function = call.function().ok()?;
+    if callable_name(&function).as_deref() != Some("requireNamespace") {
+        return None;
+    }
+    let arguments = call.arguments().ok()?;
+    let args = static_call_args(&arguments.items());
+    match args.first()?.as_ref()? {
+        StaticArg::String(package) | StaticArg::Symbol(package) => Some(package.clone()),
+    }
 }
 
 fn callable_name(expression: &AnyRExpression) -> Option<String> {
@@ -946,6 +981,31 @@ fn named_string(arguments: &RArgumentList, name: &str) -> Option<String> {
         return argument.value().and_then(|value| string_expression(&value));
     }
     None
+}
+
+fn named_logical_or_default(arguments: &RArgumentList, name: &str, default: bool) -> Option<bool> {
+    for argument in arguments {
+        let argument = argument.ok()?;
+        let Some(clause) = argument.name_clause() else {
+            continue;
+        };
+        let Some(argument_name) = clause.name().ok().and_then(|name| argument_name(&name)) else {
+            continue;
+        };
+        if argument_name != name {
+            continue;
+        }
+        return argument.value().and_then(|value| logical_expression(&value));
+    }
+    Some(default)
+}
+
+fn logical_expression(expression: &AnyRExpression) -> Option<bool> {
+    match expression {
+        AnyRExpression::RTrueExpression(_) => Some(true),
+        AnyRExpression::RFalseExpression(_) => Some(false),
+        _ => None,
+    }
 }
 
 fn argument_name(name: &AnyRArgumentName) -> Option<String> {
@@ -1036,10 +1096,7 @@ mod tests {
 
     #[test]
     fn top_level_for_variable_is_a_package_binding() {
-        assert_eq!(
-            defs("for (x in xs) y <- x"),
-            BTreeSet::from(["x".into(), "y".into()])
-        );
+        assert_eq!(defs("for (x in xs) y <- x"), BTreeSet::from(["x".into(), "y".into()]));
     }
 
     #[test]
@@ -1048,14 +1105,8 @@ mod tests {
             defs("if (flag) { x <- 1 } else { y <- 2 }"),
             BTreeSet::from(["x".into(), "y".into()])
         );
-        assert_eq!(
-            defs("while (flag) { z <- 1 }"),
-            BTreeSet::from(["z".into()])
-        );
-        assert_eq!(
-            defs("repeat { q <- 1; break }"),
-            BTreeSet::from(["q".into()])
-        );
+        assert_eq!(defs("while (flag) { z <- 1 }"), BTreeSet::from(["z".into()]));
+        assert_eq!(defs("repeat { q <- 1; break }"), BTreeSet::from(["q".into()]));
     }
 
     #[test]
@@ -1070,28 +1121,20 @@ mod tests {
         );
 
         let looped = parse_one("for (x in xs) y <- x");
-        assert!(
-            looped
-                .definitions
-                .iter()
-                .all(|definition| definition.certainty == BindingCertainty::Possible)
-        );
+        assert!(looped
+            .definitions
+            .iter()
+            .all(|definition| definition.certainty == BindingCertainty::Possible));
     }
 
     #[test]
     fn chained_assignments_share_one_top_level_unit() {
-        assert_eq!(
-            defs("x <- y <- value"),
-            BTreeSet::from(["x".into(), "y".into()])
-        );
+        assert_eq!(defs("x <- y <- value"), BTreeSet::from(["x".into(), "y".into()]));
     }
 
     #[test]
     fn function_locals_are_not_package_bindings() {
-        assert_eq!(
-            defs("f <- function(x) { y <- x; for (i in x) z <- i }"),
-            BTreeSet::from(["f".into()])
-        );
+        assert_eq!(defs("f <- function(x) { y <- x; for (i in x) z <- i }"), BTreeSet::from(["f".into()]));
     }
 
     #[test]
@@ -1118,48 +1161,33 @@ mod tests {
     fn superassignment_is_an_effect_not_a_local_definition() {
         let parsed = parse_one("f <- function() x <<- 1");
         assert_eq!(
-            parsed
-                .definitions
-                .iter()
-                .map(|d| d.name.as_str())
-                .collect::<Vec<_>>(),
+            parsed.definitions.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
             vec!["f"]
         );
-        assert!(
-            parsed
-                .effects
-                .iter()
-                .any(|e| e.kind == SyntaxEffectKind::SuperAssignment)
-        );
+        assert!(parsed.effects.iter().any(|e| e.kind == SyntaxEffectKind::SuperAssignment));
     }
 
     #[test]
     fn package_write_under_unknown_call_is_rejected_not_missed() {
         let parsed = parse_one("identity(x <- 1)");
         assert!(parsed.definitions.is_empty());
-        assert!(
-            parsed
-                .effects
-                .iter()
-                .any(|e| e.kind == SyntaxEffectKind::IndirectPackageWrite)
-        );
+        assert!(parsed.effects.iter().any(|e| e.kind == SyntaxEffectKind::IndirectPackageWrite));
     }
 
     #[test]
     fn namespace_access_is_not_an_unqualified_reference() {
         let parsed = parse_one("f <- function(x) foo::bar(x)");
-        assert!(
-            parsed
-                .package_refs
-                .iter()
-                .any(|r| r.package == "foo" && r.symbol == "bar")
-        );
-        assert!(
-            !parsed
-                .references
-                .iter()
-                .any(|r| r.name == "foo" || r.name == "bar")
-        );
+        assert!(parsed.package_refs.iter().any(|r| r.package == "foo" && r.symbol == "bar"));
+        assert!(!parsed.references.iter().any(|r| r.name == "foo" || r.name == "bar"));
+    }
+
+    #[test]
+    fn require_namespace_if_consequence_carries_optional_guard() {
+        let parsed = parse_one("f <- function() if (requireNamespace(\"foo\")) foo::bar()");
+        let reference = parsed.package_refs.iter().find(|r| r.package == "foo" && r.symbol == "bar").unwrap();
+        assert_eq!(reference.guards, vec!["foo"]);
+        let condition = parsed.calls.iter().find(|call| call.callee == "requireNamespace").unwrap();
+        assert!(condition.guards.is_empty());
     }
     #[test]
     fn empty_function_for_loop_does_not_hide_outer_binding() {
@@ -1196,19 +1224,14 @@ mod tests {
     #[test]
     fn top_level_and_function_references_have_distinct_phases() {
         let top = parse_one("y <- x");
-        assert!(
-            top.references
-                .iter()
-                .any(|r| { r.name == "x" && r.phase == EvalPhase::Materialization })
-        );
+        assert!(top.references.iter().any(|r| {
+            r.name == "x" && r.phase == EvalPhase::Materialization
+        }));
 
         let runtime = parse_one("f <- function() x");
-        assert!(
-            runtime
-                .references
-                .iter()
-                .any(|r| { r.name == "x" && r.phase == EvalPhase::Runtime })
-        );
+        assert!(runtime.references.iter().any(|r| {
+            r.name == "x" && r.phase == EvalPhase::Runtime
+        }));
     }
 
     #[test]
@@ -1238,5 +1261,7 @@ mod tests {
         let resource = parsed.resource_refs.first().unwrap();
         assert_eq!(resource.package.as_deref(), Some("foo"));
         assert_eq!(resource.path.as_deref(), Some("data/x.json"));
+        assert_eq!(resource.must_work, Some(false));
     }
+
 }

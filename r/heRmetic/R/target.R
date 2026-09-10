@@ -6,6 +6,7 @@ hrm_capture_target <- function(output, requested = character()) {
 
   .hrm_emit(output, "HEADER", paste0(R.version$major, ".", R.version$minor), R.version$os, R.version$arch)
   for (i in seq_along(libs)) .hrm_emit(output, "LIB", as.character(i - 1L), libs[[i]])
+  for (name in sort(ls(.BaseNamespaceEnv, all.names = TRUE))) .hrm_emit(output, "BASE_BINDING", name)
 
   seen <- character()
   for (lib in libs) {

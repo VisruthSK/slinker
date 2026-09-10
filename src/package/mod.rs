@@ -3,12 +3,10 @@ mod index;
 mod locator;
 mod store;
 
-pub use image::{
-    BindingImage, BindingOrigin, ClosureSource, ObjectIssue, ObjectKind, PackageImage,
-};
+pub use image::{BindingImage, BindingOrigin, ClosureSource, EmbeddedClosureSource, ObjectIssue, ObjectKind, PackageImage};
 pub use index::{
-    ExportMap, ImportBinding, ImportSpec, LifecycleMetadata, NativeComponent, PackageIndex,
-    ResourceInfo, S3Registration,
+    ExportMap, ImportBinding, ImportSpec, LifecycleMetadata, NativeComponent, NativeFacts, NativeSafety, PackageIndex,
+    S3Registration,
 };
 pub use locator::{Digest, InstalledPackage, PackageId, PackageLocator};
 pub use store::{PackageProvider, PackageStore, SyntaxValidation};

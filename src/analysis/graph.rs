@@ -16,6 +16,8 @@ pub enum NodeKind {
     Resource { path: String },
     NativeComponent { name: String },
     ExternalBinding { name: String },
+    PackageMetadata { name: String },
+    MissingPackage,
     Rejection { code: String },
 }
 
@@ -53,6 +55,7 @@ pub struct Edge {
     pub to: NodeId,
     pub kind: EdgeKind,
     pub reason: String,
+    pub span: Option<Span>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -66,39 +69,24 @@ pub struct Graph {
     #[serde(skip)]
     keys: HashMap<(String, NodeKind), NodeId>,
     #[serde(skip)]
-    edge_keys: HashSet<(NodeId, NodeId, EdgeKind, String)>,
+    edge_keys: HashSet<(NodeId, NodeId, EdgeKind, String, Option<Span>)>,
 }
 
 impl Graph {
     pub fn from_parts(nodes: Vec<Node>, edges: Vec<Edge>) -> Self {
-        let mut graph = Self {
-            nodes,
-            edges,
-            ..Self::default()
-        };
+        let mut graph = Self { nodes, edges, ..Self::default() };
         graph.rebuild_indexes();
         graph
     }
 
-    pub fn add_node(
-        &mut self,
-        package: impl Into<String>,
-        kind: NodeKind,
-        span: Option<Span>,
-    ) -> NodeId {
+    pub fn add_node(&mut self, package: impl Into<String>, kind: NodeKind, span: Option<Span>) -> NodeId {
         let package = package.into();
         let key = (package.clone(), kind.clone());
         if let Some(id) = self.keys.get(&key) {
             return *id;
         }
         let id = NodeId(self.nodes.len());
-        self.nodes.push(Node {
-            id,
-            package: package.clone(),
-            kind: kind.clone(),
-            span,
-            bytes: 0,
-        });
+        self.nodes.push(Node { id, package: package.clone(), kind: kind.clone(), span, bytes: 0 });
         self.outgoing.push(Vec::new());
         self.incoming.push(Vec::new());
         self.keys.insert(key, id);
@@ -109,52 +97,60 @@ impl Graph {
         self.nodes[id.0].bytes = bytes;
     }
 
-    pub fn add_edge(
+    pub fn add_edge(&mut self, from: NodeId, to: NodeId, kind: EdgeKind, reason: impl Into<String>) -> bool {
+        self.add_edge_at(from, to, kind, reason, None)
+    }
+
+    pub fn add_edge_at(
         &mut self,
         from: NodeId,
         to: NodeId,
         kind: EdgeKind,
         reason: impl Into<String>,
-    ) {
+        span: Option<Span>,
+    ) -> bool {
         let reason = reason.into();
-        let key = (from, to, kind, reason.clone());
+        let key = (from, to, kind, reason.clone(), span.clone());
         if !self.edge_keys.insert(key) {
-            return;
+            return false;
         }
         let index = self.edges.len();
-        self.edges.push(Edge {
-            from,
-            to,
-            kind,
-            reason,
-        });
+        self.edges.push(Edge { from, to, kind, reason, span });
         self.outgoing[from.0].push(index);
         self.incoming[to.0].push(index);
+        true
     }
 
     pub fn binding(&self, package: &str, name: &str) -> Option<NodeId> {
-        self.node_id(
-            package,
-            &NodeKind::Binding {
-                name: name.to_owned(),
-            },
-        )
+        self.node_id(package, &NodeKind::Binding { name: name.to_owned() })
     }
 
     pub fn activation(&self, package: &str) -> Option<NodeId> {
         self.node_id(package, &NodeKind::Activation)
     }
 
-    pub fn incoming(&self, node: NodeId) -> impl Iterator<Item = &Edge> {
-        self.incoming[node.0]
+
+    pub fn nodes_for_package(&self, package: &str) -> impl Iterator<Item = NodeId> + '_ {
+        let package = package.to_owned();
+        self.nodes
             .iter()
-            .map(|index| &self.edges[*index])
+            .filter(move |node| node.package == package)
+            .map(|node| node.id)
+    }
+
+    pub fn missing_packages(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(&node.kind, NodeKind::MissingPackage))
+            .map(|node| node.id)
+    }
+
+    pub fn incoming(&self, node: NodeId) -> impl Iterator<Item = &Edge> {
+        self.incoming[node.0].iter().map(|index| &self.edges[*index])
     }
 
     pub fn outgoing(&self, node: NodeId) -> impl Iterator<Item = &Edge> {
-        self.outgoing[node.0]
-            .iter()
-            .map(|index| &self.edges[*index])
+        self.outgoing[node.0].iter().map(|index| &self.edges[*index])
     }
 
     fn node_id(&self, package: &str, kind: &NodeKind) -> Option<NodeId> {
@@ -222,14 +218,12 @@ impl Graph {
         self.keys.clear();
         self.edge_keys.clear();
         for node in &self.nodes {
-            self.keys
-                .insert((node.package.clone(), node.kind.clone()), node.id);
+            self.keys.insert((node.package.clone(), node.kind.clone()), node.id);
         }
         for (index, edge) in self.edges.iter().enumerate() {
             self.outgoing[edge.from.0].push(index);
             self.incoming[edge.to.0].push(index);
-            self.edge_keys
-                .insert((edge.from, edge.to, edge.kind, edge.reason.clone()));
+            self.edge_keys.insert((edge.from, edge.to, edge.kind, edge.reason.clone(), edge.span.clone()));
         }
     }
 }

@@ -1,6 +1,6 @@
 use crate::package::{
-    ExportMap, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent,
-    PackageIndex, ResourceInfo, S3Registration,
+    ExportMap, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent, NativeSafety,
+    PackageIndex, S3Registration,
 };
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -23,6 +23,11 @@ pub enum ObjectKind {
     Character,
     Raw,
     Symbol,
+    List,
+    Pairlist,
+    Language,
+    Expression,
+    Environment,
     Builtin,
     Special,
     Other(String),
@@ -41,6 +46,11 @@ impl ObjectKind {
             "character" => Self::Character,
             "raw" => Self::Raw,
             "symbol" => Self::Symbol,
+            "list" => Self::List,
+            "pairlist" => Self::Pairlist,
+            "language" => Self::Language,
+            "expression" => Self::Expression,
+            "environment" => Self::Environment,
             "builtin" => Self::Builtin,
             "special" => Self::Special,
             "unavailable" => Self::Unavailable,
@@ -68,12 +78,20 @@ pub struct ClosureSource {
     pub environment: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmbeddedClosureSource {
+    pub path: String,
+    pub source: Arc<str>,
+    pub environment: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct BindingImage {
     pub name: String,
     pub origin: BindingOrigin,
     pub object_kind: ObjectKind,
     pub closure: Option<ClosureSource>,
+    pub embedded_closures: Vec<EmbeddedClosureSource>,
     pub issues: Vec<ObjectIssue>,
 }
 
@@ -96,7 +114,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
     let mut import_all = HashMap::<String, usize>::new();
     let mut bindings = HashMap::<String, BindingImage>::new();
     let mut datasets = Vec::new();
-    let mut resources = Vec::new();
+    let mut files = Vec::new();
     let mut s3 = Vec::new();
     let mut dynlibs = Vec::new();
 
@@ -109,9 +127,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
         let values = fields
             .map(decode_hex)
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|message| {
-                Error::Analysis(format!("image protocol line {}: {message}", line_no + 1))
-            })?;
+            .map_err(|message| Error::Analysis(format!("image protocol line {}: {message}", line_no + 1)))?;
         match kind {
             "HEADER" => {
                 require(kind, &values, 4, line_no)?;
@@ -121,11 +137,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                         package.id.name, package.id.name, package.id.version, values[0], values[1]
                     )));
                 }
-                header = Some((
-                    values[1].clone(),
-                    parse_bool(&values[2])?,
-                    parse_bool(&values[3])?,
-                ));
+                header = Some((values[1].clone(), parse_bool(&values[2])?, parse_bool(&values[3])?));
             }
             "EXPORT" => {
                 require(kind, &values, 2, line_no)?;
@@ -135,10 +147,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                 require(kind, &values, 1, line_no)?;
                 let index = imports.len();
                 import_all.insert(values[0].clone(), index);
-                imports.push(ImportSpec::All {
-                    package: values[0].clone(),
-                    except: Vec::new(),
-                });
+                imports.push(ImportSpec::All { package: values[0].clone(), except: Vec::new() });
             }
             "IMPORT_EXCEPT" => {
                 require(kind, &values, 2, line_no)?;
@@ -151,10 +160,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
             "IMPORT_FROM" => {
                 require(kind, &values, 3, line_no)?;
                 let package_name = values[0].clone();
-                let binding = ImportBinding {
-                    remote: values[1].clone(),
-                    local: values[2].clone(),
-                };
+                let binding = ImportBinding { remote: values[1].clone(), local: values[2].clone() };
                 if let Some(ImportSpec::From { bindings, .. }) = imports.iter_mut().find(|item| {
                     matches!(item, ImportSpec::From { package, .. } if package == &package_name)
                 }) {
@@ -168,20 +174,16 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                 let origin = match values[1].as_str() {
                     "code" => BindingOrigin::Code,
                     "sysdata" => BindingOrigin::Sysdata,
-                    other => {
-                        return Err(Error::Analysis(format!("unknown binding origin {other:?}")));
-                    }
+                    other => return Err(Error::Analysis(format!("unknown binding origin {other:?}"))),
                 };
-                bindings.insert(
-                    values[0].clone(),
-                    BindingImage {
-                        name: values[0].clone(),
-                        origin,
-                        object_kind: ObjectKind::from_r_type(&values[2]),
-                        closure: None,
-                        issues: Vec::new(),
-                    },
-                );
+                bindings.insert(values[0].clone(), BindingImage {
+                    name: values[0].clone(),
+                    origin,
+                    object_kind: ObjectKind::from_r_type(&values[2]),
+                    closure: None,
+                    embedded_closures: Vec::new(),
+                    issues: Vec::new(),
+                });
             }
             "CLOSURE" => {
                 require(kind, &values, 5, line_no)?;
@@ -193,6 +195,17 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                     formals: Arc::from(values[2].clone()),
                     body: Arc::from(values[3].clone()),
                     source: Arc::from(values[4].clone()),
+                });
+            }
+            "NESTED_CLOSURE" => {
+                require(kind, &values, 4, line_no)?;
+                let binding = bindings.get_mut(&values[0]).ok_or_else(|| {
+                    Error::Analysis(format!("NESTED_CLOSURE precedes BINDING for {}", values[0]))
+                })?;
+                binding.embedded_closures.push(EmbeddedClosureSource {
+                    path: values[1].clone(),
+                    environment: values[2].clone(),
+                    source: Arc::from(values[3].clone()),
                 });
             }
             "BINDING_ISSUE" => {
@@ -220,36 +233,26 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
             }
             "DYNLIB" => {
                 require(kind, &values, 1, line_no)?;
-                dynlibs.push(NativeComponent {
-                    name: values[0].clone(),
-                    callbacks: Vec::new(),
-                    opaque_r_lookup: false,
-                });
+                dynlibs.push(NativeComponent { name: values[0].clone(), safety: NativeSafety::Unanalyzed });
             }
-            "RESOURCE" => {
+            "FILE" => {
                 require(kind, &values, 1, line_no)?;
-                resources.push(ResourceInfo {
-                    path: values[0].clone(),
-                });
+                files.push(values[0].clone());
             }
             "PACKAGE_ISSUE" => {
                 // Package-level unsupported object-system metadata is represented
                 // later as an activation diagnostic. Keep the protocol forward-compatible.
             }
-            other => {
-                return Err(Error::Analysis(format!(
-                    "unknown installed-image record {other:?}"
-                )));
-            }
+            other => return Err(Error::Analysis(format!("unknown installed-image record {other:?}"))),
         }
     }
 
-    let (_, on_load, has_sysdata) =
-        header.ok_or_else(|| Error::Analysis("installed image has no HEADER".into()))?;
+    let (_, on_load, has_sysdata) = header.ok_or_else(|| Error::Analysis("installed image has no HEADER".into()))?;
     let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
     binding_names.sort();
     datasets.sort();
-    resources.sort_by(|left, right| left.path.cmp(&right.path));
+    files.sort();
+    files.dedup();
 
     let index = PackageIndex {
         description: package.description.clone(),
@@ -261,7 +264,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
         lifecycle: LifecycleMetadata { on_load },
         binding_names,
         datasets,
-        resources,
+        files,
         has_sysdata,
     };
     Ok(PackageImage { index, bindings })
@@ -283,9 +286,7 @@ fn parse_bool(value: &str) -> Result<bool> {
     match value {
         "0" => Ok(false),
         "1" => Ok(true),
-        other => Err(Error::Analysis(format!(
-            "invalid protocol boolean {other:?}"
-        ))),
+        other => Err(Error::Analysis(format!("invalid protocol boolean {other:?}"))),
     }
 }
 
