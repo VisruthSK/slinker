@@ -46,12 +46,12 @@ impl Description {
                 continue;
             }
 
-            let (key, value) = raw
-                .split_once(':')
-                .ok_or_else(|| MetadataError::MalformedField {
-                    line,
-                    text: raw.to_owned(),
-                })?;
+            let (key, value) =
+                raw.split_once(':')
+                    .ok_or_else(|| MetadataError::MalformedField {
+                        line,
+                        text: raw.to_owned(),
+                    })?;
             let key = key.trim();
             if key.is_empty() {
                 return Err(MetadataError::EmptyFieldName { line });
@@ -100,7 +100,9 @@ impl Description {
     }
 
     pub fn fields(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.fields.iter().map(|(key, value)| (key.as_str(), value.as_str()))
+        self.fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
     }
 }
 
@@ -182,7 +184,9 @@ impl fmt::Display for MetadataError {
             Self::MalformedField { line, text } => {
                 write!(f, "malformed DESCRIPTION field at line {line}: {text}")
             }
-            Self::EmptyFieldName { line } => write!(f, "empty DESCRIPTION field name at line {line}"),
+            Self::EmptyFieldName { line } => {
+                write!(f, "empty DESCRIPTION field name at line {line}")
+            }
             Self::MalformedDependency { field, value } => {
                 write!(f, "malformed {field} dependency entry: {value}")
             }

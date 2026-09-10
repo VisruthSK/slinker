@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -7,15 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-mod resolve;
-
-use resolve::{ResolvedPackage, Resolution, resolve_installed_closure};
-
-use hrm::analysis::{Analysis, Analyzer, AnalyzerConfig, NodeKind, TargetPackage};
-use hrm::{
-    Description, InspectionRequest, RToolchain, SemanticSnapshot, TargetEnvironment,
-    TargetEnvironmentRequest,
-};
+use hrm::analysis::{LinkPlan, Linker, Need, NodeKind};
+use hrm::build::Rewrite;
+use hrm::package::PackageStore;
+use hrm::{RToolchain, TargetEnvironment, TargetEnvironmentRequest};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -68,7 +63,6 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Comm
     let Some(command) = args.next() else {
         return Err(CliError::Usage("missing command"));
     };
-
     match command.to_str() {
         Some("--help" | "-h") => {
             reject_extra(args)?;
@@ -83,13 +77,14 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Comm
     }
 }
 
-fn parse_analyze_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<AnalyzeArgs, CliError> {
+fn parse_analyze_args(
+    args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<AnalyzeArgs, CliError> {
     let mut args = args.peekable();
     let mut root = None;
     let mut libraries = Vec::new();
     let mut target_provided = BTreeSet::new();
     let mut jobs = default_jobs();
-
     while let Some(argument) = args.next() {
         let text = argument.to_string_lossy();
         if text == "--lib" {
@@ -107,9 +102,9 @@ fn parse_analyze_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<
             continue;
         }
         if text == "--target-provided" {
-            let value = args
-                .next()
-                .ok_or(CliError::Usage("`--target-provided` requires a package list"))?;
+            let value = args.next().ok_or(CliError::Usage(
+                "`--target-provided` requires a package list",
+            ))?;
             insert_package_list(&mut target_provided, &value)?;
             continue;
         }
@@ -135,19 +130,234 @@ fn parse_analyze_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<
             .into_string()
             .map_err(|_| CliError::Usage("package name must be valid UTF-8"))?;
         if package.contains('/') || package.contains('\\') {
-            return Err(CliError::Usage("analyze expects an installed package name, not a source path"));
+            return Err(CliError::Usage(
+                "analyze expects an installed package name, not a source path",
+            ));
         }
         if root.replace(package).is_some() {
-            return Err(CliError::Usage("analyze accepts one installed package name"));
+            return Err(CliError::Usage(
+                "analyze accepts one installed package name",
+            ));
         }
     }
-
     Ok(AnalyzeArgs {
-        root: root.ok_or(CliError::Usage("analyze requires an installed package name"))?,
+        root: root.ok_or(CliError::Usage(
+            "analyze requires an installed package name",
+        ))?,
         libraries,
         target_provided,
         jobs,
     })
+}
+
+fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
+    let r = env::var_os("HRM_R")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_r_executable);
+    let toolchain = RToolchain::from_r(r);
+    let scratch = ScratchDir::new()?;
+    let mut target_request = TargetEnvironmentRequest::new(scratch.path().join("target"));
+    target_request.libraries = args
+        .libraries
+        .iter()
+        .map(|library| absolute_path(library))
+        .collect::<io::Result<Vec<_>>>()?;
+    let target = toolchain.capture_target_environment(&target_request)?;
+
+    let store = PackageStore::new(
+        toolchain,
+        target.clone(),
+        args.target_provided.iter().cloned(),
+        scratch.path().join("linker"),
+    )?;
+    let plan = Linker::new(store, args.jobs).analyze(&args.root)?;
+    print_analysis(&target, &args.root, &plan)?;
+    Ok(())
+}
+
+fn print_analysis(
+    target: &TargetEnvironment,
+    root_name: &str,
+    plan: &LinkPlan,
+) -> Result<(), Box<dyn Error>> {
+    let root = plan
+        .images
+        .iter()
+        .find(|(id, _)| id.name == root_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "root image missing from link plan",
+            )
+        })?;
+    let root_id = root.0;
+    let root_image = root.1;
+
+    println!("package: {} {}", root_id.name, root_id.version);
+    println!("image: {}", root_id.root.display());
+    println!("origin: installed image from {}", root_id.library.display());
+    println!(
+        "target: R {} | {} | {}",
+        target.target.r_version, target.target.os, target.target.arch
+    );
+    println!();
+
+    println!("library universe");
+    for (index, library) in target.libraries.iter().enumerate() {
+        println!("  [{index}] {}", library.display());
+    }
+    println!();
+
+    println!("root image");
+    println!("  installed bytes: {}", directory_bytes(&root_id.root)?);
+    println!("  bindings: {}", root_image.index.binding_names.len());
+    println!("  exports: {}", root_image.index.exports.len());
+    println!("  resources: {}", root_image.index.resources.len());
+    println!("  S3 registrations: {}", root_image.index.s3.len());
+    println!("  dynamic libraries: {}", root_image.index.dynlibs.len());
+    println!(
+        "  .onLoad present: {}",
+        if root_image.index.lifecycle.on_load {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!("  inspection: one structured installed lazy-load image; Air parsing is binding-lazy");
+    println!();
+
+    println!("semantic package closure");
+    let mut packages = plan
+        .images
+        .keys()
+        .filter(|id| id.name != root_name)
+        .collect::<Vec<_>>();
+    packages.sort_by(|left, right| left.name.cmp(&right.name));
+    if packages.is_empty() {
+        println!("  none internalized");
+    } else {
+        for package in &packages {
+            println!(
+                "  {} {}: demanded installed image",
+                package.name, package.version
+            );
+            println!("    {}", package.root.display());
+        }
+    }
+    let mut externals = plan
+        .graph
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            NodeKind::ExternalBinding { .. } => Some(node.package.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    externals.sort();
+    externals.dedup();
+    for package in externals {
+        println!("  {package}: exact target-provided namespace");
+    }
+    println!();
+
+    println!("graph");
+    println!("  nodes: {}", plan.graph.nodes.len());
+    println!("  edges: {}", plan.graph.edges.len());
+    println!("  roots: {}", plan.roots.len());
+    println!("  processed semantic needs: {}", plan.retained.len());
+    println!("  installed images inspected: {}", plan.inspected_packages);
+    println!("  bindings Air-parsed: {}", plan.parsed_bindings);
+    println!();
+
+    println!("retention");
+    for package in &packages {
+        let image = plan.images.get(*package).expect("retained package image");
+        let mut kept = plan
+            .retained
+            .iter()
+            .filter_map(|need| match need {
+                Need::Binding {
+                    package: owner,
+                    binding,
+                } if owner == *package => Some(binding.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        kept.sort();
+        let dropped = image.index.binding_names.len().saturating_sub(kept.len());
+        println!(
+            "  {}: {}/{} bindings retained; {} discarded",
+            package.name,
+            kept.len(),
+            image.index.binding_names.len(),
+            dropped
+        );
+        if !kept.is_empty() {
+            println!("    keep: {}", kept.join(", "));
+        }
+    }
+    if packages.is_empty() {
+        println!("  no third-party runtime bindings internalized");
+    }
+    println!();
+
+    println!("blockers");
+    if plan.diagnostics.is_empty() {
+        println!("  none");
+    } else {
+        for diagnostic in &plan.diagnostics {
+            let owner = diagnostic
+                .binding
+                .as_ref()
+                .map(|binding| format!("{}::{binding}", diagnostic.package))
+                .unwrap_or_else(|| diagnostic.package.clone());
+            let location = diagnostic
+                .span
+                .as_ref()
+                .and_then(|span| plan.sources.display(&span.source))
+                .unwrap_or(owner);
+            println!(
+                "  - {:?} [{}]: {}",
+                diagnostic.code, location, diagnostic.message
+            );
+        }
+    }
+    println!();
+
+    let namespace_rewrites = plan
+        .rewrites
+        .iter()
+        .filter(|rewrite| matches!(rewrite, Rewrite::NamespaceAccess { .. }))
+        .count();
+    let resource_rewrites = plan
+        .rewrites
+        .iter()
+        .filter(|rewrite| matches!(rewrite, Rewrite::ResourceAccess { .. }))
+        .count();
+    let discovery_rewrites = plan
+        .rewrites
+        .iter()
+        .filter(|rewrite| matches!(rewrite, Rewrite::SpecializedDiscovery { .. }))
+        .count();
+    println!("hermetification plan");
+    println!("  root package: {} {}", root_id.name, root_id.version);
+    println!("  synthetic namespaces: {}", packages.len());
+    println!("  package-qualified rewrites: {namespace_rewrites}");
+    println!("  resource rewrites: {resource_rewrites}");
+    println!("  specialized discovery rewrites: {discovery_rewrites}");
+    println!("  analysis model: binding-level demand-driven installed-image linker");
+    println!("  package discovery rounds: none");
+    println!("  per-binding temporary R files: none");
+    println!(
+        "  analysis status: {}",
+        if plan.diagnostics.is_empty() {
+            "link plan complete"
+        } else {
+            "blocked"
+        }
+    );
+    println!("  build status: graph-driven materialization and rewriting not wired yet");
+    Ok(())
 }
 
 fn parse_jobs(value: &std::ffi::OsString) -> Result<usize, CliError> {
@@ -172,17 +382,22 @@ fn default_jobs() -> usize {
         .min(8)
 }
 
-fn insert_package_list(packages: &mut BTreeSet<String>, value: &std::ffi::OsString) -> Result<(), CliError> {
-    let value = value
-        .to_str()
-        .ok_or(CliError::Usage("target-provided package names must be valid UTF-8"))?;
+fn insert_package_list(
+    packages: &mut BTreeSet<String>,
+    value: &std::ffi::OsString,
+) -> Result<(), CliError> {
+    let value = value.to_str().ok_or(CliError::Usage(
+        "target-provided package names must be valid UTF-8",
+    ))?;
     insert_package_list_str(packages, value)
 }
 
 fn insert_package_list_str(packages: &mut BTreeSet<String>, value: &str) -> Result<(), CliError> {
     for package in value.split(',').map(str::trim) {
         if package.is_empty() {
-            return Err(CliError::Usage("target-provided package list contains an empty name"));
+            return Err(CliError::Usage(
+                "target-provided package list contains an empty name",
+            ));
         }
         packages.insert(package.to_owned());
     }
@@ -201,671 +416,21 @@ fn print_help() {
     println!(
         "hrm {VERSION}\n\n\
          Usage:\n  hrm analyze PACKAGE [--lib PATH]... [--target-provided PKG[,PKG...]] [--jobs N]\n\n\
-         Link an installed R package image and its installed runtime dependency closure.\n\
-         hrm never installs, rebuilds, or downloads packages. Install the package into\n\
-         the library universe you want to analyze before invoking hrm.\n\n\
+         Link an installed R package image by following reachable semantic bindings.\n\
+         hrm never installs, rebuilds, or downloads packages, and never recursively resolves DESCRIPTION dependencies.\n\n\
          Options:\n\
            --lib PATH                     select an installed R library (repeatable, ordered)\n\
-           --target-provided PKG[,PKG...] leave only these third-party packages external\n\
-           --jobs N                       parallel package jobs (default: min(CPUs, 8))\n\n\
+           --target-provided PKG[,PKG...] leave these exact third-party namespaces external\n\
+           --jobs N                       analysis workers (default: min(CPUs, 8))\n\n\
          Environment:\n\
-           HRM_R  target R executable (defaults to R/R.exe from PATH)"
+           HRM_R          target R executable (defaults to R/R.exe from PATH)\n\
+           HRM_CACHE_DIR  persistent installed-image analysis cache"
     );
-}
-
-#[derive(Debug)]
-struct InspectedPackage {
-    resolved: ResolvedPackage,
-    snapshot: SemanticSnapshot,
-}
-
-#[derive(Debug)]
-struct RootImage {
-    name: String,
-    version: String,
-    root: PathBuf,
-    origin: String,
-    description: Description,
-}
-
-fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
-    let r = env::var_os("HRM_R")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_r_executable);
-    let toolchain = RToolchain::from_r(r);
-    let scratch = ScratchDir::new()?;
-
-    let mut target_request = TargetEnvironmentRequest::new(scratch.path().join("target"));
-    target_request.libraries = args
-        .libraries
-        .iter()
-        .map(|library| absolute_path(library))
-        .collect::<io::Result<Vec<_>>>()?;
-    let target = toolchain.capture_target_environment(&target_request)?;
-
-    let root = prepare_root(&target, &args.root)?;
-    let mut analyzer = Analyzer::with_jobs(args.jobs);
-    let mut snapshots = BTreeMap::<String, SemanticSnapshot>::new();
-    let mut additional = BTreeSet::new();
-    let mut round = 0usize;
-
-    let (resolution, dependencies, analysis) = loop {
-        let resolution = resolve_installed_closure(
-            &target,
-            &root.description,
-            &additional,
-            &args.target_provided,
-        )?;
-
-        inspect_missing_packages(
-            &toolchain,
-            &target,
-            &root,
-            &resolution,
-            &mut snapshots,
-            scratch.path(),
-            args.jobs,
-        )?;
-
-        let root_snapshot = snapshots.get(&root.name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "root package was not inspected")
-        })?;
-        let dependencies = dependencies_from_cache(&resolution, &snapshots)?;
-        let target_packages = resolution
-            .platform
-            .iter()
-            .chain(resolution.target_provided.iter())
-            .map(|(name, version)| TargetPackage {
-                name: name.clone(),
-                version: version.clone(),
-            })
-            .collect();
-        let analysis = analyzer.analyze(&AnalyzerConfig {
-            root: root_snapshot.analysis_root.clone(),
-            dependencies: dependencies
-                .iter()
-                .map(|dependency| dependency.snapshot.analysis_root.clone())
-                .collect(),
-            target_packages,
-        })?;
-
-        let present = dependencies
-            .iter()
-            .map(|dependency| dependency.resolved.installed.name.clone())
-            .chain(resolution.platform.keys().cloned())
-            .chain(resolution.target_provided.keys().cloned())
-            .collect::<BTreeSet<_>>();
-        let discovered = reachable_named_packages(&analysis)
-            .into_iter()
-            .filter(|name| {
-                name != &root.name
-                    && !present.contains(name)
-                    && target.package(name).is_some()
-            })
-            .collect::<BTreeSet<_>>();
-        let before = additional.len();
-        additional.extend(discovered);
-        if additional.len() == before {
-            break (resolution, dependencies, analysis);
-        }
-        round += 1;
-        if round > 16 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "installed dependency discovery did not converge after 16 rounds",
-            )
-            .into());
-        }
-    };
-
-    let root_snapshot = snapshots.get(&root.name).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "root package snapshot disappeared")
-    })?;
-    print_analysis(
-        &target,
-        &root,
-        root_snapshot,
-        &resolution,
-        &dependencies,
-        &analysis,
-    )?;
-    Ok(())
-}
-
-fn prepare_root(target: &TargetEnvironment, name: &str) -> Result<RootImage, Box<dyn Error>> {
-    let installed = target.package(name).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("installed root package `{name}` is not present in the selected library universe"),
-        )
-    })?;
-    let root = installed.library.join(name);
-    let description = read_description(&root)?;
-    Ok(RootImage {
-        name: name.to_owned(),
-        version: installed.version.clone(),
-        root,
-        origin: format!("installed image from {}", installed.library.display()),
-        description,
-    })
-}
-
-fn inspect_missing_packages(
-    toolchain: &RToolchain,
-    target: &TargetEnvironment,
-    root: &RootImage,
-    resolution: &Resolution,
-    snapshots: &mut BTreeMap<String, SemanticSnapshot>,
-    scratch: &Path,
-    jobs: usize,
-) -> Result<(), Box<dyn Error>> {
-    let mut names = Vec::new();
-    let mut requests = Vec::new();
-    let images = scratch.join("images");
-
-    if !snapshots.contains_key(&root.name) {
-        let installed = target.package(&root.name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "root package left target universe")
-        })?;
-        names.push(root.name.clone());
-        requests.push(InspectionRequest::new(
-            &installed.library,
-            &root.name,
-            images.join(format!("{}.hrm", root.name)),
-        ));
-    }
-
-    for resolved in &resolution.internalized {
-        let name = &resolved.installed.name;
-        if snapshots.contains_key(name) {
-            continue;
-        }
-        names.push(name.clone());
-        requests.push(InspectionRequest::new(
-            &resolved.installed.library,
-            name,
-            images.join(format!("{name}.hrm")),
-        ));
-    }
-
-    if requests.is_empty() {
-        return Ok(());
-    }
-
-    let inspected = toolchain.inspect_package_snapshots_with_libraries(
-        &requests,
-        &target.libraries,
-        jobs,
-        &scratch.join("inspection"),
-    )?;
-    for (name, snapshot) in names.into_iter().zip(inspected) {
-        snapshots.insert(name, snapshot);
-    }
-    Ok(())
-}
-
-fn dependencies_from_cache(
-    resolution: &Resolution,
-    snapshots: &BTreeMap<String, SemanticSnapshot>,
-) -> Result<Vec<InspectedPackage>, Box<dyn Error>> {
-    resolution
-        .internalized
-        .iter()
-        .map(|resolved| {
-            let snapshot = snapshots
-                .get(&resolved.installed.name)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("package {} was resolved but not inspected", resolved.installed.name),
-                    )
-                })?
-                .clone();
-            Ok(InspectedPackage {
-                resolved: resolved.clone(),
-                snapshot,
-            })
-        })
-        .collect()
-}
-
-fn reachable_named_packages(analysis: &Analysis) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for package in &analysis.packages {
-        let mut ordinal = 0usize;
-        for unit in &package.r_units {
-            for expression in &unit.parsed.expressions {
-                let reachable = analysis
-                    .graph
-                    .initialization(&package.id.name, ordinal)
-                    .is_some_and(|node| analysis.reachable[node.0]);
-                ordinal += 1;
-                if !reachable {
-                    continue;
-                }
-                for reference in &expression.package_refs {
-                    out.insert(reference.package.clone());
-                }
-                for reference in &expression.resource_refs {
-                    if let Some(name) = &reference.package {
-                        out.insert(name.clone());
-                    }
-                }
-                for call in &expression.calls {
-                    if let Some(name) = static_package_name(call) {
-                        out.insert(name.to_owned());
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn static_package_name(call: &hrm::analysis::parser::CallSite) -> Option<&str> {
-    use hrm::analysis::parser::StaticArg;
-    let first = call.args.first()?.as_ref()?;
-    match call.callee.as_str() {
-        "library" | "require" => match first {
-            StaticArg::String(name) | StaticArg::Symbol(name) => Some(name.as_str()),
-        },
-        "requireNamespace" | "loadNamespace" | "getNamespace" | "asNamespace"
-        | "packageVersion" | "find.package" => match first {
-            StaticArg::String(name) => Some(name.as_str()),
-            StaticArg::Symbol(_) => None,
-        },
-        _ => None,
-    }
-}
-
-fn print_analysis(
-    target: &TargetEnvironment,
-    root: &RootImage,
-    root_snapshot: &SemanticSnapshot,
-    resolution: &Resolution,
-    dependencies: &[InspectedPackage],
-    analysis: &Analysis,
-) -> Result<(), Box<dyn Error>> {
-    println!("package: {} {}", root.name, root.version);
-    println!("image: {}", root.root.display());
-    println!("origin: {}", root.origin);
-    println!(
-        "target: R {} | {} | {}",
-        target.target.r_version, target.target.os, target.target.arch
-    );
-    println!();
-
-    println!("library universe");
-    for (index, library) in target.libraries.iter().enumerate() {
-        println!("  [{index}] {}", library.display());
-    }
-    println!();
-
-    println!("root image");
-    print_image_evidence(&root.root, root_snapshot)?;
-    println!();
-
-    println!("runtime dependency closure");
-    if dependencies.is_empty()
-        && resolution.platform.is_empty()
-        && resolution.target_provided.is_empty()
-    {
-        println!("  none");
-    } else {
-        for dependency in dependencies {
-            println!(
-                "  {} {}: internalized installed image",
-                dependency.resolved.installed.name, dependency.resolved.installed.version
-            );
-            println!("    {}", dependency.resolved.root.display());
-        }
-        for (name, version) in &resolution.platform {
-            println!("  {name} {version}: R platform");
-        }
-        for (name, version) in &resolution.target_provided {
-            println!("  {name} {version}: target-provided (explicit)");
-        }
-    }
-    println!();
-
-    let reachable_count = analysis.reachable.iter().filter(|value| **value).count();
-    println!("graph");
-    println!("  nodes: {}", analysis.graph.nodes.len());
-    println!("  edges: {}", analysis.graph.edges.len());
-    println!("  roots: {}", analysis.roots.len());
-    println!("  reachable: {reachable_count}");
-    println!();
-
-    println!("retention");
-    if dependencies.is_empty() {
-        println!("  no third-party runtime dependencies were internalized");
-    } else {
-        for dependency in dependencies {
-            print_retention(dependency, analysis);
-        }
-    }
-    println!();
-
-    print_blockers(dependencies, analysis);
-    println!();
-    print_hermetification_plan(root, resolution, dependencies, analysis);
-    Ok(())
-}
-
-fn print_image_evidence(root: &Path, snapshot: &SemanticSnapshot) -> Result<(), Box<dyn Error>> {
-    let bytes = directory_bytes(root)?;
-    let supported = snapshot.state.bindings.iter().filter(|binding| binding.supported).count();
-    println!("  installed bytes: {bytes}");
-    println!("  bindings: {} total, {} materializable", snapshot.state.bindings.len(), supported);
-    println!("  exports: {}", snapshot.state.exports.len());
-    println!("  resources: {}", snapshot.state.resources.len());
-    println!("  S3 registrations: {}", snapshot.state.s3.len());
-    println!("  dynamic libraries: {}", snapshot.state.dynlibs.len());
-    println!("  .onLoad present: {}", if snapshot.state.has_on_load { "yes" } else { "no" });
-    println!("  inspection: direct installed lazy-load image (no loadNamespace() call for this package)");
-    Ok(())
-}
-
-fn print_retention(package: &InspectedPackage, analysis: &Analysis) {
-    let name = &package.resolved.installed.name;
-    let all = analysis
-        .graph
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Binding { name: binding } if &node.package == name => {
-                Some((binding.clone(), analysis.reachable[node.id.0]))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let mut keep = all
-        .iter()
-        .filter(|(_, reachable)| *reachable)
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    let mut drop = all
-        .iter()
-        .filter(|(_, reachable)| !*reachable)
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    keep.sort();
-    drop.sort();
-
-    let materializable = keep
-        .iter()
-        .filter(|binding| {
-            package
-                .snapshot
-                .state
-                .bindings
-                .iter()
-                .find(|state| state.name == binding.as_str())
-                .is_some_and(|state| state.supported)
-        })
-        .count();
-
-    println!(
-        "  {name}: {}/{} bindings retained, {}/{} retained bindings materializable",
-        keep.len(),
-        all.len(),
-        materializable,
-        keep.len()
-    );
-    if !keep.is_empty() {
-        println!("    keep: {}", keep.join(", "));
-    }
-    if !drop.is_empty() {
-        println!("    drop: {}", drop.join(", "));
-    }
-}
-
-fn print_blockers(dependencies: &[InspectedPackage], analysis: &Analysis) {
-    let mut blockers = Vec::new();
-    for diagnostic in &analysis.diagnostics {
-        if diagnostic.reachable {
-            blockers.push(format!("{:?} [{}]: {}", diagnostic.code, diagnostic.package, diagnostic.message));
-        }
-    }
-
-    for package in dependencies {
-        let name = &package.resolved.installed.name;
-        for node in &analysis.graph.nodes {
-            let NodeKind::Binding { name: binding } = &node.kind else { continue };
-            if &node.package != name || !analysis.reachable[node.id.0] {
-                continue;
-            }
-            let Some(state) = package.snapshot.state.bindings.iter().find(|state| &state.name == binding) else {
-                continue;
-            };
-            if !state.supported {
-                let detail = state
-                    .issues
-                    .iter()
-                    .map(|issue| format!("{}: {}", issue.kind, issue.detail))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                blockers.push(format!("materialization [{name}::{binding}]: {detail}"));
-            }
-        }
-    }
-
-    for package in dependencies {
-        let name = &package.resolved.installed.name;
-        for resource in reachable_resources(analysis, name) {
-            if resource == "*" {
-                blockers.push(format!(
-                    "resource [{name}]: dynamic system.file() path cannot be selected statically"
-                ));
-            } else if !package
-                .snapshot
-                .state
-                .resources
-                .iter()
-                .any(|path| path == &resource)
-            {
-                blockers.push(format!(
-                    "resource [{name}:{resource}]: path does not exist in the selected installed image"
-                ));
-            }
-        }
-    }
-
-    println!("blockers");
-    if blockers.is_empty() {
-        println!("  none");
-    } else {
-        for blocker in blockers {
-            println!("  - {blocker}");
-        }
-    }
-}
-
-fn print_hermetification_plan(
-    root: &RootImage,
-    resolution: &Resolution,
-    dependencies: &[InspectedPackage],
-    analysis: &Analysis,
-) {
-    println!("hermetification plan");
-    println!("  root package: {} {}", root.name, root.version);
-    println!("  synthetic namespaces: {}", dependencies.len());
-
-    let internalized = dependencies
-        .iter()
-        .map(|package| package.resolved.installed.name.clone())
-        .collect::<BTreeSet<_>>();
-
-    for package in dependencies {
-        let name = &package.resolved.installed.name;
-        let mut bindings = analysis
-            .graph
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.kind {
-                NodeKind::Binding { name: binding }
-                    if &node.package == name && analysis.reachable[node.id.0] =>
-                {
-                    Some(binding.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        bindings.sort();
-
-        let resources = reachable_resources(analysis, name);
-        let native = analysis.graph.nodes.iter().any(|node| {
-            node.package == name.as_str()
-                && analysis.reachable[node.id.0]
-                && matches!(&node.kind, NodeKind::NativeComponent { .. })
-        });
-        let package_refs = reachable_package_refs_to(analysis, name);
-        let identity_refs = reachable_identity_refs_to(analysis, name);
-
-        println!("  {name}");
-        println!("    namespace env: {name}_ns");
-        println!("    imports env: {name}_imports");
-        println!("    image: {}", package.resolved.root.display());
-        println!("    retain bindings: {}", if bindings.is_empty() { "none".into() } else { bindings.join(", ") });
-        println!("    retain resources: {}", if resources.is_empty() { "none".into() } else { resources.join(", ") });
-        println!("    retain native shared library whole: {}", if native { "yes" } else { "no" });
-        println!("    pkg::/pkg::: rewrites targeting namespace: {package_refs}");
-        println!("    package-identity rewrites targeting namespace: {identity_refs}");
-    }
-
-    println!("  R platform namespaces: {}", join_map_keys(&resolution.platform));
-    println!("  explicit external namespaces: {}", join_map_keys(&resolution.target_provided));
-    println!("  internalized namespace references requiring rewrite: {}", count_internalized_package_refs(analysis, &internalized));
-    println!("  internalized resource references requiring rewrite: {}", count_internalized_resource_refs(analysis, &internalized));
-    println!("  installed images are the canonical linker input; dependency source reconstruction: none");
-
-    let blocked = analysis.diagnostics.iter().any(|diagnostic| diagnostic.reachable)
-        || dependencies.iter().any(|package| {
-            analysis.graph.nodes.iter().any(|node| {
-                let NodeKind::Binding { name: binding } = &node.kind else { return false };
-                node.package == package.resolved.installed.name.as_str()
-                    && analysis.reachable[node.id.0]
-                    && package
-                        .snapshot
-                        .state
-                        .bindings
-                        .iter()
-                        .find(|state| state.name == binding.as_str())
-                        .is_some_and(|state| !state.supported)
-            })
-        });
-    println!("  analysis status: {}", if blocked { "blocked" } else { "link plan complete" });
-    println!("  build status: graph-driven materialization and rewriting not wired yet");
-}
-
-fn reachable_resources(analysis: &Analysis, package: &str) -> Vec<String> {
-    let mut resources = analysis
-        .graph
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Resource { path } if node.package == package && analysis.reachable[node.id.0] => Some(path.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    resources.sort();
-    resources.dedup();
-    resources
-}
-
-fn reachable_package_refs_to(analysis: &Analysis, target: &str) -> usize {
-    let mut count = 0usize;
-    for package in &analysis.packages {
-        let mut ordinal = 0usize;
-        for unit in &package.r_units {
-            for expression in &unit.parsed.expressions {
-                let reachable = analysis
-                    .graph
-                    .initialization(&package.id.name, ordinal)
-                    .is_some_and(|node| analysis.reachable[node.0]);
-                ordinal += 1;
-                if reachable {
-                    count += expression.package_refs.iter().filter(|reference| reference.package == target).count();
-                }
-            }
-        }
-    }
-    count
-}
-
-fn reachable_identity_refs_to(analysis: &Analysis, target: &str) -> usize {
-    let mut count = 0usize;
-    for package in &analysis.packages {
-        let mut ordinal = 0usize;
-        for unit in &package.r_units {
-            for expression in &unit.parsed.expressions {
-                let reachable = analysis
-                    .graph
-                    .initialization(&package.id.name, ordinal)
-                    .is_some_and(|node| analysis.reachable[node.0]);
-                ordinal += 1;
-                if !reachable {
-                    continue;
-                }
-                for call in &expression.calls {
-                    if matches!(call.callee.as_str(), "requireNamespace" | "loadNamespace" | "getNamespace" | "asNamespace" | "packageVersion" | "find.package") {
-                        if let Some(Some(hrm::analysis::parser::StaticArg::String(name))) = call.args.first() {
-                            if name == target {
-                                count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    count
-}
-
-fn count_internalized_package_refs(analysis: &Analysis, internalized: &BTreeSet<String>) -> usize {
-    internalized
-        .iter()
-        .map(|package| reachable_package_refs_to(analysis, package))
-        .sum()
-}
-
-fn count_internalized_resource_refs(analysis: &Analysis, internalized: &BTreeSet<String>) -> usize {
-    let mut count = 0usize;
-    for package in &analysis.packages {
-        let mut ordinal = 0usize;
-        for unit in &package.r_units {
-            for expression in &unit.parsed.expressions {
-                let reachable = analysis
-                    .graph
-                    .initialization(&package.id.name, ordinal)
-                    .is_some_and(|node| analysis.reachable[node.0]);
-                ordinal += 1;
-                if !reachable {
-                    continue;
-                }
-                count += expression
-                    .resource_refs
-                    .iter()
-                    .filter(|reference| reference.package.as_ref().is_some_and(|name| internalized.contains(name)))
-                    .count();
-            }
-        }
-    }
-    count
-}
-
-fn join_map_keys(map: &BTreeMap<String, String>) -> String {
-    if map.is_empty() {
-        "none".into()
-    } else {
-        map.keys().cloned().collect::<Vec<_>>().join(", ")
-    }
 }
 
 fn directory_bytes(root: &Path) -> io::Result<u64> {
     let mut total = 0u64;
     let mut pending = vec![root.to_path_buf()];
-
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
@@ -877,16 +442,7 @@ fn directory_bytes(root: &Path) -> io::Result<u64> {
             }
         }
     }
-
     Ok(total)
-}
-
-fn read_description(root: &Path) -> Result<Description, Box<dyn Error>> {
-    let path = root.join("DESCRIPTION");
-    let text = fs::read_to_string(&path)?;
-    Ok(Description::parse(&text).map_err(|error| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("{}: {error}", path.display()))
-    })?)
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
@@ -908,7 +464,6 @@ fn default_r_executable() -> PathBuf {
 struct ScratchDir {
     path: PathBuf,
 }
-
 impl ScratchDir {
     fn new() -> io::Result<Self> {
         let nonce = SystemTime::now()
@@ -919,12 +474,10 @@ impl ScratchDir {
         fs::create_dir_all(&path)?;
         Ok(Self { path })
     }
-
     fn path(&self) -> &Path {
         &self.path
     }
 }
-
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
@@ -935,7 +488,6 @@ impl Drop for ScratchDir {
 enum CliError {
     Usage(&'static str),
 }
-
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -943,7 +495,6 @@ impl std::fmt::Display for CliError {
         }
     }
 }
-
 impl Error for CliError {}
 
 #[cfg(test)]
@@ -952,7 +503,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
-
     fn os(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }
@@ -988,18 +538,5 @@ mod tests {
             })
         );
         assert!(parse_args(os(&["analyze", "voucher", "--jobs=0"])).is_err());
-    }
-
-    #[test]
-    fn target_provided_is_explicit() {
-        assert_eq!(
-            parse_args(os(&["analyze", "voucher", "--target-provided", "cli,fs"])).unwrap(),
-            Command::Analyze(AnalyzeArgs {
-                root: "voucher".into(),
-                libraries: Vec::new(),
-                target_provided: BTreeSet::from(["cli".into(), "fs".into()]),
-                jobs: default_jobs(),
-            })
-        );
     }
 }

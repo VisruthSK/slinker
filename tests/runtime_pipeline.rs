@@ -4,13 +4,15 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hrm::analysis::{Analyzer, AnalyzerConfig, TargetPackage};
-use hrm::{
-    MaterializationRequest, PackageMaterialization, RToolchain, TargetEnvironmentRequest,
-};
+use hrm::analysis::Linker;
+use hrm::package::PackageStore;
+use hrm::{MaterializationRequest, PackageMaterialization, RToolchain, TargetEnvironmentRequest};
 
 fn scratch() -> PathBuf {
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     env::temp_dir().join(format!("hrm-{}-{nonce}", std::process::id()))
 }
 
@@ -22,8 +24,11 @@ fn inspects_and_materializes_installed_voucher_image() -> Result<(), Box<dyn std
     let work = scratch();
     fs::create_dir_all(&work)?;
 
-    let target = toolchain.capture_target_environment(&TargetEnvironmentRequest::new(work.join("target")))?;
-    let voucher = target.package("voucher").ok_or("voucher must be installed in the target R library")?;
+    let target = toolchain
+        .capture_target_environment(&TargetEnvironmentRequest::new(work.join("target")))?;
+    let voucher = target
+        .package("voucher")
+        .ok_or("voucher must be installed in the target R library")?;
     for dependency in ["cli", "fs"] {
         if target.package(dependency).is_none() {
             return Err(format!(
@@ -44,23 +49,25 @@ fn inspects_and_materializes_installed_voucher_image() -> Result<(), Box<dyn std
     assert_eq!(snapshot.state.package, "voucher");
     assert!(!snapshot.state.has_on_load);
 
-    let analysis = Analyzer::default().analyze(&AnalyzerConfig {
-        root: snapshot.analysis_root.clone(),
-        dependencies: Vec::new(),
-        target_packages: target
-            .packages
-            .iter()
-            .map(|package| TargetPackage {
-                name: package.name.clone(),
-                version: package.version.clone(),
-            })
-            .collect(),
-    })?;
+    let store = PackageStore::new(
+        toolchain.clone(),
+        target.clone(),
+        Vec::<String>::new(),
+        work.join("demand-linker"),
+    )?;
+    let analysis = Linker::new(store, 4).analyze("voucher")?;
     assert!(!analysis.graph.nodes.is_empty());
-    assert!(analysis.reachable.iter().any(|reachable| *reachable));
-    assert!(analysis.diagnostics.iter().all(|diagnostic| !diagnostic.reachable));
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
 
-    for binding in ["vouch_split_handle", "vouch_parse_line", "vouch_entry_matches_target"] {
+    for binding in [
+        "vouch_split_handle",
+        "vouch_parse_line",
+        "vouch_entry_matches_target",
+    ] {
         assert!(
             snapshot
                 .state
@@ -76,15 +83,29 @@ fn inspects_and_materializes_installed_voucher_image() -> Result<(), Box<dyn std
     // into materialization is the next layer.
     let package = PackageMaterialization::from_snapshot(
         &snapshot,
-        ["vouch_split_handle", "vouch_parse_line", "vouch_entry_matches_target"],
+        [
+            "vouch_split_handle",
+            "vouch_parse_line",
+            "vouch_entry_matches_target",
+        ],
     )?;
     let mut materialization = MaterializationRequest::new(work.join("baseline.rds"));
     materialization.packages.push(package);
     materialization.target = Some(target.target.clone());
     let artifact = toolchain.materialize(&materialization)?;
     assert!(artifact.baseline_rds.is_file());
-    assert!(artifact.lazy_rdb.as_ref().is_some_and(|path| path.is_file()));
-    assert!(artifact.lazy_rdx.as_ref().is_some_and(|path| path.is_file()));
+    assert!(
+        artifact
+            .lazy_rdb
+            .as_ref()
+            .is_some_and(|path| path.is_file())
+    );
+    assert!(
+        artifact
+            .lazy_rdx
+            .as_ref()
+            .is_some_and(|path| path.is_file())
+    );
 
     let check = r#"
 check_voucher <- function(ns) {

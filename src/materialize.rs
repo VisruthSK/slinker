@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    ExportedBinding, ImportDirective, InspectError, RToolchain, SemanticSnapshot, Target,
-    InstalledPackage, ToolchainError,
+    ExportedBinding, ImportDirective, InspectError, InstalledPackage, RToolchain, SemanticSnapshot,
+    Target, ToolchainError,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,7 +20,10 @@ pub struct PackageMaterialization {
 }
 
 impl PackageMaterialization {
-    pub fn from_snapshot<I, S>(snapshot: &SemanticSnapshot, retained: I) -> Result<Self, MaterializeError>
+    pub fn from_snapshot<I, S>(
+        snapshot: &SemanticSnapshot,
+        retained: I,
+    ) -> Result<Self, MaterializeError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -71,7 +74,9 @@ impl PackageMaterialization {
             });
         }
         if snapshot.state.has_on_load && !modeled_on_load {
-            return Err(MaterializeError::UnmodeledOnLoad(snapshot.state.package.clone()));
+            return Err(MaterializeError::UnmodeledOnLoad(
+                snapshot.state.package.clone(),
+            ));
         }
         if snapshot.state.has_on_load && !retained_bindings.iter().any(|name| name == ".onLoad") {
             retained_bindings.push(".onLoad".into());
@@ -108,7 +113,11 @@ impl PackageMaterialization {
         })
     }
 
-    pub fn retain_datasets<I, S>(mut self, snapshot: &SemanticSnapshot, datasets: I) -> Result<Self, MaterializeError>
+    pub fn retain_datasets<I, S>(
+        mut self,
+        snapshot: &SemanticSnapshot,
+        datasets: I,
+    ) -> Result<Self, MaterializeError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -190,27 +199,56 @@ pub enum MaterializeError {
     Io(std::io::Error),
     Toolchain(ToolchainError),
     Inspect(InspectError),
-    UnknownBinding { package: String, binding: String },
-    UnsupportedBinding { package: String, binding: String, issues: Vec<String> },
-    UnknownDataset { package: String, dataset: String },
-    UnsupportedDataset { package: String, dataset: String, issues: Vec<String> },
-    UnsupportedPackage { package: String, issues: Vec<String> },
+    UnknownBinding {
+        package: String,
+        binding: String,
+    },
+    UnsupportedBinding {
+        package: String,
+        binding: String,
+        issues: Vec<String>,
+    },
+    UnknownDataset {
+        package: String,
+        dataset: String,
+    },
+    UnsupportedDataset {
+        package: String,
+        dataset: String,
+        issues: Vec<String>,
+    },
+    UnsupportedPackage {
+        package: String,
+        issues: Vec<String>,
+    },
     UnmodeledOnLoad(String),
-    NativePackageUnsupported { package: String, dynlibs: Vec<String> },
+    NativePackageUnsupported {
+        package: String,
+        dynlibs: Vec<String>,
+    },
     DuplicatePackage(String),
     DuplicateTargetPackage(String),
-    TargetMismatch { expected: Target, actual: Target },
+    TargetMismatch {
+        expected: Target,
+        actual: Target,
+    },
     MissingRecipe(PathBuf),
     MissingOutput(PathBuf),
     NonUtf8Path(PathBuf),
 }
 
 impl RToolchain {
-    pub fn materialize(&self, request: &MaterializationRequest) -> Result<MaterializedArtifact, MaterializeError> {
+    pub fn materialize(
+        &self,
+        request: &MaterializationRequest,
+    ) -> Result<MaterializedArtifact, MaterializeError> {
         if let Some(expected) = &request.target {
             let actual = self.probe().map_err(MaterializeError::Toolchain)?;
             if expected != &actual {
-                return Err(MaterializeError::TargetMismatch { expected: expected.clone(), actual });
+                return Err(MaterializeError::TargetMismatch {
+                    expected: expected.clone(),
+                    actual,
+                });
             }
         }
         ensure_parent(&request.output_rds)?;
@@ -231,7 +269,9 @@ impl RToolchain {
         let mut provided_names = BTreeSet::new();
         for package in &request.target_provided {
             if !provided_names.insert(package.name.clone()) {
-                return Err(MaterializeError::DuplicateTargetPackage(package.name.clone()));
+                return Err(MaterializeError::DuplicateTargetPackage(
+                    package.name.clone(),
+                ));
             }
         }
 
@@ -239,12 +279,7 @@ impl RToolchain {
         let runtime_dir = request.output_rds.with_extension("runtime");
         fs::write(&spec_path, render_spec(request)?).map_err(MaterializeError::Io)?;
         fs::create_dir_all(&runtime_dir).map_err(MaterializeError::Io)?;
-        let result = self.run_runtime(
-            &runtime_dir,
-            "materialize",
-            [spec_path.as_os_str()],
-            false,
-        );
+        let result = self.run_runtime(&runtime_dir, "materialize", [spec_path.as_os_str()], false);
         let _ = fs::remove_dir_all(&runtime_dir);
         result.map_err(MaterializeError::Toolchain)?;
 
@@ -301,7 +336,9 @@ fn render_spec(request: &MaterializationRequest) -> Result<String, MaterializeEr
 
     out.push_str(",\n  provided = list(");
     for (index, package) in request.target_provided.iter().enumerate() {
-        if index != 0 { out.push_str(", "); }
+        if index != 0 {
+            out.push_str(", ");
+        }
         out.push_str("list(name = ");
         out.push_str(&r_string(&package.name));
         out.push_str(", version = ");
@@ -313,20 +350,34 @@ fn render_spec(request: &MaterializationRequest) -> Result<String, MaterializeEr
     out.push_str("),\n  packages = list(\n");
 
     for (index, package) in request.packages.iter().enumerate() {
-        if index != 0 { out.push_str(",\n"); }
+        if index != 0 {
+            out.push_str(",\n");
+        }
         out.push_str("    list(name = ");
         out.push_str(&r_string(&package.name));
         out.push_str(", recipes = ");
         out.push_str(&r_path(&package.recipes_rds)?);
         out.push_str(", modeled_on_load = ");
-        out.push_str(if package.modeled_on_load { "TRUE" } else { "FALSE" });
+        out.push_str(if package.modeled_on_load {
+            "TRUE"
+        } else {
+            "FALSE"
+        });
         out.push_str(", retained = ");
-        render_strings(&mut out, package.retained_bindings.iter().map(String::as_str));
+        render_strings(
+            &mut out,
+            package.retained_bindings.iter().map(String::as_str),
+        );
         out.push_str(", datasets = ");
-        render_strings(&mut out, package.retained_datasets.iter().map(String::as_str));
+        render_strings(
+            &mut out,
+            package.retained_datasets.iter().map(String::as_str),
+        );
         out.push_str(", exports = list(");
         for (export_index, export) in package.exports.iter().enumerate() {
-            if export_index != 0 { out.push_str(", "); }
+            if export_index != 0 {
+                out.push_str(", ");
+            }
             out.push_str("list(name = ");
             out.push_str(&r_string(&export.name));
             out.push_str(", binding = ");
@@ -336,7 +387,9 @@ fn render_spec(request: &MaterializationRequest) -> Result<String, MaterializeEr
         out.push(')');
         out.push_str(", imports = list(");
         for (import_index, import) in package.imports.iter().enumerate() {
-            if import_index != 0 { out.push_str(", "); }
+            if import_index != 0 {
+                out.push_str(", ");
+            }
             match import {
                 ImportDirective::All { package, except } => {
                     out.push_str("list(kind = \"all\", package = ");
@@ -350,7 +403,9 @@ fn render_spec(request: &MaterializationRequest) -> Result<String, MaterializeEr
                     out.push_str(&r_string(package));
                     out.push_str(", bindings = list(");
                     for (binding_index, binding) in bindings.iter().enumerate() {
-                        if binding_index != 0 { out.push_str(", "); }
+                        if binding_index != 0 {
+                            out.push_str(", ");
+                        }
                         out.push_str("list(name = ");
                         out.push_str(&r_string(&binding.name));
                         out.push_str(", binding = ");
@@ -379,7 +434,9 @@ where
     }
     out.push_str("c(");
     for (index, value) in values.iter().enumerate() {
-        if index != 0 { out.push_str(", "); }
+        if index != 0 {
+            out.push_str(", ");
+        }
         out.push_str(&r_string(value));
     }
     out.push(')');
@@ -416,23 +473,75 @@ impl fmt::Display for MaterializeError {
             Self::Io(error) => write!(f, "materialization I/O error: {error}"),
             Self::Toolchain(error) => write!(f, "materialization failed: {error}"),
             Self::Inspect(error) => write!(f, "materialization inspection failed: {error}"),
-            Self::UnknownBinding { package, binding } => write!(f, "{package}::{binding} is not present in inspected baseline state"),
-            Self::UnsupportedBinding { package, binding, issues } => write!(f, "cannot materialize {package}::{binding}: {}", issues.join("; ")),
-            Self::UnknownDataset { package, dataset } => write!(f, "dataset {package}::{dataset} is not present in inspected baseline state"),
-            Self::UnsupportedDataset { package, dataset, issues } => write!(f, "cannot materialize dataset {package}::{dataset}: {}", issues.join("; ")),
-            Self::UnsupportedPackage { package, issues } => write!(f, "cannot materialize package {package}: {}", issues.join("; ")),
-            Self::UnmodeledOnLoad(package) => write!(f, "cannot materialize {package}: .onLoad has no modeled runtime activation semantics"),
-            Self::NativePackageUnsupported { package, dynlibs } => write!(f, "cannot materialize native package {package} before native identity/build planning: {}", dynlibs.join(", ")),
-            Self::DuplicatePackage(package) => write!(f, "duplicate materialization package {package}"),
-            Self::DuplicateTargetPackage(package) => write!(f, "duplicate target-provided package {package}"),
+            Self::UnknownBinding { package, binding } => write!(
+                f,
+                "{package}::{binding} is not present in inspected baseline state"
+            ),
+            Self::UnsupportedBinding {
+                package,
+                binding,
+                issues,
+            } => write!(
+                f,
+                "cannot materialize {package}::{binding}: {}",
+                issues.join("; ")
+            ),
+            Self::UnknownDataset { package, dataset } => write!(
+                f,
+                "dataset {package}::{dataset} is not present in inspected baseline state"
+            ),
+            Self::UnsupportedDataset {
+                package,
+                dataset,
+                issues,
+            } => write!(
+                f,
+                "cannot materialize dataset {package}::{dataset}: {}",
+                issues.join("; ")
+            ),
+            Self::UnsupportedPackage { package, issues } => write!(
+                f,
+                "cannot materialize package {package}: {}",
+                issues.join("; ")
+            ),
+            Self::UnmodeledOnLoad(package) => write!(
+                f,
+                "cannot materialize {package}: .onLoad has no modeled runtime activation semantics"
+            ),
+            Self::NativePackageUnsupported { package, dynlibs } => write!(
+                f,
+                "cannot materialize native package {package} before native identity/build planning: {}",
+                dynlibs.join(", ")
+            ),
+            Self::DuplicatePackage(package) => {
+                write!(f, "duplicate materialization package {package}")
+            }
+            Self::DuplicateTargetPackage(package) => {
+                write!(f, "duplicate target-provided package {package}")
+            }
             Self::TargetMismatch { expected, actual } => write!(
                 f,
                 "materialization target mismatch: expected R {}/{}/{}, got R {}/{}/{}",
-                expected.r_version, expected.os, expected.arch, actual.r_version, actual.os, actual.arch
+                expected.r_version,
+                expected.os,
+                expected.arch,
+                actual.r_version,
+                actual.os,
+                actual.arch
             ),
-            Self::MissingRecipe(path) => write!(f, "materialization recipe does not exist: {}", path.display()),
-            Self::MissingOutput(path) => write!(f, "materializer did not produce {}", path.display()),
-            Self::NonUtf8Path(path) => write!(f, "R materialization requires a Unicode path: {}", path.display()),
+            Self::MissingRecipe(path) => write!(
+                f,
+                "materialization recipe does not exist: {}",
+                path.display()
+            ),
+            Self::MissingOutput(path) => {
+                write!(f, "materializer did not produce {}", path.display())
+            }
+            Self::NonUtf8Path(path) => write!(
+                f,
+                "R materialization requires a Unicode path: {}",
+                path.display()
+            ),
         }
     }
 }
@@ -453,10 +562,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::{
-        MaterializationRequest, ObjectState, SemanticSnapshot, SemanticState, InstalledPackage,
+        InstalledPackage, MaterializationRequest, ObjectState, SemanticSnapshot, SemanticState,
     };
 
-    use super::{append_extension, r_string, render_spec, MaterializeError, PackageMaterialization};
+    use super::{
+        MaterializeError, PackageMaterialization, append_extension, r_string, render_spec,
+    };
 
     #[test]
     fn quotes_r_strings() {
@@ -465,12 +576,18 @@ mod tests {
 
     #[test]
     fn quotes_windows_paths_for_r() {
-        assert_eq!(r_string(r"C:\Program Files\R\library"), r#""C:\\Program Files\\R\\library""#);
+        assert_eq!(
+            r_string(r"C:\Program Files\R\library"),
+            r#""C:\\Program Files\\R\\library""#
+        );
     }
 
     #[test]
     fn appends_lazy_db_extensions() {
-        assert_eq!(append_extension(Path::new("x/hermetic"), "rdb"), PathBuf::from("x/hermetic.rdb"));
+        assert_eq!(
+            append_extension(Path::new("x/hermetic"), "rdb"),
+            PathBuf::from("x/hermetic.rdb")
+        );
     }
 
     #[test]
@@ -482,9 +599,10 @@ mod tests {
             library: PathBuf::from("/opt/R/library"),
         });
         let spec = render_spec(&request).unwrap();
-        assert!(spec.contains("name = \"stats\", version = \"4.6.1\", library = \"/opt/R/library\""));
+        assert!(
+            spec.contains("name = \"stats\", version = \"4.6.1\", library = \"/opt/R/library\"")
+        );
     }
-
 
     fn snapshot(has_on_load: bool, dynlibs: Vec<String>) -> SemanticSnapshot {
         SemanticSnapshot {
@@ -515,8 +633,11 @@ mod tests {
 
     #[test]
     fn rejects_unmodeled_on_load() {
-        let error = PackageMaterialization::from_snapshot(&snapshot(true, Vec::new()), std::iter::empty::<&str>())
-            .unwrap_err();
+        let error = PackageMaterialization::from_snapshot(
+            &snapshot(true, Vec::new()),
+            std::iter::empty::<&str>(),
+        )
+        .unwrap_err();
         assert!(matches!(error, MaterializeError::UnmodeledOnLoad(package) if package == "foo"));
     }
 
@@ -538,6 +659,8 @@ mod tests {
             std::iter::empty::<&str>(),
         )
         .unwrap_err();
-        assert!(matches!(error, MaterializeError::NativePackageUnsupported { package, .. } if package == "foo"));
+        assert!(
+            matches!(error, MaterializeError::NativePackageUnsupported { package, .. } if package == "foo")
+        );
     }
 }

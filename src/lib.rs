@@ -6,9 +6,18 @@
 
 #[derive(Debug)]
 pub enum Error {
-    Io { path: std::path::PathBuf, source: std::io::Error },
-    Metadata { path: std::path::PathBuf, source: MetadataError },
-    Parse { path: String, message: String },
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Metadata {
+        path: std::path::PathBuf,
+        source: MetadataError,
+    },
+    Parse {
+        path: String,
+        message: String,
+    },
     Analysis(String),
 }
 
@@ -18,7 +27,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "I/O error at {}: {source}", path.display()),
-            Self::Metadata { path, source } => write!(f, "metadata error at {}: {source}", path.display()),
+            Self::Metadata { path, source } => {
+                write!(f, "metadata error at {}: {source}", path.display())
+            }
             Self::Parse { path, message } => write!(f, "parse error in {path}: {message}"),
             Self::Analysis(message) => f.write_str(message),
         }
@@ -42,15 +53,21 @@ mod r_runtime;
 mod target_env;
 mod toolchain;
 
-
 #[cfg(feature = "air")]
 pub mod analysis;
-
+#[cfg(feature = "air")]
+pub mod build;
+#[cfg(feature = "air")]
+pub mod package;
+#[cfg(feature = "air")]
+pub mod semantics;
+#[cfg(feature = "air")]
+pub mod syntax;
 
 pub use inspection::{
-    BindingOrigin, ClosureEnvironment, ExportedBinding, ImportDirective, ImportedBinding, InspectError,
-    InspectionRequest,
-    ObjectIssue, ObjectState, S3Registration, SemanticSnapshot, SemanticState,
+    BindingOrigin, ClosureEnvironment, ExportedBinding, ImportDirective, ImportedBinding,
+    InspectError, InspectionRequest, ObjectIssue, ObjectState, S3Registration, SemanticSnapshot,
+    SemanticState,
 };
 pub use materialize::{
     MaterializationRequest, MaterializeError, MaterializedArtifact, PackageMaterialization,

@@ -1,7 +1,7 @@
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::ffi::OsString;
 
 use crate::{RToolchain, ToolchainError};
 
@@ -49,8 +49,14 @@ pub struct ImportedBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImportDirective {
-    All { package: String, except: Vec<String> },
-    From { package: String, bindings: Vec<ImportedBinding> },
+    All {
+        package: String,
+        except: Vec<String>,
+    },
+    From {
+        package: String,
+        bindings: Vec<ImportedBinding>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,7 +124,9 @@ impl RToolchain {
         package: &str,
         output_path: &Path,
     ) -> Result<SemanticState, InspectError> {
-        Ok(self.inspect_package_snapshot(library, package, output_path)?.state)
+        Ok(self
+            .inspect_package_snapshot(library, package, output_path)?
+            .state)
     }
 
     pub fn inspect_package_snapshot(
@@ -270,14 +278,21 @@ fn parse_semantic_state(text: &str) -> Result<SemanticState, InspectError> {
             }
             "EXPORT" => {
                 require_len(kind, &values, 2, line_no)?;
-                state_mut(&mut state, line_no)?.exports.push(ExportedBinding {
-                    name: values[0].clone(),
-                    binding: values[1].clone(),
-                });
+                state_mut(&mut state, line_no)?
+                    .exports
+                    .push(ExportedBinding {
+                        name: values[0].clone(),
+                        binding: values[1].clone(),
+                    });
             }
             "IMPORT_ALL" => {
                 let package = one(kind, &values, line_no)?.to_owned();
-                state_mut(&mut state, line_no)?.imports.push(ImportDirective::All { package, except: Vec::new() });
+                state_mut(&mut state, line_no)?
+                    .imports
+                    .push(ImportDirective::All {
+                        package,
+                        except: Vec::new(),
+                    });
             }
             "IMPORT_EXCEPT" => {
                 require_len(kind, &values, 2, line_no)?;
@@ -293,7 +308,10 @@ fn parse_semantic_state(text: &str) -> Result<SemanticState, InspectError> {
                 require_len(kind, &values, 3, line_no)?;
                 let state = state_mut(&mut state, line_no)?;
                 let package = &values[0];
-                let binding = ImportedBinding { name: values[2].clone(), binding: values[1].clone() };
+                let binding = ImportedBinding {
+                    name: values[2].clone(),
+                    binding: values[1].clone(),
+                };
                 if let Some(ImportDirective::From { bindings, .. }) = state.imports.iter_mut().rev().find(|directive| matches!(directive, ImportDirective::From { package: p, .. } if p == package)) {
                     bindings.push(binding);
                 } else {
@@ -305,7 +323,12 @@ fn parse_semantic_state(text: &str) -> Result<SemanticState, InspectError> {
                 let origin = match values[1].as_str() {
                     "code" => BindingOrigin::Code,
                     "sysdata" => BindingOrigin::Sysdata,
-                    other => return Err(InspectError::Protocol(format!("line {}: bad binding origin {other:?}", line_no + 1))),
+                    other => {
+                        return Err(InspectError::Protocol(format!(
+                            "line {}: bad binding origin {other:?}",
+                            line_no + 1
+                        )));
+                    }
                 };
                 let object = ObjectState {
                     name: values[0].clone(),
@@ -337,52 +360,83 @@ fn parse_semantic_state(text: &str) -> Result<SemanticState, InspectError> {
             }
             "ISSUE" => {
                 require_len(kind, &values, 3, line_no)?;
-                let issue = ObjectIssue { path: values[0].clone(), kind: values[1].clone(), detail: values[2].clone() };
+                let issue = ObjectIssue {
+                    path: values[0].clone(),
+                    kind: values[1].clone(),
+                    detail: values[2].clone(),
+                };
                 let state = state_mut(&mut state, line_no)?;
                 if let Some(index) = current_binding {
                     state.bindings[index].issues.push(issue);
                 } else if let Some(index) = current_dataset {
                     state.datasets[index].issues.push(issue);
                 } else {
-                    return Err(InspectError::Protocol(format!("line {}: ISSUE without object", line_no + 1)));
+                    return Err(InspectError::Protocol(format!(
+                        "line {}: ISSUE without object",
+                        line_no + 1
+                    )));
                 }
             }
             "CLOSURE_ENV" => {
                 require_len(kind, &values, 3, line_no)?;
-                let env = ClosureEnvironment { path: values[0].clone(), kind: values[1].clone(), name: values[2].clone() };
+                let env = ClosureEnvironment {
+                    path: values[0].clone(),
+                    kind: values[1].clone(),
+                    name: values[2].clone(),
+                };
                 let state = state_mut(&mut state, line_no)?;
                 if let Some(index) = current_binding {
                     state.bindings[index].closure_environments.push(env);
                 } else if let Some(index) = current_dataset {
                     state.datasets[index].closure_environments.push(env);
                 } else {
-                    return Err(InspectError::Protocol(format!("line {}: CLOSURE_ENV without object", line_no + 1)));
+                    return Err(InspectError::Protocol(format!(
+                        "line {}: CLOSURE_ENV without object",
+                        line_no + 1
+                    )));
                 }
             }
             "PACKAGE_ISSUE" => {
                 require_len(kind, &values, 3, line_no)?;
-                state_mut(&mut state, line_no)?.package_issues.push(ObjectIssue {
-                    path: values[0].clone(),
-                    kind: values[1].clone(),
-                    detail: values[2].clone(),
-                });
+                state_mut(&mut state, line_no)?
+                    .package_issues
+                    .push(ObjectIssue {
+                        path: values[0].clone(),
+                        kind: values[1].clone(),
+                        detail: values[2].clone(),
+                    });
                 current_binding = None;
                 current_dataset = None;
             }
             "S3" => {
                 require_len(kind, &values, 3, line_no)?;
-                state_mut(&mut state, line_no)?.s3.push(S3Registration { generic: values[0].clone(), class: values[1].clone(), method: values[2].clone() });
+                state_mut(&mut state, line_no)?.s3.push(S3Registration {
+                    generic: values[0].clone(),
+                    class: values[1].clone(),
+                    method: values[2].clone(),
+                });
                 current_binding = None;
                 current_dataset = None;
             }
-            "DYNLIB" => state_mut(&mut state, line_no)?.dynlibs.push(one(kind, &values, line_no)?.to_owned()),
-            "RESOURCE" => state_mut(&mut state, line_no)?.resources.push(one(kind, &values, line_no)?.to_owned()),
-            other => return Err(InspectError::Protocol(format!("line {}: unknown record {other:?}", line_no + 1))),
+            "DYNLIB" => state_mut(&mut state, line_no)?
+                .dynlibs
+                .push(one(kind, &values, line_no)?.to_owned()),
+            "RESOURCE" => state_mut(&mut state, line_no)?
+                .resources
+                .push(one(kind, &values, line_no)?.to_owned()),
+            other => {
+                return Err(InspectError::Protocol(format!(
+                    "line {}: unknown record {other:?}",
+                    line_no + 1
+                )));
+            }
         }
     }
 
     let mut state = state.ok_or_else(|| InspectError::Protocol("missing HEADER".into()))?;
-    state.exports.sort_by(|a, b| (&a.name, &a.binding).cmp(&(&b.name, &b.binding)));
+    state
+        .exports
+        .sort_by(|a, b| (&a.name, &a.binding).cmp(&(&b.name, &b.binding)));
     state.exports.dedup();
     state.bindings.sort_by(|a, b| a.name.cmp(&b.name));
     state.datasets.sort_by(|a, b| a.name.cmp(&b.name));
@@ -391,15 +445,29 @@ fn parse_semantic_state(text: &str) -> Result<SemanticState, InspectError> {
     Ok(state)
 }
 
-fn state_mut(state: &mut Option<SemanticState>, line_no: usize) -> Result<&mut SemanticState, InspectError> {
-    state.as_mut().ok_or_else(|| InspectError::Protocol(format!("line {}: record before HEADER", line_no + 1)))
+fn state_mut(
+    state: &mut Option<SemanticState>,
+    line_no: usize,
+) -> Result<&mut SemanticState, InspectError> {
+    state.as_mut().ok_or_else(|| {
+        InspectError::Protocol(format!("line {}: record before HEADER", line_no + 1))
+    })
 }
 
-fn require_len(kind: &str, values: &[String], expected: usize, line_no: usize) -> Result<(), InspectError> {
+fn require_len(
+    kind: &str,
+    values: &[String],
+    expected: usize,
+    line_no: usize,
+) -> Result<(), InspectError> {
     if values.len() == expected {
         Ok(())
     } else {
-        Err(InspectError::Protocol(format!("line {}: {kind} expected {expected} fields, got {}", line_no + 1, values.len())))
+        Err(InspectError::Protocol(format!(
+            "line {}: {kind} expected {expected} fields, got {}",
+            line_no + 1,
+            values.len()
+        )))
     }
 }
 
@@ -412,7 +480,10 @@ fn parse_bool(value: &str, line_no: usize) -> Result<bool, InspectError> {
     match value {
         "1" => Ok(true),
         "0" => Ok(false),
-        other => Err(InspectError::Protocol(format!("line {}: invalid bool {other:?}", line_no + 1))),
+        other => Err(InspectError::Protocol(format!(
+            "line {}: invalid bool {other:?}",
+            line_no + 1
+        ))),
     }
 }
 
@@ -424,8 +495,10 @@ fn decode_hex(value: &str) -> Result<String, String> {
     let chars = value.as_bytes();
     let mut index = 0;
     while index < chars.len() {
-        let high = hex_nibble(chars[index]).ok_or_else(|| format!("invalid hex field {value:?}"))?;
-        let low = hex_nibble(chars[index + 1]).ok_or_else(|| format!("invalid hex field {value:?}"))?;
+        let high =
+            hex_nibble(chars[index]).ok_or_else(|| format!("invalid hex field {value:?}"))?;
+        let low =
+            hex_nibble(chars[index + 1]).ok_or_else(|| format!("invalid hex field {value:?}"))?;
         bytes.push((high << 4) | low);
         index += 2;
     }
@@ -447,7 +520,11 @@ impl fmt::Display for InspectError {
             Self::Io(error) => write!(f, "semantic inspection I/O error: {error}"),
             Self::Toolchain(error) => write!(f, "semantic inspection failed: {error}"),
             Self::Protocol(error) => write!(f, "invalid semantic inspection output: {error}"),
-            Self::NonUtf8Path(path) => write!(f, "R inspection requires a Unicode path: {}", path.display()),
+            Self::NonUtf8Path(path) => write!(
+                f,
+                "R inspection requires a Unicode path: {}",
+                path.display()
+            ),
         }
     }
 }
@@ -467,19 +544,45 @@ mod tests {
     use super::{BindingOrigin, ImportDirective, ImportedBinding, parse_semantic_state};
 
     fn h(value: &str) -> String {
-        value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     #[test]
     fn parses_protocol() {
         let text = format!(
             "HEADER\t{}\t{}\t{}\nEXPORT\t{}\t{}\nIMPORT_FROM\t{}\t{}\t{}\nBINDING\t{}\t{}\t{}\t{}\nISSUE\t{}\t{}\t{}\n",
-            h("foo"), h("1.2.3"), h("0"), h("run"), h("run"), h("bar"), h("x"), h("local_x"),
-            h("run"), h("code"), h("closure"), h("0"), h("$.attr"), h("environment"), h("embedded environment")
+            h("foo"),
+            h("1.2.3"),
+            h("0"),
+            h("run"),
+            h("run"),
+            h("bar"),
+            h("x"),
+            h("local_x"),
+            h("run"),
+            h("code"),
+            h("closure"),
+            h("0"),
+            h("$.attr"),
+            h("environment"),
+            h("embedded environment")
         );
         let state = parse_semantic_state(&text).unwrap();
         assert_eq!(state.package, "foo");
-        assert_eq!(state.imports, vec![ImportDirective::From { package: "bar".into(), bindings: vec![ImportedBinding { name: "local_x".into(), binding: "x".into() }] }]);
+        assert_eq!(
+            state.imports,
+            vec![ImportDirective::From {
+                package: "bar".into(),
+                bindings: vec![ImportedBinding {
+                    name: "local_x".into(),
+                    binding: "x".into()
+                }]
+            }]
+        );
         assert_eq!(state.bindings[0].origin, Some(BindingOrigin::Code));
         assert!(!state.bindings[0].supported);
     }

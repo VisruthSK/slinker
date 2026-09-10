@@ -18,6 +18,15 @@ if (identical(command, "capture-target")) {
 } else if (identical(command, "inspect-batch")) {
   if (length(command_args) != 2L) stop("inspect-batch requires MANIFEST JOBS", call. = FALSE)
   runtime$hrm_inspect_batch(command_args[[1L]], as.integer(command_args[[2L]]))
+} else if (identical(command, "inspect-image")) {
+  if (length(command_args) < 3L) stop("inspect-image requires LIBRARY PACKAGE OUTPUT [VISIBLE_LIBRARY ...]", call. = FALSE)
+  runtime$hrm_inspect_image(command_args[[1L]], command_args[[2L]], command_args[[3L]], command_args[-c(1L, 2L, 3L)])
+} else if (identical(command, "inspect-image-batch")) {
+  if (length(command_args) != 2L) stop("inspect-image-batch requires MANIFEST JOBS", call. = FALSE)
+  runtime$hrm_inspect_image_batch(command_args[[1L]], as.integer(command_args[[2L]]))
+} else if (identical(command, "validate-syntax")) {
+  if (length(command_args) != 2L) stop("validate-syntax requires SOURCE RESULT", call. = FALSE)
+  runtime$hrm_validate_syntax(command_args[[1L]], command_args[[2L]])
 } else if (identical(command, "materialize")) {
   if (length(command_args) != 1L) stop("materialize requires SPEC", call. = FALSE)
   runtime$hrm_materialize(command_args[[1L]])

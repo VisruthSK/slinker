@@ -62,3 +62,8 @@
   simple <- grepl("^[A-Za-z.][A-Za-z0-9._]*$", name) && !grepl("^\\.[0-9]", name)
   if (simple) name else paste0("`", gsub("`", "\\\\`", name, fixed = TRUE), "`")
 }
+
+.hrm_emit_connection <- function(connection, kind, ...) {
+  fields <- vapply(list(...), .hrm_hex, character(1L), USE.NAMES = FALSE)
+  cat(paste(c(kind, fields), collapse = "\t"), "\n", file = connection, sep = "")
+}
