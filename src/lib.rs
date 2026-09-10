@@ -38,6 +38,7 @@ impl std::error::Error for Error {
 mod inspection;
 mod materialize;
 mod metadata;
+mod r_runtime;
 mod target_env;
 mod toolchain;
 
@@ -48,6 +49,7 @@ pub mod analysis;
 
 pub use inspection::{
     BindingOrigin, ClosureEnvironment, ExportedBinding, ImportDirective, ImportedBinding, InspectError,
+    InspectionRequest,
     ObjectIssue, ObjectState, S3Registration, SemanticSnapshot, SemanticState,
 };
 pub use materialize::{

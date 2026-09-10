@@ -236,12 +236,17 @@ impl RToolchain {
         }
 
         let spec_path = request.output_rds.with_extension("materialize-spec.R");
-        let helper_path = request.output_rds.with_extension("materialize.R");
+        let runtime_dir = request.output_rds.with_extension("runtime");
         fs::write(&spec_path, render_spec(request)?).map_err(MaterializeError::Io)?;
-        fs::write(&helper_path, include_str!("r/materialize.R")).map_err(MaterializeError::Io)?;
-
-        self.run_rscript([helper_path.as_os_str(), spec_path.as_os_str()])
-            .map_err(MaterializeError::Toolchain)?;
+        fs::create_dir_all(&runtime_dir).map_err(MaterializeError::Io)?;
+        let result = self.run_runtime(
+            &runtime_dir,
+            "materialize",
+            [spec_path.as_os_str()],
+            false,
+        );
+        let _ = fs::remove_dir_all(&runtime_dir);
+        result.map_err(MaterializeError::Toolchain)?;
 
         if !request.output_rds.is_file() {
             return Err(MaterializeError::MissingOutput(request.output_rds.clone()));

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::r_runtime;
 use crate::target_env::Target;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +111,31 @@ cat(R.version$arch, "\n", sep = "")
     {
         let mut command = self.host_rscript_command();
         command.args(args);
+        checked_output(&mut command)
+    }
+
+    pub(crate) fn run_runtime<I, S>(
+        &self,
+        work_dir: &Path,
+        command_name: &str,
+        args: I,
+        host_environment: bool,
+    ) -> Result<Output, ToolchainError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let runtime = r_runtime::prepare(work_dir).map_err(ToolchainError::Io)?;
+        let mut command = if host_environment {
+            self.host_rscript_command()
+        } else {
+            self.rscript_command()
+        };
+        command
+            .arg(&runtime.runner)
+            .arg(&runtime.package_root)
+            .arg(command_name)
+            .args(args);
         checked_output(&mut command)
     }
 }

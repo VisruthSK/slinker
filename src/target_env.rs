@@ -60,17 +60,14 @@ impl RToolchain {
         request: &TargetEnvironmentRequest,
     ) -> Result<TargetEnvironment, TargetEnvironmentError> {
         fs::create_dir_all(&request.work_dir).map_err(TargetEnvironmentError::Io)?;
-        let helper = request.work_dir.join("capture-target.R");
         let output = request.work_dir.join("target-environment.hrm");
-        fs::write(&helper, include_str!("r/target_env.R")).map_err(TargetEnvironmentError::Io)?;
-
-        let mut args = Vec::with_capacity(2 + request.libraries.len());
-        args.push(helper.as_os_str());
+        let mut args = Vec::with_capacity(1 + request.libraries.len());
         args.push(output.as_os_str());
         for library in &request.libraries {
             args.push(library.as_os_str());
         }
-        self.run_rscript_host(args).map_err(TargetEnvironmentError::Toolchain)?;
+        self.run_runtime(&request.work_dir, "capture-target", args, true)
+            .map_err(TargetEnvironmentError::Toolchain)?;
 
         let text = fs::read_to_string(&output).map_err(TargetEnvironmentError::Io)?;
         parse_target_environment(&text)

@@ -9,11 +9,13 @@ pub use diagnostic::{Diagnostic, RejectCode};
 pub use graph::{Edge, EdgeKind, Graph, Node, NodeId, NodeKind};
 pub use namespace::NamespaceDirective;
 pub use package::AnalysisPackage;
+use package::PreparedPackage;
 pub use parser::{BindingCertainty, EvalPhase, ResourceRef};
 
 use parser::{AirParser, CallSite, StaticArg, SyntaxEffectKind};
 use source::Sources;
 use crate::{Error, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -41,22 +43,111 @@ pub struct Analysis {
     pub packages: Vec<AnalysisPackage>,
 }
 
-#[derive(Default)]
 pub struct Analyzer {
-    parser: AirParser,
+    jobs: usize,
+    packages: BTreeMap<PathBuf, AnalysisPackage>,
+    sources: Sources,
+}
+
+impl Default for Analyzer {
+    fn default() -> Self {
+        Self {
+            jobs: 1,
+            packages: BTreeMap::new(),
+            sources: Sources::default(),
+        }
+    }
 }
 
 impl Analyzer {
-    pub fn analyze(&self, cfg: &AnalyzerConfig) -> Result<Analysis> {
-        let mut sources = Sources::default();
-        let root = AnalysisPackage::load(&cfg.root, &self.parser, &mut sources)?;
-        let root_name = root.id.name.clone();
-
-        let mut packages = vec![root];
-        for dep in &cfg.dependencies {
-            packages.push(AnalysisPackage::load(dep, &self.parser, &mut sources)?);
+    pub fn with_jobs(jobs: usize) -> Self {
+        Self {
+            jobs: jobs.max(1),
+            ..Self::default()
         }
+    }
+
+    pub fn analyze(&mut self, cfg: &AnalyzerConfig) -> Result<Analysis> {
+        let roots = std::iter::once(cfg.root.clone())
+            .chain(cfg.dependencies.iter().cloned())
+            .collect::<Vec<_>>();
+
+        let missing = roots
+            .iter()
+            .filter(|root| !self.packages.contains_key(*root))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !missing.is_empty() {
+            let pool = if self.jobs > 1 && missing.len() > 1 {
+                Some(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(self.jobs.min(missing.len()))
+                        .build()
+                        .map_err(|error| {
+                            Error::Analysis(format!("failed to create Rayon pool: {error}"))
+                        })?,
+                )
+            } else {
+                None
+            };
+
+            let prepared = if let Some(pool) = &pool {
+                pool.install(|| {
+                    missing
+                        .par_iter()
+                        .map(|root| PreparedPackage::load(root))
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                missing
+                    .iter()
+                    .map(|root| PreparedPackage::load(root))
+                    .collect::<Vec<_>>()
+            };
+            let prepared = prepared.into_iter().collect::<Result<Vec<_>>>()?;
+
+            let plans = prepared
+                .into_iter()
+                .map(|package| package.attach_sources(&mut self.sources))
+                .collect::<Vec<_>>();
+
+            let parsed = if let Some(pool) = &pool {
+                pool.install(|| {
+                    plans
+                        .into_par_iter()
+                        .map(|plan| plan.parse(&AirParser))
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                plans
+                    .into_iter()
+                    .map(|plan| plan.parse(&AirParser))
+                    .collect::<Vec<_>>()
+            };
+            let parsed = parsed.into_iter().collect::<Result<Vec<_>>>()?;
+
+            for (root, package) in missing.into_iter().zip(parsed) {
+                self.packages.insert(root, package);
+            }
+        }
+
+        let packages = roots
+            .iter()
+            .map(|root| {
+                self.packages
+                    .get(root)
+                    .cloned()
+                    .ok_or_else(|| Error::Analysis(format!("analysis cache missed {}", root.display())))
+            })
+            .collect::<Result<Vec<_>>>()?;
         reject_duplicate_packages(&packages)?;
+        let root_name = packages
+            .first()
+            .expect("analyzer always has a root package")
+            .id
+            .name
+            .clone();
 
         let target: HashSet<String> = cfg
             .target_packages
@@ -896,7 +987,7 @@ impl Analyzer {
             roots,
             reachable,
             diagnostics,
-            sources,
+            sources: self.sources.clone(),
             packages,
         })
     }

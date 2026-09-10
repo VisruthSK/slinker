@@ -1,7 +1,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::ffi::OsStr;
+use std::ffi::OsString;
 
 use crate::{RToolchain, ToolchainError};
 
@@ -61,6 +61,27 @@ pub struct S3Registration {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectionRequest {
+    pub library: PathBuf,
+    pub package: String,
+    pub output_path: PathBuf,
+}
+
+impl InspectionRequest {
+    pub fn new(
+        library: impl Into<PathBuf>,
+        package: impl Into<String>,
+        output_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            library: library.into(),
+            package: package.into(),
+            output_path: output_path.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticSnapshot {
     pub state: SemanticState,
     pub recipes_rds: PathBuf,
@@ -87,6 +108,7 @@ pub enum InspectError {
     Io(std::io::Error),
     Toolchain(ToolchainError),
     Protocol(String),
+    NonUtf8Path(PathBuf),
 }
 
 impl RToolchain {
@@ -120,31 +142,95 @@ impl RToolchain {
         output_path: &Path,
         libraries: &[PathBuf],
     ) -> Result<SemanticSnapshot, InspectError> {
-        let helper = output_path.with_extension("inspect.R");
-        let recipes_rds = output_path.with_extension("recipes.rds");
-        let analysis_root = output_path.with_extension("analysis");
-        fs::write(&helper, include_str!("r/inspect.R")).map_err(InspectError::Io)?;
-
-        let mut args = Vec::with_capacity(5 + libraries.len());
-        args.push(helper.as_os_str());
-        args.push(library.as_os_str());
-        args.push(OsStr::new(package));
-        args.push(output_path.as_os_str());
-        args.push(recipes_rds.as_os_str());
-        args.push(analysis_root.as_os_str());
-        for visible in libraries {
-            args.push(visible.as_os_str());
-        }
-        self.run_rscript(args).map_err(InspectError::Toolchain)?;
-
-        let text = fs::read_to_string(output_path).map_err(InspectError::Io)?;
-        Ok(SemanticSnapshot {
-            state: parse_semantic_state(&text)?,
-            recipes_rds,
-            analysis_root,
+        let request = InspectionRequest::new(library, package, output_path);
+        let work_dir = output_path.with_extension("inspect-runtime");
+        let result = self.inspect_package_snapshots_with_libraries(
+            std::slice::from_ref(&request),
+            libraries,
+            1,
+            &work_dir,
+        );
+        let _ = fs::remove_dir_all(&work_dir);
+        result?.into_iter().next().ok_or_else(|| {
+            InspectError::Protocol("single-package inspection returned no snapshot".into())
         })
     }
 
+    pub fn inspect_package_snapshots_with_libraries(
+        &self,
+        requests: &[InspectionRequest],
+        libraries: &[PathBuf],
+        jobs: usize,
+        work_dir: &Path,
+    ) -> Result<Vec<SemanticSnapshot>, InspectError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        fs::create_dir_all(work_dir).map_err(InspectError::Io)?;
+        let manifest = work_dir.join("inspection-manifest.hrm");
+        let mut text = String::new();
+        for library in libraries {
+            text.push_str("LIB\t");
+            text.push_str(&encode_path(library)?);
+            text.push('\n');
+        }
+        for request in requests {
+            if let Some(parent) = request.output_path.parent() {
+                fs::create_dir_all(parent).map_err(InspectError::Io)?;
+            }
+            let recipes = request.output_path.with_extension("recipes.rds");
+            let analysis = request.output_path.with_extension("analysis");
+            text.push_str("JOB\t");
+            text.push_str(&encode_path(&request.library)?);
+            text.push('\t');
+            text.push_str(&encode_hex(request.package.as_bytes()));
+            text.push('\t');
+            text.push_str(&encode_path(&request.output_path)?);
+            text.push('\t');
+            text.push_str(&encode_path(&recipes)?);
+            text.push('\t');
+            text.push_str(&encode_path(&analysis)?);
+            text.push('\n');
+        }
+        fs::write(&manifest, text).map_err(InspectError::Io)?;
+
+        let args = vec![
+            manifest.as_os_str().to_os_string(),
+            OsString::from(jobs.max(1).to_string()),
+        ];
+        self.run_runtime(work_dir, "inspect-batch", args, false)
+            .map_err(InspectError::Toolchain)?;
+
+        requests
+            .iter()
+            .map(|request| {
+                let text = fs::read_to_string(&request.output_path).map_err(InspectError::Io)?;
+                Ok(SemanticSnapshot {
+                    state: parse_semantic_state(&text)?,
+                    recipes_rds: request.output_path.with_extension("recipes.rds"),
+                    analysis_root: request.output_path.with_extension("analysis"),
+                })
+            })
+            .collect()
+    }
+}
+
+fn encode_path(path: &Path) -> Result<String, InspectError> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| InspectError::NonUtf8Path(path.to_path_buf()))?;
+    Ok(encode_hex(value.as_bytes()))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn parse_semantic_state(text: &str) -> Result<SemanticState, InspectError> {
@@ -361,6 +447,7 @@ impl fmt::Display for InspectError {
             Self::Io(error) => write!(f, "semantic inspection I/O error: {error}"),
             Self::Toolchain(error) => write!(f, "semantic inspection failed: {error}"),
             Self::Protocol(error) => write!(f, "invalid semantic inspection output: {error}"),
+            Self::NonUtf8Path(path) => write!(f, "R inspection requires a Unicode path: {}", path.display()),
         }
     }
 }
@@ -370,7 +457,7 @@ impl std::error::Error for InspectError {
         match self {
             Self::Io(error) => Some(error),
             Self::Toolchain(error) => Some(error),
-            Self::Protocol(_) => None,
+            Self::Protocol(_) | Self::NonUtf8Path(_) => None,
         }
     }
 }

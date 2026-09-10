@@ -13,10 +13,11 @@ required-features = ["air"]
 
 [features]
 default = ["air"]
-air = ["dep:air_r_parser", "dep:air_r_syntax", "dep:biome_rowan"]
+air = ["dep:air_r_parser", "dep:air_r_syntax", "dep:biome_rowan", "dep:rayon"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+rayon = { version = "1.12", optional = true }
 air_r_parser = { git = "https://github.com/posit-dev/air", tag = "0.11.0", optional = true }
 air_r_syntax = { git = "https://github.com/posit-dev/air", tag = "0.11.0", optional = true }
 

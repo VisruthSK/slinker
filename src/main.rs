@@ -13,7 +13,8 @@ use resolve::{ResolvedPackage, Resolution, resolve_installed_closure};
 
 use hrm::analysis::{Analysis, Analyzer, AnalyzerConfig, NodeKind, TargetPackage};
 use hrm::{
-    Description, RToolchain, SemanticSnapshot, TargetEnvironment, TargetEnvironmentRequest,
+    Description, InspectionRequest, RToolchain, SemanticSnapshot, TargetEnvironment,
+    TargetEnvironmentRequest,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -59,6 +60,7 @@ struct AnalyzeArgs {
     root: String,
     libraries: Vec<PathBuf>,
     target_provided: BTreeSet<String>,
+    jobs: usize,
 }
 
 fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Command, CliError> {
@@ -86,6 +88,7 @@ fn parse_analyze_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<
     let mut root = None;
     let mut libraries = Vec::new();
     let mut target_provided = BTreeSet::new();
+    let mut jobs = default_jobs();
 
     while let Some(argument) = args.next() {
         let text = argument.to_string_lossy();
@@ -114,6 +117,17 @@ fn parse_analyze_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<
             insert_package_list_str(&mut target_provided, value)?;
             continue;
         }
+        if text == "--jobs" {
+            let value = args
+                .next()
+                .ok_or(CliError::Usage("`--jobs` requires a positive integer"))?;
+            jobs = parse_jobs(&value)?;
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--jobs=") {
+            jobs = parse_jobs_str(value)?;
+            continue;
+        }
         if text.starts_with('-') {
             return Err(CliError::Usage("unknown analyze option"));
         }
@@ -132,7 +146,30 @@ fn parse_analyze_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<
         root: root.ok_or(CliError::Usage("analyze requires an installed package name"))?,
         libraries,
         target_provided,
+        jobs,
     })
+}
+
+fn parse_jobs(value: &std::ffi::OsString) -> Result<usize, CliError> {
+    let value = value
+        .to_str()
+        .ok_or(CliError::Usage("`--jobs` must be valid UTF-8"))?;
+    parse_jobs_str(value)
+}
+
+fn parse_jobs_str(value: &str) -> Result<usize, CliError> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|jobs| *jobs > 0)
+        .ok_or(CliError::Usage("`--jobs` requires a positive integer"))
+}
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(8)
 }
 
 fn insert_package_list(packages: &mut BTreeSet<String>, value: &std::ffi::OsString) -> Result<(), CliError> {
@@ -163,13 +200,14 @@ fn reject_extra(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<()
 fn print_help() {
     println!(
         "hrm {VERSION}\n\n\
-         Usage:\n  hrm analyze PACKAGE [--lib PATH]... [--target-provided PKG[,PKG...]]\n\n\
+         Usage:\n  hrm analyze PACKAGE [--lib PATH]... [--target-provided PKG[,PKG...]] [--jobs N]\n\n\
          Link an installed R package image and its installed runtime dependency closure.\n\
          hrm never installs, rebuilds, or downloads packages. Install the package into\n\
          the library universe you want to analyze before invoking hrm.\n\n\
          Options:\n\
            --lib PATH                     select an installed R library (repeatable, ordered)\n\
-           --target-provided PKG[,PKG...] leave only these third-party packages external\n\n\
+           --target-provided PKG[,PKG...] leave only these third-party packages external\n\
+           --jobs N                       parallel package jobs (default: min(CPUs, 8))\n\n\
          Environment:\n\
            HRM_R  target R executable (defaults to R/R.exe from PATH)"
     );
@@ -188,7 +226,6 @@ struct RootImage {
     root: PathBuf,
     origin: String,
     description: Description,
-    snapshot: SemanticSnapshot,
 }
 
 fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
@@ -206,7 +243,9 @@ fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
         .collect::<io::Result<Vec<_>>>()?;
     let target = toolchain.capture_target_environment(&target_request)?;
 
-    let root = prepare_root(&toolchain, &target, &args.root, scratch.path())?;
+    let root = prepare_root(&target, &args.root)?;
+    let mut analyzer = Analyzer::with_jobs(args.jobs);
+    let mut snapshots = BTreeMap::<String, SemanticSnapshot>::new();
     let mut additional = BTreeSet::new();
     let mut round = 0usize;
 
@@ -217,12 +256,21 @@ fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
             &additional,
             &args.target_provided,
         )?;
-        let dependencies = inspect_dependencies(
+
+        inspect_missing_packages(
             &toolchain,
             &target,
+            &root,
             &resolution,
-            &scratch.path().join(format!("round-{round}")),
+            &mut snapshots,
+            scratch.path(),
+            args.jobs,
         )?;
+
+        let root_snapshot = snapshots.get(&root.name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "root package was not inspected")
+        })?;
+        let dependencies = dependencies_from_cache(&resolution, &snapshots)?;
         let target_packages = resolution
             .platform
             .iter()
@@ -232,8 +280,8 @@ fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
                 version: version.clone(),
             })
             .collect();
-        let analysis = Analyzer::default().analyze(&AnalyzerConfig {
-            root: root.snapshot.analysis_root.clone(),
+        let analysis = analyzer.analyze(&AnalyzerConfig {
+            root: root_snapshot.analysis_root.clone(),
             dependencies: dependencies
                 .iter()
                 .map(|dependency| dependency.snapshot.analysis_root.clone())
@@ -270,16 +318,21 @@ fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    print_analysis(&target, &root, &resolution, &dependencies, &analysis)?;
+    let root_snapshot = snapshots.get(&root.name).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "root package snapshot disappeared")
+    })?;
+    print_analysis(
+        &target,
+        &root,
+        root_snapshot,
+        &resolution,
+        &dependencies,
+        &analysis,
+    )?;
     Ok(())
 }
 
-fn prepare_root(
-    toolchain: &RToolchain,
-    target: &TargetEnvironment,
-    name: &str,
-    scratch: &Path,
-) -> Result<RootImage, Box<dyn Error>> {
+fn prepare_root(target: &TargetEnvironment, name: &str) -> Result<RootImage, Box<dyn Error>> {
     let installed = target.package(name).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -288,49 +341,92 @@ fn prepare_root(
     })?;
     let root = installed.library.join(name);
     let description = read_description(&root)?;
-    let output = scratch.join("root-image.hrm");
-    let snapshot = toolchain.inspect_package_snapshot_with_libraries(
-        &installed.library,
-        name,
-        &output,
-        &target.libraries,
-    )?;
     Ok(RootImage {
         name: name.to_owned(),
         version: installed.version.clone(),
         root,
         origin: format!("installed image from {}", installed.library.display()),
         description,
-        snapshot,
     })
 }
 
-fn inspect_dependencies(
+fn inspect_missing_packages(
     toolchain: &RToolchain,
     target: &TargetEnvironment,
+    root: &RootImage,
     resolution: &Resolution,
+    snapshots: &mut BTreeMap<String, SemanticSnapshot>,
     scratch: &Path,
-) -> Result<Vec<InspectedPackage>, Box<dyn Error>> {
-    let mut out = Vec::with_capacity(resolution.internalized.len());
-    for (index, resolved) in resolution.internalized.iter().enumerate() {
-        let output = scratch
-            .join("images")
-            .join(format!("{index:04}-{}.hrm", resolved.installed.name));
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let snapshot = toolchain.inspect_package_snapshot_with_libraries(
-            &resolved.installed.library,
-            &resolved.installed.name,
-            &output,
-            &target.libraries,
-        )?;
-        out.push(InspectedPackage {
-            resolved: resolved.clone(),
-            snapshot,
-        });
+    jobs: usize,
+) -> Result<(), Box<dyn Error>> {
+    let mut names = Vec::new();
+    let mut requests = Vec::new();
+    let images = scratch.join("images");
+
+    if !snapshots.contains_key(&root.name) {
+        let installed = target.package(&root.name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "root package left target universe")
+        })?;
+        names.push(root.name.clone());
+        requests.push(InspectionRequest::new(
+            &installed.library,
+            &root.name,
+            images.join(format!("{}.hrm", root.name)),
+        ));
     }
-    Ok(out)
+
+    for resolved in &resolution.internalized {
+        let name = &resolved.installed.name;
+        if snapshots.contains_key(name) {
+            continue;
+        }
+        names.push(name.clone());
+        requests.push(InspectionRequest::new(
+            &resolved.installed.library,
+            name,
+            images.join(format!("{name}.hrm")),
+        ));
+    }
+
+    if requests.is_empty() {
+        return Ok(());
+    }
+
+    let inspected = toolchain.inspect_package_snapshots_with_libraries(
+        &requests,
+        &target.libraries,
+        jobs,
+        &scratch.join("inspection"),
+    )?;
+    for (name, snapshot) in names.into_iter().zip(inspected) {
+        snapshots.insert(name, snapshot);
+    }
+    Ok(())
+}
+
+fn dependencies_from_cache(
+    resolution: &Resolution,
+    snapshots: &BTreeMap<String, SemanticSnapshot>,
+) -> Result<Vec<InspectedPackage>, Box<dyn Error>> {
+    resolution
+        .internalized
+        .iter()
+        .map(|resolved| {
+            let snapshot = snapshots
+                .get(&resolved.installed.name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("package {} was resolved but not inspected", resolved.installed.name),
+                    )
+                })?
+                .clone();
+            Ok(InspectedPackage {
+                resolved: resolved.clone(),
+                snapshot,
+            })
+        })
+        .collect()
 }
 
 fn reachable_named_packages(analysis: &Analysis) -> BTreeSet<String> {
@@ -385,6 +481,7 @@ fn static_package_name(call: &hrm::analysis::parser::CallSite) -> Option<&str> {
 fn print_analysis(
     target: &TargetEnvironment,
     root: &RootImage,
+    root_snapshot: &SemanticSnapshot,
     resolution: &Resolution,
     dependencies: &[InspectedPackage],
     analysis: &Analysis,
@@ -405,7 +502,7 @@ fn print_analysis(
     println!();
 
     println!("root image");
-    print_image_evidence(&root.root, &root.snapshot)?;
+    print_image_evidence(&root.root, root_snapshot)?;
     println!();
 
     println!("runtime dependency closure");
@@ -851,7 +948,7 @@ impl Error for CliError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalyzeArgs, Command, parse_args};
+    use super::{AnalyzeArgs, Command, default_jobs, parse_args};
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -874,8 +971,23 @@ mod tests {
                 root: "voucher".into(),
                 libraries: vec![PathBuf::from("one"), PathBuf::from("two")],
                 target_provided: BTreeSet::new(),
+                jobs: default_jobs(),
             })
         );
+    }
+
+    #[test]
+    fn accepts_explicit_jobs() {
+        assert_eq!(
+            parse_args(os(&["analyze", "voucher", "--jobs", "6"])).unwrap(),
+            Command::Analyze(AnalyzeArgs {
+                root: "voucher".into(),
+                libraries: Vec::new(),
+                target_provided: BTreeSet::new(),
+                jobs: 6,
+            })
+        );
+        assert!(parse_args(os(&["analyze", "voucher", "--jobs=0"])).is_err());
     }
 
     #[test]
@@ -886,6 +998,7 @@ mod tests {
                 root: "voucher".into(),
                 libraries: Vec::new(),
                 target_provided: BTreeSet::from(["cli".into(), "fs".into()]),
+                jobs: default_jobs(),
             })
         );
     }

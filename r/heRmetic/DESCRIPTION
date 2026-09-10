@@ -1,0 +1,10 @@
+Package: heRmetic
+Title: R Runtime for heRmetic Installed-Image Linking
+Version: 0.1.0
+Authors@R: person("heRmetic", "authors", email = "maintainers@hermetic.invalid", role = c("aut", "cre"))
+Description: Internal R runtime for inspecting installed package images, preserving
+    R object semantics, and materializing synthetic namespaces for heRmetic.
+License: BSD_3_clause + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.2.0)
+Imports: parallel
