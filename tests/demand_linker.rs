@@ -3,8 +3,9 @@
 use slinker::analysis::{DiscoveryPolicy, EdgeKind, LinkPolicy, Linker, Need, NodeKind, RejectCode};
 use slinker::package::{
     BindingImage, BindingOrigin, ClosureSource, Digest, ExportMap, ImportBinding, ImportSpec,
-    InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeSafety, ObjectKind, PackageId, PackageImage,
-    PackageIndex, PackageProvider, S3Registration, SyntaxValidation,
+    InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeRegistration, NativeSafety, NativeSymbolBinding,
+    ObjectIssue, ObjectKind, PackageId, PackageImage, PackageIndex, PackageProvider, PrivateBindingImage,
+    PrivateEnvironmentImage, S3Registration, SyntaxValidation,
 };
 use slinker::{Description, Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -32,9 +33,9 @@ impl FakeProvider {
             base: [
                 "library", "require", "requireNamespace", "loadNamespace", "getNamespace", "asNamespace",
                 "packageVersion", "find.package", "system.file", ".Call", ".C", ".Fortran", ".External",
-                "deparse", "substitute", "match.call", "print", "identity", "c", "list", "paste",
-                "isNamespaceLoaded", "getNamespaceExports", "setHook", "packageEvent",
-                "+", "-", "*", "/", "[", "[[", "$", "<-", "{", "if", "for", "return", "%in%", "&&",
+                "deparse", "substitute", "match.call", "quote", "bquote", "print", "identity", "c", "list", "paste",
+                "isNamespaceLoaded", "getNamespaceExports", "setHook", "packageEvent", "makeActiveBinding",
+                "environment", "+", "-", "*", "/", "[", "[[", "$", "<-", "{", "if", "for", "return", "%in%", "&&",
             ].into_iter().map(str::to_owned).collect(),
         }
     }
@@ -88,7 +89,7 @@ impl PackageProvider for FakeProvider {
 
     fn is_target_provided(&self, package: &InstalledPackage) -> bool {
         self.target.contains(&package.id.name)
-            || package.description.get("Priority").is_some_and(|value| value == "base")
+
     }
 
     fn is_base_binding(&self, name: &str) -> bool {
@@ -118,11 +119,11 @@ fn package_with(
     files: Vec<String>,
     extra_description: &str,
 ) -> PackageImage {
-    let description = Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n{extra_description}")).unwrap();
+    let description = Description::parse(&format!("Package: {name}\nVersion: 1.0.0\n{extra_description}"));
     let installed = InstalledPackage {
         id: PackageId {
             name: name.into(),
-            version: "1.0.0".into(),
+            version: "1.0.0".parse().expect("valid test package version"),
             library: PathBuf::from(format!("/lib/{name}")),
             root: PathBuf::from(format!("/lib/{name}/{name}")),
             image_fingerprint: Digest(format!("fp-{name}")),
@@ -138,6 +139,7 @@ fn package_with(
         images.insert((*binding).into(), BindingImage {
             name: (*binding).into(),
             origin: BindingOrigin::Code,
+            active: false,
             object_kind: if closure.is_some() { ObjectKind::Closure } else { ObjectKind::Integer },
             closure,
             embedded_closures: Vec::new(),
@@ -161,6 +163,7 @@ fn package_with(
             has_sysdata: false,
         },
         bindings: images,
+        private_environments: HashMap::new(),
     }
 }
 
@@ -172,6 +175,24 @@ fn retained_binding(plan: &slinker::analysis::LinkPlan, package: &str, binding: 
     plan.retained.iter().any(|need| matches!(need,
         Need::Binding { package: owner, binding: name } if owner.name == package && name == binding
     ))
+}
+
+fn retained_private_binding(plan: &slinker::analysis::LinkPlan, package: &str, environment: &str, binding: &str) -> bool {
+    plan.retained.iter().any(|need| matches!(need,
+        Need::PrivateBinding { package: owner, environment: owner_environment, binding: name }
+            if owner.name == package && owner_environment == environment && name == binding
+    ))
+}
+
+fn private_closure(name: &str, environment: &str, source: &str) -> PrivateBindingImage {
+    PrivateBindingImage {
+        name: name.into(),
+        active: false,
+        object_kind: ObjectKind::Closure,
+        closure: Some(ClosureSource { environment: environment.into(), source: Arc::from(source) }),
+        embedded_closures: Vec::new(),
+        issues: Vec::new(),
+    }
 }
 
 #[test]
@@ -209,6 +230,152 @@ fn root_starts_from_exports_and_recurses_only_into_referenced_internal_bindings(
     assert!(!retained_binding(&plan, "root", "unused_optional"));
     assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
     assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn closure_private_environment_is_inventory_not_a_root_set() {
+    let mut root = package_with(
+        "root",
+        &[("public", Some("public <- function() 1"))],
+        Vec::new(),
+        export("public"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    root.bindings.get_mut("public").unwrap().closure.as_mut().unwrap().environment = "private:1".into();
+    root.private_environments.insert(
+        "private:1".into(),
+        PrivateEnvironmentImage {
+            id: "private:1".into(),
+            parent: "namespace:root".into(),
+            bindings: HashMap::from([
+                ("unused".into(), private_closure("unused", "private:1", "unused <- function() foo::bar()")),
+            ]),
+        },
+    );
+    let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 2).analyze("root").unwrap();
+    assert!(!retained_private_binding(&plan, "root", "private:1", "unused"));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+}
+
+#[test]
+fn lexical_lookup_demands_only_the_referenced_private_binding() {
+    let mut root = package_with(
+        "root",
+        &[("public", Some("public <- function() helper()"))],
+        Vec::new(),
+        export("public"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Suggests: foo\n",
+    );
+    root.bindings.get_mut("public").unwrap().closure.as_mut().unwrap().environment = "private:1".into();
+    root.private_environments.insert(
+        "private:1".into(),
+        PrivateEnvironmentImage {
+            id: "private:1".into(),
+            parent: "namespace:root".into(),
+            bindings: HashMap::from([
+                ("helper".into(), private_closure("helper", "private:1", "helper <- function() 1")),
+                ("unused".into(), private_closure("unused", "private:1", "unused <- function() foo::bar()")),
+            ]),
+        },
+    );
+    let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 2).analyze("root").unwrap();
+    assert!(retained_private_binding(&plan, "root", "private:1", "helper"));
+    assert!(!retained_private_binding(&plan, "root", "private:1", "unused"));
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+}
+
+#[test]
+fn unused_private_binding_issue_does_not_block_owner_closure() {
+    let mut root = package_with(
+        "root",
+        &[("public", Some("public <- function() 1"))],
+        Vec::new(), export("public"), Vec::new(), Vec::new(), Vec::new(), "",
+    );
+    root.bindings.get_mut("public").unwrap().closure.as_mut().unwrap().environment = "private:1".into();
+    root.private_environments.insert(
+        "private:1".into(),
+        PrivateEnvironmentImage {
+            id: "private:1".into(),
+            parent: "namespace:root".into(),
+            bindings: HashMap::from([(
+                "bad".into(),
+                PrivateBindingImage {
+                    name: "bad".into(), active: false, object_kind: ObjectKind::Other("externalptr".into()),
+                    closure: None, embedded_closures: Vec::new(),
+                    issues: vec![ObjectIssue { path: "$".into(), kind: "external_pointer".into(), detail: "external pointer".into() }],
+                },
+            )]),
+        },
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1).analyze("root").unwrap();
+    assert!(!plan.diagnostics.iter().any(|diagnostic| diagnostic.code == RejectCode::UnsupportedObject));
+}
+
+#[test]
+fn onload_can_create_a_missing_exported_active_binding() {
+    let mut root = package_with(
+        "root",
+        &[
+            ("dummy", Some("dummy <- function() NULL")),
+            ("get_pb", Some("get_pb <- function() 1")),
+            (".onLoad", Some(".onLoad <- function(lib, pkg) { pkgenv <- environment(dummy); makeActiveBinding(\"pb\", get_pb, pkgenv) }")),
+        ],
+        Vec::new(), export("pb"), Vec::new(), Vec::new(), Vec::new(), "",
+    );
+    root.index.lifecycle.on_load = true;
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1).analyze("root").unwrap();
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.binding.as_deref() == Some("pb")
+    }));
+    assert!(retained_binding(&plan, "root", "get_pb"));
+}
+
+#[test]
+fn dependency_onload_can_create_a_missing_exported_active_binding() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() foo::pb"))],
+        Vec::new(), export("f"), Vec::new(), Vec::new(), Vec::new(), "Imports: foo\n",
+    );
+    let mut foo = package_with(
+        "foo",
+        &[
+            ("dummy", Some("dummy <- function() NULL")),
+            ("get_pb", Some("get_pb <- function() 1")),
+            (".onLoad", Some(".onLoad <- function(lib, pkg) { pkgenv <- environment(dummy); makeActiveBinding(\"pb\", get_pb, pkgenv) }")),
+        ],
+        Vec::new(), export("pb"), Vec::new(), Vec::new(), Vec::new(), "",
+    );
+    foo.index.lifecycle.on_load = true;
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnresolvedBinding
+            && diagnostic.package == "foo"
+            && diagnostic.binding.as_deref() == Some("pb")
+    }));
+    assert!(retained_binding(&plan, "foo", "get_pb"));
+}
+
+#[test]
+fn runtime_make_active_binding_does_not_satisfy_missing_export() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function() makeActiveBinding(\"pb\", function() 1, asNamespace(\"root\"))"))],
+        Vec::new(), ExportMap::from([("f".into(), "f".into()), ("pb".into(), "pb".into())]),
+        Vec::new(), Vec::new(), Vec::new(), "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1).analyze("root").unwrap();
+    assert!(plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.binding.as_deref() == Some("pb")
+    }));
 }
 
 #[test]
@@ -406,9 +573,81 @@ fn cyclic_local_references_terminate_with_one_node_each() {
 }
 
 #[test]
+fn registered_native_symbol_is_not_an_unresolved_r_binding() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function(x) .Call(croot_f, x)"))],
+        Vec::new(), export("f"), Vec::new(),
+        vec![NativeComponent {
+            name: "root".into(),
+            registration: Some(NativeRegistration { prefix: "c".into(), suffix: "".into() }),
+            symbols: vec![NativeSymbolBinding { binding: "croot_f".into(), symbol: "root_f".into() }],
+            safety: NativeSafety::Safe(NativeFacts { callbacks: Vec::new() }),
+        }],
+        Vec::new(), "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1).analyze("root").unwrap();
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("croot_f")
+    }));
+    assert!(plan.retained.iter().any(|need| matches!(need, Need::Native { component, .. } if component == "root")));
+}
+
+#[test]
+fn registered_native_symbol_can_be_assigned_into_namespace_state() {
+    let root = package_with(
+        "root",
+        &[
+            ("slot", None),
+            (".onLoad", Some(".onLoad <- function(lib, pkg) slot <<- croot_tick")),
+        ],
+        Vec::new(), ExportMap::new(), Vec::new(),
+        vec![NativeComponent {
+            name: "root".into(),
+            registration: Some(NativeRegistration { prefix: "c".into(), suffix: "".into() }),
+            symbols: vec![NativeSymbolBinding { binding: "croot_tick".into(), symbol: "root_tick".into() }],
+            safety: NativeSafety::Safe(NativeFacts { callbacks: Vec::new() }),
+        }],
+        Vec::new(), "",
+    );
+    let mut root = root;
+    root.index.lifecycle.on_load = true;
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1).analyze("root").unwrap();
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("croot_tick")
+    }));
+    assert!(!plan.diagnostics.iter().any(|diagnostic| diagnostic.code == RejectCode::EnvironmentMutation));
+}
+
+#[test]
+fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
+    let mut root = package_with(
+        "root",
+        &[
+            ("slot", None),
+            (".onLoad", Some(".onLoad <- function(lib, pkg) slot <<- croot_tick")),
+        ],
+        Vec::new(), ExportMap::new(), Vec::new(),
+        vec![NativeComponent {
+            name: "root".into(),
+            registration: Some(NativeRegistration { prefix: "".into(), suffix: "".into() }),
+            symbols: Vec::new(),
+            safety: NativeSafety::Unanalyzed,
+        }],
+        Vec::new(), "",
+    );
+    root.index.lifecycle.on_load = true;
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1).analyze("root").unwrap();
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("croot_tick")
+    }));
+    assert!(plan.diagnostics.iter().any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup));
+}
+
+#[test]
 fn native_activation_keeps_component_without_widening_r_bindings() {
     let root = package("root", &[("f", Some("f <- function() foo::a()"))]);
-    let foo = package_with("foo", &[("a", Some("a <- function(x) .Call(foo_a, x)")), ("b", Some("b <- function(x) .Call(foo_b, x)")), ("unused", Some("unused <- function(x) x"))], Vec::new(), export("a"), Vec::new(), vec![NativeComponent { name: "foo".into(), safety: NativeSafety::Safe(NativeFacts { callbacks: Vec::new() }) }], Vec::new(), "");
+    let foo = package_with("foo", &[("a", Some("a <- function(x) .Call(foo_a, x)")), ("b", Some("b <- function(x) .Call(foo_b, x)")), ("unused", Some("unused <- function(x) x"))], Vec::new(), export("a"), Vec::new(), vec![NativeComponent { name: "foo".into(), registration: None, symbols: Vec::new(), safety: NativeSafety::Safe(NativeFacts { callbacks: Vec::new() }) }], Vec::new(), "");
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1).analyze("root").unwrap();
     assert!(retained_binding(&plan, "foo", "a"));
     assert!(!retained_binding(&plan, "foo", "b"));
@@ -427,6 +666,8 @@ fn known_native_callback_adds_binding_edge() {
         Vec::new(),
         vec![NativeComponent {
             name: "foo".into(),
+            registration: None,
+            symbols: Vec::new(),
             safety: NativeSafety::Safe(NativeFacts { callbacks: vec!["callback".into()] }),
         }],
         Vec::new(),
@@ -449,6 +690,8 @@ fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
         Vec::new(),
         vec![NativeComponent {
             name: "foo".into(),
+            registration: None,
+            symbols: Vec::new(),
             safety: NativeSafety::Unsupported(vec!["dynamic R lookup".into()]),
         }],
         Vec::new(),
@@ -1264,4 +1507,97 @@ fn target_provided_namespace_is_not_assumed_loaded_for_onload_guard() {
         .analyze("root")
         .unwrap();
     assert!(!plan.graph.nodes.iter().any(|node| node.package == "knitr"));
+}
+
+#[test]
+fn quoted_iscam_style_symbols_do_not_create_graph_edges() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some(
+                "f <- function() quote(list(atop(P, X), phantom(hat(mu)), sigma, N, M, SD, x1, x2, x3, x4, x5, foo::bar, system.file('data', package = 'foo')))"
+            ),
+        )],
+    );
+    let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(!plan.graph.nodes.iter().any(|node| node.package == "foo"));
+    for name in [
+        "atop", "P", "X", "phantom", "hat", "mu", "sigma", "N", "M", "SD", "x1", "x2", "x3", "x4", "x5",
+    ] {
+        assert!(!plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic.binding.as_deref() == Some("f")
+                && diagnostic.code == RejectCode::UnresolvedBinding
+                && diagnostic.message.contains(name)
+        }), "quoted symbol {name} leaked into lexical dependency diagnostics");
+    }
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        matches!(diagnostic.code, RejectCode::MissingDependency | RejectCode::MissingResource)
+    }));
+}
+
+#[test]
+fn conditional_special_callee_blocks_path_dependent_specialization() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some(
+                "f <- function(flag) { if (flag) system.file <- identity; system.file('data', package = 'foo') }"
+            ),
+        )],
+    );
+    let foo = package_with(
+        "foo",
+        &[],
+        Vec::new(),
+        ExportMap::new(),
+        Vec::new(),
+        Vec::new(),
+        vec!["data".into()],
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.binding.as_deref() == Some("f")
+            && diagnostic.code == RejectCode::SemanticAmbiguity
+            && diagnostic.message.contains("system.file")
+    }));
+    assert!(!plan.retained.iter().any(|need| matches!(
+        need,
+        Need::Resource { package, .. } if package.name == "foo"
+    )));
+}
+
+
+#[test]
+fn conditional_local_fallthrough_is_not_reported_as_missing_dependency() {
+    let root = package(
+        "root",
+        &[("f", Some("f <- function(flag) { if (flag) x <- 1; x }"))],
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.binding.as_deref() == Some("f")
+            && diagnostic.code == RejectCode::PotentialUnboundLocal
+            && diagnostic.message.contains("x")
+    }));
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.binding.as_deref() == Some("f")
+            && matches!(
+                diagnostic.code,
+                RejectCode::MissingDependency | RejectCode::UnresolvedBinding
+            )
+            && diagnostic.message.contains("x")
+    }));
 }

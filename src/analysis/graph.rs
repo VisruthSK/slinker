@@ -9,6 +9,7 @@ pub struct NodeId(pub usize);
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeKind {
     Binding { name: String },
+    PrivateBinding { environment: String, name: String },
     Activation,
     Dataset { name: String },
     Lifecycle { hook: String },

@@ -45,3 +45,11 @@ This checkpoint produces the analysis graph and rewrite plan only. Materializati
 ## Out of scope for v0.1.0
 
 Cross-platform rebuilding, source-package provenance reconstruction, package-manager resolution, arbitrary reflective R behavior, and general plugin/open-world extension protocols are outside the core installed-image linker.
+
+## Oak semantic migration checkpoint
+
+R lexical/control-flow semantics belong to `oak_semantic`. Air supplies syntax at the exact revision used by the pinned Ark/Oak commit; slinker translates Oak semantic uses, namespace accesses, evaluation state, and lexical fallthrough into the existing demand graph. The old `Collector`/`Flow` lexical engine is removed rather than retained as a fallback.
+
+Installed `DESCRIPTION` parsing belongs to `r-description-parser`, with versions and dependency relations represented by `r-metadata`. Slinker must not restore its previous DCF parser or duplicate relation/version types.
+
+The current checkpoint is intentionally incomplete: the Oak `SemanticIndex` adapter and typed relation-field extraction still fail closed until their exact crate APIs are wired. This is preferable to silently using structural AST reachability.

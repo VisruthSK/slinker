@@ -15,6 +15,7 @@ pub struct S3Id {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Need {
     Binding { package: PackageId, binding: BindingName },
+    PrivateBinding { package: PackageId, environment: String, binding: BindingName },
     Activation { package: PackageId },
     Resource { package: PackageId, resource: ResourceId },
     Dataset { package: PackageId, dataset: String },
@@ -27,6 +28,7 @@ impl Need {
     pub fn package(&self) -> &PackageId {
         match self {
             Self::Binding { package, .. }
+            | Self::PrivateBinding { package, .. }
             | Self::Activation { package }
             | Self::Resource { package, .. }
             | Self::Dataset { package, .. }

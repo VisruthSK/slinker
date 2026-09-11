@@ -1,5 +1,5 @@
 use crate::package::{
-    ExportMap, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent, NativeSafety,
+    ExportMap, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent, NativeRegistration, NativeSafety, NativeSymbolBinding,
     PackageIndex, S3Registration,
 };
 use crate::{Error, Result};
@@ -87,6 +87,7 @@ pub struct EmbeddedClosureSource {
 pub struct BindingImage {
     pub name: String,
     pub origin: BindingOrigin,
+    pub active: bool,
     pub object_kind: ObjectKind,
     pub closure: Option<ClosureSource>,
     pub embedded_closures: Vec<EmbeddedClosureSource>,
@@ -94,14 +95,40 @@ pub struct BindingImage {
 }
 
 #[derive(Clone, Debug)]
+pub struct PrivateBindingImage {
+    pub name: String,
+    pub active: bool,
+    pub object_kind: ObjectKind,
+    pub closure: Option<ClosureSource>,
+    pub embedded_closures: Vec<EmbeddedClosureSource>,
+    pub issues: Vec<ObjectIssue>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrivateEnvironmentImage {
+    pub id: String,
+    pub parent: String,
+    pub bindings: HashMap<String, PrivateBindingImage>,
+}
+
+#[derive(Clone, Debug)]
 pub struct PackageImage {
     pub index: PackageIndex,
     pub bindings: HashMap<String, BindingImage>,
+    pub private_environments: HashMap<String, PrivateEnvironmentImage>,
 }
 
 impl PackageImage {
     pub fn binding(&self, name: &str) -> Option<&BindingImage> {
         self.bindings.get(name)
+    }
+
+    pub fn private_environment(&self, id: &str) -> Option<&PrivateEnvironmentImage> {
+        self.private_environments.get(id)
+    }
+
+    pub fn private_binding(&self, environment: &str, name: &str) -> Option<&PrivateBindingImage> {
+        self.private_environment(environment)?.bindings.get(name)
     }
 }
 
@@ -111,6 +138,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
     let mut imports = Vec::<ImportSpec>::new();
     let mut import_all = HashMap::<String, usize>::new();
     let mut bindings = HashMap::<String, BindingImage>::new();
+    let mut private_environments = HashMap::<String, PrivateEnvironmentImage>::new();
     let mut datasets = Vec::new();
     let mut files = Vec::new();
     let mut s3 = Vec::new();
@@ -129,7 +157,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
         match kind {
             "HEADER" => {
                 require(kind, &values, 4, line_no)?;
-                if values[0] != package.id.name || values[1] != package.id.version {
+                if values[0] != package.id.name || values[1] != package.id.version.to_string() {
                     return Err(Error::Analysis(format!(
                         "installed image identity changed while inspecting {}: expected {} {}, got {} {}",
                         package.id.name, package.id.name, package.id.version, values[0], values[1]
@@ -168,7 +196,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                 }
             }
             "BINDING" => {
-                require(kind, &values, 3, line_no)?;
+                require(kind, &values, 4, line_no)?;
                 let origin = match values[1].as_str() {
                     "code" => BindingOrigin::Code,
                     "sysdata" => BindingOrigin::Sysdata,
@@ -177,6 +205,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                 bindings.insert(values[0].clone(), BindingImage {
                     name: values[0].clone(),
                     origin,
+                    active: parse_bool(&values[3])?,
                     object_kind: ObjectKind::from_r_type(&values[2]),
                     closure: None,
                     embedded_closures: Vec::new(),
@@ -215,6 +244,69 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                     detail: values[3].clone(),
                 });
             }
+            "PRIVATE_ENV" => {
+                require(kind, &values, 2, line_no)?;
+                private_environments.insert(values[0].clone(), PrivateEnvironmentImage {
+                    id: values[0].clone(),
+                    parent: values[1].clone(),
+                    bindings: HashMap::new(),
+                });
+            }
+            "PRIVATE_BINDING" => {
+                require(kind, &values, 4, line_no)?;
+                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
+                    Error::Analysis(format!("PRIVATE_BINDING precedes PRIVATE_ENV for {}", values[0]))
+                })?;
+                environment.bindings.insert(values[1].clone(), PrivateBindingImage {
+                    name: values[1].clone(),
+                    active: parse_bool(&values[3])?,
+                    object_kind: ObjectKind::from_r_type(&values[2]),
+                    closure: None,
+                    embedded_closures: Vec::new(),
+                    issues: Vec::new(),
+                });
+            }
+            "PRIVATE_CLOSURE" => {
+                require(kind, &values, 4, line_no)?;
+                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
+                    Error::Analysis(format!("PRIVATE_CLOSURE precedes PRIVATE_ENV for {}", values[0]))
+                })?;
+                let binding = environment.bindings.get_mut(&values[1]).ok_or_else(|| {
+                    Error::Analysis(format!("PRIVATE_CLOSURE precedes PRIVATE_BINDING for {}::{}", values[0], values[1]))
+                })?;
+                binding.closure = Some(ClosureSource {
+                    environment: values[2].clone(),
+                    source: Arc::from(values[3].clone()),
+                });
+            }
+            "PRIVATE_NESTED_CLOSURE" => {
+                require(kind, &values, 5, line_no)?;
+                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
+                    Error::Analysis(format!("PRIVATE_NESTED_CLOSURE precedes PRIVATE_ENV for {}", values[0]))
+                })?;
+                let binding = environment.bindings.get_mut(&values[1]).ok_or_else(|| {
+                    Error::Analysis(format!("PRIVATE_NESTED_CLOSURE precedes PRIVATE_BINDING for {}::{}", values[0], values[1]))
+                })?;
+                binding.embedded_closures.push(EmbeddedClosureSource {
+                    path: values[2].clone(),
+                    environment: values[3].clone(),
+                    source: Arc::from(values[4].clone()),
+                });
+            }
+            "PRIVATE_BINDING_ISSUE" => {
+                require(kind, &values, 5, line_no)?;
+                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
+                    Error::Analysis(format!("PRIVATE_BINDING_ISSUE precedes PRIVATE_ENV for {}", values[0]))
+                })?;
+                let binding = environment.bindings.get_mut(&values[1]).ok_or_else(|| {
+                    Error::Analysis(format!("PRIVATE_BINDING_ISSUE precedes PRIVATE_BINDING for {}::{}", values[0], values[1]))
+                })?;
+                binding.issues.push(ObjectIssue {
+                    path: values[2].clone(),
+                    kind: values[3].clone(),
+                    detail: values[4].clone(),
+                });
+            }
             "DATASET" => {
                 require(kind, &values, 1, line_no)?;
                 datasets.push(values[0].clone());
@@ -228,8 +320,27 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
                 });
             }
             "DYNLIB" => {
-                require(kind, &values, 1, line_no)?;
-                dynlibs.push(NativeComponent { name: values[0].clone(), safety: NativeSafety::Unanalyzed });
+                require(kind, &values, 4, line_no)?;
+                let registration = parse_bool(&values[1])?.then(|| NativeRegistration {
+                    prefix: values[2].clone(),
+                    suffix: values[3].clone(),
+                });
+                dynlibs.push(NativeComponent {
+                    name: values[0].clone(),
+                    registration,
+                    symbols: Vec::new(),
+                    safety: NativeSafety::Unanalyzed,
+                });
+            }
+            "NATIVE_SYMBOL" => {
+                require(kind, &values, 3, line_no)?;
+                let native = dynlibs.iter_mut().find(|native| native.name == values[0]).ok_or_else(|| {
+                    Error::Analysis(format!("NATIVE_SYMBOL precedes DYNLIB for {}", values[0]))
+                })?;
+                native.symbols.push(NativeSymbolBinding {
+                    binding: values[1].clone(),
+                    symbol: values[2].clone(),
+                });
             }
             "FILE" => {
                 require(kind, &values, 1, line_no)?;
@@ -263,7 +374,7 @@ pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Resu
         files,
         has_sysdata,
     };
-    Ok(PackageImage { index, bindings })
+    Ok(PackageImage { index, bindings, private_environments })
 }
 
 fn require(kind: &str, values: &[String], expected: usize, line_no: usize) -> Result<()> {

@@ -4,6 +4,8 @@ use crate::package::{BindingName, PackageId};
 pub enum ResolvedName {
     Local(String),
     PackageBinding { package: PackageId, binding: BindingName },
+    PrivateBinding { package: PackageId, environment: String, binding: BindingName },
+    NativeSymbol { package: PackageId, component: String, binding: BindingName },
     Imported { package: PackageId, binding: BindingName },
     TargetProvided { package: PackageId, binding: BindingName },
     PackageMetadata { package: PackageId, name: String },

@@ -131,7 +131,30 @@
     }
   }
 
-  for (dll in as.character(ns_info$dynlibs)) emit("DYNLIB", dll)
+  for (dll in as.character(ns_info$dynlibs)) {
+    native <- ns_info$nativeRoutines[[dll]]
+    use_registration <- !is.null(native) && isTRUE(native$useRegistration)
+    fixes <- if (use_registration && length(native$registrationFixes) >= 2L) {
+      as.character(native$registrationFixes[1:2])
+    } else {
+      c("", "")
+    }
+    emit(
+      "DYNLIB",
+      dll,
+      if (use_registration) "1" else "0",
+      fixes[[1L]],
+      fixes[[2L]]
+    )
+    symbols <- if (is.null(native)) character() else native$symbolNames
+    if (length(symbols)) {
+      variables <- names(symbols)
+      if (is.null(variables)) variables <- as.character(symbols)
+      for (i in seq_along(symbols)) {
+        emit("NATIVE_SYMBOL", dll, variables[[i]], as.character(symbols[[i]]))
+      }
+    }
+  }
 
 }
 
@@ -145,11 +168,100 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
   invisible(NULL)
 }
 
-.slinker_scan_retained_object <- function(value, image_env, package) {
+.slinker_new_scan_state <- function(image_env, package) {
+  state <- new.env(parent = emptyenv())
+  state$image_env <- image_env
+  state$package <- package
+  state$private_envs <- list()
+  state$private_records <- list()
+  state$private_status <- integer()
+  state
+}
+
+.slinker_private_environment_id <- function(state, env) {
+  if (length(state$private_envs)) {
+    matches <- vapply(state$private_envs, identical, logical(1L), y = env)
+    if (any(matches)) return(which(matches)[[1L]])
+  }
+  state$private_envs[[length(state$private_envs) + 1L]] <- env
+  state$private_records[[length(state$private_envs)]] <- list(parent = NULL, bindings = list())
+  state$private_status[[length(state$private_envs)]] <- 0L
+  length(state$private_envs)
+}
+
+.slinker_environment_ref <- function(state, env) {
+  if (identical(env, state$image_env)) return(paste0("namespace:", state$package))
+  if (isNamespace(env)) return(paste0("namespace:", getNamespaceName(env)))
+  if (identical(env, baseenv())) return("base:base")
+  if (identical(env, emptyenv())) return("base:empty")
+  if (identical(env, .GlobalEnv)) return("unsupported:global")
+  name <- environmentName(env)
+  if (grepl("^package:", name)) return(paste0("unsupported:", name))
+
+  id <- .slinker_private_environment_id(state, env)
+  .slinker_inventory_private_environment(state, env, id)
+  paste0("private:", id)
+}
+
+.slinker_read_binding_without_firing <- function(env, name) {
+  active <- tryCatch(bindingIsActive(name, env), error = function(...) FALSE)
+  value <- if (isTRUE(active)) {
+    tryCatch(activeBindingFunction(name, env), error = identity)
+  } else {
+    tryCatch(get(name, envir = env, inherits = FALSE), error = identity)
+  }
+  list(active = isTRUE(active), value = value)
+}
+
+.slinker_inventory_private_environment <- function(state, env, id) {
+  status <- state$private_status[[id]]
+  if (!identical(status, 0L)) return(invisible(NULL))
+  state$private_status[[id]] <- 1L
+
+  parent_ref <- .slinker_environment_ref(state, parent.env(env))
+  record <- state$private_records[[id]]
+  record$parent <- parent_ref
+  state$private_records[[id]] <- record
+
+  for (name in sort(ls(env, all.names = TRUE))) {
+    read <- .slinker_read_binding_without_firing(env, name)
+    if (inherits(read$value, "error")) {
+      binding <- list(
+        name = name,
+        active = read$active,
+        type = "unavailable",
+        closure = NULL,
+        closures = list(),
+        issues = list(list(path = "$", kind = "force_error", detail = conditionMessage(read$value)))
+      )
+    } else {
+      value <- read$value
+      scan <- .slinker_scan_retained_object(value, state)
+      binding <- list(
+        name = name,
+        active = read$active,
+        type = typeof(value),
+        closure = if (typeof(value) == "closure") list(
+          environment = scan$root_environment,
+          source = .slinker_analysis_binding(name, value)
+        ) else NULL,
+        closures = scan$closures,
+        issues = scan$issues
+      )
+    }
+    record <- state$private_records[[id]]
+    record$bindings[[length(record$bindings) + 1L]] <- binding
+    state$private_records[[id]] <- record
+  }
+
+  state$private_status[[id]] <- 2L
+  invisible(NULL)
+}
+
+.slinker_scan_retained_object <- function(value, state) {
   issues <- list()
   closures <- list()
   seen_envs <- list()
-  private_envs <- list()
 
   add_issue <- function(path, kind, detail) {
     issues[[length(issues) + 1L]] <<- list(path = path, kind = kind, detail = detail)
@@ -159,24 +271,7 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
     seen_envs[[length(seen_envs) + 1L]] <<- env
     FALSE
   }
-  private_environment_id <- function(env) {
-    if (length(private_envs)) {
-      matches <- vapply(private_envs, identical, logical(1L), y = env)
-      if (any(matches)) return(which(matches)[[1L]])
-    }
-    private_envs[[length(private_envs) + 1L]] <<- env
-    length(private_envs)
-  }
-  environment_ref <- function(env) {
-    if (identical(env, image_env)) return(paste0("namespace:", package))
-    if (isNamespace(env)) return(paste0("namespace:", getNamespaceName(env)))
-    if (identical(env, baseenv())) return("base:base")
-    if (identical(env, emptyenv())) return("base:empty")
-    if (identical(env, .GlobalEnv)) return("unsupported:global")
-    name <- environmentName(env)
-    if (grepl("^package:", name)) return(paste0("unsupported:", name))
-    paste0("private:", private_environment_id(env))
-  }
+  environment_ref <- function(env) .slinker_environment_ref(state, env)
   add_closure <- function(path, value, env_ref) {
     closures[[length(closures) + 1L]] <<- list(
       path = path,
@@ -199,12 +294,12 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
     if (length(classes) && any(grepl("^S7", classes))) add_issue(path, "s7", paste(classes, collapse = "/"))
 
     if (type == "closure") {
-      env <- environment(x)
-      env_ref <- environment_ref(env)
+      env_ref <- environment_ref(environment(x))
       if (embedded) add_closure(path, x, env_ref)
-      if (startsWith(env_ref, "private:")) {
-        walk(env, paste0(path, ".environment"), depth + 1L, TRUE)
-      } else if (startsWith(env_ref, "unsupported:")) {
+      # A closure environment is lexical scope. Register its inventory so Rust
+      # can resolve names through it, but never turn every binding into a child
+      # of the closure merely because the environment is retained.
+      if (startsWith(env_ref, "unsupported:")) {
         add_issue(paste0(path, ".environment"), "environment_identity", substring(env_ref, 13L))
       }
     } else if (type %in% c("list", "expression", "pairlist", "language")) {
@@ -221,19 +316,19 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
       if (startsWith(ref, "unsupported:")) {
         add_issue(path, "environment_identity", substring(ref, 13L))
       } else if (startsWith(ref, "private:") && !seen_environment(x)) {
-        parent <- parent.env(x)
-        parent_ref <- environment_ref(parent)
+        # An environment retained as an ordinary object is itself observable,
+        # unlike a closure's lexical environment. Conservatively retain its
+        # contents as embedded object state.
+        parent_ref <- environment_ref(parent.env(x))
         if (startsWith(parent_ref, "unsupported:")) {
           add_issue(paste0(path, ".parent"), "environment_parent", substring(parent_ref, 13L))
-        } else if (startsWith(parent_ref, "private:")) {
-          walk(parent, paste0(path, ".parent"), depth + 1L, TRUE)
         }
         for (name in sort(ls(x, all.names = TRUE))) {
-          child <- tryCatch(get(name, envir = x, inherits = FALSE), error = identity)
-          if (inherits(child, "error")) {
-            add_issue(paste0(path, "$", name), "force_error", conditionMessage(child))
+          read <- .slinker_read_binding_without_firing(x, name)
+          if (inherits(read$value, "error")) {
+            add_issue(paste0(path, "$", name), "force_error", conditionMessage(read$value))
           } else {
-            walk(child, paste0(path, "$", name), depth + 1L, TRUE)
+            walk(read$value, paste0(path, "$", name), depth + 1L, TRUE)
           }
         }
       }
@@ -262,6 +357,48 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
   )
 }
 
+.slinker_emit_private_environments <- function(state, emit) {
+  if (!length(state$private_records)) return(invisible(NULL))
+  for (id in seq_along(state$private_records)) {
+    record <- state$private_records[[id]]
+    env_ref <- paste0("private:", id)
+    emit("PRIVATE_ENV", env_ref, if (is.null(record$parent)) "base:empty" else record$parent)
+    if (!length(record$bindings)) next
+    for (binding in record$bindings) {
+      emit(
+        "PRIVATE_BINDING",
+        env_ref,
+        binding$name,
+        binding$type,
+        if (binding$active) "1" else "0"
+      )
+      for (issue in binding$issues) {
+        emit("PRIVATE_BINDING_ISSUE", env_ref, binding$name, issue$path, issue$kind, issue$detail)
+      }
+      for (closure in binding$closures) {
+        emit(
+          "PRIVATE_NESTED_CLOSURE",
+          env_ref,
+          binding$name,
+          closure$path,
+          closure$environment,
+          closure$source
+        )
+      }
+      if (!is.null(binding$closure)) {
+        emit(
+          "PRIVATE_CLOSURE",
+          env_ref,
+          binding$name,
+          binding$closure$environment,
+          binding$closure$source
+        )
+      }
+    }
+  }
+  invisible(NULL)
+}
+
 slinker_inspect_image <- function(library, package, output, visible_libraries = character()) {
   context <- .slinker_package_image_context(library, package, visible_libraries)
   if (file.exists(output)) invisible(file.remove(output))
@@ -270,26 +407,29 @@ slinker_inspect_image <- function(library, package, output, visible_libraries = 
   emit <- function(kind, ...) .slinker_emit_connection(connection, kind, ...)
 
   .slinker_emit_package_index(context, emit, binding_record = NULL)
+  scan_state <- .slinker_new_scan_state(context$image_env, context$package)
 
   for (name in context$binding_names) {
     origin <- if (name %in% context$sysdata_names) "sysdata" else "code"
-    value <- tryCatch(get(name, envir = context$image_env, inherits = FALSE), error = identity)
+    read <- .slinker_read_binding_without_firing(context$image_env, name)
+    value <- read$value
     if (inherits(value, "error")) {
-      emit("BINDING", name, origin, "unavailable")
+      emit("BINDING", name, origin, "unavailable", if (read$active) "1" else "0")
       emit("BINDING_ISSUE", name, "$", "force_error", conditionMessage(value))
       next
     }
     type <- typeof(value)
-    emit("BINDING", name, origin, type)
-    scan <- .slinker_scan_retained_object(value, context$image_env, context$package)
+    emit("BINDING", name, origin, type, if (read$active) "1" else "0")
+    scan <- .slinker_scan_retained_object(value, scan_state)
     for (issue in scan$issues) emit("BINDING_ISSUE", name, issue$path, issue$kind, issue$detail)
     for (closure in scan$closures) emit("NESTED_CLOSURE", name, closure$path, closure$environment, closure$source)
     if (identical(type, "closure")) {
       source <- .slinker_analysis_binding(name, value)
-      environment_ref <- scan$root_environment
-      emit("CLOSURE", name, environment_ref, source)
+      emit("CLOSURE", name, scan$root_environment, source)
     }
   }
+
+  .slinker_emit_private_environments(scan_state, emit)
   invisible(NULL)
 }
 

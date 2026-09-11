@@ -36,8 +36,22 @@ pub enum NativeSafety {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct NativeRegistration {
+    pub prefix: String,
+    pub suffix: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct NativeSymbolBinding {
+    pub binding: String,
+    pub symbol: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NativeComponent {
     pub name: String,
+    pub registration: Option<NativeRegistration>,
+    pub symbols: Vec<NativeSymbolBinding>,
     pub safety: NativeSafety,
 }
 
@@ -101,7 +115,7 @@ pub(crate) fn parse_package_index(text: &str, package: InstalledPackage) -> crat
         match kind {
             "HEADER" => {
                 require(kind, &values, 4, line_no)?;
-                if values[0] != package.id.name || values[1] != package.id.version {
+                if values[0] != package.id.name || values[1] != package.id.version.to_string() {
                     return Err(Error::Analysis(format!(
                         "installed index identity changed while inspecting {}: expected {} {}, got {} {}",
                         package.id.name, package.id.name, package.id.version, values[0], values[1]
@@ -156,8 +170,27 @@ pub(crate) fn parse_package_index(text: &str, package: InstalledPackage) -> crat
                 });
             }
             "DYNLIB" => {
-                require(kind, &values, 1, line_no)?;
-                dynlibs.push(NativeComponent { name: values[0].clone(), safety: NativeSafety::Unanalyzed });
+                require(kind, &values, 4, line_no)?;
+                let registration = parse_bool(&values[1])?.then(|| NativeRegistration {
+                    prefix: values[2].clone(),
+                    suffix: values[3].clone(),
+                });
+                dynlibs.push(NativeComponent {
+                    name: values[0].clone(),
+                    registration,
+                    symbols: Vec::new(),
+                    safety: NativeSafety::Unanalyzed,
+                });
+            }
+            "NATIVE_SYMBOL" => {
+                require(kind, &values, 3, line_no)?;
+                let native = dynlibs.iter_mut().find(|native| native.name == values[0]).ok_or_else(|| {
+                    Error::Analysis(format!("NATIVE_SYMBOL precedes DYNLIB for {}", values[0]))
+                })?;
+                native.symbols.push(NativeSymbolBinding {
+                    binding: values[1].clone(),
+                    symbol: values[2].clone(),
+                });
             }
             "FILE" => {
                 require(kind, &values, 1, line_no)?;

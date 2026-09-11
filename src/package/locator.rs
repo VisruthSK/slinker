@@ -1,4 +1,4 @@
-use crate::{Description, Error, Result, TargetEnvironment};
+use crate::{Description, Error, Result, TargetEnvironment, Version};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
@@ -11,7 +11,7 @@ pub struct Digest(pub String);
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PackageId {
     pub name: String,
-    pub version: String,
+    pub version: Version,
     pub library: PathBuf,
     pub root: PathBuf,
     pub image_fingerprint: Digest,
@@ -59,14 +59,32 @@ impl PackageLocator {
                 path: description_path.clone(),
                 source,
             })?;
-            let description = Description::parse(&description_text).map_err(|source| Error::Metadata {
-                path: description_path,
-                source,
-            })?;
+            let description = Description::parse(&description_text);
+            let declared_name = description
+                .package()
+                .ok_or_else(|| Error::Metadata {
+                    path: description_path.clone(),
+                    message: "missing Package field".to_owned(),
+                })?;
+            if declared_name.as_str() != name {
+                return Err(Error::Metadata {
+                    path: description_path.clone(),
+                    message: format!(
+                        "installed directory name `{name}` disagrees with DESCRIPTION Package `{}`",
+                        declared_name.as_str(),
+                    ),
+                });
+            }
             let version = description
-                .version()
-                .ok_or_else(|| Error::Analysis(format!("installed package `{name}` has no Version field")))?
-                .to_owned();
+                .version_parsed()
+                .ok_or_else(|| Error::Metadata {
+                    path: description_path.clone(),
+                    message: "missing Version field".to_owned(),
+                })?
+                .map_err(|error| Error::Metadata {
+                    path: description_path.clone(),
+                    message: format!("invalid Version field: {error}"),
+                })?;
             let fingerprint = fingerprint_image(&root)?;
             return Ok(Some(InstalledPackage {
                 id: PackageId {

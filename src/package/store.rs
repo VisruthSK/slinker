@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-binding-linker-v5";
+const ANALYSIS_SCHEMA: &str = "slinker-binding-linker-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyntaxValidation {
@@ -116,7 +116,7 @@ impl PackageStore {
             AIR_VERSION,
             ANALYSIS_SCHEMA,
             package.id.name.as_str(),
-            package.id.version.as_str(),
+            &package.id.version.to_string(),
             library.as_str(),
             package.id.image_fingerprint.0.as_str(),
         ]);
@@ -144,7 +144,7 @@ impl PackageStore {
             let kind = line.split('\t').next().unwrap_or_default();
             match kind {
                 "HEADER" | "EXPORT" | "IMPORT_ALL" | "IMPORT_EXCEPT" | "IMPORT_FROM"
-                | "DATASET" | "S3" | "DYNLIB" | "FILE" | "PACKAGE_ISSUE" => {
+                | "DATASET" | "S3" | "DYNLIB" | "NATIVE_SYMBOL" | "FILE" | "PACKAGE_ISSUE" => {
                     index.push_str(line);
                     index.push('\n');
                 }
@@ -501,10 +501,10 @@ impl PackageProvider for PackageStore {
 
     fn is_target_provided(&self, package: &InstalledPackage) -> bool {
         self.explicit_target.contains(&package.id)
-            || package
-                .description
-                .get("Priority")
-                .is_some_and(|priority| priority.eq_ignore_ascii_case("base"))
+            || matches!(
+                package.description.priority_parsed(),
+                Some(Ok(crate::metadata::Priority::Base))
+            )
     }
 
     fn is_base_binding(&self, name: &str) -> bool {

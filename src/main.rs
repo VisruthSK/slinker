@@ -376,6 +376,9 @@ fn node_label(plan: &LinkPlan, id: NodeId) -> String {
     let node = &plan.graph.nodes[id.0];
     match &node.kind {
         NodeKind::Binding { name } | NodeKind::ExternalBinding { name } => format!("{}::{name}", node.package),
+        NodeKind::PrivateBinding { environment, name } => {
+            format!("{} [private {environment}::{name}]", node.package)
+        }
         NodeKind::Activation => format!("{} [activation]", node.package),
         NodeKind::Dataset { name } => format!("{} [dataset {name}]", node.package),
         NodeKind::Lifecycle { hook } => format!("{}::{hook} [lifecycle]", node.package),
