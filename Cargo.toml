@@ -24,6 +24,7 @@ air = [
 [dependencies]
 sha2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 rayon = { version = "1.12", optional = true }
 
 # Keep slinker's direct Air crates on the exact parser revision used by the

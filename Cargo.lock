@@ -899,6 +899,7 @@ dependencies = [
  "r-metadata",
  "rayon",
  "serde",
+ "serde_json",
  "sha2",
 ]
 

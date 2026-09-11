@@ -3,11 +3,12 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use slinker::analysis::{Edge, LinkPlan, Linker, Need, NodeId, NodeKind};
+use slinker::analysis::{Edge, GraphExport, LinkPlan, Linker, Need, NodeId, NodeKind};
 use slinker::build::Rewrite;
 use slinker::package::PackageStore;
 use slinker::{RToolchain, TargetEnvironment, TargetEnvironmentRequest};
@@ -61,8 +62,15 @@ struct AnalyzeArgs {
     target_provided: BTreeSet<String>,
     extra_pkgs: BTreeSet<String>,
     jobs: usize,
+    graph_format: Option<GraphFormat>,
     dump_graph: Option<PathBuf>,
     dump_objects: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum GraphFormat {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -105,6 +113,7 @@ fn parse_analyze_args(
     let mut target_provided = BTreeSet::new();
     let mut extra_pkgs = BTreeSet::new();
     let mut jobs = default_jobs();
+    let mut graph_format = None;
     let mut dump_graph = None;
     let mut dump_objects = None;
     while let Some(argument) = args.next() {
@@ -151,6 +160,26 @@ fn parse_analyze_args(
         }
         if let Some(value) = text.strip_prefix("--jobs=") {
             jobs = parse_jobs_str(value)?;
+            continue;
+        }
+        if text == "--graph" {
+            if graph_format.is_none() {
+                graph_format = Some(GraphFormat::Text);
+            }
+            continue;
+        }
+        if text == "--graph-format" {
+            let value = args.next().ok_or(CliError::Usage(
+                "`--graph-format` requires `text` or `json`",
+            ))?;
+            let value = value
+                .to_str()
+                .ok_or(CliError::Usage("`--graph-format` must be valid UTF-8"))?;
+            graph_format = Some(parse_graph_format(value)?);
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--graph-format=") {
+            graph_format = Some(parse_graph_format(value)?);
             continue;
         }
         if text == "--dump-graph" {
@@ -206,6 +235,7 @@ fn parse_analyze_args(
         target_provided,
         extra_pkgs,
         jobs,
+        graph_format,
         dump_graph,
         dump_objects,
     })
@@ -325,7 +355,22 @@ fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
     if let Some(path) = &args.dump_objects {
         fs::write(path, dump_object_graphs(&plan))?;
     }
-    print_analysis(&target, &args.root, &plan)?;
+    match args.graph_format {
+        Some(GraphFormat::Json) => {
+            let graph = GraphExport::from_plan(&plan, &target, &args.root)?;
+            let stdout = io::stdout();
+            let mut stdout = stdout.lock();
+            serde_json::to_writer_pretty(&mut stdout, &graph)?;
+            writeln!(stdout)?;
+        }
+        Some(GraphFormat::Text) => {
+            print_analysis(&target, &args.root, &plan)?;
+            let graph = GraphExport::from_plan(&plan, &target, &args.root)?;
+            println!();
+            print!("{}", graph.render_text());
+        }
+        None => print_analysis(&target, &args.root, &plan)?,
+    }
     Ok(())
 }
 
@@ -351,6 +396,7 @@ fn query_link_args(args: &QueryArgs) -> AnalyzeArgs {
         target_provided: args.target_provided.clone(),
         extra_pkgs: args.extra_pkgs.clone(),
         jobs: args.jobs,
+        graph_format: None,
         dump_graph: None,
         dump_objects: None,
     }
@@ -811,6 +857,14 @@ fn parse_jobs(value: &std::ffi::OsString) -> Result<usize, CliError> {
     parse_jobs_str(value)
 }
 
+fn parse_graph_format(value: &str) -> Result<GraphFormat, CliError> {
+    match value {
+        "text" => Ok(GraphFormat::Text),
+        "json" => Ok(GraphFormat::Json),
+        _ => Err(CliError::InvalidGraphFormat(value.to_owned())),
+    }
+}
+
 fn parse_jobs_str(value: &str) -> Result<usize, CliError> {
     value
         .parse::<usize>()
@@ -891,7 +945,7 @@ fn reject_extra(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<()
 fn print_help() {
     println!(
         "slinker {VERSION}\n\n\
-         Usage:\n  slinker analyze PACKAGE [--lib PATH]... [--target-provided PKG[,PKG...]] [--extra-pkgs PKG...] [--jobs N] [--dump-graph PATH] [--dump-objects PATH]\n  slinker why ROOT TARGET [same options]\n  slinker path ROOT DOWNSTREAM [same options]\n\n\
+         Usage:\n  slinker analyze PACKAGE [--lib PATH]... [--target-provided PKG[,PKG...]] [--extra-pkgs PKG...] [--jobs N] [--graph | --graph-format FORMAT] [--dump-graph PATH] [--dump-objects PATH]\n  slinker why ROOT TARGET [same options]\n  slinker path ROOT DOWNSTREAM [same options]\n\n\
          Link an installed R package image by following reachable semantic bindings.\n  `why` prints a shortest provenance chain; `path` prints every cross-package use site.\n\
          slinker never installs, rebuilds, or downloads packages, and never recursively resolves DESCRIPTION dependencies.\n\n\
          Options:\n\
@@ -899,6 +953,8 @@ fn print_help() {
            --target-provided PKG[,PKG...] leave these exact third-party namespaces external\n\
            --extra-pkgs PKG...             enable named optional packages when reachable\n\
            --jobs N                       analysis workers (default: min(CPUs, 8))\n\
+           --graph                        print the semantic reachability graph after analysis\n\
+           --graph-format FORMAT          graph output format: text or json\n\
            --dump-graph PATH              write deterministic semantic graph dump\n\
            --dump-objects PATH            write deterministic installed object/environment dump\n\n\
          Environment:\n\
@@ -949,11 +1005,16 @@ impl Drop for ScratchDir {
 #[derive(Debug)]
 enum CliError {
     Usage(&'static str),
+    InvalidGraphFormat(String),
 }
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Usage(message) => write!(f, "{message}; run `slinker --help`"),
+            Self::InvalidGraphFormat(value) => write!(
+                f,
+                "invalid value '{value}' for '--graph-format'\npossible values: text, json"
+            ),
         }
     }
 }
@@ -961,7 +1022,7 @@ impl Error for CliError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalyzeArgs, Command, default_jobs, parse_args};
+    use super::{AnalyzeArgs, Command, GraphFormat, default_jobs, parse_args};
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -985,6 +1046,7 @@ mod tests {
                 target_provided: BTreeSet::new(),
                 extra_pkgs: BTreeSet::new(),
                 jobs: default_jobs(),
+                graph_format: None,
                 dump_graph: None,
                 dump_objects: None,
             })
@@ -1013,6 +1075,7 @@ mod tests {
                 target_provided: BTreeSet::new(),
                 extra_pkgs,
                 jobs: 3,
+                graph_format: None,
                 dump_graph: None,
                 dump_objects: None,
             })
@@ -1031,6 +1094,7 @@ mod tests {
                 target_provided: BTreeSet::new(),
                 extra_pkgs: BTreeSet::new(),
                 jobs: 6,
+                graph_format: None,
                 dump_graph: None,
                 dump_objects: None,
             })
@@ -1055,9 +1119,37 @@ mod tests {
                 target_provided: BTreeSet::new(),
                 extra_pkgs: BTreeSet::new(),
                 jobs: default_jobs(),
+                graph_format: None,
                 dump_graph: Some(PathBuf::from("graph.txt")),
                 dump_objects: Some(PathBuf::from("objects.txt")),
             })
+        );
+    }
+
+    #[test]
+    fn accepts_graph_output_options() {
+        let text = parse_args(os(&["analyze", "voucher", "--graph"])).unwrap();
+        let json = parse_args(os(&["analyze", "voucher", "--graph-format", "json"])).unwrap();
+        let explicit_text = parse_args(os(&["analyze", "voucher", "--graph-format=text"])).unwrap();
+
+        for (command, expected) in [
+            (text, GraphFormat::Text),
+            (json, GraphFormat::Json),
+            (explicit_text, GraphFormat::Text),
+        ] {
+            let Command::Analyze(args) = command else {
+                panic!("expected analyze command");
+            };
+            assert_eq!(args.graph_format, Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_graph_format() {
+        let error = parse_args(os(&["analyze", "voucher", "--graph-format", "yaml"])).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid value 'yaml' for '--graph-format'\npossible values: text, json"
         );
     }
 }

@@ -1,7 +1,8 @@
 #![cfg(feature = "air")]
 
 use slinker::analysis::{
-    DiscoveryPolicy, EdgeKind, LinkPolicy, Linker, Need, NodeKind, RejectCode,
+    DiscoveryPolicy, EdgeKind, GraphEdgeReasonExport, GraphExport, LinkPolicy, Linker, Need,
+    NodeKind, RejectCode,
 };
 use slinker::package::{
     BindingImage, BindingOrigin, ClosureSource, Digest, EmbeddedClosureSource,
@@ -11,7 +12,7 @@ use slinker::package::{
     PackageImage, PackageIndex, PackageProvider, PrivateBindingImage, PrivateEnvironmentImage,
     S3Registration, SyntaxValidation,
 };
-use slinker::{Description, Error, Result};
+use slinker::{Description, Error, Result, Target, TargetEnvironment};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -3455,4 +3456,87 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
             && diagnostic.code == RejectCode::PotentialUnboundLocal
             && diagnostic.message.contains("value")
     }));
+}
+
+#[test]
+fn graph_export_is_deterministic_semantic_and_count_consistent() {
+    let analyze = || {
+        let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
+        let foo = package_with(
+            "foo",
+            &[("bar", Some("bar <- function() 1"))],
+            Vec::new(),
+            export("bar"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "",
+        );
+        Linker::new(FakeProvider::new(vec![root, foo]), 2)
+            .analyze("root")
+            .unwrap()
+    };
+    let first_plan = analyze();
+    let second_plan = analyze();
+    let target = TargetEnvironment {
+        target: Target {
+            r_version: "4.6.1".into(),
+            os: "mingw32".into(),
+            arch: "x86_64".into(),
+        },
+        libraries: Vec::new(),
+        base_bindings: Default::default(),
+    };
+
+    let first = GraphExport::from_plan(&first_plan, &target, "root").unwrap();
+    let second = GraphExport::from_plan(&second_plan, &target, "root").unwrap();
+    let first_json = serde_json::to_string_pretty(&first).unwrap();
+    let second_json = serde_json::to_string_pretty(&second).unwrap();
+
+    assert_eq!(first_json, second_json);
+    assert_eq!(first.schema_version, 1);
+    assert_eq!(first.stats.nodes, first.nodes.len());
+    assert_eq!(first.stats.edges, first.edges.len());
+    assert_eq!(first.stats.roots, first.roots.len());
+    assert_eq!(first.stats.nodes, first_plan.graph.nodes.len());
+    assert_eq!(first.stats.edges, first_plan.graph.edges.len());
+    assert!(first.nodes.windows(2).all(|pair| pair[0].id <= pair[1].id));
+    assert!(first.roots.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(first.edges.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(first.edges.iter().any(|edge| {
+        edge.from == "root::f"
+            && edge.to == "foo::bar"
+            && edge.reasons == vec![GraphEdgeReasonExport::QualifiedReference]
+    }));
+    assert!(first.root_reasons.iter().any(|root| {
+        root.id == "root::f" && root.reasons == vec![GraphEdgeReasonExport::ExportRoot]
+    }));
+    assert!(first.root_reasons.iter().any(|root| {
+        root.id == "package:root" && root.reasons == vec![GraphEdgeReasonExport::PackageRoot]
+    }));
+}
+
+#[test]
+fn graph_export_survives_blocked_analysis() {
+    let root = package("root", &[("awkward", Some("awkward <- function() {"))]);
+    let provider = FakeProvider::new(vec![root])
+        .validation(SyntaxValidation::Rejected("unexpected end of input".into()));
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+    assert!(!plan.diagnostics.is_empty());
+
+    let target = TargetEnvironment {
+        target: Target {
+            r_version: "4.6.1".into(),
+            os: "mingw32".into(),
+            arch: "x86_64".into(),
+        },
+        libraries: Vec::new(),
+        base_bindings: Default::default(),
+    };
+    let export = GraphExport::from_plan(&plan, &target, "root").unwrap();
+    let json = serde_json::to_string(&export).unwrap();
+
+    assert!(!export.nodes.is_empty());
+    assert!(!export.blockers.is_empty());
+    assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
 }
