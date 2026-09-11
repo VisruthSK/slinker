@@ -3,9 +3,15 @@ mod index;
 mod locator;
 mod store;
 
-pub use image::{BindingImage, BindingOrigin, ClosureSource, EmbeddedClosureSource, ObjectIssue, ObjectKind, PackageImage, PrivateBindingImage, PrivateEnvironmentImage};
+pub use image::{
+    BindingImage, BindingOrigin, ClosureId, ClosureObject, ClosureSource, CodeId,
+    EmbeddedClosureSource, EmbeddedEnvironmentRef, EnvironmentId, EnvironmentObject,
+    InstalledObject, ObjectId, ObjectIssue, ObjectKind, ObjectProvenance, PackageImage,
+    PackageObjectGraph, PrivateBindingImage, PrivateEnvironmentImage,
+};
 pub use index::{
-    ExportMap, ImportBinding, ImportSpec, LifecycleMetadata, NativeComponent, NativeFacts, NativeRegistration, NativeSafety, NativeSymbolBinding, PackageIndex,
+    ExportMap, ImportBinding, ImportSpec, LifecycleMetadata, NativeComponent, NativeFacts,
+    NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding, PackageIndex,
     S3Registration,
 };
 pub use locator::{Digest, InstalledPackage, PackageId, PackageLocator};

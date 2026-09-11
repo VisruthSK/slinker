@@ -12,8 +12,14 @@ pub struct ImportBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImportSpec {
-    All { package: String, except: Vec<String> },
-    From { package: String, bindings: Vec<ImportBinding> },
+    All {
+        package: String,
+        except: Vec<String>,
+    },
+    From {
+        package: String,
+        bindings: Vec<ImportBinding>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -25,13 +31,25 @@ pub struct S3Registration {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NativeFacts {
+    /// Statically named R bindings called by the component regardless of call
+    /// site. Retained for summaries that truly have fixed callbacks.
     pub callbacks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct NativeRoutineSummary {
+    /// Registered R-side binding or native routine symbol used as the selector.
+    pub selector: String,
+    /// One-based native routine argument positions that are invoked as R
+    /// callables. The `.Call`/`.External` selector itself is not counted.
+    pub callback_arguments: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum NativeSafety {
     Unanalyzed,
     Safe(NativeFacts),
+    Summarized(Vec<NativeRoutineSummary>),
     Unsupported(Vec<String>),
 }
 
@@ -89,7 +107,10 @@ impl PackageIndex {
     }
 }
 
-pub(crate) fn parse_package_index(text: &str, package: InstalledPackage) -> crate::Result<PackageIndex> {
+pub(crate) fn parse_package_index(
+    text: &str,
+    package: InstalledPackage,
+) -> crate::Result<PackageIndex> {
     use crate::Error;
 
     let mut header: Option<(bool, bool)> = None;
@@ -111,7 +132,9 @@ pub(crate) fn parse_package_index(text: &str, package: InstalledPackage) -> crat
         let values = fields
             .map(decode_hex)
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|message| Error::Analysis(format!("index protocol line {}: {message}", line_no + 1)))?;
+            .map_err(|message| {
+                Error::Analysis(format!("index protocol line {}: {message}", line_no + 1))
+            })?;
         match kind {
             "HEADER" => {
                 require(kind, &values, 4, line_no)?;
@@ -131,7 +154,10 @@ pub(crate) fn parse_package_index(text: &str, package: InstalledPackage) -> crat
                 require(kind, &values, 1, line_no)?;
                 let index = imports.len();
                 import_all.insert(values[0].clone(), index);
-                imports.push(ImportSpec::All { package: values[0].clone(), except: Vec::new() });
+                imports.push(ImportSpec::All {
+                    package: values[0].clone(),
+                    except: Vec::new(),
+                });
             }
             "IMPORT_EXCEPT" => {
                 require(kind, &values, 2, line_no)?;
@@ -144,7 +170,10 @@ pub(crate) fn parse_package_index(text: &str, package: InstalledPackage) -> crat
             "IMPORT_FROM" => {
                 require(kind, &values, 3, line_no)?;
                 let package_name = values[0].clone();
-                let binding = ImportBinding { remote: values[1].clone(), local: values[2].clone() };
+                let binding = ImportBinding {
+                    remote: values[1].clone(),
+                    local: values[2].clone(),
+                };
                 if let Some(ImportSpec::From { bindings, .. }) = imports.iter_mut().find(|item| {
                     matches!(item, ImportSpec::From { package, .. } if package == &package_name)
                 }) {
@@ -184,9 +213,12 @@ pub(crate) fn parse_package_index(text: &str, package: InstalledPackage) -> crat
             }
             "NATIVE_SYMBOL" => {
                 require(kind, &values, 3, line_no)?;
-                let native = dynlibs.iter_mut().find(|native| native.name == values[0]).ok_or_else(|| {
-                    Error::Analysis(format!("NATIVE_SYMBOL precedes DYNLIB for {}", values[0]))
-                })?;
+                let native = dynlibs
+                    .iter_mut()
+                    .find(|native| native.name == values[0])
+                    .ok_or_else(|| {
+                        Error::Analysis(format!("NATIVE_SYMBOL precedes DYNLIB for {}", values[0]))
+                    })?;
                 native.symbols.push(NativeSymbolBinding {
                     binding: values[1].clone(),
                     symbol: values[2].clone(),
@@ -197,11 +229,16 @@ pub(crate) fn parse_package_index(text: &str, package: InstalledPackage) -> crat
                 files.push(values[0].clone());
             }
             "PACKAGE_ISSUE" => {}
-            other => return Err(Error::Analysis(format!("unknown installed-index record {other:?}"))),
+            other => {
+                return Err(Error::Analysis(format!(
+                    "unknown installed-index record {other:?}"
+                )));
+            }
         }
     }
 
-    let (on_load, has_sysdata) = header.ok_or_else(|| Error::Analysis("installed index has no HEADER".into()))?;
+    let (on_load, has_sysdata) =
+        header.ok_or_else(|| Error::Analysis("installed index has no HEADER".into()))?;
     binding_names.sort();
     binding_names.dedup();
     datasets.sort();
@@ -240,7 +277,9 @@ fn parse_bool(value: &str) -> crate::Result<bool> {
     match value {
         "0" => Ok(false),
         "1" => Ok(true),
-        other => Err(crate::Error::Analysis(format!("invalid protocol boolean {other:?}"))),
+        other => Err(crate::Error::Analysis(format!(
+            "invalid protocol boolean {other:?}"
+        ))),
     }
 }
 

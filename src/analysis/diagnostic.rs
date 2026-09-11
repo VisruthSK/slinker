@@ -22,6 +22,8 @@ pub enum RejectCode {
     PotentialUnboundLocal,
     SemanticAmbiguity,
     SyntaxObservation,
+    UnknownClosureEnclosure,
+    UnknownNativeEffects,
     UnknownNativeLookup,
     UnresolvedBinding,
     UnsupportedObject,
@@ -40,7 +42,11 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub fn reject(package: impl Into<String>, code: RejectCode, message: impl Into<String>) -> Self {
+    pub fn reject(
+        package: impl Into<String>,
+        code: RejectCode,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             package: package.into(),
             binding: None,

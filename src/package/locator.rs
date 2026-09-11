@@ -52,20 +52,19 @@ impl PackageLocator {
             if !description_path.is_file() {
                 continue;
             }
-            let library = fs::canonicalize(candidate_library)
-                .unwrap_or_else(|_| candidate_library.clone());
+            let library =
+                fs::canonicalize(candidate_library).unwrap_or_else(|_| candidate_library.clone());
             let root = fs::canonicalize(&candidate_root).unwrap_or(candidate_root);
-            let description_text = fs::read_to_string(&description_path).map_err(|source| Error::Io {
-                path: description_path.clone(),
-                source,
-            })?;
-            let description = Description::parse(&description_text);
-            let declared_name = description
-                .package()
-                .ok_or_else(|| Error::Metadata {
+            let description_text =
+                fs::read_to_string(&description_path).map_err(|source| Error::Io {
                     path: description_path.clone(),
-                    message: "missing Package field".to_owned(),
+                    source,
                 })?;
+            let description = Description::parse(&description_text);
+            let declared_name = description.package().ok_or_else(|| Error::Metadata {
+                path: description_path.clone(),
+                message: "missing Package field".to_owned(),
+            })?;
             if declared_name.as_str() != name {
                 return Err(Error::Metadata {
                     path: description_path.clone(),
@@ -112,21 +111,42 @@ fn fingerprint_image(root: &Path) -> Result<Digest> {
     let mut files = Vec::<Entry>::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory).map_err(|source| Error::Io { path: directory.clone(), source })? {
-            let entry = entry.map_err(|source| Error::Io { path: directory.clone(), source })?;
+        for entry in fs::read_dir(&directory).map_err(|source| Error::Io {
+            path: directory.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| Error::Io {
+                path: directory.clone(),
+                source,
+            })?;
             let path = entry.path();
-            let file_type = entry.file_type().map_err(|source| Error::Io { path: path.clone(), source })?;
+            let file_type = entry.file_type().map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
             if file_type.is_dir() {
                 pending.push(path);
             } else if file_type.is_file() {
-                let metadata = entry.metadata().map_err(|source| Error::Io { path: path.clone(), source })?;
-                let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+                let metadata = entry.metadata().map_err(|source| Error::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
                 let modified_ns = metadata
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map(|duration| duration.as_nanos());
-                files.push(Entry { path, relative, size: metadata.len(), modified_ns });
+                files.push(Entry {
+                    path,
+                    relative,
+                    size: metadata.len(),
+                    modified_ns,
+                });
             }
         }
     }
@@ -157,7 +177,9 @@ fn fingerprint_image(root: &Path) -> Result<Digest> {
             let mut fields = text.trim().split('\t');
             if fields.next() == Some(manifest.as_str()) {
                 if let Some(fingerprint) = fields.next() {
-                    if fingerprint.len() == 64 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    if fingerprint.len() == 64
+                        && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    {
                         return Ok(Digest(fingerprint.to_owned()));
                     }
                 }
@@ -170,11 +192,17 @@ fn fingerprint_image(root: &Path) -> Result<Digest> {
     for entry in &files {
         hash.update(entry.relative.as_bytes());
         hash.update([0]);
-        let file = File::open(&entry.path).map_err(|source| Error::Io { path: entry.path.clone(), source })?;
+        let file = File::open(&entry.path).map_err(|source| Error::Io {
+            path: entry.path.clone(),
+            source,
+        })?;
         let mut reader = BufReader::new(file);
         let mut buffer = [0u8; 128 * 1024];
         loop {
-            let read = reader.read(&mut buffer).map_err(|source| Error::Io { path: entry.path.clone(), source })?;
+            let read = reader.read(&mut buffer).map_err(|source| Error::Io {
+                path: entry.path.clone(),
+                source,
+            })?;
             if read == 0 {
                 break;
             }
@@ -219,7 +247,8 @@ fn fingerprint_cache_path(root: &Path) -> PathBuf {
     let mut key = Sha256::new();
     key.update(b"slinker-fingerprint-path-v1\0");
     key.update(root.to_string_lossy().as_bytes());
-    base.join("fingerprints").join(format!("{:x}.slinker", key.finalize()))
+    base.join("fingerprints")
+        .join(format!("{:x}.slinker", key.finalize()))
 }
 
 pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<str>>) -> Digest {

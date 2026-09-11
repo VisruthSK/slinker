@@ -231,7 +231,9 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
         active = read$active,
         type = "unavailable",
         closure = NULL,
+        environment = NULL,
         closures = list(),
+        environments = list(),
         issues = list(list(path = "$", kind = "force_error", detail = conditionMessage(read$value)))
       )
     } else {
@@ -245,7 +247,9 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
           environment = scan$root_environment,
           source = .slinker_analysis_binding(name, value)
         ) else NULL,
+        environment = if (typeof(value) == "environment") scan$root_environment else NULL,
         closures = scan$closures,
+        environments = scan$environments,
         issues = scan$issues
       )
     }
@@ -261,6 +265,7 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
 .slinker_scan_retained_object <- function(value, state) {
   issues <- list()
   closures <- list()
+  environments <- list()
   seen_envs <- list()
 
   add_issue <- function(path, kind, detail) {
@@ -280,6 +285,12 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
         ".slinker_embedded <- ",
         paste(deparse(value, width.cutoff = 500L, control = c("keepInteger", "keepNA", "niceNames")), collapse = "\n")
       )
+    )
+  }
+  add_environment <- function(path, env_ref) {
+    environments[[length(environments) + 1L]] <<- list(
+      path = path,
+      environment = env_ref
     )
   }
 
@@ -302,7 +313,7 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
       if (startsWith(env_ref, "unsupported:")) {
         add_issue(paste0(path, ".environment"), "environment_identity", substring(env_ref, 13L))
       }
-    } else if (type %in% c("list", "expression", "pairlist", "language")) {
+    } else if (type %in% c("list", "pairlist")) {
       values <- as.list(x)
       if (length(values)) {
         for (i in seq_along(values)) {
@@ -311,8 +322,14 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
           }
         }
       }
+    } else if (type %in% c("language", "expression")) {
+      # Language and expression objects are data at inspection time. Do not
+      # recursively promote symbols or function literals inside them to live
+      # executable objects. Supported eval/parse semantics may activate them
+      # later at the analysis layer.
     } else if (type == "environment") {
       ref <- environment_ref(x)
+      if (embedded && !startsWith(ref, "unsupported:")) add_environment(path, ref)
       if (startsWith(ref, "unsupported:")) {
         add_issue(path, "environment_identity", substring(ref, 13L))
       } else if (startsWith(ref, "private:") && !seen_environment(x)) {
@@ -340,20 +357,30 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
       add_issue(path, "unsupported_type", type)
     }
 
-    attrs <- attributes(x)
-    if (length(attrs)) {
-      for (name in names(attrs)) {
-        walk(attrs[[name]], paste0(path, ".attr[", name, "]"), depth + 1L, TRUE)
+    if (!(type %in% c("language", "expression"))) {
+      attrs <- attributes(x)
+      if (length(attrs)) {
+        for (name in names(attrs)) {
+          walk(attrs[[name]], paste0(path, ".attr[", name, "]"), depth + 1L, TRUE)
+        }
       }
     }
     invisible(NULL)
   }
 
   walk(value)
+  root_environment <- if (typeof(value) == "closure") {
+    environment_ref(environment(value))
+  } else if (typeof(value) == "environment") {
+    environment_ref(value)
+  } else {
+    NULL
+  }
   list(
     issues = issues,
     closures = closures,
-    root_environment = if (typeof(value) == "closure") environment_ref(environment(value)) else NULL
+    environments = environments,
+    root_environment = root_environment
   )
 }
 
@@ -372,8 +399,20 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
         binding$type,
         if (binding$active) "1" else "0"
       )
+      if (!is.null(binding$environment)) {
+        emit("PRIVATE_BINDING_ENV", env_ref, binding$name, binding$environment)
+      }
       for (issue in binding$issues) {
         emit("PRIVATE_BINDING_ISSUE", env_ref, binding$name, issue$path, issue$kind, issue$detail)
+      }
+      for (nested_env in binding$environments) {
+        emit(
+          "PRIVATE_NESTED_ENV",
+          env_ref,
+          binding$name,
+          nested_env$path,
+          nested_env$environment
+        )
       }
       for (closure in binding$closures) {
         emit(
@@ -421,7 +460,9 @@ slinker_inspect_image <- function(library, package, output, visible_libraries = 
     type <- typeof(value)
     emit("BINDING", name, origin, type, if (read$active) "1" else "0")
     scan <- .slinker_scan_retained_object(value, scan_state)
+    if (identical(type, "environment")) emit("BINDING_ENV", name, scan$root_environment)
     for (issue in scan$issues) emit("BINDING_ISSUE", name, issue$path, issue$kind, issue$detail)
+    for (nested_env in scan$environments) emit("NESTED_ENV", name, nested_env$path, nested_env$environment)
     for (closure in scan$closures) emit("NESTED_CLOSURE", name, closure$path, closure$environment, closure$source)
     if (identical(type, "closure")) {
       source <- .slinker_analysis_binding(name, value)

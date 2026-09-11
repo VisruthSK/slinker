@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::fmt;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -59,15 +59,20 @@ impl RRuntimeServer {
             message: "persistent R runtime stdin is closed".into(),
         })?;
         let path = manifest.to_string_lossy();
-        writeln!(stdin, "{command}\t{}", encode_hex(path.as_bytes())).map_err(ToolchainError::Io)?;
+        writeln!(stdin, "{command}\t{}", encode_hex(path.as_bytes()))
+            .map_err(ToolchainError::Io)?;
         stdin.flush().map_err(ToolchainError::Io)?;
 
         match self.responses.recv_timeout(Duration::from_secs(seconds)) {
             Ok(response) if response == "OK" => Ok(()),
             Ok(response) if response.starts_with("ERROR\t") => {
                 let encoded = &response[6..];
-                let message = decode_hex(encoded).unwrap_or_else(|| format!("invalid encoded R runtime error: {encoded}"));
-                Err(ToolchainError::Runtime { program: self.program.clone(), message })
+                let message = decode_hex(encoded)
+                    .unwrap_or_else(|| format!("invalid encoded R runtime error: {encoded}"));
+                Err(ToolchainError::Runtime {
+                    program: self.program.clone(),
+                    message,
+                })
             }
             Ok(response) => Err(ToolchainError::Runtime {
                 program: self.program.clone(),
@@ -77,14 +82,25 @@ impl RRuntimeServer {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
                 self.stdin.take();
-                Err(ToolchainError::Timeout { program: self.program.clone(), seconds, context })
+                Err(ToolchainError::Timeout {
+                    program: self.program.clone(),
+                    seconds,
+                    context,
+                })
             }
             Err(RecvTimeoutError::Disconnected) => {
-                let status = self.child.try_wait().ok().flatten().and_then(|status| status.code());
+                let status = self
+                    .child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .and_then(|status| status.code());
                 self.stdin.take();
                 Err(ToolchainError::Runtime {
                     program: self.program.clone(),
-                    message: format!("persistent R runtime terminated unexpectedly with status {status:?}"),
+                    message: format!(
+                        "persistent R runtime terminated unexpectedly with status {status:?}"
+                    ),
                 })
             }
         }
@@ -113,7 +129,11 @@ impl Drop for RRuntimeServer {
 impl RToolchain {
     pub fn from_r(r: impl Into<PathBuf>) -> Self {
         let r = r.into();
-        let name = if cfg!(windows) { "Rscript.exe" } else { "Rscript" };
+        let name = if cfg!(windows) {
+            "Rscript.exe"
+        } else {
+            "Rscript"
+        };
         let rscript = r
             .parent()
             .map(|parent| parent.join(name))
@@ -140,10 +160,8 @@ cat(R.version$arch, "\n", sep = "")
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let probe_dir = std::env::temp_dir().join(format!(
-            "slinker-probe-{}-{nonce}",
-            std::process::id()
-        ));
+        let probe_dir =
+            std::env::temp_dir().join(format!("slinker-probe-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&probe_dir).map_err(ToolchainError::Io)?;
         let probe_path = probe_dir.join("probe.R");
         fs::write(&probe_path, PROBE).map_err(ToolchainError::Io)?;
@@ -159,7 +177,11 @@ cat(R.version$arch, "\n", sep = "")
         if r_version.is_empty() || os.is_empty() || arch.is_empty() {
             return Err(ToolchainError::InvalidProbe(stdout.into_owned()));
         }
-        Ok(Target { r_version, os, arch })
+        Ok(Target {
+            r_version,
+            os,
+            arch,
+        })
     }
 
     pub(crate) fn rscript_command(&self) -> Command {
@@ -277,7 +299,12 @@ cat(R.version$arch, "\n", sep = "")
             }
         });
 
-        Ok(RRuntimeServer { program, child, stdin: Some(stdin), responses })
+        Ok(RRuntimeServer {
+            program,
+            child,
+            stdin: Some(stdin),
+            responses,
+        })
     }
 }
 
@@ -341,13 +368,21 @@ pub(crate) fn checked_output_timeout(
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err(ToolchainError::Timeout { program, seconds, context });
+            return Err(ToolchainError::Timeout {
+                program,
+                seconds,
+                context,
+            });
         }
         thread::sleep(Duration::from_millis(25));
     };
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
-    let output = Output { status, stdout, stderr };
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
     if output.status.success() {
         Ok(output)
     } else {
@@ -359,7 +394,6 @@ pub(crate) fn checked_output_timeout(
         })
     }
 }
-
 
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -397,20 +431,52 @@ impl fmt::Display for ToolchainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "failed to run R toolchain: {error}"),
-            Self::Failed { program, status, stdout, stderr } => {
+            Self::Failed {
+                program,
+                status,
+                stdout,
+                stderr,
+            } => {
                 let stdout = stdout.trim();
                 let stderr = stderr.trim();
                 if stdout.is_empty() {
-                    write!(f, "{} exited with {:?}: {}", program.display(), status, stderr)
+                    write!(
+                        f,
+                        "{} exited with {:?}: {}",
+                        program.display(),
+                        status,
+                        stderr
+                    )
                 } else if stderr.is_empty() {
-                    write!(f, "{} exited with {:?}: {}", program.display(), status, stdout)
+                    write!(
+                        f,
+                        "{} exited with {:?}: {}",
+                        program.display(),
+                        status,
+                        stdout
+                    )
                 } else {
-                    write!(f, "{} exited with {:?}: {}\n{}", program.display(), status, stderr, stdout)
+                    write!(
+                        f,
+                        "{} exited with {:?}: {}\n{}",
+                        program.display(),
+                        status,
+                        stderr,
+                        stdout
+                    )
                 }
             }
             Self::InvalidProbe(stdout) => write!(f, "invalid R toolchain probe output: {stdout:?}"),
             Self::Runtime { program, message } => write!(f, "{}: {message}", program.display()),
-            Self::Timeout { program, seconds, context } => write!(f, "{} timed out after {seconds}s ({context})", program.display()),
+            Self::Timeout {
+                program,
+                seconds,
+                context,
+            } => write!(
+                f,
+                "{} timed out after {seconds}s ({context})",
+                program.display()
+            ),
         }
     }
 }

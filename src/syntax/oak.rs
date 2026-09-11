@@ -3,23 +3,27 @@
 //! Air owns parsing. Oak owns lexical scopes, definitions, uses, use-def
 //! relationships, lexical fallthrough, and annotated evaluation/NSE effects.
 //! Slinker translates Oak results into the fact types consumed by the existing
-//! demand linker. Source-text inspection below is limited to recovering static
-//! arguments and spans at sites Oak has already classified as semantically live.
-//! It does not decide lexical reachability or rebuild control-flow state.
+//! demand linker. Source-text inspection below recovers static arguments and
+//! spans at sites Oak has already classified as semantically live. A narrow
+//! refinement can discharge Oak conditional fallthrough only when Oak's own
+//! reaching definitions plus stable repeated predicates or terminating branches
+//! prove that every surviving path is bound. It does not build a parallel lexical
+//! environment or general control-flow evaluator.
 
 use crate::syntax::facts::{
-    ActiveBindingDef, CalleeKind, CallSite, EvalPhase, NameRef, NameRefKind, PackageGuard,
+    ActiveBindingDef, CallSite, CalleeKind, EvalPhase, NameRef, NameRefKind, PackageGuard,
     PackageRef, ParsedExpression, ParsedRFile, ResourceRef, SemanticIssue, SemanticIssueKind,
     StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span};
 use crate::{Error, Result};
-use air_r_parser::{parse, RParserOptions};
+use air_r_parser::{RParserOptions, parse};
 use air_r_syntax::RRoot;
 use oak_semantic::semantic_index::{
-    DefinitionKind, NamespaceAccessKind, ScopeId, SemanticDiagnostic, SemanticIndex,
+    DefinitionKind, NamespaceAccessKind, ScopeId, ScopeKind, SemanticDiagnostic, SemanticIndex,
+    UseId,
 };
-use oak_semantic::{build_index, EffectsHandlers, ImportsResolver, SourceResolution};
+use oak_semantic::{EffectsHandlers, ImportsResolver, SourceResolution, build_index};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub trait RParser {
@@ -144,6 +148,11 @@ impl NamespaceImports {
 pub struct OakParseContext {
     shadowed_names: BTreeSet<String>,
     imports: NamespaceImports,
+    /// Package-local closures that slinker has conservatively proved cannot
+    /// return to their caller. This is used only to refine Oak conditional
+    /// fallthrough diagnostics after Oak has identified the live use and its
+    /// reaching definitions.
+    non_returning_names: BTreeSet<String>,
 }
 
 impl OakParseContext {
@@ -151,16 +160,19 @@ impl OakParseContext {
         Self {
             shadowed_names,
             imports: NamespaceImports::default(),
+            non_returning_names: BTreeSet::new(),
         }
     }
 
     pub(crate) fn with_imports(
         shadowed_names: BTreeSet<String>,
         imports: NamespaceImports,
+        non_returning_names: BTreeSet<String>,
     ) -> Self {
         Self {
             shadowed_names,
             imports,
+            non_returning_names,
         }
     }
 
@@ -250,6 +262,8 @@ struct LiveUse {
     name: String,
     start: usize,
     end: usize,
+    scope: ScopeId,
+    use_id: UseId,
     callee_kind: CalleeKind,
     phase: EvalPhase,
 }
@@ -275,8 +289,27 @@ struct LiveCall {
     raw: RawCall,
 }
 
+#[derive(Debug, Clone)]
+struct FunctionRegion {
+    function_start: usize,
+    formals_start: usize,
+    formals_end: usize,
+    body_start: usize,
+    body_end: usize,
+    parameters: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ForRegion {
+    variable: String,
+    variable_start: usize,
+    body_start: usize,
+    body_end: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IfRegion {
+    if_start: usize,
     condition_start: usize,
     condition_end: usize,
     then_start: usize,
@@ -327,7 +360,6 @@ fn translate_index(
     context: &OakParseContext,
     index: &SemanticIndex,
 ) -> ParsedRFile {
-    let mut references = Vec::new();
     let mut live_uses = Vec::new();
 
     for scope in index.scope_ids() {
@@ -339,7 +371,8 @@ fn translate_index(
             let start = text_offset(range.start());
             let end = text_offset(range.end());
             let bound = index.use_is_bound(scope, use_id);
-            let has_reaching_definitions = index.reaching_definitions(scope, use_id).next().is_some();
+            let has_reaching_definitions =
+                index.reaching_definitions(scope, use_id).next().is_some();
             let callee_kind = if bound {
                 CalleeKind::DefinitelyLexical
             } else if has_reaching_definitions {
@@ -349,27 +382,66 @@ fn translate_index(
             };
 
             live_uses.push(LiveUse {
-                name: name.clone(),
+                name,
                 start,
                 end,
+                scope,
+                use_id,
                 callee_kind,
                 phase,
             });
+        }
+    }
 
-            let kind = match callee_kind {
-                CalleeKind::DefinitelyLexical => continue,
+    let function_regions = find_function_regions(text);
+    let for_regions = find_for_regions(text);
+    let if_regions = find_if_regions(text);
+    for live_use in &mut live_uses {
+        // Oak currently treats a `for` induction definition as sufficient to
+        // bind a later use. R has a zero-iteration path where that assignment
+        // never happens. Put that path back before applying positive slinker
+        // refinements. A pre-existing definitely executed binding still makes
+        // the post-loop use safe.
+        if live_use.callee_kind == CalleeKind::DefinitelyLexical
+            && post_for_use_may_fall_through(text, index, &for_regions, &if_regions, live_use)
+        {
+            live_use.callee_kind = CalleeKind::ConditionalFallthrough;
+        }
+
+        if live_use.callee_kind != CalleeKind::DefinitelyLexical
+            && (formal_default_use_is_bound(&function_regions, live_use)
+                || for_body_use_is_bound(index, &for_regions, live_use))
+        {
+            live_use.callee_kind = CalleeKind::DefinitelyLexical;
+            continue;
+        }
+        if live_use.callee_kind == CalleeKind::ConditionalFallthrough
+            && conditional_fallthrough_proven_bound(text, context, index, &if_regions, live_use)
+        {
+            live_use.callee_kind = CalleeKind::DefinitelyLexical;
+        }
+    }
+
+    let mut references = live_uses
+        .iter()
+        .filter_map(|live_use| {
+            if is_r_language_constant(&live_use.name) {
+                return None;
+            }
+            let kind = match live_use.callee_kind {
+                CalleeKind::DefinitelyLexical => return None,
                 CalleeKind::DefinitelyExternal => NameRefKind::External,
                 CalleeKind::ConditionalFallthrough => NameRefKind::ConditionalFallthrough,
             };
-            references.push(NameRef {
-                name,
+            Some(NameRef {
+                name: live_use.name.clone(),
                 kind,
-                phase,
+                phase: live_use.phase,
                 guards: Vec::new(),
-                span: Span::new(source.clone(), start, end),
-            });
-        }
-    }
+                span: Span::new(source.clone(), live_use.start, live_use.end),
+            })
+        })
+        .collect::<Vec<_>>();
 
     let mut package_refs = Vec::new();
     let mut live_calls = Vec::new();
@@ -383,7 +455,16 @@ fn translate_index(
                 callee: live_use.name.clone(),
                 callee_kind: live_use.callee_kind,
                 qualified_package: None,
-                args: raw.args.iter().map(|argument| argument.static_arg.clone()).collect(),
+                args: raw
+                    .args
+                    .iter()
+                    .map(|argument| argument.static_arg.clone())
+                    .collect(),
+                arg_names: raw
+                    .args
+                    .iter()
+                    .map(|argument| argument.name.clone())
+                    .collect(),
                 phase: live_use.phase,
                 guards: Vec::new(),
                 span: Span::new(source.clone(), raw.start, raw.end),
@@ -419,7 +500,16 @@ fn translate_index(
                     callee: access.symbol().to_owned(),
                     callee_kind: CalleeKind::DefinitelyExternal,
                     qualified_package: Some(access.package().to_owned()),
-                    args: raw.args.iter().map(|argument| argument.static_arg.clone()).collect(),
+                    args: raw
+                        .args
+                        .iter()
+                        .map(|argument| argument.static_arg.clone())
+                        .collect(),
+                    arg_names: raw
+                        .args
+                        .iter()
+                        .map(|argument| argument.name.clone())
+                        .collect(),
                     phase: phase_for_scope(index, scope),
                     guards: Vec::new(),
                     span: Span::new(source.clone(), raw.start, raw.end),
@@ -431,7 +521,6 @@ fn translate_index(
 
     deduplicate_calls(&mut live_calls);
 
-    let if_regions = find_if_regions(text);
     let mut guard_regions = if_guard_regions(text, context, &if_regions, &live_calls);
     apply_guard_regions_to_references(&guard_regions, &mut references);
     apply_guard_regions_to_package_refs(&guard_regions, &mut package_refs);
@@ -452,7 +541,14 @@ fn translate_index(
         &live_calls,
         &if_regions,
     );
-    let (mut effects, suppressed_reference_spans) = collect_superassignments(source.clone(), text, index);
+    let (mut effects, suppressed_reference_spans) = collect_superassignments(
+        source.clone(),
+        text,
+        index,
+        &function_regions,
+        &for_regions,
+        &if_regions,
+    );
     references.retain(|reference| {
         !suppressed_reference_spans.iter().any(|(name, start, end)| {
             reference.name == *name && reference.span.start == *start && reference.span.end == *end
@@ -488,6 +584,1302 @@ fn phase_for_scope(index: &SemanticIndex, scope: ScopeId) -> EvalPhase {
 
 fn text_offset(offset: impl Into<u32>) -> usize {
     offset.into() as usize
+}
+
+fn is_r_language_constant(name: &str) -> bool {
+    matches!(
+        name,
+        "NULL"
+            | "TRUE"
+            | "FALSE"
+            | "NA"
+            | "NaN"
+            | "Inf"
+            | "NA_integer_"
+            | "NA_real_"
+            | "NA_complex_"
+            | "NA_character_"
+    )
+}
+
+fn formal_default_use_is_bound(regions: &[FunctionRegion], live_use: &LiveUse) -> bool {
+    let mut containing = regions
+        .iter()
+        .filter(|region| {
+            live_use.start >= region.formals_start && live_use.end <= region.formals_end
+        })
+        .collect::<Vec<_>>();
+    containing.sort_by_key(|region| region.formals_end.saturating_sub(region.formals_start));
+    containing
+        .into_iter()
+        .any(|region| region.parameters.contains(&live_use.name))
+}
+
+fn for_body_use_is_bound(index: &SemanticIndex, regions: &[ForRegion], live_use: &LiveUse) -> bool {
+    if !regions.iter().any(|region| {
+        region.variable == live_use.name
+            && live_use.start >= region.body_start
+            && live_use.end <= region.body_end
+    }) {
+        return false;
+    }
+
+    index
+        .reaching_definitions(live_use.scope, live_use.use_id)
+        .any(|(scope, definition_id)| {
+            let definition = &index.definitions(scope)[definition_id];
+            let symbol = index.symbols(scope).symbol(definition.symbol());
+            symbol.name() == live_use.name
+                && matches!(definition.kind(), DefinitionKind::ForVariable(_))
+        })
+}
+
+/// Whether a use after a `for` loop must retain the loop's zero-iteration
+/// fallthrough. Oak's current use-def map can report the induction variable as
+/// definitely bound after the loop, but R assigns it only when an iteration
+/// actually begins.
+fn post_for_use_may_fall_through(
+    text: &str,
+    index: &SemanticIndex,
+    regions: &[ForRegion],
+    if_regions: &[IfRegion],
+    live_use: &LiveUse,
+) -> bool {
+    for region in regions.iter().rev() {
+        if region.variable != live_use.name || region.body_end > live_use.start {
+            continue;
+        }
+
+        let has_reaching_for_definition = index
+            .reaching_definitions(live_use.scope, live_use.use_id)
+            .any(|(scope, definition_id)| {
+                if scope != live_use.scope {
+                    return false;
+                }
+                let definition = &index.definitions(scope)[definition_id];
+                let symbol = index.symbols(scope).symbol(definition.symbol());
+                symbol.name() == live_use.name
+                    && matches!(definition.kind(), DefinitionKind::ForVariable(_))
+            });
+        if !has_reaching_for_definition {
+            continue;
+        }
+
+        if scope_has_definite_binding_before(
+            text,
+            index,
+            live_use.scope,
+            &live_use.name,
+            region.variable_start,
+            live_use.start,
+            regions,
+            if_regions,
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    false
+}
+
+fn scope_has_definite_binding_before(
+    text: &str,
+    index: &SemanticIndex,
+    scope: ScopeId,
+    name: &str,
+    before: usize,
+    use_position: usize,
+    for_regions: &[ForRegion],
+    if_regions: &[IfRegion],
+) -> bool {
+    let Some(symbol_id) = index.symbols(scope).id(name) else {
+        return false;
+    };
+
+    index
+        .definitions(scope)
+        .iter()
+        .any(|(_definition_id, definition)| {
+            if definition.symbol() != symbol_id {
+                return false;
+            }
+            match definition.kind() {
+                DefinitionKind::Parameter(_) => true,
+                DefinitionKind::Assignment(_) | DefinitionKind::Assign { .. } => {
+                    let definition_start = text_offset(definition.range().start());
+                    definition_start < before
+                        && definition_must_execute_before_position(
+                            text,
+                            definition_start,
+                            use_position,
+                            for_regions,
+                            if_regions,
+                        )
+                }
+                DefinitionKind::ForVariable(_)
+                | DefinitionKind::SuperAssignment(_)
+                | DefinitionKind::Import { .. } => false,
+            }
+        })
+}
+
+/// A deliberately structural dominance check used only for local bindings that
+/// Oak has already identified. It does not discover names. A definition is
+/// accepted when every enclosing branch/loop containing the definition also
+/// contains the later position, so reaching the later position implies that
+/// the definition's control region was entered.
+fn definition_must_execute_before_position(
+    _text: &str,
+    definition_start: usize,
+    position: usize,
+    for_regions: &[ForRegion],
+    if_regions: &[IfRegion],
+) -> bool {
+    if definition_start >= position {
+        return false;
+    }
+
+    for region in for_regions {
+        if definition_start >= region.body_start && definition_start < region.body_end {
+            if !(position >= region.body_start && position < region.body_end) {
+                return false;
+            }
+        }
+    }
+
+    for region in if_regions {
+        let in_then = definition_start >= region.then_start && definition_start < region.then_end;
+        if in_then && !(position >= region.then_start && position < region.then_end) {
+            return false;
+        }
+        if let (Some(else_start), Some(else_end)) = (region.else_start, region.else_end) {
+            let in_else = definition_start >= else_start && definition_start < else_end;
+            if in_else && !(position >= else_start && position < else_end) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchAssumption {
+    condition: String,
+    truth: bool,
+    symbols: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PredicateValue {
+    String(String),
+    Logical(bool),
+    Number(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SimplePredicate {
+    Eq {
+        symbol: String,
+        value: PredicateValue,
+    },
+    Ne {
+        symbol: String,
+        value: PredicateValue,
+    },
+    IsNull {
+        symbol: String,
+        is_null: bool,
+    },
+    Static(bool),
+}
+
+/// Refine one of Oak's conservative conditional fallthroughs only when the
+/// source proves that every path reaching this use has already executed a
+/// reaching local definition. Oak still supplies the live use and the exact
+/// reaching-definition set. This pass adds a deliberately small path domain
+/// for stable scalar predicates plus definitely terminating branches.
+fn conditional_fallthrough_proven_bound(
+    text: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    live_use: &LiveUse,
+) -> bool {
+    let reaching = index
+        .reaching_definitions(live_use.scope, live_use.use_id)
+        .filter(|(scope, _)| *scope == live_use.scope)
+        .filter_map(|(scope, definition_id)| {
+            let definition = &index.definitions(scope)[definition_id];
+            let symbol = index.symbols(scope).symbol(definition.symbol());
+            (symbol.name() == live_use.name
+                && matches!(definition.kind(), DefinitionKind::Assignment(_)))
+            .then_some((definition, text_offset(definition.range().start())))
+        })
+        .filter(|(_, start)| *start < live_use.start)
+        .collect::<Vec<_>>();
+
+    if reaching.is_empty() {
+        return false;
+    }
+
+    let use_assumptions = branch_assumptions_at(text, regions, live_use.start);
+
+    // Correlate a repeated stable predicate, including equivalent negations
+    // such as an `else` of `x == "a"` and a later `x != "a"` branch.
+    for (_definition, definition_start) in &reaching {
+        if !definition_is_direct_in_branch(text, regions, *definition_start) {
+            continue;
+        }
+        let definition_assumptions = branch_assumptions_at(text, regions, *definition_start);
+        if definition_assumptions.is_empty()
+            || !assumptions_imply(&use_assumptions, &definition_assumptions)
+            || !assumptions_are_repeatable(context, index, live_use.scope, &definition_assumptions)
+        {
+            continue;
+        }
+        let symbols = assumption_symbols(&definition_assumptions);
+        if condition_symbols_stable(text, index, *definition_start, live_use.start, &symbols) {
+            return true;
+        }
+    }
+
+    let definition_starts = reaching.iter().map(|(_, start)| *start).collect::<Vec<_>>();
+
+    // Prove an earlier exhaustive dispatch. A chain is sufficient only when
+    // each path that can continue after it has a direct reaching assignment to
+    // this name; a path may omit the assignment only if it exits the function
+    // or invokes a callee already proved non-returning.
+    for region in regions {
+        let Some(chain_end) = region.else_end else {
+            continue;
+        };
+        if chain_end > live_use.start || region.if_start >= live_use.start {
+            continue;
+        }
+
+        let chain_assumptions = branch_assumptions_at(text, regions, region.if_start);
+        if !assumptions_imply(&use_assumptions, &chain_assumptions) {
+            continue;
+        }
+        let symbols = assumption_symbols(&chain_assumptions);
+        if !condition_symbols_stable(text, index, region.if_start, live_use.start, &symbols) {
+            continue;
+        }
+
+        if if_chain_all_returning_paths_bind(
+            text,
+            context,
+            index,
+            regions,
+            region,
+            &definition_starts,
+        ) {
+            return true;
+        }
+    }
+
+    // Preserve the finite alternatives of an earlier exhaustive equality
+    // dispatch instead of collapsing them to one generic "maybe assigned"
+    // state. This is the ISCAM shape where a later branch re-tests the same
+    // unchanged selector and therefore rules out earlier arms.
+    for region in regions {
+        let Some(chain_end) = region.else_end else {
+            continue;
+        };
+        if chain_end > live_use.start || region.if_start >= live_use.start {
+            continue;
+        }
+        if exhaustive_equality_dispatch_proves_binding(
+            text,
+            context,
+            index,
+            regions,
+            region,
+            live_use,
+            &use_assumptions,
+            &definition_starts,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn branch_assumptions_at(
+    text: &str,
+    regions: &[IfRegion],
+    position: usize,
+) -> Vec<BranchAssumption> {
+    let mut assumptions = Vec::new();
+    for region in regions {
+        let truth = if position >= region.then_start && position < region.then_end {
+            Some(true)
+        } else if let (Some(start), Some(end)) = (region.else_start, region.else_end) {
+            (position >= start && position < end).then_some(false)
+        } else {
+            None
+        };
+        let Some(truth) = truth else {
+            continue;
+        };
+        assumptions.push(BranchAssumption {
+            condition: canonical_condition(text, region.condition_start, region.condition_end),
+            truth,
+            symbols: condition_symbols(text, region.condition_start, region.condition_end),
+        });
+    }
+    assumptions
+}
+
+fn assumptions_imply(known: &[BranchAssumption], required: &[BranchAssumption]) -> bool {
+    required.iter().all(|required| {
+        let Some(required) = effective_predicate(required) else {
+            return false;
+        };
+        known
+            .iter()
+            .filter_map(effective_predicate)
+            .any(|known| known == required)
+    })
+}
+
+fn assumptions_are_repeatable(
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    scope: ScopeId,
+    assumptions: &[BranchAssumption],
+) -> bool {
+    assumptions.iter().all(|assumption| {
+        let Some(predicate) = effective_predicate(assumption) else {
+            return false;
+        };
+        predicate_is_repeatable(context, index, scope, &predicate)
+    })
+}
+
+fn effective_predicate(assumption: &BranchAssumption) -> Option<SimplePredicate> {
+    let predicate = parse_simple_predicate(&assumption.condition)?;
+    if assumption.truth {
+        Some(predicate)
+    } else {
+        Some(negate_predicate(predicate))
+    }
+}
+
+fn predicate_is_repeatable(
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    scope: ScopeId,
+    predicate: &SimplePredicate,
+) -> bool {
+    match predicate {
+        SimplePredicate::Eq { .. } | SimplePredicate::Ne { .. } | SimplePredicate::Static(_) => {
+            true
+        }
+        SimplePredicate::IsNull { .. } => {
+            context.resolves_to_base("is.null") && index.resolve("is.null", scope).is_none()
+        }
+    }
+}
+
+fn negate_predicate(predicate: SimplePredicate) -> SimplePredicate {
+    match predicate {
+        SimplePredicate::Eq { symbol, value } => SimplePredicate::Ne { symbol, value },
+        SimplePredicate::Ne { symbol, value } => SimplePredicate::Eq { symbol, value },
+        SimplePredicate::IsNull { symbol, is_null } => SimplePredicate::IsNull {
+            symbol,
+            is_null: !is_null,
+        },
+        SimplePredicate::Static(value) => SimplePredicate::Static(!value),
+    }
+}
+
+fn parse_simple_predicate(condition: &str) -> Option<SimplePredicate> {
+    let condition = strip_outer_parentheses(condition);
+    if condition == "TRUE" {
+        return Some(SimplePredicate::Static(true));
+    }
+    if condition == "FALSE" {
+        return Some(SimplePredicate::Static(false));
+    }
+    if let Some(inner) = condition
+        .strip_prefix("!is.null(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return static_symbol(inner).map(|symbol| SimplePredicate::IsNull {
+            symbol,
+            is_null: false,
+        });
+    }
+    if let Some(inner) = condition
+        .strip_prefix("is.null(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return static_symbol(inner).map(|symbol| SimplePredicate::IsNull {
+            symbol,
+            is_null: true,
+        });
+    }
+    if let Some((left, right)) = split_top_level_operator(condition, "==") {
+        let (symbol, value) = symbol_constant_pair(left, right)?;
+        return Some(SimplePredicate::Eq { symbol, value });
+    }
+    if let Some((left, right)) = split_top_level_operator(condition, "!=") {
+        let (symbol, value) = symbol_constant_pair(left, right)?;
+        return Some(SimplePredicate::Ne { symbol, value });
+    }
+    None
+}
+
+fn strip_outer_parentheses(mut value: &str) -> &str {
+    loop {
+        if !value.starts_with('(') || !value.ends_with(')') {
+            return value;
+        }
+        let Some(close) = matching_delimiter(value, 0) else {
+            return value;
+        };
+        if close + 1 != value.len() {
+            return value;
+        }
+        value = &value[1..value.len() - 1];
+    }
+}
+
+fn split_top_level_operator<'a>(value: &'a str, operator: &str) -> Option<(&'a str, &'a str)> {
+    let bytes = value.as_bytes();
+    let operator_bytes = operator.as_bytes();
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                cursor += 1;
+            }
+            b'(' => {
+                depth += 1;
+                cursor += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                cursor += 1;
+            }
+            _ if depth == 0
+                && cursor + operator_bytes.len() <= bytes.len()
+                && &bytes[cursor..cursor + operator_bytes.len()] == operator_bytes =>
+            {
+                return Some((&value[..cursor], &value[cursor + operator_bytes.len()..]));
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn symbol_constant_pair(left: &str, right: &str) -> Option<(String, PredicateValue)> {
+    if let (Some(symbol), Some(value)) = (static_symbol(left), predicate_constant(right)) {
+        return Some((symbol, value));
+    }
+    if let (Some(value), Some(symbol)) = (predicate_constant(left), static_symbol(right)) {
+        return Some((symbol, value));
+    }
+    None
+}
+
+fn predicate_constant(value: &str) -> Option<PredicateValue> {
+    if let Some(value) = static_string(value) {
+        return Some(PredicateValue::String(value));
+    }
+    match value {
+        "TRUE" => Some(PredicateValue::Logical(true)),
+        "FALSE" => Some(PredicateValue::Logical(false)),
+        _ if simple_numeric_literal(value) => Some(PredicateValue::Number(value.to_owned())),
+        _ => None,
+    }
+}
+
+fn simple_numeric_literal(value: &str) -> bool {
+    let value = value.strip_suffix('L').unwrap_or(value);
+    !value.is_empty() && value.parse::<f64>().is_ok()
+}
+
+fn exhaustive_equality_dispatch_proves_binding(
+    text: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    region: &IfRegion,
+    live_use: &LiveUse,
+    use_assumptions: &[BranchAssumption],
+    definition_starts: &[usize],
+) -> bool {
+    let mut current = region;
+    let mut selector = None::<String>;
+    let mut cases = Vec::<(PredicateValue, usize, usize)>::new();
+    let final_else = loop {
+        let condition = canonical_condition(text, current.condition_start, current.condition_end);
+        let Some(SimplePredicate::Eq { symbol, value }) = parse_simple_predicate(&condition) else {
+            return false;
+        };
+        if selector
+            .as_ref()
+            .is_some_and(|existing| existing != &symbol)
+        {
+            return false;
+        }
+        selector.get_or_insert(symbol);
+        if cases.iter().any(|(existing, _, _)| existing == &value) {
+            return false;
+        }
+        cases.push((value, current.then_start, current.then_end));
+
+        let (Some(else_start), Some(else_end)) = (current.else_start, current.else_end) else {
+            return false;
+        };
+        if let Some(nested) = regions
+            .iter()
+            .find(|candidate| candidate.if_start == else_start)
+        {
+            current = nested;
+            continue;
+        }
+        break (else_start, else_end);
+    };
+
+    let selector = selector.expect("equality chain has at least one selector");
+    if !branch_exits_current_function(text, context, index, regions, final_else.0, final_else.1) {
+        return false;
+    }
+
+    if !condition_symbols_stable(
+        text,
+        index,
+        region.if_start,
+        live_use.start,
+        &BTreeSet::from([selector.clone()]),
+    ) {
+        return false;
+    }
+
+    let known = use_assumptions
+        .iter()
+        .filter_map(effective_predicate)
+        .collect::<Vec<_>>();
+    let mut possible_case = false;
+    for (value, branch_start, branch_end) in cases {
+        if !case_is_consistent_with(&selector, &value, &known) {
+            continue;
+        }
+        possible_case = true;
+        if !branch_binds_reaching_definition(
+            text,
+            regions,
+            branch_start,
+            branch_end,
+            definition_starts,
+        ) && !branch_exits_current_function(
+            text,
+            context,
+            index,
+            regions,
+            branch_start,
+            branch_end,
+        ) {
+            return false;
+        }
+    }
+    possible_case
+}
+
+fn case_is_consistent_with(
+    selector: &str,
+    value: &PredicateValue,
+    predicates: &[SimplePredicate],
+) -> bool {
+    for predicate in predicates {
+        match predicate {
+            SimplePredicate::Eq {
+                symbol,
+                value: required,
+            } if symbol == selector => {
+                if required != value {
+                    return false;
+                }
+            }
+            SimplePredicate::Ne {
+                symbol,
+                value: excluded,
+            } if symbol == selector => {
+                if excluded == value {
+                    return false;
+                }
+            }
+            SimplePredicate::Static(false) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn assumption_symbols(assumptions: &[BranchAssumption]) -> BTreeSet<String> {
+    assumptions
+        .iter()
+        .flat_map(|assumption| assumption.symbols.iter().cloned())
+        .collect()
+}
+
+fn canonical_condition(text: &str, start: usize, end: usize) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::new();
+    let mut cursor = start;
+    let mut quote = None;
+    while cursor < end {
+        let byte = bytes[cursor];
+        if let Some(delimiter) = quote {
+            output.push(byte as char);
+            if byte == b'\\' {
+                if cursor + 1 < end {
+                    cursor += 1;
+                    output.push(bytes[cursor] as char);
+                }
+            } else if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                output.push(byte as char);
+                cursor += 1;
+            }
+            b'#' => cursor = skip_comment(text, cursor, end),
+            byte if byte.is_ascii_whitespace() => cursor += 1,
+            _ => {
+                let character = text[cursor..].chars().next().expect("valid UTF-8 source");
+                output.push(character);
+                cursor += character.len_utf8();
+            }
+        }
+    }
+    output
+}
+
+fn condition_symbols(text: &str, start: usize, end: usize) -> BTreeSet<String> {
+    let mut symbols = BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut cursor = start;
+    let mut quote = None;
+    while cursor < end {
+        let byte = bytes[cursor];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                cursor = (cursor + 2).min(end);
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                cursor += 1;
+            }
+            b'#' => cursor = skip_comment(text, cursor, end),
+            _ => {
+                let Some(character) = text[cursor..].chars().next() else {
+                    break;
+                };
+                if character.is_alphabetic() || character == '.' || character == '_' {
+                    let token_start = cursor;
+                    cursor += character.len_utf8();
+                    while cursor < end {
+                        let Some(next) = text[cursor..].chars().next() else {
+                            break;
+                        };
+                        if !(next.is_alphanumeric() || next == '.' || next == '_') {
+                            break;
+                        }
+                        cursor += next.len_utf8();
+                    }
+                    if let Some(name) = text.get(token_start..cursor) {
+                        symbols.insert(name.to_owned());
+                    }
+                } else {
+                    cursor += character.len_utf8();
+                }
+            }
+        }
+    }
+    symbols
+}
+
+fn condition_symbols_stable(
+    text: &str,
+    index: &SemanticIndex,
+    start: usize,
+    end: usize,
+    symbols: &BTreeSet<String>,
+) -> bool {
+    if start >= end || symbols.is_empty() {
+        return true;
+    }
+
+    // Invalidate a predicate fact if any syntactic mutation of one of its
+    // symbols appears between the two sites. Checking descendant scopes as
+    // well is conservative: defining a nested closure does not itself execute
+    // its assignments, but refusing a proof is safer than assuming the closure
+    // cannot run and mutate a captured binding before the repeated predicate.
+    for definition_scope in index.scope_ids() {
+        for (_, definition) in index.definitions(definition_scope).iter() {
+            if !matches!(
+                definition.kind(),
+                DefinitionKind::Assignment(_)
+                    | DefinitionKind::SuperAssignment(_)
+                    | DefinitionKind::ForVariable(_)
+                    | DefinitionKind::Assign { .. }
+            ) {
+                continue;
+            }
+            let definition_start = text_offset(definition.range().start());
+            if definition_start <= start || definition_start >= end {
+                continue;
+            }
+            let name = index
+                .symbols(definition_scope)
+                .symbol(definition.symbol())
+                .name();
+            if symbols.contains(name) {
+                return false;
+            }
+        }
+    }
+
+    // `rm()` / `remove()` can destroy a binding without creating an Oak
+    // definition. Refuse the correlation proof if either appears between the
+    // two sites. This is deliberately conservative; false negatives here keep
+    // a PotentialUnboundLocal rather than hiding one.
+    let segment = text.get(start..end).unwrap_or_default();
+    !contains_call_named(segment, "rm") && !contains_call_named(segment, "remove")
+}
+
+fn contains_call_named(text: &str, name: &str) -> bool {
+    let mut offset = 0;
+    while let Some(relative) = text[offset..].find(name) {
+        let start = offset + relative;
+        let end = start + name.len();
+        if word_boundary_before(text, start)
+            && word_boundary_after(text, end)
+            && text.as_bytes().get(skip_trivia(text, end)).copied() == Some(b'(')
+        {
+            return true;
+        }
+        offset = end;
+        if offset >= text.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn definition_is_direct_in_branch(
+    text: &str,
+    regions: &[IfRegion],
+    definition_start: usize,
+) -> bool {
+    regions
+        .iter()
+        .filter_map(|region| {
+            if definition_start >= region.then_start && definition_start < region.then_end {
+                Some((region.then_start, region.then_end))
+            } else if let (Some(start), Some(end)) = (region.else_start, region.else_end) {
+                (definition_start >= start && definition_start < end).then_some((start, end))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|(start, end)| end.saturating_sub(*start))
+        .is_some_and(|(start, end)| {
+            definition_is_top_level_in_branch(text, start, end, definition_start)
+        })
+}
+
+fn if_chain_all_returning_paths_bind(
+    text: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    region: &IfRegion,
+    definition_starts: &[usize],
+) -> bool {
+    if !branch_binds_reaching_definition(
+        text,
+        regions,
+        region.then_start,
+        region.then_end,
+        definition_starts,
+    ) && !branch_exits_current_function(
+        text,
+        context,
+        index,
+        regions,
+        region.then_start,
+        region.then_end,
+    ) {
+        return false;
+    }
+
+    let (Some(else_start), Some(else_end)) = (region.else_start, region.else_end) else {
+        return false;
+    };
+
+    if let Some(nested) = regions
+        .iter()
+        .find(|candidate| candidate.if_start == else_start)
+    {
+        return if_chain_all_returning_paths_bind(
+            text,
+            context,
+            index,
+            regions,
+            nested,
+            definition_starts,
+        );
+    }
+
+    branch_binds_reaching_definition(text, regions, else_start, else_end, definition_starts)
+        || branch_exits_current_function(text, context, index, regions, else_start, else_end)
+}
+
+fn branch_binds_reaching_definition(
+    text: &str,
+    regions: &[IfRegion],
+    branch_start: usize,
+    branch_end: usize,
+    definition_starts: &[usize],
+) -> bool {
+    definition_starts.iter().copied().any(|definition_start| {
+        definition_start >= branch_start
+            && definition_start < branch_end
+            && definition_is_top_level_in_branch(text, branch_start, branch_end, definition_start)
+            && !regions.iter().any(|nested| {
+                nested.if_start >= branch_start
+                    && nested.if_start < branch_end
+                    && nested.if_start != branch_start
+                    && ((definition_start >= nested.then_start && definition_start < nested.then_end)
+                        || matches!((nested.else_start, nested.else_end), (Some(start), Some(end)) if definition_start >= start && definition_start < end))
+            })
+    })
+}
+
+fn definition_is_top_level_in_branch(
+    text: &str,
+    branch_start: usize,
+    branch_end: usize,
+    definition_start: usize,
+) -> bool {
+    let start = skip_trivia_bounded(text, branch_start, branch_end);
+    if text.as_bytes().get(start).copied() != Some(b'{') {
+        return start == definition_start;
+    }
+    let Some(close) = matching_delimiter(text, start) else {
+        return false;
+    };
+    if definition_start <= start || definition_start >= close {
+        return false;
+    }
+
+    let statement = skip_trivia_bounded(
+        text,
+        statement_start(text, definition_start).max(start + 1),
+        definition_start,
+    );
+    if statement != definition_start {
+        return false;
+    }
+
+    let bytes = text.as_bytes();
+    let mut cursor = start + 1;
+    let mut brace_depth = 0usize;
+    let mut quote = None;
+    while cursor < definition_start {
+        let byte = bytes[cursor];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                cursor = (cursor + 2).min(definition_start);
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                cursor += 1;
+            }
+            b'#' => cursor = skip_comment(text, cursor, definition_start),
+            b'{' => {
+                brace_depth += 1;
+                cursor += 1;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                cursor += 1;
+            }
+            _ => cursor += 1,
+        }
+    }
+    brace_depth == 0
+}
+
+fn branch_exits_current_function(
+    text: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    start: usize,
+    end: usize,
+) -> bool {
+    let Some((expression_start, expression_end)) = last_top_level_expression(text, start, end)
+    else {
+        return false;
+    };
+
+    if let Some(region) = regions.iter().find(|region| {
+        region.if_start == expression_start
+            && region
+                .else_end
+                .is_some_and(|else_end| else_end <= expression_end)
+    }) {
+        return if_chain_all_paths_exit(text, context, index, regions, region);
+    }
+
+    let Some((package, callee, callee_start)) =
+        direct_call_expression(text, expression_start, expression_end)
+    else {
+        return false;
+    };
+    if package.is_none() && callee == "return" {
+        return true;
+    }
+    call_is_non_returning(context, index, package.as_deref(), &callee, callee_start)
+}
+
+fn if_chain_all_paths_exit(
+    text: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    region: &IfRegion,
+) -> bool {
+    if !branch_exits_current_function(
+        text,
+        context,
+        index,
+        regions,
+        region.then_start,
+        region.then_end,
+    ) {
+        return false;
+    }
+    let (Some(else_start), Some(else_end)) = (region.else_start, region.else_end) else {
+        return false;
+    };
+    if let Some(nested) = regions
+        .iter()
+        .find(|candidate| candidate.if_start == else_start)
+    {
+        if_chain_all_paths_exit(text, context, index, regions, nested)
+    } else {
+        branch_exits_current_function(text, context, index, regions, else_start, else_end)
+    }
+}
+
+fn bare_call_is_external(index: &SemanticIndex, callee: &str, start: usize) -> bool {
+    for scope in index.scope_ids() {
+        for (use_id, use_site) in index.uses(scope).iter() {
+            if text_offset(use_site.range().start()) != start {
+                continue;
+            }
+            let symbol = index.symbols(scope).symbol(use_site.symbol());
+            if symbol.name() != callee {
+                continue;
+            }
+            return !index.use_is_bound(scope, use_id)
+                && index.reaching_definitions(scope, use_id).next().is_none();
+        }
+    }
+    false
+}
+
+fn call_is_non_returning(
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    package: Option<&str>,
+    callee: &str,
+    callee_start: usize,
+) -> bool {
+    match package {
+        Some("base") => matches!(callee, "stop" | "q" | "quit"),
+        Some(_) => false,
+        None if !bare_call_is_external(index, callee, callee_start) => false,
+        None if matches!(callee, "stop" | "q" | "quit") => context.resolves_to_base(callee),
+        None => context.non_returning_names.contains(callee),
+    }
+}
+
+fn last_top_level_expression(text: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let start = skip_trivia_bounded(text, start, end);
+    let (mut cursor, limit) = if text.as_bytes().get(start).copied() == Some(b'{') {
+        let close = matching_delimiter(text, start)?;
+        (start + 1, close.min(end))
+    } else {
+        (start, end)
+    };
+
+    let mut last = None;
+    while cursor < limit {
+        cursor = skip_trivia_bounded(text, cursor, limit);
+        while cursor < limit && text.as_bytes()[cursor] == b';' {
+            cursor += 1;
+            cursor = skip_trivia_bounded(text, cursor, limit);
+        }
+        if cursor >= limit {
+            break;
+        }
+        let expression_start = cursor;
+        let expression_end = expression_end(text, expression_start).min(limit);
+        if expression_end <= expression_start {
+            break;
+        }
+        last = Some((expression_start, expression_end));
+        cursor = expression_end;
+        while cursor < limit && matches!(text.as_bytes()[cursor], b';' | b'\n' | b'\r') {
+            cursor += 1;
+        }
+    }
+    last
+}
+
+fn direct_call_expression(
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Option<(Option<String>, String, usize)> {
+    let start = skip_trivia_bounded(text, start, end);
+    let first_end = name_token_end(text, start)?;
+    let first = static_symbol(text.get(start..first_end)?)?;
+    let mut cursor = skip_trivia_bounded(text, first_end, end);
+
+    let (package, callee, callee_start) = if text
+        .get(cursor..end)
+        .is_some_and(|rest| rest.starts_with(":::"))
+    {
+        cursor += 3;
+        cursor = skip_trivia_bounded(text, cursor, end);
+        let callee_start = cursor;
+        let callee_end = name_token_end(text, cursor)?;
+        let callee = static_symbol(text.get(cursor..callee_end)?)?;
+        cursor = callee_end;
+        (Some(first), callee, callee_start)
+    } else if text
+        .get(cursor..end)
+        .is_some_and(|rest| rest.starts_with("::"))
+    {
+        cursor += 2;
+        cursor = skip_trivia_bounded(text, cursor, end);
+        let callee_start = cursor;
+        let callee_end = name_token_end(text, cursor)?;
+        let callee = static_symbol(text.get(cursor..callee_end)?)?;
+        cursor = callee_end;
+        (Some(first), callee, callee_start)
+    } else {
+        (None, first, start)
+    };
+
+    cursor = skip_trivia_bounded(text, cursor, end);
+    if text.as_bytes().get(cursor).copied() != Some(b'(') {
+        return None;
+    }
+    let close = matching_delimiter(text, cursor)?;
+    let trailing = skip_trivia_bounded(text, close + 1, end);
+    (trailing >= end).then_some((package, callee, callee_start))
+}
+
+/// Conservative package-local summary used by the linker when constructing an
+/// Oak parse context. This summary is intentionally small: it recognizes only
+/// control flow whose final expression is provably non-returning through base
+/// termination primitives, an exhaustive `if`/`else`, or another package-local
+/// helper already carrying the same summary. Any explicit `return()` elsewhere
+/// in the closure prevents the summary.
+pub(crate) fn closure_definitely_non_returning(text: &str, context: &OakParseContext) -> bool {
+    let Some((body_start, body_end)) = function_body_range(text) else {
+        return false;
+    };
+    if contains_call_named(text.get(body_start..body_end).unwrap_or_default(), "return") {
+        return false;
+    }
+    expression_definitely_non_returning(text, context, body_start, body_end)
+}
+
+fn expression_definitely_non_returning(
+    text: &str,
+    context: &OakParseContext,
+    start: usize,
+    end: usize,
+) -> bool {
+    let Some((expression_start, expression_end)) = last_top_level_expression(text, start, end)
+    else {
+        return false;
+    };
+
+    let regions = find_if_regions(text);
+    if let Some(region) = regions.iter().find(|region| {
+        region.if_start == expression_start
+            && region
+                .else_end
+                .is_some_and(|else_end| else_end <= expression_end)
+    }) {
+        let (Some(else_start), Some(else_end)) = (region.else_start, region.else_end) else {
+            return false;
+        };
+        return expression_definitely_non_returning(
+            text,
+            context,
+            region.then_start,
+            region.then_end,
+        ) && expression_definitely_non_returning(text, context, else_start, else_end);
+    }
+
+    let Some((package, callee, callee_start)) =
+        direct_call_expression(text, expression_start, expression_end)
+    else {
+        return false;
+    };
+
+    match package.as_deref() {
+        Some("base") => matches!(callee.as_str(), "stop" | "q" | "quit"),
+        Some(_) => false,
+        None if matches!(callee.as_str(), "stop" | "q" | "quit") => {
+            context.resolves_to_base(&callee)
+                && !identifier_occurs_before(text, &callee, callee_start)
+        }
+        None => {
+            context.non_returning_names.contains(&callee)
+                && !identifier_occurs_before(text, &callee, callee_start)
+        }
+    }
+}
+
+fn identifier_occurs_before(text: &str, name: &str, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    let mut quote = None;
+    while cursor < end.min(bytes.len()) {
+        let byte = bytes[cursor];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                cursor = (cursor + 2).min(end);
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                cursor += 1;
+            }
+            b'#' => cursor = skip_comment(text, cursor, end),
+            _ if text
+                .get(cursor..end)
+                .is_some_and(|rest| rest.starts_with(name))
+                && word_boundary_before(text, cursor)
+                && word_boundary_after(text, cursor + name.len()) =>
+            {
+                return true;
+            }
+            _ => cursor += text[cursor..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    false
+}
+
+fn function_body_range(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    let mut quote = None;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                cursor += 1;
+            }
+            b'#' => cursor = skip_comment(text, cursor, bytes.len()),
+            b'f' if text
+                .get(cursor..)
+                .is_some_and(|rest| rest.starts_with("function"))
+                && word_boundary_before(text, cursor)
+                && word_boundary_after(text, cursor + "function".len()) =>
+            {
+                let open = skip_trivia(text, cursor + "function".len());
+                if bytes.get(open).copied() != Some(b'(') {
+                    cursor += "function".len();
+                    continue;
+                }
+                let close = matching_delimiter(text, open)?;
+                let body_start = skip_trivia(text, close + 1);
+                if bytes.get(body_start).copied() == Some(b'{') {
+                    let body_close = matching_delimiter(text, body_start)?;
+                    return Some((body_start, body_close + 1));
+                }
+                let body_end = expression_end(text, body_start);
+                return Some((body_start, body_end));
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
 }
 
 fn is_base_call(context: &OakParseContext, call: &CallSite) -> bool {
@@ -579,7 +1971,12 @@ fn collect_active_bindings(
         if call.site.callee != "makeActiveBinding" || !is_base_call(context, &call.site) {
             continue;
         }
-        let Some(StaticArg::String(name)) = call.raw.args.first().and_then(|argument| argument.static_arg.as_ref()) else {
+        let Some(StaticArg::String(name)) = call
+            .raw
+            .args
+            .first()
+            .and_then(|argument| argument.static_arg.as_ref())
+        else {
             continue;
         };
         let Some(target_argument) = call.raw.args.get(2) else {
@@ -590,8 +1987,15 @@ fn collect_active_bindings(
             continue;
         };
         let certain = !if_regions.iter().any(|region| {
-            range_contains(region.then_start, region.then_end, call.site.span.start, call.site.span.end)
-                || region.else_start.zip(region.else_end).is_some_and(|(start, end)| {
+            range_contains(
+                region.then_start,
+                region.then_end,
+                call.site.span.start,
+                call.site.span.end,
+            ) || region
+                .else_start
+                .zip(region.else_end)
+                .is_some_and(|(start, end)| {
                     range_contains(start, end, call.site.span.start, call.site.span.end)
                 })
         });
@@ -621,13 +2025,19 @@ fn collect_environment_aliases(
             let name = index.symbols(scope).symbol(definition.symbol()).name();
             let range = definition.range();
             let target_end = text_offset(range.end());
-            let Some((value_start, value_end)) = assignment_rhs_after(text, target_end, "<-") else {
+            let Some((value_start, value_end)) = assignment_rhs_after(text, target_end, "<-")
+            else {
                 continue;
             };
             let Some(environment_call) = calls.iter().find(|call| {
                 call.site.callee == "environment"
                     && is_base_call(context, &call.site)
-                    && range_contains(value_start, value_end, call.site.span.start, call.site.span.end)
+                    && range_contains(
+                        value_start,
+                        value_end,
+                        call.site.span.start,
+                        call.site.span.end,
+                    )
             }) else {
                 continue;
             };
@@ -639,7 +2049,10 @@ fn collect_environment_aliases(
             else {
                 continue;
             };
-            aliases.insert(name.to_owned(), StaticEnvironment::ClosureBinding(binding.clone()));
+            aliases.insert(
+                name.to_owned(),
+                StaticEnvironment::ClosureBinding(binding.clone()),
+            );
         }
     }
     aliases
@@ -671,7 +2084,9 @@ fn environment_target(
             .args
             .first()
             .and_then(|argument| match argument.static_arg.as_ref() {
-                Some(StaticArg::String(package)) => Some(StaticEnvironment::Namespace(package.clone())),
+                Some(StaticArg::String(package)) => {
+                    Some(StaticEnvironment::Namespace(package.clone()))
+                }
                 _ => None,
             });
     }
@@ -681,7 +2096,9 @@ fn environment_target(
             .args
             .first()
             .and_then(|argument| match argument.static_arg.as_ref() {
-                Some(StaticArg::Symbol(binding)) => Some(StaticEnvironment::ClosureBinding(binding.clone())),
+                Some(StaticArg::Symbol(binding)) => {
+                    Some(StaticEnvironment::ClosureBinding(binding.clone()))
+                }
                 _ => None,
             });
     }
@@ -693,6 +2110,9 @@ fn collect_superassignments(
     source: SourceId,
     text: &str,
     index: &SemanticIndex,
+    function_regions: &[FunctionRegion],
+    for_regions: &[ForRegion],
+    if_regions: &[IfRegion],
 ) -> (Vec<SyntaxEffect>, Vec<(String, usize, usize)>) {
     let mut effects = Vec::new();
     let mut suppressed = Vec::new();
@@ -702,7 +2122,11 @@ fn collect_superassignments(
             if !matches!(definition.kind(), DefinitionKind::SuperAssignment(_)) {
                 continue;
             }
-            let target = index.symbols(scope).symbol(definition.symbol()).name().to_owned();
+            let target = index
+                .symbols(scope)
+                .symbol(definition.symbol())
+                .name()
+                .to_owned();
             let range = definition.range();
             let target_start = text_offset(range.start());
             let target_end = text_offset(range.end());
@@ -720,10 +2144,16 @@ fn collect_superassignments(
                 }
                 None => (target_start, target_end, None),
             };
-            let target_enclosing_local = index
-                .scope(scope)
-                .parent()
-                .is_some_and(|parent| index.resolve(&target, parent).is_some());
+            let target_enclosing_local = superassignment_targets_captured_activation(
+                text,
+                index,
+                function_regions,
+                for_regions,
+                if_regions,
+                scope,
+                target_start,
+                &target,
+            );
             effects.push(SyntaxEffect {
                 kind: SyntaxEffectKind::SuperAssignment,
                 target: Some(target),
@@ -738,6 +2168,135 @@ fn collect_superassignments(
     (effects, suppressed)
 }
 
+fn superassignment_targets_captured_activation(
+    text: &str,
+    index: &SemanticIndex,
+    function_regions: &[FunctionRegion],
+    for_regions: &[ForRegion],
+    if_regions: &[IfRegion],
+    scope: ScopeId,
+    target_start: usize,
+    target: &str,
+) -> bool {
+    // `<<-` skips the current function environment and searches lexical
+    // parents. Oak records the superassignment at its lexical site, but the
+    // index does not expose a point-in-time query for a definition target.
+    // Use Oak to identify bindings, and syntax regions only to identify which
+    // function activation owns those bindings and whether their assignment
+    // must have executed before the nested closure is created.
+    if index.scope(scope).kind() != ScopeKind::Function {
+        return false;
+    }
+
+    let Some(current_function) = innermost_function_region(function_regions, target_start) else {
+        return false;
+    };
+
+    let mut ancestors = function_regions
+        .iter()
+        .filter(|region| {
+            region.function_start != current_function.function_start
+                && region.body_start <= current_function.function_start
+                && current_function.function_start < region.body_end
+        })
+        .collect::<Vec<_>>();
+    ancestors.sort_by_key(|region| region.body_end.saturating_sub(region.body_start));
+
+    for ancestor in ancestors {
+        // Formal bindings exist in the activation frame from function entry.
+        if ancestor.parameters.contains(target) {
+            return true;
+        }
+
+        // The direct child function on the path to the superassignment is the
+        // conservative closure-creation boundary for assignments in this
+        // ancestor. Assignments after that point may still be safe if the
+        // closure is invoked later, but proving that requires call-context
+        // analysis and is deliberately left unresolved here.
+        let child_start = direct_child_function_start(function_regions, ancestor, current_function)
+            .unwrap_or(current_function.function_start);
+
+        for definition_scope in index.scope_ids() {
+            if index.scope(definition_scope).kind() != ScopeKind::Function {
+                continue;
+            }
+            for (_definition_id, definition) in index.definitions(definition_scope).iter() {
+                let symbol = index.symbols(definition_scope).symbol(definition.symbol());
+                if symbol.name() != target {
+                    continue;
+                }
+
+                let definition_start = text_offset(definition.range().start());
+                if definition_start < ancestor.body_start || definition_start >= ancestor.body_end {
+                    continue;
+                }
+                if innermost_function_region(function_regions, definition_start)
+                    .is_some_and(|owner| owner.function_start != ancestor.function_start)
+                {
+                    continue;
+                }
+
+                match definition.kind() {
+                    DefinitionKind::Parameter(_) => return true,
+                    DefinitionKind::Assignment(_) | DefinitionKind::Assign { .. } => {
+                        if definition_must_execute_before_position(
+                            text,
+                            definition_start,
+                            child_start,
+                            for_regions,
+                            if_regions,
+                        ) {
+                            return true;
+                        }
+                    }
+                    DefinitionKind::ForVariable(_) => {
+                        if for_regions.iter().any(|region| {
+                            region.variable == target
+                                && region.variable_start >= ancestor.body_start
+                                && region.variable_start < ancestor.body_end
+                                && child_start >= region.body_start
+                                && child_start < region.body_end
+                        }) {
+                            return true;
+                        }
+                    }
+                    DefinitionKind::SuperAssignment(_) | DefinitionKind::Import { .. } => {}
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn innermost_function_region(
+    regions: &[FunctionRegion],
+    position: usize,
+) -> Option<&FunctionRegion> {
+    regions
+        .iter()
+        .filter(|region| position >= region.body_start && position < region.body_end)
+        .min_by_key(|region| region.body_end.saturating_sub(region.body_start))
+}
+
+fn direct_child_function_start(
+    regions: &[FunctionRegion],
+    ancestor: &FunctionRegion,
+    descendant: &FunctionRegion,
+) -> Option<usize> {
+    regions
+        .iter()
+        .filter(|candidate| {
+            candidate.function_start != ancestor.function_start
+                && candidate.function_start >= ancestor.body_start
+                && candidate.body_end <= ancestor.body_end
+                && candidate.body_start <= descendant.function_start
+                && descendant.function_start < candidate.body_end
+        })
+        .max_by_key(|candidate| candidate.body_end.saturating_sub(candidate.body_start))
+        .map(|candidate| candidate.function_start)
+}
+
 fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<SemanticIssue> {
     index
         .diagnostics()
@@ -749,7 +2308,9 @@ fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<Semanti
                 reason,
             } => SemanticIssue {
                 kind: SemanticIssueKind::AmbiguousEffect,
-                message: format!("Oak could not prove one evaluation effect for `{name}`: {reason:?}"),
+                message: format!(
+                    "Oak could not prove one evaluation effect for `{name}`: {reason:?}"
+                ),
                 span: Some(Span::new(
                     source.clone(),
                     text_offset(call_range.start()),
@@ -812,10 +2373,7 @@ fn apply_guard_regions_to_package_refs(
     }
 }
 
-fn apply_guard_regions_to_calls(
-    regions: &[(usize, usize, PackageGuard)],
-    calls: &mut [LiveCall],
-) {
+fn apply_guard_regions_to_calls(regions: &[(usize, usize, PackageGuard)], calls: &mut [LiveCall]) {
     for (start, end, guard) in regions {
         for call in calls.iter_mut() {
             if range_contains(*start, *end, call.site.span.start, call.site.span.end) {
@@ -1017,7 +2575,11 @@ fn assignment_rhs_after(text: &str, target_end: usize, operator: &str) -> Option
     (value_start < value_end).then_some((value_start, value_end))
 }
 
-fn superassignment_parts(text: &str, target_start: usize, target_end: usize) -> Option<SuperAssignmentParts> {
+fn superassignment_parts(
+    text: &str,
+    target_start: usize,
+    target_end: usize,
+) -> Option<SuperAssignmentParts> {
     let mut cursor = skip_trivia(text, target_end);
     if text.get(cursor..)?.starts_with("<<-") {
         cursor += 3;
@@ -1187,7 +2749,10 @@ fn named_argument_split(text: &str, start: usize, end: usize) -> Option<(String,
                 cursor += 1;
             }
             b'=' if stack.is_empty() => {
-                let previous = cursor.checked_sub(1).and_then(|index| bytes.get(index)).copied();
+                let previous = cursor
+                    .checked_sub(1)
+                    .and_then(|index| bytes.get(index))
+                    .copied();
                 let next = bytes.get(cursor + 1).copied();
                 if matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) || next == Some(b'=') {
                     cursor += 1;
@@ -1396,6 +2961,177 @@ fn matching_delimiter(text: &str, open: usize) -> Option<usize> {
     None
 }
 
+fn find_function_regions(text: &str) -> Vec<FunctionRegion> {
+    let mut regions = Vec::new();
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    let mut quote = None;
+
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                cursor += 1;
+            }
+            b'#' => cursor = skip_comment(text, cursor, bytes.len()),
+            b'f' if text
+                .get(cursor..)
+                .is_some_and(|rest| rest.starts_with("function"))
+                && word_boundary_before(text, cursor)
+                && word_boundary_after(text, cursor + "function".len()) =>
+            {
+                let open = skip_trivia(text, cursor + "function".len());
+                if bytes.get(open).copied() != Some(b'(') {
+                    cursor += "function".len();
+                    continue;
+                }
+                if let Some(region) = function_region_after_open(text, cursor, open) {
+                    regions.push(region);
+                }
+                cursor += "function".len();
+            }
+            b'\\' => {
+                let open = skip_trivia(text, cursor + 1);
+                if bytes.get(open).copied() == Some(b'(') {
+                    if let Some(region) = function_region_after_open(text, cursor, open) {
+                        regions.push(region);
+                    }
+                }
+                cursor += 1;
+            }
+            _ => cursor += text[cursor..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+
+    regions
+}
+
+fn function_region_after_open(
+    text: &str,
+    function_start: usize,
+    open: usize,
+) -> Option<FunctionRegion> {
+    let close = matching_delimiter(text, open)?;
+    let body_start = skip_trivia(text, close + 1);
+    if body_start >= text.len() {
+        return None;
+    }
+    let body_end = expression_end(text, body_start);
+    let parameters = split_arguments(text, open + 1, close)
+        .into_iter()
+        .filter_map(|argument| {
+            let RawArgument {
+                name,
+                value_start,
+                value_end,
+                ..
+            } = argument;
+            name.or_else(|| text.get(value_start..value_end).and_then(static_symbol))
+        })
+        .collect();
+
+    Some(FunctionRegion {
+        function_start,
+        formals_start: open + 1,
+        formals_end: close,
+        body_start,
+        body_end,
+        parameters,
+    })
+}
+
+fn find_for_regions(text: &str) -> Vec<ForRegion> {
+    let mut regions = Vec::new();
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    let mut quote = None;
+
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+                continue;
+            }
+            if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                cursor += 1;
+            }
+            b'#' => cursor = skip_comment(text, cursor, bytes.len()),
+            b'f' if text
+                .get(cursor..)
+                .is_some_and(|rest| rest.starts_with("for"))
+                && word_boundary_before(text, cursor)
+                && word_boundary_after(text, cursor + 3) =>
+            {
+                let open = skip_trivia(text, cursor + 3);
+                if bytes.get(open).copied() != Some(b'(') {
+                    cursor += 3;
+                    continue;
+                }
+                let Some(close) = matching_delimiter(text, open) else {
+                    cursor += 3;
+                    continue;
+                };
+                let variable_start = skip_trivia_bounded(text, open + 1, close);
+                let Some(variable_end) = name_token_end(text, variable_start) else {
+                    cursor += 3;
+                    continue;
+                };
+                let Some(variable) = text
+                    .get(variable_start..variable_end)
+                    .and_then(static_symbol)
+                else {
+                    cursor += 3;
+                    continue;
+                };
+                let in_start = skip_trivia_bounded(text, variable_end, close);
+                if !text
+                    .get(in_start..close)
+                    .is_some_and(|rest| rest.starts_with("in"))
+                    || !word_boundary_after(text, in_start + 2)
+                {
+                    cursor += 3;
+                    continue;
+                }
+                let body_start = skip_trivia(text, close + 1);
+                let body_end = expression_end(text, body_start);
+                regions.push(ForRegion {
+                    variable,
+                    variable_start,
+                    body_start,
+                    body_end,
+                });
+                cursor += 3;
+            }
+            _ => cursor += text[cursor..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+
+    regions
+}
+
 fn find_if_regions(text: &str) -> Vec<IfRegion> {
     let mut regions = Vec::new();
     let bytes = text.as_bytes();
@@ -1420,7 +3156,9 @@ fn find_if_regions(text: &str) -> Vec<IfRegion> {
                 cursor += 1;
             }
             b'#' => cursor = skip_comment(text, cursor, bytes.len()),
-            b'i' if text.get(cursor..).is_some_and(|rest| rest.starts_with("if"))
+            b'i' if text
+                .get(cursor..)
+                .is_some_and(|rest| rest.starts_with("if"))
                 && word_boundary_before(text, cursor)
                 && word_boundary_after(text, cursor + 2) =>
             {
@@ -1448,6 +3186,7 @@ fn find_if_regions(text: &str) -> Vec<IfRegion> {
                     (None, None)
                 };
                 regions.push(IfRegion {
+                    if_start: cursor,
                     condition_start: open + 1,
                     condition_end: close,
                     then_start,
@@ -1516,6 +3255,15 @@ fn expression_end(text: &str, start: usize) -> usize {
                 cursor += 1;
             }
             b';' | b'\n' if stack.is_empty() => return trim_end_offset(text, cursor),
+            b'e' if stack.is_empty()
+                && text
+                    .get(cursor..)
+                    .is_some_and(|rest| rest.starts_with("else"))
+                && word_boundary_before(text, cursor)
+                && word_boundary_after(text, cursor + 4) =>
+            {
+                return trim_end_offset(text, cursor);
+            }
             _ => cursor += 1,
         }
     }
@@ -1586,21 +3334,26 @@ fn word_boundary_before(text: &str, position: usize) -> bool {
         || text
             .get(..position)
             .and_then(|prefix| prefix.chars().next_back())
-            .is_none_or(|character| !(character.is_alphanumeric() || character == '.' || character == '_'))
+            .is_none_or(|character| {
+                !(character.is_alphanumeric() || character == '.' || character == '_')
+            })
 }
 
 fn word_boundary_after(text: &str, position: usize) -> bool {
     text.get(position..)
         .and_then(|suffix| suffix.chars().next())
-        .is_none_or(|character| !(character.is_alphanumeric() || character == '.' || character == '_'))
+        .is_none_or(|character| {
+            !(character.is_alphanumeric() || character == '.' || character == '_')
+        })
 }
 
 impl RParser for OakParser {
     fn parse(&self, source: SourceId, text: &str) -> Result<ParsedRFile> {
-        self.parse_binding(source.clone(), text).map_err(|message| Error::Parse {
-            path: format!("source:{}", source.0),
-            message,
-        })
+        self.parse_binding(source.clone(), text)
+            .map_err(|message| Error::Parse {
+                path: format!("source:{}", source.0),
+                message,
+            })
     }
 }
 
@@ -1681,10 +3434,12 @@ mod tests {
     #[test]
     fn evaluated_namespace_access_is_recorded() {
         let parsed = parse_source("f <- function() foo::bar()");
-        assert!(parsed.expressions[0]
-            .package_refs
-            .iter()
-            .any(|reference| reference.package == "foo" && reference.symbol == "bar"));
+        assert!(
+            parsed.expressions[0]
+                .package_refs
+                .iter()
+                .any(|reference| reference.package == "foo" && reference.symbol == "bar")
+        );
     }
 
     #[test]
@@ -1722,15 +3477,433 @@ mod tests {
     fn attached_search_path_does_not_claim_bare_effect_identity() {
         let context = OakParseContext::default();
         let mut resolver = SlinkerImportsResolver { context: &context };
-        assert!(resolver
-            .resolve_effects("quote", &["some_attached_package".to_owned()])
-            .is_none());
+        assert!(
+            resolver
+                .resolve_effects("quote", &["some_attached_package".to_owned()])
+                .is_none()
+        );
     }
 
     #[test]
     fn definite_local_assignment_never_becomes_external_reference() {
         let parsed = parse_source("f <- function() { x <- 1; x }");
         assert!(!reference_names(&parsed).contains(&"x"));
+    }
+
+    #[test]
+    fn repeated_predicate_proves_local_binding() {
+        let parsed = parse_source(
+            "f <- function(alternative) { if (!is.null(alternative)) { tvalue <- 1 }; if (!is.null(alternative)) tvalue }",
+        );
+        assert!(!reference_names(&parsed).contains(&"tvalue"));
+    }
+
+    #[test]
+    fn repeated_else_if_predicates_preserve_branch_specific_bindings() {
+        let parsed = parse_source(
+            r#"f <- function(alternative, prob2) {
+                if (alternative == "less") {
+                    rr <- 1
+                } else if (alternative == "greater") {
+                    rr <- 2
+                } else if (alternative == "two.sided") {
+                    lowerrr <- 3
+                    upperrr <- 4
+                } else {
+                    stop("bad alternative")
+                }
+                if (!is.null(prob2)) {
+                    if (alternative == "less") rr
+                    else if (alternative == "greater") rr
+                    else if (alternative == "two.sided") lowerrr + upperrr
+                }
+            }"#,
+        );
+        let names = reference_names(&parsed);
+        assert!(!names.contains(&"rr"));
+        assert!(!names.contains(&"lowerrr"));
+        assert!(!names.contains(&"upperrr"));
+    }
+
+    #[test]
+    fn impure_repeated_predicate_does_not_prove_local_binding() {
+        let parsed =
+            parse_source("f <- function() { if (predicate()) x <- 1; if (predicate()) x }");
+        let reference = parsed.expressions[0]
+            .references
+            .iter()
+            .find(|reference| reference.name == "x")
+            .expect("impure repeated predicate must retain fallthrough");
+        assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+    }
+
+    #[test]
+    fn rebound_predicate_symbol_does_not_prove_local_binding() {
+        let parsed =
+            parse_source("f <- function(flag) { if (flag) x <- 1; flag <- !flag; if (flag) x }");
+        let reference = parsed.expressions[0]
+            .references
+            .iter()
+            .find(|reference| reference.name == "x")
+            .expect("rebinding predicate input must retain fallthrough");
+        assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+    }
+
+    #[test]
+    fn broader_later_guard_does_not_hide_real_fallthrough() {
+        let parsed = parse_source(
+            r#"f <- function(alternative) {
+                if (!is.null(alternative)) {
+                    if (alternative == "less") pvalue <- 1
+                    else if (alternative == "greater") pvalue <- 2
+                    else if (alternative == "two.sided") pvalue <- 3
+                }
+                if (!is.null(alternative)) pvalue
+            }"#,
+        );
+        let reference = parsed.expressions[0]
+            .references
+            .iter()
+            .find(|reference| reference.name == "pvalue")
+            .expect("invalid alternative must retain fallthrough");
+        assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+    }
+
+    #[test]
+    fn exhaustive_dispatch_with_stop_proves_local_binding() {
+        let parsed = parse_source(
+            r#"f <- function(direction) {
+                if (direction == "below") showprob <- 1
+                else if (direction == "above") showprob <- 2
+                else if (direction == "between") showprob <- 3
+                else if (direction == "outside") showprob <- 4
+                else stop("bad direction")
+                showprob
+            }"#,
+        );
+        assert!(!reference_names(&parsed).contains(&"showprob"));
+    }
+
+    #[test]
+    fn package_local_non_returning_helper_proves_local_binding() {
+        let mut context = OakParseContext::default();
+        context.non_returning_names.insert(".die".to_owned());
+        let parsed = OakParser
+            .parse_binding_with_context(
+                SourceId(0),
+                r#"f <- function(direction) {
+                    if (direction == "below") showprob <- 1
+                    else if (direction == "above") showprob <- 2
+                    else .die()
+                    showprob
+                }"#,
+                &context,
+            )
+            .unwrap();
+        assert!(!reference_names(&parsed).contains(&"showprob"));
+    }
+
+    #[test]
+    fn missing_final_else_keeps_real_fallthrough() {
+        let parsed = parse_source(
+            r#"f <- function(direction) {
+                if (direction == "below") showprob <- 1
+                else if (direction == "above") showprob <- 2
+                showprob
+            }"#,
+        );
+        let reference = parsed.expressions[0]
+            .references
+            .iter()
+            .find(|reference| reference.name == "showprob")
+            .expect("unhandled direction must remain a fallthrough");
+        assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+    }
+
+    #[test]
+    fn zero_iteration_loop_keeps_real_fallthrough() {
+        let parsed =
+            parse_source("f <- function(xs) { for (i in seq_along(xs)) sephat <- i; sephat }");
+        let reference = parsed.expressions[0]
+            .references
+            .iter()
+            .find(|reference| reference.name == "sephat")
+            .expect("zero-iteration loop must retain fallthrough");
+        assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+    }
+
+    #[test]
+    fn locally_shadowed_non_returning_helper_does_not_discharge_fallthrough() {
+        let mut context = OakParseContext::default();
+        context.non_returning_names.insert(".die".to_owned());
+        let parsed = OakParser
+            .parse_binding_with_context(
+                SourceId(0),
+                "f <- function(flag, .die) { if (flag) x <- 1 else .die(); x }",
+                &context,
+            )
+            .unwrap();
+        let reference = parsed.expressions[0]
+            .references
+            .iter()
+            .find(|reference| reference.name == "x")
+            .expect("shadowed helper may return, so x must still fall through");
+        assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+    }
+
+    #[test]
+    fn locally_shadowed_stop_is_not_summarized_as_non_returning() {
+        let context = OakParseContext::default();
+        assert!(!closure_definitely_non_returning(
+            "function(stop) stop('not base stop')",
+            &context,
+        ));
+    }
+
+    #[test]
+    fn non_returning_summary_requires_terminal_stop() {
+        let context = OakParseContext::default();
+        assert!(closure_definitely_non_returning(
+            "function(message) { stop(message) }",
+            &context,
+        ));
+        assert!(!closure_definitely_non_returning(
+            "function(flag) { if (flag) stop('bad'); 1 }",
+            &context,
+        ));
+    }
+
+    #[test]
+    fn later_formal_is_bound_in_earlier_default() {
+        let parsed = parse_source("f <- function(x = y, y = 1) x");
+        assert!(!reference_names(&parsed).contains(&"y"));
+    }
+
+    #[test]
+    fn missing_later_formal_is_still_bound_in_default_environment() {
+        let parsed = parse_source("f <- function(x = y, y) x");
+        assert!(!reference_names(&parsed).contains(&"y"));
+    }
+
+    #[test]
+    fn self_referential_default_is_not_global_fallthrough() {
+        let parsed = parse_source("f <- function(x = x) x");
+        assert!(!reference_names(&parsed).contains(&"x"));
+    }
+
+    #[test]
+    fn for_variable_is_definitely_bound_inside_body() {
+        let parsed = parse_source("f <- function(xs) { for (x in xs) print(x) }");
+        assert!(!reference_names(&parsed).contains(&"x"));
+    }
+
+    #[test]
+    fn for_variable_may_be_unbound_after_zero_iterations() {
+        let parsed = parse_source("f <- function(xs) { for (x in xs) {}; print(x) }");
+        let reference = parsed.expressions[0]
+            .references
+            .iter()
+            .find(|reference| reference.name == "x")
+            .expect("post-loop use must preserve the zero-iteration fallthrough");
+        assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+    }
+
+    #[test]
+    fn preexisting_binding_keeps_post_for_use_bound() {
+        let parsed = parse_source("f <- function(xs) { x <- 0; for (x in xs) {}; print(x) }");
+        assert!(!reference_names(&parsed).contains(&"x"));
+    }
+
+    #[test]
+    fn nested_for_variables_are_bound_across_next_paths() {
+        let parsed = parse_source(
+            "f <- function(xs, ys, flag) { for (x in xs) { for (y in ys) { if (flag) next; print(x + y) } } }",
+        );
+        let names = reference_names(&parsed);
+        assert!(!names.contains(&"x"));
+        assert!(!names.contains(&"y"));
+    }
+
+    #[test]
+    fn captured_activation_superassignment_is_resolved() {
+        let parsed = parse_source("outer <- function() { x <- 1; function() { x <<- x + 1 } }");
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn conditional_outer_assignment_does_not_fake_capture() {
+        let parsed =
+            parse_source("outer <- function(flag) { if (flag) x <- 1; function() x <<- 2 }");
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(!effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn uncaptured_superassignment_remains_unresolved() {
+        let parsed = parse_source("outer <- function() { function() x <<- 1 }");
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(!effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn current_function_local_does_not_satisfy_superassignment() {
+        let parsed = parse_source("outer <- function() { x <- 1; x <<- 2 }");
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(!effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn current_function_parameter_does_not_satisfy_superassignment() {
+        let parsed = parse_source("outer <- function(x) { x <<- 2 }");
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(!effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn enclosing_function_parameter_satisfies_superassignment() {
+        let parsed = parse_source("outer <- function(x) { function() x <<- 2 }");
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn sibling_function_binding_does_not_satisfy_superassignment() {
+        let parsed = parse_source(
+            "outer <- function() { sibling <- function() { x <- 1 }; function() x <<- 2 }",
+        );
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(!effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn dominating_branch_binding_satisfies_nested_superassignment() {
+        let parsed =
+            parse_source("outer <- function(flag) { if (flag) { x <- 1; function() x <<- 2 } }");
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn three_level_capture_resolves_outer_activation_binding() {
+        let parsed = parse_source(
+            "a <- function() { x <- 1; b <- function() { c <- function() x <<- 2; c }; b() }",
+        );
+        let effect = parsed.expressions[0]
+            .effects
+            .iter()
+            .find(|effect| effect.target.as_deref() == Some("x"))
+            .expect("superassignment effect");
+        assert!(effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn language_constants_do_not_become_external_bindings() {
+        let parsed = parse_source(
+            "f <- function() list(NULL, TRUE, FALSE, NA, NaN, Inf, NA_integer_, NA_real_, NA_complex_, NA_character_)",
+        );
+        let names = reference_names(&parsed);
+        for constant in [
+            "NULL",
+            "TRUE",
+            "FALSE",
+            "NA",
+            "NaN",
+            "Inf",
+            "NA_integer_",
+            "NA_real_",
+            "NA_complex_",
+            "NA_character_",
+        ] {
+            assert!(
+                !names.contains(&constant),
+                "language constant {constant} leaked as a reference"
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_equality_chain_correlates_later_else_branch() {
+        let parsed = parse_source(
+            r#"f <- function(alternative) {
+                if (alternative == "less") {
+                    rr <- 1
+                } else if (alternative == "greater") {
+                    rr <- 2
+                } else if (alternative == "two.sided") {
+                    lowerrr <- 3
+                    upperrr <- 4
+                } else {
+                    stop("bad alternative")
+                }
+                if (alternative == "less") rr
+                else if (alternative == "greater") rr
+                else lowerrr + upperrr
+            }"#,
+        );
+        let names = reference_names(&parsed);
+        assert!(!names.contains(&"rr"));
+        assert!(!names.contains(&"lowerrr"));
+        assert!(!names.contains(&"upperrr"));
+    }
+
+    #[test]
+    fn non_returning_summary_handles_multi_statement_terminal_stop() {
+        let context = OakParseContext::default();
+        assert!(closure_definitely_non_returning(
+            "function(x) { message <- x; stop(message) }",
+            &context,
+        ));
+    }
+
+    #[test]
+    fn non_returning_summary_handles_exhaustive_terminating_if() {
+        let context = OakParseContext::default();
+        assert!(closure_definitely_non_returning(
+            "function(flag) { if (flag) stop('a') else base::stop('b') }",
+            &context,
+        ));
+    }
+
+    #[test]
+    fn explicit_return_prevents_never_returns_summary() {
+        let context = OakParseContext::default();
+        assert!(!closure_definitely_non_returning(
+            "function(flag) { if (flag) return(1); stop('otherwise') }",
+            &context,
+        ));
     }
 
     #[test]
@@ -1754,7 +3927,10 @@ mod tests {
         let mut imports = NamespaceImports::default();
         imports.add_import_all(
             "first",
-            Some(BTreeMap::from([("target".to_owned(), "target_impl".to_owned())])),
+            Some(BTreeMap::from([(
+                "target".to_owned(),
+                "target_impl".to_owned(),
+            )])),
             Vec::<String>::new(),
         );
         imports.add_import_all("missing", None, Vec::<String>::new());

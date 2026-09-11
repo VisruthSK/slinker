@@ -30,7 +30,10 @@ pub struct TargetEnvironmentRequest {
 
 impl TargetEnvironmentRequest {
     pub fn new(work_dir: impl Into<PathBuf>) -> Self {
-        Self { work_dir: work_dir.into(), libraries: Vec::new() }
+        Self {
+            work_dir: work_dir.into(),
+            libraries: Vec::new(),
+        }
     }
 }
 
@@ -67,13 +70,17 @@ fn parse_target_environment(text: &str) -> Result<TargetEnvironment, TargetEnvir
     let mut base_bindings = BTreeSet::new();
 
     for (line_no, line) in text.lines().enumerate() {
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         let mut fields = line.split('\t');
         let kind = fields.next().unwrap_or_default();
         let values = fields
             .map(decode_hex)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| TargetEnvironmentError::Protocol(format!("line {}: {error}", line_no + 1)))?;
+            .map_err(|error| {
+                TargetEnvironmentError::Protocol(format!("line {}: {error}", line_no + 1))
+            })?;
 
         match kind {
             "HEADER" => {
@@ -87,7 +94,11 @@ fn parse_target_environment(text: &str) -> Result<TargetEnvironment, TargetEnvir
             "LIB" => {
                 require_len(kind, &values, 2, line_no)?;
                 let index = values[0].parse::<usize>().map_err(|_| {
-                    TargetEnvironmentError::Protocol(format!("line {}: invalid library index {:?}", line_no + 1, values[0]))
+                    TargetEnvironmentError::Protocol(format!(
+                        "line {}: invalid library index {:?}",
+                        line_no + 1,
+                        values[0]
+                    ))
                 })?;
                 libraries.insert(index, PathBuf::from(&values[1]));
             }
@@ -95,26 +106,46 @@ fn parse_target_environment(text: &str) -> Result<TargetEnvironment, TargetEnvir
                 require_len(kind, &values, 1, line_no)?;
                 base_bindings.insert(values[0].clone());
             }
-            other => return Err(TargetEnvironmentError::Protocol(format!("line {}: unknown record {other:?}", line_no + 1))),
+            other => {
+                return Err(TargetEnvironmentError::Protocol(format!(
+                    "line {}: unknown record {other:?}",
+                    line_no + 1
+                )));
+            }
         }
     }
 
     let target = target.ok_or_else(|| TargetEnvironmentError::Protocol("missing HEADER".into()))?;
     let libraries = libraries.into_values().collect::<Vec<_>>();
 
-    Ok(TargetEnvironment { target, libraries, base_bindings })
+    Ok(TargetEnvironment {
+        target,
+        libraries,
+        base_bindings,
+    })
 }
 
-fn require_len(kind: &str, values: &[String], expected: usize, line_no: usize) -> Result<(), TargetEnvironmentError> {
+fn require_len(
+    kind: &str,
+    values: &[String],
+    expected: usize,
+    line_no: usize,
+) -> Result<(), TargetEnvironmentError> {
     if values.len() == expected {
         Ok(())
     } else {
-        Err(TargetEnvironmentError::Protocol(format!("line {}: {kind} expected {expected} fields, got {}", line_no + 1, values.len())))
+        Err(TargetEnvironmentError::Protocol(format!(
+            "line {}: {kind} expected {expected} fields, got {}",
+            line_no + 1,
+            values.len()
+        )))
     }
 }
 
 fn decode_hex(value: &str) -> Result<String, String> {
-    if value.len() % 2 != 0 { return Err(format!("odd-length hex field {value:?}")); }
+    if value.len() % 2 != 0 {
+        return Err(format!("odd-length hex field {value:?}"));
+    }
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
     let mut i = 0;
@@ -161,14 +192,23 @@ mod tests {
     use super::parse_target_environment;
 
     fn h(value: &str) -> String {
-        value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     #[test]
     fn parses_target_resolution_order() {
         let text = format!(
             "HEADER\t{}\t{}\t{}\nLIB\t{}\t{}\nBASE_BINDING\t{}\n",
-            h("4.6.1"), h("linux-gnu"), h("x86_64"), h("0"), h("/target/lib"), h("library")
+            h("4.6.1"),
+            h("linux-gnu"),
+            h("x86_64"),
+            h("0"),
+            h("/target/lib"),
+            h("library")
         );
         let target = parse_target_environment(&text).unwrap();
         assert_eq!(target.target.r_version, "4.6.1");

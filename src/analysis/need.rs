@@ -14,14 +14,44 @@ pub struct S3Id {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Need {
-    Binding { package: PackageId, binding: BindingName },
-    PrivateBinding { package: PackageId, environment: String, binding: BindingName },
-    Activation { package: PackageId },
-    Resource { package: PackageId, resource: ResourceId },
-    Dataset { package: PackageId, dataset: String },
-    S3Registration { package: PackageId, registration: S3Id },
-    Native { package: PackageId, component: NativeId },
-    Lifecycle { package: PackageId, hook: LifecycleId },
+    Binding {
+        package: PackageId,
+        binding: BindingName,
+    },
+    PrivateBinding {
+        package: PackageId,
+        environment: String,
+        binding: BindingName,
+    },
+    ClosureObject {
+        package: PackageId,
+        owner_environment: Option<String>,
+        owner_binding: BindingName,
+        path: String,
+    },
+    Activation {
+        package: PackageId,
+    },
+    Resource {
+        package: PackageId,
+        resource: ResourceId,
+    },
+    Dataset {
+        package: PackageId,
+        dataset: String,
+    },
+    S3Registration {
+        package: PackageId,
+        registration: S3Id,
+    },
+    Native {
+        package: PackageId,
+        component: NativeId,
+    },
+    Lifecycle {
+        package: PackageId,
+        hook: LifecycleId,
+    },
 }
 
 impl Need {
@@ -29,6 +59,7 @@ impl Need {
         match self {
             Self::Binding { package, .. }
             | Self::PrivateBinding { package, .. }
+            | Self::ClosureObject { package, .. }
             | Self::Activation { package }
             | Self::Resource { package, .. }
             | Self::Dataset { package, .. }

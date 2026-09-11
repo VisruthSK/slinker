@@ -12,6 +12,8 @@ pub struct LinkPolicy {
 
 impl Default for LinkPolicy {
     fn default() -> Self {
-        Self { namespace_discovery: DiscoveryPolicy::Reject }
+        Self {
+            namespace_discovery: DiscoveryPolicy::Reject,
+        }
     }
 }

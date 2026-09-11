@@ -7,9 +7,18 @@
 
 #[derive(Debug)]
 pub enum Error {
-    Io { path: std::path::PathBuf, source: std::io::Error },
-    Metadata { path: std::path::PathBuf, message: String },
-    Parse { path: String, message: String },
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Metadata {
+        path: std::path::PathBuf,
+        message: String,
+    },
+    Parse {
+        path: String,
+        message: String,
+    },
     Analysis(String),
 }
 
@@ -19,7 +28,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "I/O error at {}: {source}", path.display()),
-            Self::Metadata { path, message } => write!(f, "metadata error at {}: {message}", path.display()),
+            Self::Metadata { path, message } => {
+                write!(f, "metadata error at {}: {message}", path.display())
+            }
             Self::Parse { path, message } => write!(f, "parse error in {path}: {message}"),
             Self::Analysis(message) => f.write_str(message),
         }

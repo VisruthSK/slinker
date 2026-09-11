@@ -91,6 +91,9 @@ pub struct CallSite {
     /// callees are resolved by the linker against the installed namespace.
     pub qualified_package: Option<String>,
     pub args: Vec<Option<StaticArg>>,
+    /// Syntactic argument names aligned with `args`; `None` denotes a positional argument.
+    #[serde(default)]
+    pub arg_names: Vec<Option<String>>,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
     pub span: Span,
@@ -184,6 +187,8 @@ pub struct ParsedRFile {
 
 impl ParsedRFile {
     pub fn bindings(&self) -> impl Iterator<Item = &BindingDef> {
-        self.expressions.iter().flat_map(|expr| expr.definitions.iter())
+        self.expressions
+            .iter()
+            .flat_map(|expr| expr.definitions.iter())
     }
 }
