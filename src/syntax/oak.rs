@@ -465,6 +465,7 @@ fn translate_index(
                     .iter()
                     .map(|argument| argument.name.clone())
                     .collect(),
+                arg_spans: argument_spans(&source, &raw.args),
                 phase: live_use.phase,
                 guards: Vec::new(),
                 span: Span::new(source.clone(), raw.start, raw.end),
@@ -510,6 +511,7 @@ fn translate_index(
                         .iter()
                         .map(|argument| argument.name.clone())
                         .collect(),
+                    arg_spans: argument_spans(&source, &raw.args),
                     phase: phase_for_scope(index, scope),
                     guards: Vec::new(),
                     span: Span::new(source.clone(), raw.start, raw.end),
@@ -2717,6 +2719,21 @@ fn raw_argument(text: &str, start: usize, end: usize) -> Option<RawArgument> {
     })
 }
 
+fn argument_spans(source: &SourceId, arguments: &[RawArgument]) -> Vec<Option<Span>> {
+    arguments
+        .iter()
+        .map(|argument| {
+            (argument.value_start < argument.value_end).then(|| {
+                Span::new(
+                    source.clone(),
+                    argument.value_start,
+                    argument.value_end,
+                )
+            })
+        })
+        .collect()
+}
+
 fn named_argument_split(text: &str, start: usize, end: usize) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
     let mut cursor = start;
@@ -3852,6 +3869,33 @@ mod tests {
                 "language constant {constant} leaked as a reference"
             );
         }
+    }
+
+    #[test]
+    fn call_argument_span_matches_selector_name_reference() {
+        let parsed = parse_source("f <- function(x) .Call(.NAME = croot_f, x)");
+        let expression = &parsed.expressions[0];
+        let reference = expression
+            .references
+            .iter()
+            .find(|reference| reference.name == "croot_f")
+            .expect("selector reference");
+        let call = expression
+            .calls
+            .iter()
+            .find(|call| call.callee == ".Call")
+            .expect("native call");
+        let selector = call
+            .arg_names
+            .iter()
+            .position(|name| name.as_deref() == Some(".NAME"))
+            .expect("named selector");
+
+        assert_eq!(
+            call.args[selector],
+            Some(StaticArg::Symbol("croot_f".into()))
+        );
+        assert_eq!(call.arg_spans[selector].as_ref(), Some(&reference.span));
     }
 
     #[test]

@@ -88,6 +88,11 @@ struct SyntaxObservation {
     kind: String,
 }
 
+struct NativeCallTarget {
+    component: String,
+    consumes_selector: bool,
+}
+
 impl<P: PackageProvider> Linker<P> {
     pub fn new(packages: P, jobs: usize) -> Self {
         Self {
@@ -1139,8 +1144,38 @@ impl<P: PackageProvider> Linker<P> {
                     }
                 }
             }
+            let mut consumed_native_selectors = Vec::new();
+            for call in &expression.calls {
+                if !self.guards_active(image, &call.guards)?
+                    || !matches!(
+                        call.callee.as_str(),
+                        ".Call" | ".External" | ".C" | ".Fortran"
+                    )
+                    || !self.call_resolves_definitely_to_base(
+                        package,
+                        image,
+                        lexical_environment,
+                        call,
+                    )?
+                {
+                    continue;
+                }
+                let Some(target) =
+                    self.native_component_for_call(package, image, lexical_environment, call)?
+                else {
+                    continue;
+                };
+                if target.consumes_selector
+                    && let Some(span) = native_selector_span(call)
+                {
+                    consumed_native_selectors.push(span.clone());
+                }
+            }
             for reference in &expression.references {
                 if !self.guards_active(image, &reference.guards)? {
+                    continue;
+                }
+                if consumed_native_selectors.contains(&reference.span) {
                     continue;
                 }
                 let resolved = self.resolve_lexical_name(
@@ -2074,14 +2109,57 @@ impl<P: PackageProvider> Linker<P> {
         }
     }
 
-    fn native_component_for_call<'a>(index: &'a PackageIndex, call: &CallSite) -> Option<&'a str> {
-        let selector_index = matched_call_arg_index(call, &[".NAME"], ".NAME")?;
-        let selector = call.args.get(selector_index)?.as_ref()?;
-        let name = match selector {
-            StaticArg::Symbol(name) | StaticArg::String(name) => name,
+    fn native_component_for_call(
+        &mut self,
+        current: &InstalledPackage,
+        image: &PackageImage,
+        lexical_environment: &str,
+        call: &CallSite,
+    ) -> Result<Option<NativeCallTarget>> {
+        let Some(selector_index) = matched_call_arg_index(call, &[".NAME"], ".NAME") else {
+            return Ok(None);
         };
-        if let Some(component) = Self::native_component_for_binding(index, name) {
-            return Some(component);
+        let Some(selector) = call.args.get(selector_index).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        if let StaticArg::String(symbol) = selector {
+            let mut components = image.index.dynlibs.iter().filter(|native| {
+                native
+                    .symbols
+                    .iter()
+                    .any(|binding| binding.symbol == *symbol)
+            });
+            let Some(component) = components.next() else {
+                return Ok(None);
+            };
+            if components.next().is_some() {
+                return Ok(None);
+            }
+            return Ok(Some(NativeCallTarget {
+                component: component.name.clone(),
+                consumes_selector: false,
+            }));
+        }
+
+        let StaticArg::Symbol(name) = selector else {
+            return Ok(None);
+        };
+        match self.resolve_lexical_name(current, image, lexical_environment, name)? {
+            ResolvedName::NativeSymbol { component, .. } => {
+                return Ok(Some(NativeCallTarget {
+                    component,
+                    consumes_selector: false,
+                }));
+            }
+            ResolvedName::Unknown(_) => {}
+            ResolvedName::Local(_)
+            | ResolvedName::PackageBinding { .. }
+            | ResolvedName::PrivateBinding { .. }
+            | ResolvedName::Imported { .. }
+            | ResolvedName::TargetProvided { .. }
+            | ResolvedName::PackageMetadata { .. }
+            | ResolvedName::MissingPackage { .. }
+            | ResolvedName::Base(_) => return Ok(None),
         }
 
         // With .registration=TRUE, R creates RegisteredNativeSymbol variables
@@ -2090,17 +2168,19 @@ impl<P: PackageProvider> Linker<P> {
         // symbol selector can therefore be associated with the sole registered
         // package DLL even when its exact routine name is unavailable until DLL
         // load. String selectors do not have that lexical binding guarantee.
-        if !matches!(selector, StaticArg::Symbol(_)) {
-            return None;
-        }
-        let mut registered = index.dynlibs.iter().filter(|native| {
+        let mut registered = image.index.dynlibs.iter().filter(|native| {
             native.registration.is_some() && !matches!(native.safety, NativeSafety::Unsupported(_))
         });
-        let first = registered.next()?;
+        let Some(first) = registered.next() else {
+            return Ok(None);
+        };
         if registered.next().is_some() {
-            None
+            Ok(None)
         } else {
-            Some(first.name.as_str())
+            Ok(Some(NativeCallTarget {
+                component: first.name.clone(),
+                consumes_selector: true,
+            }))
         }
     }
 
@@ -2439,9 +2519,10 @@ impl<P: PackageProvider> Linker<P> {
             "packageVersion" => self.identity_query(from, current, image, call, true)?,
             "find.package" => self.identity_query(from, current, image, call, false)?,
             ".Call" | ".External" | ".C" | ".Fortran" => {
-                if let Some(component) =
-                    Self::native_component_for_call(&image.index, call).map(str::to_owned)
+                if let Some(target) =
+                    self.native_component_for_call(current, image, lexical_environment, call)?
                 {
+                    let component = target.component;
                     self.require_at(
                         from,
                         Need::Native { package: current.id.clone(), component: component.clone() },
@@ -2480,6 +2561,26 @@ impl<P: PackageProvider> Linker<P> {
             _ => {}
         }
         Ok(())
+    }
+
+    fn call_resolves_definitely_to_base(
+        &mut self,
+        current: &InstalledPackage,
+        image: &PackageImage,
+        lexical_environment: &str,
+        call: &CallSite,
+    ) -> Result<bool> {
+        if call.callee_kind != CalleeKind::DefinitelyExternal {
+            return Ok(false);
+        }
+        match call.qualified_package.as_deref() {
+            Some("base") => Ok(true),
+            Some(_) => Ok(false),
+            None => Ok(matches!(
+                self.resolve_lexical_name(current, image, lexical_environment, &call.callee)?,
+                ResolvedName::Base(_)
+            )),
+        }
     }
 
     fn identity_query(
@@ -3315,6 +3416,11 @@ fn matched_static_arg<'a>(
 ) -> Option<&'a StaticArg> {
     let index = matched_call_arg_index(call, formals, target)?;
     call.args.get(index)?.as_ref()
+}
+
+fn native_selector_span(call: &CallSite) -> Option<&Span> {
+    let index = matched_call_arg_index(call, &[".NAME"], ".NAME")?;
+    call.arg_spans.get(index)?.as_ref()
 }
 
 fn static_string_arg(call: &CallSite) -> Option<&str> {

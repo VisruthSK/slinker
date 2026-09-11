@@ -94,6 +94,9 @@ pub struct CallSite {
     /// Syntactic argument names aligned with `args`; `None` denotes a positional argument.
     #[serde(default)]
     pub arg_names: Vec<Option<String>>,
+    /// Source extents aligned with `args`; omitted arguments have no extent.
+    #[serde(default)]
+    pub arg_spans: Vec<Option<Span>>,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
     pub span: Span,

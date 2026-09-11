@@ -1580,6 +1580,249 @@ fn registered_native_symbol_is_not_an_unresolved_r_binding() {
     );
 }
 
+fn opaque_registered_component() -> NativeComponent {
+    NativeComponent {
+        name: "root".into(),
+        registration: Some(NativeRegistration {
+            prefix: "".into(),
+            suffix: "".into(),
+        }),
+        symbols: Vec::new(),
+        safety: NativeSafety::Unanalyzed,
+    }
+}
+
+#[test]
+fn opaque_registered_selector_is_consumed_by_native_call() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function(x) .Call(croot_f, x)"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        vec![opaque_registered_component()],
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        plan.retained
+            .iter()
+            .any(|need| matches!(need, Need::Native { component, .. } if component == "root"))
+    );
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
+    );
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnknownNativeLookup
+            || (diagnostic.code == RejectCode::UnresolvedBinding
+                && diagnostic.message.contains("croot_f"))
+    }));
+}
+
+#[test]
+fn opaque_native_selector_consumption_is_occurrence_specific() {
+    let root = package_with(
+        "root",
+        &[(
+            "f",
+            Some("f <- function(x) { identity(croot_f); .Call(croot_f, x) }"),
+        )],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        vec![opaque_registered_component()],
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert_eq!(
+        plan.diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == RejectCode::UnresolvedBinding
+                    && diagnostic.message.contains("croot_f")
+            })
+            .count(),
+        1
+    );
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
+    );
+}
+
+#[test]
+fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function(x) .Call(foo, x)")), ("foo", None)],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        vec![opaque_registered_component()],
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(retained_binding(&plan, "root", "foo"));
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
+    );
+}
+
+#[test]
+fn shadowed_native_primitive_does_not_consume_selector() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function(.Call, x) .Call(croot_f, x)"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        vec![opaque_registered_component()],
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    let function = plan.graph.binding("root", "f").expect("function binding");
+    assert!(!plan.graph.edges.iter().any(|edge| {
+        edge.from == function
+            && edge.kind == EdgeKind::Native
+            && matches!(
+                plan.graph.nodes[edge.to.0].kind,
+                NodeKind::NativeComponent { .. }
+            )
+    }));
+    assert!(plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("croot_f")
+    }));
+}
+
+#[test]
+fn named_opaque_native_selector_is_matched_by_formal_name() {
+    let root = package_with(
+        "root",
+        &[("f", Some("f <- function(x) .Call(x, .NAME = croot_f)"))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        vec![opaque_registered_component()],
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        plan.retained
+            .iter()
+            .any(|need| matches!(need, Need::Native { .. }))
+    );
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnknownNativeLookup
+            || (diagnostic.code == RejectCode::UnresolvedBinding
+                && diagnostic.message.contains("croot_f"))
+    }));
+}
+
+#[test]
+fn string_native_selector_matches_routine_symbol_not_r_binding() {
+    let component = NativeComponent {
+        name: "root".into(),
+        registration: Some(NativeRegistration {
+            prefix: "c".into(),
+            suffix: "".into(),
+        }),
+        symbols: vec![NativeSymbolBinding {
+            binding: "croot_f".into(),
+            symbol: "root_f".into(),
+        }],
+        safety: NativeSafety::Safe(NativeFacts {
+            callbacks: Vec::new(),
+        }),
+    };
+    let root = package_with(
+        "root",
+        &[
+            (
+                "by_symbol",
+                Some("by_symbol <- function(x) .Call(\"root_f\", x)"),
+            ),
+            (
+                "by_binding",
+                Some("by_binding <- function(x) .Call(\"croot_f\", x)"),
+            ),
+        ],
+        Vec::new(),
+        export("by_symbol"),
+        Vec::new(),
+        vec![component],
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
+    );
+
+    let root = package_with(
+        "root",
+        &[(
+            "by_binding",
+            Some("by_binding <- function(x) .Call(\"croot_f\", x)"),
+        )],
+        Vec::new(),
+        export("by_binding"),
+        Vec::new(),
+        vec![NativeComponent {
+            name: "root".into(),
+            registration: None,
+            symbols: vec![NativeSymbolBinding {
+                binding: "croot_f".into(),
+                symbol: "root_f".into(),
+            }],
+            safety: NativeSafety::Safe(NativeFacts {
+                callbacks: Vec::new(),
+            }),
+        }],
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
+    );
+}
+
 #[test]
 fn registered_native_symbol_can_be_assigned_into_namespace_state() {
     let root = package_with(
