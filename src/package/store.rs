@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-object-environment-v2";
+const ANALYSIS_SCHEMA: &str = "slinker-object-environment-v3";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyntaxValidation {

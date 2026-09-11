@@ -69,6 +69,12 @@ impl FakeProvider {
                 "packageEvent",
                 "makeActiveBinding",
                 "environment",
+                "new.env",
+                "list2env",
+                "lapply",
+                "is.function",
+                "length",
+                "==",
                 "stop",
                 "+",
                 "-",
@@ -412,6 +418,125 @@ fn retaining_structured_object_does_not_execute_nested_closure() {
 }
 
 #[test]
+fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
+    let mut root = package_with(
+        "root",
+        &[
+            (
+                "f",
+                Some(
+                    "f <- function() { generator <- new.env(parent = capsule); generator$self <- generator; methods <- assign_func_envs(templates, generator); list2env2(methods, generator); generator }",
+                ),
+            ),
+            ("capsule", None),
+            ("templates", None),
+        ],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    root.bindings
+        .get_mut("f")
+        .unwrap()
+        .closure
+        .as_mut()
+        .unwrap()
+        .environment = "private:1".into();
+    let capsule = root.bindings.get_mut("capsule").unwrap();
+    capsule.object_kind = ObjectKind::Environment;
+    capsule.environment = Some("private:1".into());
+    {
+        let templates = root.bindings.get_mut("templates").unwrap();
+        templates.object_kind = ObjectKind::List;
+        for name in ["first", "second"] {
+            templates.embedded_closures.push(EmbeddedClosureSource {
+                path: format!("$${name}"),
+                source: Arc::from(format!(
+                    ".slinker_embedded <- function() {{ self; {name}_dependency() }}"
+                )),
+                environment: "namespace:root".into(),
+            });
+        }
+    }
+    for name in ["first", "second"] {
+        root.bindings.insert(
+            format!("{name}_dependency"),
+            BindingImage {
+                name: format!("{name}_dependency"),
+                origin: BindingOrigin::Code,
+                active: false,
+                object_kind: ObjectKind::Closure,
+                closure: Some(ClosureSource {
+                    source: Arc::from(format!("{name}_dependency <- function() 1")),
+                    environment: "namespace:root".into(),
+                }),
+                environment: None,
+                embedded_closures: Vec::new(),
+                embedded_environments: Vec::new(),
+                issues: Vec::new(),
+            },
+        );
+    }
+    root.private_environments.insert(
+        "private:1".into(),
+        PrivateEnvironmentImage {
+            id: "private:1".into(),
+            parent: "namespace:root".into(),
+            bindings: HashMap::from([
+                (
+                    "assign_func_envs".into(),
+                    private_closure(
+                        "assign_func_envs",
+                        "private:1",
+                        "assign_func_envs <- function(objs, target_env) { if (is.null(target_env)) return(objs); lapply(objs, function(x) { if (is.function(x)) environment(x) <- target_env; x }) }",
+                    ),
+                ),
+                (
+                    "list2env2".into(),
+                    private_closure(
+                        "list2env2",
+                        "private:1",
+                        "list2env2 <- function(x, envir = NULL) { if (is.null(envir)) envir <- new.env(); if (length(x) == 0L) return(NULL); list2env(x, envir) }",
+                    ),
+                ),
+            ]),
+        },
+    );
+    root.index.binding_names = root.bindings.keys().cloned().collect();
+
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert_eq!(plan.parsed_nested_closures, 0);
+    assert_eq!(plan.parsed_derived_closures, 2);
+    assert!(retained_binding(&plan, "root", "first_dependency"));
+    assert!(retained_binding(&plan, "root", "second_dependency"));
+    assert!(!plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("self")
+    }));
+    let graph = plan
+        .object_graphs
+        .iter()
+        .find_map(|(package, graph)| (package.name == "root").then_some(graph))
+        .expect("root object graph");
+    let derived = graph
+        .closures
+        .values()
+        .filter(|closure| closure.derived_from.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(derived.len(), 2);
+    assert!(derived.iter().all(|closure| {
+        graph.environments[&closure.enclosure]
+            .bindings
+            .contains_key("self")
+    }));
+}
+
+#[test]
 fn environment_object_identity_preserves_self_reference_and_nested_aliases() {
     let mut root = package_with(
         "root",
@@ -735,6 +860,40 @@ fn list2env_preserves_known_names_for_unmodeled_scalar_members() {
         matches!(&graph.objects[&scalar], InstalledObject::Atom(ObjectKind::Other(kind)) if kind == "abstract")
     );
     assert!(!graph.environments[&derived].unknown_fields);
+}
+
+#[test]
+fn list2env_uses_installed_named_member_paths() {
+    let mut root = package_with(
+        "root",
+        &[("values", None)],
+        Vec::new(),
+        export("values"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let binding = root.bindings.get_mut("values").unwrap();
+    binding.object_kind = ObjectKind::List;
+    binding.embedded_closures.push(EmbeddedClosureSource {
+        path: "$$method".into(),
+        source: Arc::from(".slinker_embedded <- function() 1"),
+        environment: "namespace:root".into(),
+    });
+
+    let mut graph = root.object_graph();
+    let namespace = graph.environment_id("namespace:root").unwrap();
+    let environment = graph.derive_environment(Some(namespace));
+    let values = graph.namespace_bindings["values"];
+    graph.populate_environment_from_structured(environment, values, None);
+
+    assert!(
+        graph.environments[&environment]
+            .bindings
+            .contains_key("method")
+    );
+    assert!(!graph.environments[&environment].unknown_fields);
 }
 
 #[test]

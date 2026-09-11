@@ -1,4 +1,4 @@
-use crate::package::{BindingName, PackageId};
+use crate::package::{BindingName, ClosureId, PackageId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedName {
@@ -11,6 +11,10 @@ pub enum ResolvedName {
         package: PackageId,
         environment: String,
         binding: BindingName,
+    },
+    ClosureObject {
+        package: PackageId,
+        closure: ClosureId,
     },
     NativeSymbol {
         package: PackageId,

@@ -3,15 +3,17 @@ use crate::analysis::{Diagnostic, EdgeKind, Graph, Need, NodeId, NodeKind, Rejec
 use crate::build::{PackageOperation, Rewrite};
 use crate::metadata::{RelationField, relations};
 use crate::package::{
-    BindingImage, ClosureSource, ImportSpec, InstalledObject, InstalledPackage,
-    NativeRoutineSummary, NativeSafety, ObjectKind, PackageId, PackageImage, PackageIndex,
-    PackageObjectGraph, PackageProvider, PrivateBindingImage, SyntaxValidation,
+    BindingImage, ClosureId, ClosureObject, ClosureSource, EnvironmentId, ImportSpec,
+    InstalledObject, InstalledPackage, NativeRoutineSummary, NativeSafety, ObjectId, ObjectKind,
+    PackageId, PackageImage, PackageIndex, PackageObjectGraph, PackageProvider,
+    PrivateBindingImage, SyntaxValidation,
 };
 use crate::syntax::{
-    ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImportResolution,
-    NamespaceImports, OakParseContext, OakParser, PackageGuard, ParsedRFile, ResolvedName,
-    SemanticIssueKind, SourceId, Sources, Span, StaticArg, StaticEnvironment, SyntaxEffect,
-    SyntaxEffectKind, closure_definitely_non_returning,
+    ActiveBindingDef, CallSite, CalleeKind, ConstructionArgument, ConstructionCall,
+    ConstructionExpr, ConstructionExprKind, ConstructionTarget, NameRefKind,
+    NamespaceImportResolution, NamespaceImports, OakParseContext, OakParser, PackageGuard,
+    ParsedRFile, ResolvedName, SemanticIssueKind, SourceId, Sources, Span, StaticArg,
+    StaticEnvironment, SyntaxEffect, SyntaxEffectKind, closure_definitely_non_returning,
 };
 use crate::{Error, Result};
 use rayon::prelude::*;
@@ -32,6 +34,7 @@ pub struct LinkPlan {
     pub parsed_top_level_closures: usize,
     pub parsed_private_closures: usize,
     pub parsed_nested_closures: usize,
+    pub parsed_derived_closures: usize,
     pub inspected_packages: usize,
     pub images: HashMap<PackageId, Arc<PackageImage>>,
     pub object_graphs: HashMap<PackageId, PackageObjectGraph>,
@@ -48,6 +51,7 @@ enum ParseKind {
     NamespaceClosure,
     PrivateClosure,
     NestedClosure,
+    DerivedClosure,
 }
 
 pub struct Linker<P: PackageProvider> {
@@ -91,6 +95,50 @@ struct SyntaxObservation {
 struct NativeCallTarget {
     component: String,
     consumes_selector: bool,
+}
+
+#[derive(Clone, Debug)]
+enum AbstractValue {
+    Unknown,
+    Null,
+    Logical(bool),
+    Integer(i64),
+    String(String),
+    Object(ObjectId),
+    Function {
+        parameters: Vec<String>,
+        body: ConstructionExpr,
+        captures: HashMap<String, AbstractValue>,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExecutionState {
+    locals: HashMap<String, AbstractValue>,
+}
+
+#[derive(Clone, Debug)]
+struct ExecutionOutcome {
+    value: AbstractValue,
+    returned: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ExecutionContext<'a> {
+    node: NodeId,
+    package: &'a InstalledPackage,
+    image: &'a PackageImage,
+    lexical_environment: &'a str,
+    depth: usize,
+}
+
+impl ExecutionOutcome {
+    fn value(value: AbstractValue) -> Self {
+        Self {
+            value,
+            returned: false,
+        }
+    }
 }
 
 impl<P: PackageProvider> Linker<P> {
@@ -200,6 +248,11 @@ impl<P: PackageProvider> Linker<P> {
             .values()
             .filter(|kind| matches!(kind, ParseKind::NestedClosure))
             .count();
+        let parsed_derived_closures = self
+            .parse_kinds
+            .values()
+            .filter(|kind| matches!(kind, ParseKind::DerivedClosure))
+            .count();
         Ok(LinkPlan {
             graph: self.graph,
             roots: self.roots,
@@ -213,6 +266,7 @@ impl<P: PackageProvider> Linker<P> {
             parsed_top_level_closures,
             parsed_private_closures,
             parsed_nested_closures,
+            parsed_derived_closures,
             inspected_packages,
             images: self.images,
             object_graphs: self.object_graphs,
@@ -304,7 +358,7 @@ impl<P: PackageProvider> Linker<P> {
                 need,
                 Need::Binding { .. }
                     | Need::PrivateBinding { .. }
-                    | Need::ClosureObject { .. }
+                    | Need::ClosureExecution { .. }
                     | Need::Dataset { .. }
             ) {
                 continue;
@@ -409,60 +463,40 @@ impl<P: PackageProvider> Linker<P> {
                         ParseKind::PrivateClosure,
                     )
                 }
-                Need::ClosureObject {
+                Need::ClosureExecution {
                     package: id,
-                    owner_environment,
-                    owner_binding,
-                    path,
+                    closure,
                 } => {
                     let package = self.packages.locate(&id.name)?;
                     if self.packages.is_target_provided(&package) {
                         continue;
                     }
                     let image = self.image(&package)?;
-                    let embedded = match owner_environment.as_deref() {
-                        Some(environment) => image
-                            .private_binding(environment, &owner_binding)
-                            .and_then(|binding| {
-                                binding
-                                    .embedded_closures
-                                    .iter()
-                                    .find(|closure| closure.path == path)
-                            })
-                            .cloned(),
-                        None => image
-                            .binding(&owner_binding)
-                            .and_then(|binding| {
-                                binding
-                                    .embedded_closures
-                                    .iter()
-                                    .find(|closure| closure.path == path)
-                            })
-                            .cloned(),
+                    let Some((closure_object, owner_source, source_key, environment)) =
+                        self.closure_execution_source(&id, closure)
+                    else {
+                        continue;
                     };
-                    let Some(closure) = embedded else { continue };
-                    let owner_source = owner_environment
-                        .as_deref()
-                        .map(|environment| Self::private_source_key(environment, &owner_binding))
-                        .unwrap_or_else(|| owner_binding.clone());
-                    let source_key = format!("{owner_source}{path}");
-                    let owner_node = self.need_node(&Need::ClosureObject {
+                    let owner_node = self.need_node(&Need::ClosureExecution {
                         package: id.clone(),
-                        owner_environment: owner_environment.clone(),
-                        owner_binding: owner_binding.clone(),
-                        path: path.clone(),
+                        closure,
                     });
+                    let parse_kind = if closure_object.derived_from.is_some() {
+                        ParseKind::DerivedClosure
+                    } else {
+                        ParseKind::NestedClosure
+                    };
                     (
                         id,
                         owner_source,
                         source_key,
                         ClosureSource {
-                            source: closure.source,
-                            environment: closure.environment,
+                            source: closure_object.source,
+                            environment,
                         },
                         owner_node,
                         image,
-                        ParseKind::NestedClosure,
+                        parse_kind,
                     )
                 }
                 _ => continue,
@@ -559,12 +593,9 @@ impl<P: PackageProvider> Linker<P> {
                 environment,
                 binding,
             } => self.process_private_binding(package, environment, binding),
-            Need::ClosureObject {
-                package,
-                owner_environment,
-                owner_binding,
-                path,
-            } => self.process_closure_object(package, owner_environment, owner_binding, path),
+            Need::ClosureExecution { package, closure } => {
+                self.process_closure_execution(package, closure)
+            }
             Need::Activation { package } => self.process_activation(package),
             Need::Resource { package, resource } => self.process_resource(package, resource),
             Need::Dataset { package, dataset } => self.process_dataset(package, dataset),
@@ -577,19 +608,11 @@ impl<P: PackageProvider> Linker<P> {
         }
     }
 
-    fn process_closure_object(
-        &mut self,
-        id: PackageId,
-        owner_environment: Option<String>,
-        owner_binding: String,
-        path: String,
-    ) -> Result<()> {
+    fn process_closure_execution(&mut self, id: PackageId, closure: ClosureId) -> Result<()> {
         let package = self.packages.locate(&id.name)?;
-        let need = Need::ClosureObject {
+        let need = Need::ClosureExecution {
             package: id.clone(),
-            owner_environment: owner_environment.clone(),
-            owner_binding: owner_binding.clone(),
-            path: path.clone(),
+            closure,
         };
         let node = self.need_node(&need);
         if self.packages.is_target_provided(&package) {
@@ -597,74 +620,51 @@ impl<P: PackageProvider> Linker<P> {
             return Ok(());
         }
         let image = self.image(&package)?;
-        let embedded = match owner_environment.as_deref() {
-            Some(environment) => image
-                .private_binding(environment, &owner_binding)
-                .and_then(|binding| {
-                    binding
-                        .embedded_closures
-                        .iter()
-                        .find(|closure| closure.path == path)
-                })
-                .cloned(),
-            None => image
-                .binding(&owner_binding)
-                .and_then(|binding| {
-                    binding
-                        .embedded_closures
-                        .iter()
-                        .find(|closure| closure.path == path)
-                })
-                .cloned(),
-        };
-        let Some(embedded) = embedded else {
+        let Some((closure_object, owner_source, source_key, environment)) =
+            self.closure_execution_source(&id, closure)
+        else {
             self.diagnostic(
                 node,
                 &id,
-                Some(&owner_binding),
+                None,
                 RejectCode::UnsupportedObject,
-                format!(
-                    "structured closure `{path}` is missing from installed object `{owner_binding}`"
-                ),
+                "executable closure is missing from the package object graph",
                 None,
             );
             return Ok(());
         };
 
-        if embedded.environment.starts_with("unsupported:") {
+        if environment.starts_with("unsupported:") {
             self.diagnostic(
                 node,
                 &id,
-                Some(&owner_binding),
+                Some(&owner_source),
                 RejectCode::UnknownClosureEnclosure,
-                format!(
-                    "embedded closure at {path} has unknown enclosure `{}`",
-                    embedded.environment
-                ),
+                format!("executable closure has unknown enclosure `{environment}`"),
                 None,
             );
         }
-        let owner_source = owner_environment
-            .as_deref()
-            .map(|environment| Self::private_source_key(environment, &owner_binding))
-            .unwrap_or_else(|| owner_binding.clone());
-        let source_key = format!("{owner_source}{path}");
-        let context = self.oak_parse_context(&image, &embedded.environment)?;
+        let context = self.oak_parse_context(&image, &environment)?;
+        let parse_kind = if closure_object.derived_from.is_some() {
+            ParseKind::DerivedClosure
+        } else {
+            ParseKind::NestedClosure
+        };
         if let Some(parsed) = self.parsed_source(
             &id,
             &owner_source,
             &source_key,
             node,
-            Arc::clone(&embedded.source),
+            Arc::clone(&closure_object.source),
             context,
-            ParseKind::NestedClosure,
+            parse_kind,
         )? {
             self.process_parsed(
                 node,
                 &package,
                 &image,
                 &owner_source,
-                &embedded.environment,
+                &environment,
                 parsed.as_ref(),
             )?;
         }
@@ -797,6 +797,7 @@ impl<P: PackageProvider> Linker<P> {
                     }
                     ResolvedName::PackageBinding { .. }
                     | ResolvedName::PrivateBinding { .. }
+                    | ResolvedName::ClosureObject { .. }
                     | ResolvedName::Local(_) => {}
                 }
             }
@@ -1095,6 +1096,783 @@ impl<P: PackageProvider> Linker<P> {
         Ok(true)
     }
 
+    fn execute_construction(
+        &mut self,
+        context: ExecutionContext<'_>,
+        expressions: &[ConstructionExpr],
+    ) -> Result<()> {
+        let mut state = ExecutionState::default();
+        for expression in expressions {
+            if self
+                .evaluate_construction(context, &mut state, expression)?
+                .returned
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate_construction(
+        &mut self,
+        context: ExecutionContext<'_>,
+        state: &mut ExecutionState,
+        expression: &ConstructionExpr,
+    ) -> Result<ExecutionOutcome> {
+        if context.depth > 16 {
+            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+        }
+        match &expression.kind {
+            ConstructionExprKind::Unknown | ConstructionExprKind::Double { .. } => {
+                Ok(ExecutionOutcome::value(AbstractValue::Unknown))
+            }
+            ConstructionExprKind::Null => Ok(ExecutionOutcome::value(AbstractValue::Null)),
+            ConstructionExprKind::Logical { value } => {
+                Ok(ExecutionOutcome::value(AbstractValue::Logical(*value)))
+            }
+            ConstructionExprKind::Integer { value } => {
+                Ok(ExecutionOutcome::value(AbstractValue::Integer(*value)))
+            }
+            ConstructionExprKind::String { value } => Ok(ExecutionOutcome::value(
+                AbstractValue::String(value.clone()),
+            )),
+            ConstructionExprKind::Symbol { name } => Ok(ExecutionOutcome::value(
+                self.construction_symbol(context, state, name)?,
+            )),
+            ConstructionExprKind::Sequence { expressions } => {
+                let mut outcome = ExecutionOutcome::value(AbstractValue::Null);
+                for expression in expressions {
+                    outcome = self.evaluate_construction(context, state, expression)?;
+                    if outcome.returned {
+                        break;
+                    }
+                }
+                Ok(outcome)
+            }
+            ConstructionExprKind::Call { call } => {
+                self.evaluate_construction_call(context, state, call)
+            }
+            ConstructionExprKind::Member { object, name } => {
+                let object = self.evaluate_construction(context, state, object)?.value;
+                Ok(ExecutionOutcome::value(self.construction_member(
+                    context,
+                    object,
+                    name.as_deref(),
+                )))
+            }
+            ConstructionExprKind::Index { object, index } => {
+                let object = self.evaluate_construction(context, state, object)?.value;
+                let index = self.evaluate_construction(context, state, index)?.value;
+                Ok(ExecutionOutcome::value(
+                    self.construction_index(context, object, index),
+                ))
+            }
+            ConstructionExprKind::Assign { target, value } => {
+                let value = self.evaluate_construction(context, state, value)?.value;
+                self.assign_construction(context, state, target, value.clone(), &expression.span)?;
+                Ok(ExecutionOutcome::value(value))
+            }
+            ConstructionExprKind::If {
+                condition,
+                consequence,
+                alternative,
+            } => {
+                let condition = self.evaluate_construction(context, state, condition)?.value;
+                match condition {
+                    AbstractValue::Logical(true) => {
+                        self.evaluate_construction(context, state, consequence)
+                    }
+                    AbstractValue::Logical(false) => alternative.as_deref().map_or_else(
+                        || Ok(ExecutionOutcome::value(AbstractValue::Null)),
+                        |alternative| self.evaluate_construction(context, state, alternative),
+                    ),
+                    _ => Ok(ExecutionOutcome::value(AbstractValue::Unknown)),
+                }
+            }
+            ConstructionExprKind::Function { parameters, body } => {
+                Ok(ExecutionOutcome::value(AbstractValue::Function {
+                    parameters: parameters.clone(),
+                    body: body.as_ref().clone(),
+                    captures: state.locals.clone(),
+                }))
+            }
+        }
+    }
+
+    fn construction_symbol(
+        &mut self,
+        context: ExecutionContext<'_>,
+        state: &ExecutionState,
+        name: &str,
+    ) -> Result<AbstractValue> {
+        if let Some(value) = state.locals.get(name) {
+            return Ok(value.clone());
+        }
+        let resolved = self.resolve_lexical_name(
+            context.package,
+            context.image,
+            context.lexical_environment,
+            name,
+        )?;
+        let graph = &self.object_graphs[&context.package.id];
+        let object = match resolved {
+            ResolvedName::PackageBinding { package, binding } if package == context.package.id => {
+                graph.namespace_bindings.get(&binding).copied()
+            }
+            ResolvedName::PrivateBinding {
+                package,
+                environment,
+                binding,
+            } if package == context.package.id => graph
+                .environment_id(&environment)
+                .and_then(|environment| graph.environments[&environment].bindings.get(&binding))
+                .copied(),
+            ResolvedName::ClosureObject { package, closure } if package == context.package.id => {
+                graph.closures.get(&closure).map(|closure| closure.object)
+            }
+            _ => None,
+        };
+        Ok(object.map_or(AbstractValue::Unknown, AbstractValue::Object))
+    }
+
+    fn construction_member(
+        &self,
+        context: ExecutionContext<'_>,
+        object: AbstractValue,
+        name: Option<&str>,
+    ) -> AbstractValue {
+        let (AbstractValue::Object(object), Some(name)) = (object, name) else {
+            return AbstractValue::Unknown;
+        };
+        let graph = &self.object_graphs[&context.package.id];
+        let member = match graph.objects.get(&object) {
+            Some(InstalledObject::Environment(environment)) => {
+                graph.lookup_environment_binding(*environment, name).0
+            }
+            Some(InstalledObject::Structured { members, .. }) => {
+                members.get(&format!("$${name}")).copied()
+            }
+            _ => None,
+        };
+        member.map_or(AbstractValue::Unknown, AbstractValue::Object)
+    }
+
+    fn construction_index(
+        &self,
+        context: ExecutionContext<'_>,
+        object: AbstractValue,
+        index: AbstractValue,
+    ) -> AbstractValue {
+        if let AbstractValue::String(name) = index {
+            return self.construction_member(context, object, Some(&name));
+        }
+        let (AbstractValue::Object(object), AbstractValue::Integer(index)) = (object, index) else {
+            return AbstractValue::Unknown;
+        };
+        let Ok(index) = usize::try_from(index) else {
+            return AbstractValue::Unknown;
+        };
+        let graph = &self.object_graphs[&context.package.id];
+        let Some(InstalledObject::Structured { members, .. }) = graph.objects.get(&object) else {
+            return AbstractValue::Unknown;
+        };
+        members
+            .get(&format!("$[[{index}]]"))
+            .copied()
+            .map_or(AbstractValue::Unknown, AbstractValue::Object)
+    }
+
+    fn assign_construction(
+        &mut self,
+        context: ExecutionContext<'_>,
+        state: &mut ExecutionState,
+        target: &ConstructionTarget,
+        value: AbstractValue,
+        span: &Span,
+    ) -> Result<()> {
+        match target {
+            ConstructionTarget::Local { name } => {
+                state.locals.insert(name.clone(), value);
+            }
+            ConstructionTarget::Member { object, name } => {
+                let target = self.evaluate_construction(context, state, object)?.value;
+                let AbstractValue::Object(target) = target else {
+                    return Ok(());
+                };
+                let environment = match self.object_graphs[&context.package.id].objects.get(&target)
+                {
+                    Some(InstalledObject::Environment(environment)) => Some(*environment),
+                    _ => None,
+                };
+                let Some(environment) = environment else {
+                    return Ok(());
+                };
+                let Some(name) = name else {
+                    self.object_graphs
+                        .get_mut(&context.package.id)
+                        .expect("package object graph")
+                        .mark_environment_unknown_fields(environment);
+                    return Ok(());
+                };
+                let object = match value {
+                    AbstractValue::Object(object) => object,
+                    AbstractValue::Unknown
+                    | AbstractValue::Null
+                    | AbstractValue::Logical(_)
+                    | AbstractValue::Integer(_)
+                    | AbstractValue::String(_)
+                    | AbstractValue::Function { .. } => self
+                        .object_graphs
+                        .get_mut(&context.package.id)
+                        .expect("package object graph")
+                        .abstract_value(),
+                };
+                self.object_graphs
+                    .get_mut(&context.package.id)
+                    .expect("package object graph")
+                    .set_environment_binding(environment, name, object);
+                self.schedule_executable_object(context, object, span);
+            }
+            ConstructionTarget::ClosureEnvironment { closure } => {
+                let closure_value = self.evaluate_construction(context, state, closure)?.value;
+                let (
+                    AbstractValue::Object(closure_object),
+                    AbstractValue::Object(environment_object),
+                ) = (closure_value, value)
+                else {
+                    return Ok(());
+                };
+                let graph = &self.object_graphs[&context.package.id];
+                let closure_id = match graph.objects.get(&closure_object) {
+                    Some(InstalledObject::Closure(closure)) => Some(*closure),
+                    _ => None,
+                };
+                let environment = match graph.objects.get(&environment_object) {
+                    Some(InstalledObject::Environment(environment)) => Some(*environment),
+                    _ => None,
+                };
+                let (Some(closure_id), Some(environment)) = (closure_id, environment) else {
+                    return Ok(());
+                };
+                let derived = self
+                    .object_graphs
+                    .get_mut(&context.package.id)
+                    .expect("package object graph")
+                    .reenclose_closure(closure_id, environment)
+                    .expect("known closure and environment");
+                if let ConstructionExprKind::Symbol { name } = &closure.kind {
+                    state
+                        .locals
+                        .insert(name.clone(), AbstractValue::Object(derived));
+                }
+            }
+            ConstructionTarget::Unknown => {}
+        }
+        Ok(())
+    }
+
+    fn schedule_executable_object(
+        &mut self,
+        context: ExecutionContext<'_>,
+        object: ObjectId,
+        span: &Span,
+    ) {
+        let closure = match self.object_graphs[&context.package.id].objects.get(&object) {
+            Some(InstalledObject::Closure(closure)) => Some(*closure),
+            _ => None,
+        };
+        if let Some(closure) = closure {
+            self.require_at(
+                context.node,
+                Need::ClosureExecution {
+                    package: context.package.id.clone(),
+                    closure,
+                },
+                EdgeKind::ClosureExecution,
+                "runtime construction installs an executable closure",
+                Some(span.clone()),
+            );
+        }
+    }
+
+    fn evaluate_construction_call(
+        &mut self,
+        context: ExecutionContext<'_>,
+        state: &mut ExecutionState,
+        call: &ConstructionCall,
+    ) -> Result<ExecutionOutcome> {
+        let mut arguments = Vec::with_capacity(call.arguments.len());
+        for argument in &call.arguments {
+            arguments.push(match &argument.value {
+                Some(value) => self.evaluate_construction(context, state, value)?.value,
+                None => AbstractValue::Unknown,
+            });
+        }
+
+        if let Some(AbstractValue::Function {
+            parameters,
+            body,
+            captures,
+        }) = state.locals.get(&call.callee).cloned()
+        {
+            return self
+                .evaluate_inline_function(context, call, &arguments, parameters, body, captures);
+        }
+
+        let resolved = match call.qualified_package.as_deref() {
+            Some("base") => ResolvedName::Base(call.callee.clone()),
+            Some(_) => return Ok(ExecutionOutcome::value(AbstractValue::Unknown)),
+            None => self.resolve_lexical_name(
+                context.package,
+                context.image,
+                context.lexical_environment,
+                &call.callee,
+            )?,
+        };
+        match resolved {
+            ResolvedName::Base(name) => {
+                self.evaluate_base_construction_call(context, state, call, &name, &arguments)
+            }
+            ResolvedName::PackageBinding { package, binding } if package == context.package.id => {
+                self.evaluate_installed_function(context, call, &arguments, None, &binding)
+            }
+            ResolvedName::PrivateBinding {
+                package,
+                environment,
+                binding,
+            } if package == context.package.id => self.evaluate_installed_function(
+                context,
+                call,
+                &arguments,
+                Some(&environment),
+                &binding,
+            ),
+            _ => Ok(ExecutionOutcome::value(AbstractValue::Unknown)),
+        }
+    }
+
+    fn evaluate_inline_function(
+        &mut self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        arguments: &[AbstractValue],
+        parameters: Vec<String>,
+        body: ConstructionExpr,
+        captures: HashMap<String, AbstractValue>,
+    ) -> Result<ExecutionOutcome> {
+        let mut nested = ExecutionState { locals: captures };
+        bind_construction_arguments(&mut nested, &parameters, call, arguments);
+        self.evaluate_construction(
+            ExecutionContext {
+                depth: context.depth + 1,
+                ..context
+            },
+            &mut nested,
+            &body,
+        )
+    }
+
+    fn evaluate_installed_function(
+        &mut self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        arguments: &[AbstractValue],
+        private_environment: Option<&str>,
+        binding: &str,
+    ) -> Result<ExecutionOutcome> {
+        let (closure, owner, kind) = match private_environment {
+            Some(environment) => {
+                let Some(closure) = context
+                    .image
+                    .private_binding(environment, binding)
+                    .and_then(|binding| binding.closure.clone())
+                else {
+                    return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+                };
+                (
+                    closure,
+                    Self::private_source_key(environment, binding),
+                    ParseKind::PrivateClosure,
+                )
+            }
+            None => {
+                let Some(closure) = context
+                    .image
+                    .binding(binding)
+                    .and_then(|binding| binding.closure.clone())
+                else {
+                    return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+                };
+                (closure, binding.to_owned(), ParseKind::NamespaceClosure)
+            }
+        };
+        let parse_context = self.oak_parse_context(context.image, &closure.environment)?;
+        let Some(parsed) = self.parsed_source(
+            &context.package.id,
+            &owner,
+            &owner,
+            context.node,
+            closure.source,
+            parse_context,
+            kind,
+        )?
+        else {
+            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+        };
+        let Some(expression) = parsed.expressions.first() else {
+            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+        };
+        let mut nested = ExecutionState::default();
+        bind_construction_arguments(&mut nested, &expression.parameters, call, arguments);
+        let nested_context = ExecutionContext {
+            lexical_environment: &closure.environment,
+            depth: context.depth + 1,
+            ..context
+        };
+        let mut outcome = ExecutionOutcome::value(AbstractValue::Null);
+        for construction in &expression.construction {
+            outcome = self.evaluate_construction(nested_context, &mut nested, construction)?;
+            if outcome.returned {
+                break;
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn evaluate_base_construction_call(
+        &mut self,
+        context: ExecutionContext<'_>,
+        state: &mut ExecutionState,
+        call: &ConstructionCall,
+        name: &str,
+        arguments: &[AbstractValue],
+    ) -> Result<ExecutionOutcome> {
+        let value = match name {
+            "new.env" => {
+                let parent =
+                    construction_argument(call, arguments, &["hash", "parent", "size"], "parent")
+                        .and_then(|value| self.abstract_environment(context, value));
+                let environment = self
+                    .object_graphs
+                    .get_mut(&context.package.id)
+                    .expect("package object graph")
+                    .derive_environment(parent);
+                let object = self
+                    .object_graphs
+                    .get_mut(&context.package.id)
+                    .expect("package object graph")
+                    .environment_object(environment)
+                    .expect("derived environment has an object");
+                AbstractValue::Object(object)
+            }
+            "environment" => arguments
+                .first()
+                .and_then(|value| self.abstract_closure(context, value))
+                .and_then(|closure| {
+                    self.object_graphs[&context.package.id]
+                        .closures
+                        .get(&closure)
+                        .map(|closure| closure.enclosure)
+                })
+                .and_then(|environment| {
+                    self.object_graphs
+                        .get_mut(&context.package.id)
+                        .expect("package object graph")
+                        .environment_object(environment)
+                })
+                .map_or(AbstractValue::Unknown, AbstractValue::Object),
+            "is.null" => arguments
+                .first()
+                .map_or(AbstractValue::Unknown, |value| match value {
+                    AbstractValue::Unknown => AbstractValue::Unknown,
+                    AbstractValue::Null => AbstractValue::Logical(true),
+                    AbstractValue::Logical(_)
+                    | AbstractValue::Integer(_)
+                    | AbstractValue::String(_)
+                    | AbstractValue::Object(_)
+                    | AbstractValue::Function { .. } => AbstractValue::Logical(false),
+                }),
+            "is.function" => arguments.first().map_or(AbstractValue::Unknown, |value| {
+                if matches!(value, AbstractValue::Unknown) {
+                    AbstractValue::Unknown
+                } else {
+                    AbstractValue::Logical(
+                        self.abstract_closure(context, value).is_some()
+                            || matches!(value, AbstractValue::Function { .. }),
+                    )
+                }
+            }),
+            "length" => arguments
+                .first()
+                .and_then(|value| self.abstract_length(context, value))
+                .map_or(AbstractValue::Unknown, AbstractValue::Integer),
+            "==" => match arguments {
+                [AbstractValue::Integer(left), AbstractValue::Integer(right)] => {
+                    AbstractValue::Logical(left == right)
+                }
+                [AbstractValue::String(left), AbstractValue::String(right)] => {
+                    AbstractValue::Logical(left == right)
+                }
+                _ => AbstractValue::Unknown,
+            },
+            "return" => {
+                return Ok(ExecutionOutcome {
+                    value: arguments.first().cloned().unwrap_or(AbstractValue::Null),
+                    returned: true,
+                });
+            }
+            "lapply" => self.evaluate_reenclosing_lapply(context, arguments),
+            "list2env" => {
+                let Some(AbstractValue::Object(values)) =
+                    construction_argument(call, arguments, &["x", "envir", "parent", "hash"], "x")
+                else {
+                    return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+                };
+                let environment = construction_argument(
+                    call,
+                    arguments,
+                    &["x", "envir", "parent", "hash"],
+                    "envir",
+                )
+                .and_then(|value| self.abstract_environment(context, value));
+                let parent = construction_argument(
+                    call,
+                    arguments,
+                    &["x", "envir", "parent", "hash"],
+                    "parent",
+                )
+                .and_then(|value| self.abstract_environment(context, value));
+                let environment = self
+                    .object_graphs
+                    .get_mut(&context.package.id)
+                    .expect("package object graph")
+                    .list2env(*values, None, environment, parent);
+                self.schedule_environment_closures(context, environment, &call.arguments);
+                let object = self
+                    .object_graphs
+                    .get_mut(&context.package.id)
+                    .expect("package object graph")
+                    .environment_object(environment)
+                    .expect("list2env result environment");
+                AbstractValue::Object(object)
+            }
+            "assign" => {
+                let field = construction_argument(
+                    call,
+                    arguments,
+                    &["x", "value", "pos", "envir", "inherits", "immediate"],
+                    "x",
+                );
+                let value = construction_argument(
+                    call,
+                    arguments,
+                    &["x", "value", "pos", "envir", "inherits", "immediate"],
+                    "value",
+                );
+                let environment = construction_argument(
+                    call,
+                    arguments,
+                    &["x", "value", "pos", "envir", "inherits", "immediate"],
+                    "envir",
+                )
+                .and_then(|value| self.abstract_environment(context, value));
+                if let (
+                    Some(AbstractValue::String(field)),
+                    Some(AbstractValue::Object(value)),
+                    Some(environment),
+                ) = (field, value, environment)
+                {
+                    self.object_graphs
+                        .get_mut(&context.package.id)
+                        .expect("package object graph")
+                        .set_environment_binding(environment, field, *value);
+                } else if let Some(environment) = environment {
+                    self.object_graphs
+                        .get_mut(&context.package.id)
+                        .expect("package object graph")
+                        .mark_environment_unknown_fields(environment);
+                }
+                AbstractValue::Null
+            }
+            _ => AbstractValue::Unknown,
+        };
+        let _ = state;
+        Ok(ExecutionOutcome::value(value))
+    }
+
+    fn abstract_environment(
+        &self,
+        context: ExecutionContext<'_>,
+        value: &AbstractValue,
+    ) -> Option<EnvironmentId> {
+        let AbstractValue::Object(object) = value else {
+            return None;
+        };
+        match self.object_graphs[&context.package.id].objects.get(object) {
+            Some(InstalledObject::Environment(environment)) => Some(*environment),
+            _ => None,
+        }
+    }
+
+    fn abstract_closure(
+        &self,
+        context: ExecutionContext<'_>,
+        value: &AbstractValue,
+    ) -> Option<ClosureId> {
+        let AbstractValue::Object(object) = value else {
+            return None;
+        };
+        match self.object_graphs[&context.package.id].objects.get(object) {
+            Some(InstalledObject::Closure(closure)) => Some(*closure),
+            _ => None,
+        }
+    }
+
+    fn abstract_length(&self, context: ExecutionContext<'_>, value: &AbstractValue) -> Option<i64> {
+        match value {
+            AbstractValue::Null => Some(0),
+            AbstractValue::String(_) => Some(1),
+            AbstractValue::Object(object) => {
+                match self.object_graphs[&context.package.id].objects.get(object) {
+                    Some(InstalledObject::Structured { members, .. }) => {
+                        i64::try_from(members.len()).ok()
+                    }
+                    Some(InstalledObject::Closure(_))
+                    | Some(InstalledObject::Environment(_))
+                    | Some(InstalledObject::Atom(_))
+                    | None => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn evaluate_reenclosing_lapply(
+        &mut self,
+        context: ExecutionContext<'_>,
+        arguments: &[AbstractValue],
+    ) -> AbstractValue {
+        let [AbstractValue::Object(object), function, ..] = arguments else {
+            return AbstractValue::Unknown;
+        };
+        let Some(environment) = self.reenclosure_callback(context, function) else {
+            return AbstractValue::Unknown;
+        };
+        self.object_graphs
+            .get_mut(&context.package.id)
+            .expect("package object graph")
+            .reenclose_structured_closures(*object, environment)
+            .map_or(AbstractValue::Unknown, AbstractValue::Object)
+    }
+
+    fn reenclosure_callback(
+        &self,
+        context: ExecutionContext<'_>,
+        function: &AbstractValue,
+    ) -> Option<EnvironmentId> {
+        let AbstractValue::Function {
+            parameters,
+            body,
+            captures,
+        } = function
+        else {
+            return None;
+        };
+        let parameter = parameters.first()?;
+        let ConstructionExprKind::Sequence { expressions } = &body.kind else {
+            return None;
+        };
+        let [condition, result] = expressions.as_slice() else {
+            return None;
+        };
+        if !matches!(
+            &result.kind,
+            ConstructionExprKind::Symbol { name } if name == parameter
+        ) {
+            return None;
+        }
+        let ConstructionExprKind::If {
+            condition,
+            consequence,
+            alternative: None,
+        } = &condition.kind
+        else {
+            return None;
+        };
+        let ConstructionExprKind::Call { call } = &condition.kind else {
+            return None;
+        };
+        if call.callee != "is.function"
+            || !matches!(
+                call.arguments.first().and_then(|argument| argument.value.as_ref()).map(|value| &value.kind),
+                Some(ConstructionExprKind::Symbol { name }) if name == parameter
+            )
+        {
+            return None;
+        }
+        let assignment = match &consequence.kind {
+            ConstructionExprKind::Assign { target, value } => Some((target, value.as_ref())),
+            ConstructionExprKind::Sequence { expressions } => {
+                expressions.iter().find_map(|expr| match &expr.kind {
+                    ConstructionExprKind::Assign { target, value } => {
+                        Some((target, value.as_ref()))
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        }?;
+        let (
+            ConstructionTarget::ClosureEnvironment { closure },
+            ConstructionExpr {
+                kind: ConstructionExprKind::Symbol { name: environment },
+                ..
+            },
+        ) = assignment
+        else {
+            return None;
+        };
+        if !matches!(&closure.kind, ConstructionExprKind::Symbol { name } if name == parameter) {
+            return None;
+        }
+        let value = captures.get(environment)?;
+        self.abstract_environment(context, value)
+    }
+
+    fn schedule_environment_closures(
+        &mut self,
+        context: ExecutionContext<'_>,
+        environment: EnvironmentId,
+        arguments: &[ConstructionArgument],
+    ) {
+        let closures = self.object_graphs[&context.package.id].environments[&environment]
+            .bindings
+            .values()
+            .filter_map(|object| {
+                match self.object_graphs[&context.package.id].objects.get(object) {
+                    Some(InstalledObject::Closure(closure)) => Some(*closure),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let span = arguments
+            .first()
+            .and_then(|argument| argument.value.as_ref())
+            .map(|value| value.span.clone());
+        for closure in closures {
+            self.require_at(
+                context.node,
+                Need::ClosureExecution {
+                    package: context.package.id.clone(),
+                    closure,
+                },
+                EdgeKind::ClosureExecution,
+                "list2env installs an executable closure",
+                span.clone(),
+            );
+        }
+    }
+
     fn process_parsed(
         &mut self,
         node: NodeId,
@@ -1123,6 +1901,16 @@ impl<P: PackageProvider> Linker<P> {
         }
 
         for expression in &parsed.expressions {
+            self.execute_construction(
+                ExecutionContext {
+                    node,
+                    package,
+                    image,
+                    lexical_environment,
+                    depth: 0,
+                },
+                &expression.construction,
+            )?;
             for active in &expression.active_bindings {
                 if binding != ".onLoad" || !active.certain {
                     continue;
@@ -2042,6 +2830,13 @@ impl<P: PackageProvider> Linker<P> {
                     format!("native routine `{selector}` invokes argument #{position} as private R binding `{callback}` in {environment}"),
                     Some(call.span.clone()),
                 ),
+                ResolvedName::ClosureObject { package, closure } => self.require_at(
+                    native_node,
+                    Need::ClosureExecution { package, closure },
+                    EdgeKind::Callback,
+                    format!("native routine `{selector}` invokes argument #{position} as a retained closure"),
+                    Some(call.span.clone()),
+                ),
                 ResolvedName::Imported { package, binding: callback } => {
                     self.require_at(
                         native_node,
@@ -2153,6 +2948,7 @@ impl<P: PackageProvider> Linker<P> {
             }
             ResolvedName::Unknown(_) => {}
             ResolvedName::Local(_)
+            | ResolvedName::ClosureObject { .. }
             | ResolvedName::PackageBinding { .. }
             | ResolvedName::PrivateBinding { .. }
             | ResolvedName::Imported { .. }
@@ -2205,7 +3001,9 @@ impl<P: PackageProvider> Linker<P> {
         lexical_environment: &str,
         effect: &SyntaxEffect,
     ) -> Result<()> {
-        if let Some(value) = &effect.value_symbol {
+        if let Some(value) = &effect.value_symbol
+            && !is_r_constant(value)
+        {
             let resolved = self.resolve_lexical_name(package, image, lexical_environment, value)?;
             if binding == ".onLoad" && matches!(resolved, ResolvedName::Unknown(_)) {
                 if let Some(component) = Self::sole_opaque_registered_native_component(&image.index)
@@ -2275,7 +3073,9 @@ impl<P: PackageProvider> Linker<P> {
                 format!("superassignment mutates private binding `{target_binding}` in {environment}"),
                 Some(effect.span.clone()),
             ),
+            ResolvedName::Local(_) if lexical_environment.starts_with("derived:") => {}
             ResolvedName::NativeSymbol { .. }
+            | ResolvedName::ClosureObject { .. }
             | ResolvedName::Imported { .. }
             | ResolvedName::TargetProvided { .. }
             | ResolvedName::PackageMetadata { .. }
@@ -2796,6 +3596,29 @@ impl<P: PackageProvider> Linker<P> {
         let mut private_shadowed = BTreeSet::new();
         let mut visible_private = BTreeMap::new();
         let mut environment = lexical_environment.to_owned();
+        if let Some(graph) = self.object_graphs.get(&image.index.package.id)
+            && let Some(mut environment_id) = graph.environment_id(&environment)
+        {
+            let mut seen = BTreeSet::new();
+            while seen.insert(environment_id) {
+                let Some(shape) = graph.environments.get(&environment_id) else {
+                    break;
+                };
+                if !shape.derived {
+                    environment = shape.label.clone();
+                    break;
+                }
+                for name in shape.bindings.keys() {
+                    private_shadowed.insert(name.clone());
+                    shadowed.insert(name.clone());
+                }
+                let Some(parent) = shape.parent else {
+                    environment.clear();
+                    break;
+                };
+                environment_id = parent;
+            }
+        }
         let mut seen = HashSet::new();
         while seen.insert(environment.clone()) {
             let Some(private) = image.private_environment(&environment) else {
@@ -2854,6 +3677,27 @@ impl<P: PackageProvider> Linker<P> {
         format!("{environment}${binding}")
     }
 
+    fn closure_execution_source(
+        &self,
+        package: &PackageId,
+        closure: ClosureId,
+    ) -> Option<(ClosureObject, String, String, String)> {
+        let graph = self.object_graphs.get(package)?;
+        let closure = graph.closures.get(&closure)?.clone();
+        let environment = graph.environments.get(&closure.enclosure)?.label.clone();
+        let owner = match (
+            &closure.provenance.namespace_binding,
+            &closure.provenance.private_environment,
+            &closure.provenance.private_binding,
+        ) {
+            (Some(binding), _, _) => binding.clone(),
+            (_, Some(private), Some(binding)) => Self::private_source_key(private, binding),
+            _ => "runtime".into(),
+        };
+        let source_key = format!("{owner}{}@{environment}", closure.provenance.path);
+        Some((closure, owner, source_key, environment))
+    }
+
     fn resolve_lexical_name(
         &mut self,
         current: &InstalledPackage,
@@ -2875,19 +3719,27 @@ impl<P: PackageProvider> Linker<P> {
                         if let Some(object) = object {
                             let resolved = match graph.objects.get(&object) {
                                 Some(InstalledObject::Closure(closure)) => {
-                                    let provenance = &graph.closures[closure].provenance;
-                                    if let Some(binding) = &provenance.namespace_binding {
+                                    let closure_object = &graph.closures[closure];
+                                    let provenance = &closure_object.provenance;
+                                    if closure_object.derived_from.is_some()
+                                        || provenance.path != "$"
+                                    {
+                                        ResolvedName::ClosureObject {
+                                            package: current.id.clone(),
+                                            closure: *closure,
+                                        }
+                                    } else if let Some(binding) = &provenance.namespace_binding {
                                         ResolvedName::PackageBinding {
                                             package: current.id.clone(),
                                             binding: binding.clone(),
                                         }
-                                    } else if let (Some(private_environment), Some(binding)) = (
+                                    } else if let (Some(environment), Some(binding)) = (
                                         &provenance.private_environment,
                                         &provenance.private_binding,
                                     ) {
                                         ResolvedName::PrivateBinding {
                                             package: current.id.clone(),
-                                            environment: private_environment.clone(),
+                                            environment: environment.clone(),
                                             binding: binding.clone(),
                                         }
                                     } else {
@@ -3064,6 +3916,13 @@ impl<P: PackageProvider> Linker<P> {
                 format!("lexical private reference `{binding}` in {environment}"),
                 Some(span.clone()),
             ),
+            ResolvedName::ClosureObject { package, closure } => self.require_at(
+                from,
+                Need::ClosureExecution { package, closure },
+                EdgeKind::ClosureExecution,
+                "reachable lexical reference resolves to an executable retained closure",
+                Some(span.clone()),
+            ),
             ResolvedName::NativeSymbol {
                 package,
                 component,
@@ -3217,19 +4076,15 @@ impl<P: PackageProvider> Linker<P> {
                 environment: environment.clone(),
                 name: binding.clone(),
             },
-            Need::ClosureObject {
-                owner_environment,
-                owner_binding,
-                path,
-                ..
-            } => {
-                let owner = owner_environment
-                    .as_deref()
-                    .map(|environment| Self::private_source_key(environment, owner_binding))
-                    .unwrap_or_else(|| owner_binding.clone());
+            Need::ClosureExecution { package, closure } => {
+                let (closure, owner, _, enclosure) = self
+                    .closure_execution_source(package, *closure)
+                    .expect("closure execution need references the package object graph");
                 NodeKind::ClosureObject {
                     owner,
-                    path: path.clone(),
+                    path: closure.provenance.path,
+                    enclosure,
+                    derived: closure.derived_from.is_some(),
                 }
             }
             Need::Activation { .. } => NodeKind::Activation,
@@ -3335,6 +4190,22 @@ impl<P: PackageProvider> Linker<P> {
     }
 }
 
+fn is_r_constant(name: &str) -> bool {
+    matches!(
+        name,
+        "NULL"
+            | "TRUE"
+            | "FALSE"
+            | "NA"
+            | "NaN"
+            | "Inf"
+            | "NA_integer_"
+            | "NA_real_"
+            | "NA_complex_"
+            | "NA_character_"
+    )
+}
+
 fn rewrite_span(rewrite: &Rewrite) -> &Span {
     match rewrite {
         Rewrite::NamespaceAccess { source, .. }
@@ -3347,17 +4218,48 @@ fn spans_overlap(left: &Span, right: &Span) -> bool {
     left.source == right.source && left.start < right.end && right.start < left.end
 }
 
-fn matched_call_arg_index(call: &CallSite, formals: &[&str], target: &str) -> Option<usize> {
-    let target_index = formals.iter().position(|formal| *formal == target)?;
+trait NamedArguments {
+    fn len(&self) -> usize;
+    fn name(&self, index: usize) -> Option<&str>;
+}
+
+impl NamedArguments for CallSite {
+    fn len(&self) -> usize {
+        self.args.len()
+    }
+
+    fn name(&self, index: usize) -> Option<&str> {
+        self.arg_names.get(index).and_then(Option::as_deref)
+    }
+}
+
+impl NamedArguments for ConstructionCall {
+    fn len(&self) -> usize {
+        self.arguments.len()
+    }
+
+    fn name(&self, index: usize) -> Option<&str> {
+        self.arguments.get(index)?.name.as_deref()
+    }
+}
+
+fn matched_arg_index<A, S>(arguments: &A, formals: &[S], target: &str) -> Option<usize>
+where
+    A: NamedArguments,
+    S: AsRef<str>,
+{
+    let target_index = formals
+        .iter()
+        .position(|formal| formal.as_ref() == target)?;
     let mut assigned = vec![None; formals.len()];
-    let mut consumed = vec![false; call.args.len()];
+    let mut consumed = vec![false; arguments.len()];
 
     // R first performs exact named matching.
-    for (arg_index, name) in call.arg_names.iter().enumerate() {
-        let Some(name) = name.as_deref() else {
+    for arg_index in 0..arguments.len() {
+        let Some(name) = arguments.name(arg_index) else {
             continue;
         };
-        if let Some(formal_index) = formals.iter().position(|formal| *formal == name) {
+        if let Some(formal_index) = formals.iter().position(|formal| formal.as_ref() == name) {
             if assigned[formal_index].is_none() {
                 assigned[formal_index] = Some(arg_index);
                 consumed[arg_index] = true;
@@ -3367,8 +4269,8 @@ fn matched_call_arg_index(call: &CallSite, formals: &[&str], target: &str) -> Op
 
     // Then accept an unambiguous partial name. This bounded matcher is used
     // only for primitives whose relevant formal prefix is known here.
-    for (arg_index, name) in call.arg_names.iter().enumerate() {
-        let Some(name) = name.as_deref() else {
+    for arg_index in 0..arguments.len() {
+        let Some(name) = arguments.name(arg_index) else {
             continue;
         };
         if consumed[arg_index] {
@@ -3378,7 +4280,7 @@ fn matched_call_arg_index(call: &CallSite, formals: &[&str], target: &str) -> Op
             .iter()
             .enumerate()
             .filter(|(formal_index, formal)| {
-                assigned[*formal_index].is_none() && formal.starts_with(name)
+                assigned[*formal_index].is_none() && formal.as_ref().starts_with(name)
             })
             .map(|(formal_index, _)| formal_index)
             .collect::<Vec<_>>();
@@ -3391,8 +4293,8 @@ fn matched_call_arg_index(call: &CallSite, formals: &[&str], target: &str) -> Op
 
     // Remaining unnamed arguments match the remaining formals positionally.
     let mut next_formal = 0;
-    for (arg_index, name) in call.arg_names.iter().enumerate() {
-        if name.is_some() || consumed[arg_index] {
+    for arg_index in 0..arguments.len() {
+        if arguments.name(arg_index).is_some() || consumed[arg_index] {
             continue;
         }
         while next_formal < assigned.len() && assigned[next_formal].is_some() {
@@ -3407,6 +4309,35 @@ fn matched_call_arg_index(call: &CallSite, formals: &[&str], target: &str) -> Op
     }
 
     assigned[target_index]
+}
+
+fn matched_call_arg_index(call: &CallSite, formals: &[&str], target: &str) -> Option<usize> {
+    matched_arg_index(call, formals, target)
+}
+
+fn construction_argument<'a>(
+    call: &ConstructionCall,
+    values: &'a [AbstractValue],
+    formals: &[&str],
+    target: &str,
+) -> Option<&'a AbstractValue> {
+    let index = matched_arg_index(call, formals, target)?;
+    values.get(index)
+}
+
+fn bind_construction_arguments(
+    state: &mut ExecutionState,
+    parameters: &[String],
+    call: &ConstructionCall,
+    values: &[AbstractValue],
+) {
+    for parameter in parameters {
+        let value = matched_arg_index(call, parameters, parameter)
+            .and_then(|index| values.get(index))
+            .cloned()
+            .unwrap_or(AbstractValue::Unknown);
+        state.locals.insert(parameter.clone(), value);
+    }
 }
 
 fn matched_static_arg<'a>(

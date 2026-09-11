@@ -126,6 +126,91 @@ pub enum StaticEnvironment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstructionExpr {
+    pub kind: ConstructionExprKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConstructionExprKind {
+    Unknown,
+    Null,
+    Logical {
+        value: bool,
+    },
+    Integer {
+        value: i64,
+    },
+    Double {
+        value: String,
+    },
+    String {
+        value: String,
+    },
+    Symbol {
+        name: String,
+    },
+    Sequence {
+        expressions: Vec<ConstructionExpr>,
+    },
+    Call {
+        call: ConstructionCall,
+    },
+    Member {
+        object: Box<ConstructionExpr>,
+        name: Option<String>,
+    },
+    Index {
+        object: Box<ConstructionExpr>,
+        index: Box<ConstructionExpr>,
+    },
+    Assign {
+        target: ConstructionTarget,
+        value: Box<ConstructionExpr>,
+    },
+    If {
+        condition: Box<ConstructionExpr>,
+        consequence: Box<ConstructionExpr>,
+        alternative: Option<Box<ConstructionExpr>>,
+    },
+    Function {
+        parameters: Vec<String>,
+        body: Box<ConstructionExpr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstructionCall {
+    pub callee: String,
+    pub callee_kind: CalleeKind,
+    pub qualified_package: Option<String>,
+    pub arguments: Vec<ConstructionArgument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstructionArgument {
+    pub name: Option<String>,
+    pub value: Option<ConstructionExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConstructionTarget {
+    Local {
+        name: String,
+    },
+    Member {
+        object: Box<ConstructionExpr>,
+        name: Option<String>,
+    },
+    ClosureEnvironment {
+        closure: Box<ConstructionExpr>,
+    },
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveBindingDef {
     pub name: String,
     pub target: StaticEnvironment,
@@ -172,6 +257,8 @@ pub struct SemanticIssue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedExpression {
     pub span: Span,
+    #[serde(default)]
+    pub parameters: Vec<String>,
     pub definitions: Vec<BindingDef>,
     pub references: Vec<NameRef>,
     pub package_refs: Vec<PackageRef>,
@@ -179,6 +266,8 @@ pub struct ParsedExpression {
     pub calls: Vec<CallSite>,
     pub active_bindings: Vec<ActiveBindingDef>,
     pub effects: Vec<SyntaxEffect>,
+    #[serde(default)]
+    pub construction: Vec<ConstructionExpr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

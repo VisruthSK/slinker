@@ -89,6 +89,7 @@ pub enum GraphEdgeReasonExport {
     NativeCall,
     NativeCallback,
     ClosureCapture,
+    ClosureExecution,
     SpecializedDiscovery,
     SemanticEffect,
 }
@@ -417,6 +418,7 @@ impl GraphEdgeReasonExport {
             Self::NativeCall => "native_call",
             Self::NativeCallback => "native_callback",
             Self::ClosureCapture => "closure_capture",
+            Self::ClosureExecution => "closure_execution",
             Self::SpecializedDiscovery => "specialized_discovery",
             Self::SemanticEffect => "semantic_effect",
         }
@@ -431,8 +433,17 @@ fn semantic_node_id(node: &Node) -> String {
         NodeKind::PrivateBinding { environment, name } => {
             format!("private:{}::{environment}::{name}", node.package)
         }
-        NodeKind::ClosureObject { owner, path } => {
-            format!("closure:{}::{owner}{path}", node.package)
+        NodeKind::ClosureObject {
+            owner,
+            path,
+            enclosure,
+            derived,
+        } => {
+            format!(
+                "closure:{}::{owner}{path}@{enclosure}:{}",
+                node.package,
+                if *derived { "derived" } else { "installed" }
+            )
         }
         NodeKind::Activation => format!("package:{}", node.package),
         NodeKind::Dataset { name } => format!("dataset:{}::{name}", node.package),
@@ -489,6 +500,7 @@ fn edge_reason(edge: &Edge, source: &NodeKind, target: &NodeKind) -> GraphEdgeRe
         EdgeKind::Native => GraphEdgeReasonExport::NativeCall,
         EdgeKind::Callback => GraphEdgeReasonExport::NativeCallback,
         EdgeKind::ClosureCapture => GraphEdgeReasonExport::ClosureCapture,
+        EdgeKind::ClosureExecution => GraphEdgeReasonExport::ClosureExecution,
         EdgeKind::Discovery => GraphEdgeReasonExport::SpecializedDiscovery,
         EdgeKind::Effect => GraphEdgeReasonExport::SemanticEffect,
     }

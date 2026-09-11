@@ -17,6 +17,7 @@ default = ["air"]
 air = [
     "dep:air_r_parser",
     "dep:air_r_syntax",
+    "dep:biome_rowan",
     "dep:oak_semantic",
     "dep:rayon",
 ]
@@ -31,6 +32,7 @@ rayon = { version = "1.12", optional = true }
 # pinned Ark/Oak revision. Do not reintroduce an independent Air tag/version.
 air_r_parser = { git = "https://github.com/posit-dev/air", rev = "d2659d5b158374bf486b594625ca50abbd0ac879", optional = true }
 air_r_syntax = { git = "https://github.com/posit-dev/air", rev = "d2659d5b158374bf486b594625ca50abbd0ac879", optional = true }
+biome_rowan = { git = "https://github.com/lionel-/biome", rev = "a1296ea6ba363d8b8d8f02181b2a4ce9315c5ef9", optional = true }
 
 # Oak semantic analysis only. Do not pull Ark runtime/LSP/Jupyter crates.
 oak_semantic = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a", optional = true }

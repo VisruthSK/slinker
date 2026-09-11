@@ -582,8 +582,17 @@ fn node_label(plan: &LinkPlan, id: NodeId) -> String {
         NodeKind::PrivateBinding { environment, name } => {
             format!("{} [private {environment}::{name}]", node.package)
         }
-        NodeKind::ClosureObject { owner, path } => {
-            format!("{} [{owner}{path} closure]", node.package)
+        NodeKind::ClosureObject {
+            owner,
+            path,
+            enclosure,
+            derived,
+        } => {
+            let origin = if *derived { "derived" } else { "installed" };
+            format!(
+                "{} [{owner}{path} {origin} closure in {enclosure}]",
+                node.package
+            )
         }
         NodeKind::Activation => format!("{} [activation]", node.package),
         NodeKind::Dataset { name } => format!("{} [dataset {name}]", node.package),
@@ -707,6 +716,10 @@ fn print_analysis(
     println!(
         "  nested closures Air-parsed: {}",
         plan.parsed_nested_closures
+    );
+    println!(
+        "  derived closures Air-parsed: {}",
+        plan.parsed_derived_closures
     );
     println!(
         "  total closure bodies Air-parsed: {}",

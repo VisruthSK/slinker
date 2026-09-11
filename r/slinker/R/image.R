@@ -316,9 +316,15 @@ slinker_inspect_index <- function(library, package, output, visible_libraries = 
     } else if (type %in% c("list", "pairlist")) {
       values <- as.list(x)
       if (length(values)) {
+        value_names <- names(values)
         for (i in seq_along(values)) {
           if (!.slinker_is_missing_slot(values, i)) {
-            walk(values[[i]], paste0(path, "[[", i, "]]"), depth + 1L, TRUE)
+            member <- if (!is.null(value_names) && nzchar(value_names[[i]])) {
+              paste0("$", value_names[[i]])
+            } else {
+              paste0("[[", i, "]]")
+            }
+            walk(values[[i]], paste0(path, member), depth + 1L, TRUE)
           }
         }
       }

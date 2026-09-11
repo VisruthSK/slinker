@@ -894,6 +894,7 @@ version = "0.1.0"
 dependencies = [
  "air_r_parser",
  "air_r_syntax",
+ "biome_rowan",
  "oak_semantic",
  "r-description-parser",
  "r-metadata",

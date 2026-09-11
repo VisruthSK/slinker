@@ -4,8 +4,9 @@ pub mod resolve;
 pub mod source;
 
 pub use facts::{
-    ActiveBindingDef, BindingCertainty, BindingDef, CallSite, CalleeKind, EvalPhase, NameRef,
-    NameRefKind, PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourceRef,
+    ActiveBindingDef, BindingCertainty, BindingDef, CallSite, CalleeKind, ConstructionArgument,
+    ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, EvalPhase,
+    NameRef, NameRefKind, PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourceRef,
     SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 pub(crate) use oak::{

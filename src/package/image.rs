@@ -627,14 +627,24 @@ impl PackageObjectGraph {
         object: ObjectId,
         names: Option<&[String]>,
     ) {
-        let Some(names) = names else {
-            self.mark_environment_unknown_fields(environment);
-            return;
-        };
         let Some(InstalledObject::Structured { members, .. }) = self.objects.get(&object) else {
             self.mark_environment_unknown_fields(environment);
             return;
         };
+        if names.is_none() {
+            let named = members
+                .iter()
+                .filter_map(|(path, value)| direct_structured_name(path).map(|name| (name, *value)))
+                .collect::<Vec<_>>();
+            if named.len() != members.len() {
+                self.mark_environment_unknown_fields(environment);
+            }
+            for (name, value) in named {
+                self.set_environment_binding(environment, name, value);
+            }
+            return;
+        }
+        let names = names.expect("known names handled after the unnamed-object branch");
         let indexed = members
             .iter()
             .filter_map(|(path, value)| direct_structured_index(path).map(|index| (index, *value)))
@@ -828,6 +838,11 @@ fn direct_structured_index(path: &str) -> Option<usize> {
         return None;
     }
     value.parse().ok()
+}
+
+fn direct_structured_name(path: &str) -> Option<String> {
+    let value = path.strip_prefix("$$")?;
+    (!value.is_empty() && !value.contains(['$', '[', ']'])).then(|| value.to_owned())
 }
 
 fn normalized_closure_code(source: &str) -> &str {

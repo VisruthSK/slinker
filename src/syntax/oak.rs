@@ -11,14 +11,16 @@
 //! environment or general control-flow evaluator.
 
 use crate::syntax::facts::{
-    ActiveBindingDef, CallSite, CalleeKind, EvalPhase, NameRef, NameRefKind, PackageGuard,
-    PackageRef, ParsedExpression, ParsedRFile, ResourceRef, SemanticIssue, SemanticIssueKind,
-    StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    ActiveBindingDef, CallSite, CalleeKind, ConstructionArgument, ConstructionCall,
+    ConstructionExpr, ConstructionExprKind, ConstructionTarget, EvalPhase, NameRef, NameRefKind,
+    PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourceRef, SemanticIssue,
+    SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span};
 use crate::{Error, Result};
 use air_r_parser::{RParserOptions, parse};
-use air_r_syntax::RRoot;
+use air_r_syntax::{AnyRExpression, RRoot};
+use biome_rowan::{AstNode, AstNodeList, AstSeparatedList};
 use oak_semantic::semantic_index::{
     DefinitionKind, NamespaceAccessKind, ScopeId, ScopeKind, SemanticDiagnostic, SemanticIndex,
     UseId,
@@ -346,7 +348,7 @@ impl OakParser {
         }
         let root = parsed.tree();
         let index = build_semantic_index(&root, context);
-        Ok(translate_index(source, text, context, &index))
+        Ok(translate_index(source, text, context, &root, &index))
     }
 }
 
@@ -358,6 +360,7 @@ fn translate_index(
     source: SourceId,
     text: &str,
     context: &OakParseContext,
+    root: &RRoot,
     index: &SemanticIndex,
 ) -> ParsedRFile {
     let mut live_uses = Vec::new();
@@ -558,12 +561,14 @@ fn translate_index(
     });
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
 
+    let (parameters, construction) = collect_construction(source.clone(), text, &root, &live_calls);
     let calls = live_calls.into_iter().map(|call| call.site).collect();
     let issues = translate_diagnostics(source.clone(), index);
 
     ParsedRFile {
         expressions: vec![ParsedExpression {
             span: Span::new(source, 0, text.len()),
+            parameters,
             definitions: Vec::new(),
             references,
             package_refs,
@@ -571,8 +576,347 @@ fn translate_index(
             calls,
             active_bindings,
             effects,
+            construction,
         }],
         issues,
+    }
+}
+
+fn collect_construction(
+    source: SourceId,
+    text: &str,
+    root: &RRoot,
+    calls: &[LiveCall],
+) -> (Vec<String>, Vec<ConstructionExpr>) {
+    let Some(function) = root
+        .expressions()
+        .iter()
+        .find_map(|expression| outer_function(&expression))
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let parameters = function
+        .parameters()
+        .ok()
+        .into_iter()
+        .flat_map(|parameters| parameters.items().iter().collect::<Vec<_>>())
+        .filter_map(|parameter| parameter.ok())
+        .filter_map(|parameter| parameter.name().ok())
+        .map(|name| ast_text(text, &name))
+        .collect();
+    let construction = function
+        .body()
+        .ok()
+        .map(|body| construction_statements(&source, text, body, calls))
+        .unwrap_or_default();
+    (parameters, construction)
+}
+
+fn outer_function(expression: &AnyRExpression) -> Option<air_r_syntax::RFunctionDefinition> {
+    match expression {
+        AnyRExpression::RFunctionDefinition(function) => Some(function.clone()),
+        AnyRExpression::RBinaryExpression(binary)
+            if binary
+                .operator()
+                .is_ok_and(|operator| operator.text_trimmed() == "<-") =>
+        {
+            match binary.right().ok()? {
+                AnyRExpression::RFunctionDefinition(function) => Some(function),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn construction_statements(
+    source: &SourceId,
+    text: &str,
+    expression: AnyRExpression,
+    calls: &[LiveCall],
+) -> Vec<ConstructionExpr> {
+    match expression {
+        AnyRExpression::RBracedExpressions(block) => block
+            .expressions()
+            .iter()
+            .filter_map(|expression| construction_expr(source, text, expression, calls))
+            .collect(),
+        expression => construction_expr(source, text, expression, calls)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn construction_expr(
+    source: &SourceId,
+    text: &str,
+    expression: AnyRExpression,
+    calls: &[LiveCall],
+) -> Option<ConstructionExpr> {
+    let span = ast_span(source, &expression);
+    let kind = match expression {
+        AnyRExpression::RNullExpression(_) => ConstructionExprKind::Null,
+        AnyRExpression::RTrueExpression(_) => ConstructionExprKind::Logical { value: true },
+        AnyRExpression::RFalseExpression(_) => ConstructionExprKind::Logical { value: false },
+        AnyRExpression::RIdentifier(identifier) => ConstructionExprKind::Symbol {
+            name: identifier.name_token().ok()?.text_trimmed().to_owned(),
+        },
+        AnyRExpression::AnyRValue(_) => {
+            let value = text.get(span.start..span.end)?.trim();
+            if let Some(StaticArg::String(value)) = static_arg(value) {
+                ConstructionExprKind::String { value }
+            } else if let Some(integer) =
+                value.strip_suffix('L').unwrap_or(value).parse::<i64>().ok()
+            {
+                ConstructionExprKind::Integer { value: integer }
+            } else {
+                ConstructionExprKind::Double {
+                    value: value.to_owned(),
+                }
+            }
+        }
+        AnyRExpression::RBracedExpressions(block) => ConstructionExprKind::Sequence {
+            expressions: block
+                .expressions()
+                .iter()
+                .filter_map(|expression| construction_expr(source, text, expression, calls))
+                .collect(),
+        },
+        AnyRExpression::RParenthesizedExpression(parenthesized) => {
+            return construction_expr(source, text, parenthesized.body().ok()?, calls);
+        }
+        AnyRExpression::RBinaryExpression(binary) => {
+            let operator = binary.operator().ok()?.text_trimmed().to_owned();
+            let left = binary.left().ok()?;
+            let right = binary.right().ok()?;
+            if operator == "<-" || operator == "=" {
+                ConstructionExprKind::Assign {
+                    target: construction_target(source, text, left, calls),
+                    value: Box::new(construction_expr(source, text, right, calls)?),
+                }
+            } else {
+                ConstructionExprKind::Call {
+                    call: ConstructionCall {
+                        callee: operator,
+                        callee_kind: CalleeKind::DefinitelyExternal,
+                        qualified_package: Some("base".into()),
+                        arguments: vec![
+                            ConstructionArgument {
+                                name: None,
+                                value: construction_expr(source, text, left, calls),
+                            },
+                            ConstructionArgument {
+                                name: None,
+                                value: construction_expr(source, text, right, calls),
+                            },
+                        ],
+                    },
+                }
+            }
+        }
+        AnyRExpression::RCall(call) => {
+            let site = calls
+                .iter()
+                .find(|candidate| candidate.site.span == span)
+                .map(|call| &call.site);
+            let function = call.function().ok()?;
+            let callee = site
+                .map(|site| site.callee.clone())
+                .unwrap_or_else(|| ast_text(text, &function));
+            ConstructionExprKind::Call {
+                call: ConstructionCall {
+                    callee,
+                    callee_kind: site
+                        .map(|site| site.callee_kind)
+                        .unwrap_or(CalleeKind::DefinitelyLexical),
+                    qualified_package: site.and_then(|site| site.qualified_package.clone()),
+                    arguments: call
+                        .arguments()
+                        .ok()?
+                        .items()
+                        .iter()
+                        .filter_map(|argument| argument.ok())
+                        .map(|argument| ConstructionArgument {
+                            name: argument
+                                .name_clause()
+                                .and_then(|clause| clause.name().ok())
+                                .map(|name| ast_text(text, &name)),
+                            value: argument
+                                .value()
+                                .and_then(|value| construction_expr(source, text, value, calls)),
+                        })
+                        .collect(),
+                },
+            }
+        }
+        AnyRExpression::RExtractExpression(extract) => ConstructionExprKind::Member {
+            object: Box::new(construction_expr(
+                source,
+                text,
+                extract.left().ok()?,
+                calls,
+            )?),
+            name: extract.right().ok().map(|name| ast_text(text, &name)),
+        },
+        AnyRExpression::RSubset2(subset) => {
+            let mut arguments = subset
+                .arguments()
+                .ok()?
+                .items()
+                .iter()
+                .filter_map(|argument| argument.ok());
+            let index = arguments.next()?.value()?;
+            ConstructionExprKind::Index {
+                object: Box::new(construction_expr(
+                    source,
+                    text,
+                    subset.function().ok()?,
+                    calls,
+                )?),
+                index: Box::new(construction_expr(source, text, index, calls)?),
+            }
+        }
+        AnyRExpression::RIfStatement(statement) => ConstructionExprKind::If {
+            condition: Box::new(construction_expr(
+                source,
+                text,
+                statement.condition().ok()?,
+                calls,
+            )?),
+            consequence: Box::new(construction_expr(
+                source,
+                text,
+                statement.consequence().ok()?,
+                calls,
+            )?),
+            alternative: statement
+                .else_clause()
+                .and_then(|clause| clause.alternative().ok())
+                .and_then(|alternative| construction_expr(source, text, alternative, calls))
+                .map(Box::new),
+        },
+        AnyRExpression::RFunctionDefinition(function) => ConstructionExprKind::Function {
+            parameters: function
+                .parameters()
+                .ok()?
+                .items()
+                .iter()
+                .filter_map(|parameter| parameter.ok())
+                .filter_map(|parameter| parameter.name().ok())
+                .map(|name| ast_text(text, &name))
+                .collect(),
+            body: Box::new(construction_expr(
+                source,
+                text,
+                function.body().ok()?,
+                calls,
+            )?),
+        },
+        _ => ConstructionExprKind::Unknown,
+    };
+    Some(ConstructionExpr { kind, span })
+}
+
+fn construction_target(
+    source: &SourceId,
+    text: &str,
+    target: AnyRExpression,
+    calls: &[LiveCall],
+) -> ConstructionTarget {
+    match target {
+        AnyRExpression::RIdentifier(identifier) => identifier
+            .name_token()
+            .ok()
+            .map(|name| ConstructionTarget::Local {
+                name: name.text_trimmed().to_owned(),
+            })
+            .unwrap_or(ConstructionTarget::Unknown),
+        AnyRExpression::RExtractExpression(extract) => ConstructionTarget::Member {
+            object: Box::new(
+                extract
+                    .left()
+                    .ok()
+                    .and_then(|object| construction_expr(source, text, object, calls))
+                    .unwrap_or_else(|| unknown_construction(source, &extract)),
+            ),
+            name: extract.right().ok().map(|name| ast_text(text, &name)),
+        },
+        AnyRExpression::RSubset2(subset) => {
+            let name = subset
+                .arguments()
+                .ok()
+                .and_then(|arguments| {
+                    arguments
+                        .items()
+                        .iter()
+                        .filter_map(|argument| argument.ok())
+                        .next()
+                })
+                .and_then(|argument| argument.value())
+                .and_then(|value| construction_expr(source, text, value, calls))
+                .and_then(|value| match value.kind {
+                    ConstructionExprKind::String { value } => Some(value),
+                    _ => None,
+                });
+            ConstructionTarget::Member {
+                object: Box::new(
+                    subset
+                        .function()
+                        .ok()
+                        .and_then(|object| construction_expr(source, text, object, calls))
+                        .unwrap_or_else(|| unknown_construction(source, &subset)),
+                ),
+                name,
+            }
+        }
+        AnyRExpression::RCall(call) => {
+            let callee = call.function().ok().map(|callee| ast_text(text, &callee));
+            if callee.as_deref() != Some("environment") {
+                return ConstructionTarget::Unknown;
+            }
+            let closure = call
+                .arguments()
+                .ok()
+                .and_then(|arguments| {
+                    arguments
+                        .items()
+                        .iter()
+                        .filter_map(|argument| argument.ok())
+                        .next()
+                })
+                .and_then(|argument| argument.value())
+                .and_then(|closure| construction_expr(source, text, closure, calls));
+            closure
+                .map(|closure| ConstructionTarget::ClosureEnvironment {
+                    closure: Box::new(closure),
+                })
+                .unwrap_or(ConstructionTarget::Unknown)
+        }
+        _ => ConstructionTarget::Unknown,
+    }
+}
+
+fn ast_span(source: &SourceId, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> Span {
+    let range = node.syntax().text_trimmed_range();
+    Span::new(
+        source.clone(),
+        text_offset(range.start()),
+        text_offset(range.end()),
+    )
+}
+
+fn ast_text(text: &str, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> String {
+    let span = node.syntax().text_trimmed_range();
+    text[text_offset(span.start())..text_offset(span.end())].to_owned()
+}
+
+fn unknown_construction(
+    source: &SourceId,
+    node: &impl AstNode<Language = air_r_syntax::RLanguage>,
+) -> ConstructionExpr {
+    ConstructionExpr {
+        kind: ConstructionExprKind::Unknown,
+        span: ast_span(source, node),
     }
 }
 
@@ -2723,13 +3067,8 @@ fn argument_spans(source: &SourceId, arguments: &[RawArgument]) -> Vec<Option<Sp
     arguments
         .iter()
         .map(|argument| {
-            (argument.value_start < argument.value_end).then(|| {
-                Span::new(
-                    source.clone(),
-                    argument.value_start,
-                    argument.value_end,
-                )
-            })
+            (argument.value_start < argument.value_end)
+                .then(|| Span::new(source.clone(), argument.value_start, argument.value_end))
         })
         .collect()
 }
@@ -3896,6 +4235,60 @@ mod tests {
             Some(StaticArg::Symbol("croot_f".into()))
         );
         assert_eq!(call.arg_spans[selector].as_ref(), Some(&reference.span));
+    }
+
+    #[test]
+    fn construction_facts_preserve_order_and_target_shapes() {
+        let parsed = parse_source(
+            "f <- function(template, parent) { env <- new.env(parent = parent); env$self <- env; environment(template) <- env; list2env(template, envir = env) }",
+        );
+        let construction = &parsed.expressions[0].construction;
+
+        assert_eq!(construction.len(), 4);
+        assert!(matches!(
+            &construction[0].kind,
+            ConstructionExprKind::Assign {
+                target: ConstructionTarget::Local { name },
+                value,
+            } if name == "env" && matches!(
+                &value.kind,
+                ConstructionExprKind::Call { call } if call.callee == "new.env"
+            )
+        ));
+        assert!(matches!(
+            &construction[1].kind,
+            ConstructionExprKind::Assign {
+                target: ConstructionTarget::Member { name: Some(name), .. },
+                ..
+            } if name == "self"
+        ));
+        assert!(matches!(
+            &construction[2].kind,
+            ConstructionExprKind::Assign {
+                target: ConstructionTarget::ClosureEnvironment { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &construction[3].kind,
+            ConstructionExprKind::Call { call } if call.callee == "list2env"
+        ));
+    }
+
+    #[test]
+    fn reenclosure_helper_construction_shape() {
+        let parsed = parse_source(
+            "assign_func_envs <- function(objs, target_env) { if (is.null(target_env)) return(objs); lapply(objs, function(x) { if (is.function(x)) environment(x) <- target_env; x }) }",
+        );
+        assert!(matches!(
+            &parsed.expressions[0].construction[1].kind,
+            ConstructionExprKind::Call { call }
+                if call.callee == "lapply"
+                    && matches!(
+                        call.arguments.get(1).and_then(|argument| argument.value.as_ref()).map(|value| &value.kind),
+                        Some(ConstructionExprKind::Function { .. })
+                    )
+        ));
     }
 
     #[test]

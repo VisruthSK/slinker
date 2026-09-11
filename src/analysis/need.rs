@@ -1,4 +1,4 @@
-use crate::package::PackageId;
+use crate::package::{ClosureId, PackageId};
 
 pub type BindingName = String;
 pub type ResourceId = String;
@@ -23,11 +23,9 @@ pub enum Need {
         environment: String,
         binding: BindingName,
     },
-    ClosureObject {
+    ClosureExecution {
         package: PackageId,
-        owner_environment: Option<String>,
-        owner_binding: BindingName,
-        path: String,
+        closure: ClosureId,
     },
     Activation {
         package: PackageId,
@@ -59,7 +57,7 @@ impl Need {
         match self {
             Self::Binding { package, .. }
             | Self::PrivateBinding { package, .. }
-            | Self::ClosureObject { package, .. }
+            | Self::ClosureExecution { package, .. }
             | Self::Activation { package }
             | Self::Resource { package, .. }
             | Self::Dataset { package, .. }

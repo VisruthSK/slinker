@@ -8,19 +8,46 @@ pub struct NodeId(pub usize);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeKind {
-    Binding { name: String },
-    PrivateBinding { environment: String, name: String },
-    ClosureObject { owner: String, path: String },
+    Binding {
+        name: String,
+    },
+    PrivateBinding {
+        environment: String,
+        name: String,
+    },
+    ClosureObject {
+        owner: String,
+        path: String,
+        enclosure: String,
+        derived: bool,
+    },
     Activation,
-    Dataset { name: String },
-    Lifecycle { hook: String },
-    S3Registration { generic: String, class: String },
-    Resource { path: String },
-    NativeComponent { name: String },
-    ExternalBinding { name: String },
-    PackageMetadata { name: String },
+    Dataset {
+        name: String,
+    },
+    Lifecycle {
+        hook: String,
+    },
+    S3Registration {
+        generic: String,
+        class: String,
+    },
+    Resource {
+        path: String,
+    },
+    NativeComponent {
+        name: String,
+    },
+    ExternalBinding {
+        name: String,
+    },
+    PackageMetadata {
+        name: String,
+    },
     MissingPackage,
-    Rejection { code: String },
+    Rejection {
+        code: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +75,7 @@ pub enum EdgeKind {
     Native,
     Callback,
     ClosureCapture,
+    ClosureExecution,
     Discovery,
     Effect,
 }
@@ -313,7 +341,12 @@ fn stable_node_identity(node: &Node) -> String {
     let kind = match &node.kind {
         NodeKind::Binding { name } => format!("binding:{name}"),
         NodeKind::PrivateBinding { environment, name } => format!("private:{environment}:{name}"),
-        NodeKind::ClosureObject { owner, path } => format!("closure:{owner}:{path}"),
+        NodeKind::ClosureObject {
+            owner,
+            path,
+            enclosure,
+            derived,
+        } => format!("closure:{owner}:{path}:{enclosure}:{derived}"),
         NodeKind::Activation => "activation".into(),
         NodeKind::Dataset { name } => format!("dataset:{name}"),
         NodeKind::Lifecycle { hook } => format!("lifecycle:{hook}"),
@@ -343,6 +376,7 @@ fn stable_edge_kind(kind: EdgeKind) -> &'static str {
         EdgeKind::Native => "NativeCall",
         EdgeKind::Callback => "NativeCallback",
         EdgeKind::ClosureCapture => "ClosureCapture",
+        EdgeKind::ClosureExecution => "ClosureExecution",
         EdgeKind::Discovery => "DynamicDiscovery",
         EdgeKind::Effect => "Effect",
     }
