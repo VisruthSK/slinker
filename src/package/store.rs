@@ -1,10 +1,14 @@
 use crate::package::image::parse_package_image;
 use crate::package::index::parse_package_index;
 use crate::package::locator::fingerprint_strings;
-use crate::package::{InstalledPackage, PackageId, PackageImage, PackageIndex, PackageLocator};
+use crate::package::{
+    InstalledPackage, NativeFacts, NativeRoutineSummary, NativeSafety, PackageId, PackageImage,
+    PackageIndex, PackageLocator,
+};
 use crate::toolchain::RRuntimeServer;
 use crate::{Error, RToolchain, Result, TargetEnvironment};
 use rayon::prelude::*;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +17,158 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const AIR_VERSION: &str = "0.11.0";
 const ANALYSIS_SCHEMA: &str = "slinker-object-environment-v3";
+
+#[derive(Debug, Default, Deserialize)]
+struct NativeSummaryManifest {
+    schema: u32,
+    #[serde(default)]
+    packages: Vec<NativePackageSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativePackageSummary {
+    package: String,
+    version: String,
+    image_fingerprint: String,
+    components: Vec<NativeComponentSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeComponentSummary {
+    component: String,
+    #[serde(flatten)]
+    safety: NativeSummarySafety,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "safety", rename_all = "snake_case")]
+enum NativeSummarySafety {
+    Safe {
+        #[serde(default)]
+        callbacks: Vec<String>,
+    },
+    Summarized {
+        routines: Vec<NativeRoutineSummaryRecord>,
+    },
+    Unsupported {
+        effects: Vec<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeRoutineSummaryRecord {
+    selector: String,
+    #[serde(default)]
+    callback_arguments: Vec<usize>,
+}
+
+impl NativeSummaryManifest {
+    fn load() -> Result<Self> {
+        let Some(path) = std::env::var_os("SLINKER_NATIVE_SUMMARIES") else {
+            return Ok(Self::default());
+        };
+        let path = PathBuf::from(path);
+        let text = fs::read_to_string(&path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let manifest: Self = serde_json::from_str(&text).map_err(|error| {
+            Error::Analysis(format!(
+                "invalid native summary manifest {}: {error}",
+                path.display()
+            ))
+        })?;
+        if manifest.schema != 1 {
+            return Err(Error::Analysis(format!(
+                "unsupported native summary manifest schema {} in {}",
+                manifest.schema,
+                path.display()
+            )));
+        }
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let mut packages = HashSet::new();
+        for package in &self.packages {
+            let key = (
+                package.package.as_str(),
+                package.version.as_str(),
+                package.image_fingerprint.as_str(),
+            );
+            if !packages.insert(key) {
+                return Err(Error::Analysis(format!(
+                    "duplicate native summary package identity {} {} {}",
+                    package.package, package.version, package.image_fingerprint
+                )));
+            }
+            let mut components = HashSet::new();
+            for component in &package.components {
+                if !components.insert(component.component.as_str()) {
+                    return Err(Error::Analysis(format!(
+                        "duplicate native component summary {}::{}",
+                        package.package, component.component
+                    )));
+                }
+                if let NativeSummarySafety::Summarized { routines } = &component.safety {
+                    let mut selectors = HashSet::new();
+                    for routine in routines {
+                        if routine.selector.is_empty() || !selectors.insert(&routine.selector) {
+                            return Err(Error::Analysis(format!(
+                                "empty or duplicate native selector in {}::{}",
+                                package.package, component.component
+                            )));
+                        }
+                        if routine.callback_arguments.contains(&0) {
+                            return Err(Error::Analysis(format!(
+                                "native callback positions are one-based in {}::{} `{}`",
+                                package.package, component.component, routine.selector
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply(&self, index: &mut PackageIndex) {
+        let Some(package) = self.packages.iter().find(|summary| {
+            summary.package == index.package.id.name
+                && summary.version == index.package.id.version.as_ref()
+                && summary.image_fingerprint == index.package.id.image_fingerprint.0
+        }) else {
+            return;
+        };
+        for summary in &package.components {
+            let Some(component) = index
+                .dynlibs
+                .iter_mut()
+                .find(|component| component.name == summary.component)
+            else {
+                continue;
+            };
+            component.safety = match &summary.safety {
+                NativeSummarySafety::Safe { callbacks } => NativeSafety::Safe(NativeFacts {
+                    callbacks: callbacks.clone(),
+                }),
+                NativeSummarySafety::Summarized { routines } => NativeSafety::Summarized(
+                    routines
+                        .iter()
+                        .map(|routine| NativeRoutineSummary {
+                            selector: routine.selector.clone(),
+                            callback_arguments: routine.callback_arguments.clone(),
+                        })
+                        .collect(),
+                ),
+                NativeSummarySafety::Unsupported { effects } => {
+                    NativeSafety::Unsupported(effects.clone())
+                }
+            };
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyntaxValidation {
@@ -65,6 +221,7 @@ pub struct PackageStore {
     runtime_server: Option<RRuntimeServer>,
     locate_pool: Option<(usize, Arc<rayon::ThreadPool>)>,
     validations: AtomicUsize,
+    native_summaries: NativeSummaryManifest,
 }
 
 impl PackageStore {
@@ -106,6 +263,7 @@ impl PackageStore {
             path: work_dir.clone(),
             source,
         })?;
+        let native_summaries = NativeSummaryManifest::load()?;
         Ok(Self {
             toolchain,
             locator,
@@ -120,7 +278,20 @@ impl PackageStore {
             runtime_server: None,
             locate_pool: None,
             validations: AtomicUsize::new(0),
+            native_summaries,
         })
+    }
+
+    fn parsed_index(&self, text: &str, package: InstalledPackage) -> Result<Arc<PackageIndex>> {
+        let mut index = parse_package_index(text, package)?;
+        self.native_summaries.apply(&mut index);
+        Ok(Arc::new(index))
+    }
+
+    fn parsed_image(&self, text: &str, package: InstalledPackage) -> Result<Arc<PackageImage>> {
+        let mut image = parse_package_image(text, package)?;
+        self.native_summaries.apply(&mut image.index);
+        Ok(Arc::new(image))
     }
 
     pub fn target(&self) -> &TargetEnvironment {
@@ -301,9 +472,8 @@ impl PackageStore {
             path: cache.clone(),
             source,
         })?;
-        match parse_package_index(&text, package.clone()) {
+        match self.parsed_index(&text, package.clone()) {
             Ok(index) => {
-                let index = Arc::new(index);
                 self.indexes.insert(package.id.clone(), Arc::clone(&index));
                 Ok(Some(index))
             }
@@ -329,10 +499,9 @@ impl PackageStore {
             path: cache.clone(),
             source,
         })?;
-        match parse_package_image(&text, package.clone()) {
+        match self.parsed_image(&text, package.clone()) {
             Ok(image) => {
                 self.persist_index_from_image(package, &text)?;
-                let image = Arc::new(image);
                 self.indexes
                     .insert(package.id.clone(), Arc::new(image.index.clone()));
                 self.images.insert(package.id.clone(), Arc::clone(&image));
@@ -452,7 +621,7 @@ impl PackageProvider for PackageStore {
             path: cache.clone(),
             source,
         })?;
-        let index = Arc::new(parse_package_index(&text, package.clone())?);
+        let index = self.parsed_index(&text, package.clone())?;
         self.indexes.insert(package.id.clone(), Arc::clone(&index));
         Ok(index)
     }
@@ -468,7 +637,7 @@ impl PackageProvider for PackageStore {
             path: cache.clone(),
             source,
         })?;
-        let image = Arc::new(parse_package_image(&text, package.clone())?);
+        let image = self.parsed_image(&text, package.clone())?;
         self.persist_index_from_image(package, &text)?;
         self.indexes
             .insert(package.id.clone(), Arc::new(image.index.clone()));
@@ -522,7 +691,7 @@ impl PackageProvider for PackageStore {
                 path: cache.clone(),
                 source,
             })?;
-            let index = Arc::new(parse_package_index(&text, package.clone())?);
+            let index = self.parsed_index(&text, package.clone())?;
             self.indexes.insert(package.id.clone(), index);
         }
         Ok(())
@@ -574,7 +743,7 @@ impl PackageProvider for PackageStore {
                 path: cache.clone(),
                 source,
             })?;
-            let image = Arc::new(parse_package_image(&text, package.clone())?);
+            let image = self.parsed_image(&text, package.clone())?;
             self.persist_index_from_image(package, &text)?;
             self.indexes
                 .insert(package.id.clone(), Arc::new(image.index.clone()));
@@ -719,5 +888,96 @@ fn nibble(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Description;
+    use crate::package::{Digest, LifecycleMetadata, NativeComponent};
+
+    fn package_index() -> PackageIndex {
+        let description = Description::parse("Package: fixture\nVersion: 1.0.0\n");
+        PackageIndex {
+            package: InstalledPackage {
+                id: PackageId {
+                    name: "fixture".into(),
+                    version: "1.0.0".parse().expect("version"),
+                    library: PathBuf::from("/library"),
+                    root: PathBuf::from("/library/fixture"),
+                    image_fingerprint: Digest("exact-image".into()),
+                },
+                description: description.clone(),
+            },
+            description,
+            exports: Default::default(),
+            imports: Vec::new(),
+            s3: Vec::new(),
+            dynlibs: vec![NativeComponent {
+                name: "fixture".into(),
+                registration: None,
+                symbols: Vec::new(),
+                safety: NativeSafety::Unanalyzed,
+            }],
+            lifecycle: LifecycleMetadata::default(),
+            binding_names: Vec::new(),
+            datasets: Vec::new(),
+            files: Vec::new(),
+            has_sysdata: false,
+        }
+    }
+
+    #[test]
+    fn exact_image_native_manifest_attaches_routine_callbacks() {
+        let manifest: NativeSummaryManifest = serde_json::from_str(
+            r#"{
+                "schema": 1,
+                "packages": [{
+                    "package": "fixture",
+                    "version": "1.0.0",
+                    "image_fingerprint": "exact-image",
+                    "components": [{
+                        "component": "fixture",
+                        "safety": "summarized",
+                        "routines": [{"selector": "fixture_call", "callback_arguments": [2]}]
+                    }]
+                }]
+            }"#,
+        )
+        .expect("manifest");
+        manifest.validate().expect("valid manifest");
+        let mut index = package_index();
+        manifest.apply(&mut index);
+
+        assert!(matches!(
+            &index.dynlibs[0].safety,
+            NativeSafety::Summarized(routines)
+                if routines == &[NativeRoutineSummary {
+                    selector: "fixture_call".into(),
+                    callback_arguments: vec![2],
+                }]
+        ));
+    }
+
+    #[test]
+    fn native_manifest_rejects_zero_callback_position() {
+        let manifest: NativeSummaryManifest = serde_json::from_str(
+            r#"{
+                "schema": 1,
+                "packages": [{
+                    "package": "fixture",
+                    "version": "1.0.0",
+                    "image_fingerprint": "exact-image",
+                    "components": [{
+                        "component": "fixture",
+                        "safety": "summarized",
+                        "routines": [{"selector": "fixture_call", "callback_arguments": [0]}]
+                    }]
+                }]
+            }"#,
+        )
+        .expect("manifest");
+        assert!(manifest.validate().is_err());
     }
 }

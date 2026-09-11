@@ -70,6 +70,8 @@ The semantic stack is deliberately narrow: `air_r_parser`, `air_r_syntax`, `oak_
 
 Native opacity widens the demanded native component, not the package's R namespace. A demanded DLL is retained whole, while unrelated R wrappers remain eligible for elimination. Unanalyzed dynamic native behavior is a blocker rather than an excuse to retain the entire R layer.
 
+Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema `1` keys each JSON entry by package name, version, and slinker's installed-image fingerprint, so a summary cannot silently transfer to a different native build. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and continue to produce `UnknownNativeEffects`.
+
 ## Root versus internalized packages
 
 The root package keeps its real installed-package behavior, including package metadata, help/documentation databases, and normal root namespace identity. Internalized dependency packages are synthetic and minimal: only semantically retained bindings, imports, resources, datasets, S3/native obligations, and lifecycle behavior belong in the link plan.
@@ -79,4 +81,5 @@ The root package keeps its real installed-package behavior, including package me
 ```text
 SLINKER_R          target R executable
 SLINKER_CACHE_DIR  persistent installed-image analysis cache
+SLINKER_NATIVE_SUMMARIES  audited native-effect manifest for exact installed images
 ```

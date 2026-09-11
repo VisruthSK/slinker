@@ -97,6 +97,9 @@ pub struct CallSite {
     /// Source extents aligned with `args`; omitted arguments have no extent.
     #[serde(default)]
     pub arg_spans: Vec<Option<Span>>,
+    /// Whether Oak proves the aligned symbol argument is a locally assigned closure.
+    #[serde(default)]
+    pub local_closure_args: Vec<bool>,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
     pub span: Span,

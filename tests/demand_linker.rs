@@ -2210,6 +2210,58 @@ fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
 }
 
 #[test]
+fn native_summary_accepts_oak_proven_local_closure_callback() {
+    let root = package_with(
+        "root",
+        &[(
+            "a",
+            Some("a <- function() { callback <- function(x) x; .Call(root_a, callback) }"),
+        )],
+        Vec::new(),
+        export("a"),
+        Vec::new(),
+        vec![NativeComponent {
+            name: "root".into(),
+            registration: Some(NativeRegistration {
+                prefix: "".into(),
+                suffix: "".into(),
+            }),
+            symbols: vec![NativeSymbolBinding {
+                binding: "root_a".into(),
+                symbol: "root_a".into(),
+            }],
+            safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
+                selector: "root_a".into(),
+                callback_arguments: vec![1],
+            }]),
+        }],
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
+    );
+    let native = plan
+        .graph
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, NodeKind::NativeComponent { .. }))
+        .expect("native component")
+        .id;
+    let owner = plan.graph.binding("root", "a").expect("owner binding");
+    assert!(plan.graph.edges.iter().any(|edge| {
+        edge.from == native && edge.to == owner && edge.kind == EdgeKind::Callback
+    }));
+}
+
+#[test]
 fn native_callback_positions_ignore_named_package_and_match_named_selector() {
     let root = package_with(
         "root",

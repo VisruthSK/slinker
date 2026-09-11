@@ -2751,6 +2751,7 @@ impl<P: PackageProvider> Linker<P> {
 
     fn process_native_routine_callbacks(
         &mut self,
+        callback_owner: NodeId,
         current: &InstalledPackage,
         image: &PackageImage,
         binding: &str,
@@ -2800,7 +2801,8 @@ impl<P: PackageProvider> Linker<P> {
                 );
                 continue;
             }
-            let callback = native_call_argument(call, position);
+            let callback_index = native_call_argument_index(call, position);
+            let callback = callback_index.and_then(|index| call.args.get(index)?.as_ref());
             let Some(StaticArg::Symbol(callback_name)) = callback else {
                 self.diagnostic(
                     native_node,
@@ -2814,6 +2816,20 @@ impl<P: PackageProvider> Linker<P> {
                 );
                 continue;
             };
+            if callback_index
+                .and_then(|index| call.local_closure_args.get(index))
+                .copied()
+                .unwrap_or(false)
+            {
+                self.graph.add_edge_at(
+                    native_node,
+                    callback_owner,
+                    EdgeKind::Callback,
+                    format!("native routine `{selector}` invokes locally defined callback argument #{position} `{callback_name}`"),
+                    Some(call.span.clone()),
+                );
+                continue;
+            }
 
             match self.resolve_lexical_name(current, image, lexical_environment, callback_name)? {
                 ResolvedName::PackageBinding { package, binding: callback } => self.require_at(
@@ -3331,6 +3347,7 @@ impl<P: PackageProvider> Linker<P> {
                         Some(call.span.clone()),
                     );
                     self.process_native_routine_callbacks(
+                        from,
                         current,
                         image,
                         binding,
@@ -4376,13 +4393,13 @@ fn static_package_arg(call: &CallSite) -> Option<&str> {
     }
 }
 
-fn native_call_argument(call: &CallSite, position: usize) -> Option<&StaticArg> {
+fn native_call_argument_index(call: &CallSite, position: usize) -> Option<usize> {
     if position == 0 {
         return None;
     }
     let selector = matched_call_arg_index(call, &[".NAME"], ".NAME")?;
     let mut current = 0;
-    for (index, argument) in call.args.iter().enumerate() {
+    for index in 0..call.args.len() {
         if index == selector
             || call.arg_names.get(index).and_then(Option::as_deref) == Some("PACKAGE")
         {
@@ -4390,7 +4407,7 @@ fn native_call_argument(call: &CallSite, position: usize) -> Option<&StaticArg> 
         }
         current += 1;
         if current == position {
-            return argument.as_ref();
+            return Some(index);
         }
     }
     None

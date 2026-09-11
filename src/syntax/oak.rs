@@ -482,6 +482,7 @@ fn translate_index(
                     .map(|argument| argument.name.clone())
                     .collect(),
                 arg_spans: argument_spans(&source, &raw.args),
+                local_closure_args: local_closure_arguments(text, index, &live_uses, &raw.args),
                 phase: live_use.phase,
                 guards: Vec::new(),
                 span: Span::new(source.clone(), raw.start, raw.end),
@@ -528,6 +529,7 @@ fn translate_index(
                         .map(|argument| argument.name.clone())
                         .collect(),
                     arg_spans: argument_spans(&source, &raw.args),
+                    local_closure_args: local_closure_arguments(text, index, &live_uses, &raw.args),
                     phase: phase_for_scope(index, scope),
                     guards: Vec::new(),
                     span: Span::new(source.clone(), raw.start, raw.end),
@@ -3375,6 +3377,44 @@ fn argument_spans(source: &SourceId, arguments: &[RawArgument]) -> Vec<Option<Sp
         .collect()
 }
 
+fn local_closure_arguments(
+    text: &str,
+    index: &SemanticIndex,
+    live_uses: &[LiveUse],
+    arguments: &[RawArgument],
+) -> Vec<bool> {
+    arguments
+        .iter()
+        .map(|argument| {
+            let Some(StaticArg::Symbol(name)) = &argument.static_arg else {
+                return false;
+            };
+            let Some(use_site) = live_uses.iter().find(|live_use| {
+                live_use.name == *name
+                    && live_use.start == argument.value_start
+                    && live_use.end == argument.value_end
+                    && live_use.callee_kind == CalleeKind::DefinitelyLexical
+            }) else {
+                return false;
+            };
+            index
+                .reaching_definitions(use_site.scope, use_site.use_id)
+                .any(|(scope, definition_id)| {
+                    let definition = &index.definitions(scope)[definition_id];
+                    if !matches!(definition.kind(), DefinitionKind::Assignment(_)) {
+                        return false;
+                    }
+                    assignment_rhs_after(text, text_offset(definition.range().end()), "<-")
+                        .and_then(|(start, _)| text.get(start..))
+                        .is_some_and(|rhs| {
+                            rhs.starts_with("function")
+                                && word_boundary_after(rhs, "function".len())
+                        })
+                })
+        })
+        .collect()
+}
+
 fn named_argument_split(text: &str, start: usize, end: usize) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
     let mut cursor = start;
@@ -4649,6 +4689,20 @@ mod tests {
             Some(StaticArg::Symbol("croot_f".into()))
         );
         assert_eq!(call.arg_spans[selector].as_ref(), Some(&reference.span));
+    }
+
+    #[test]
+    fn call_argument_records_definite_local_closure_identity() {
+        let parsed = parse_source(
+            "f <- function() { callback <- function(x) x; .Call(native_call, 1, callback) }",
+        );
+        let call = parsed.expressions[0]
+            .calls
+            .iter()
+            .find(|call| call.callee == ".Call")
+            .expect("native call");
+
+        assert_eq!(call.local_closure_args, [false, false, true]);
     }
 
     #[test]
