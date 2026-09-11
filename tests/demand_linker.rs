@@ -368,10 +368,13 @@ fn structured_nested_closure_is_an_object_member_not_a_namespace_binding() {
 }
 
 #[test]
-fn retained_nested_closure_gets_distinct_semantic_identity() {
+fn retaining_structured_object_does_not_execute_nested_closure() {
     let mut root = package_with(
         "root",
-        &[("generator_funs", None)],
+        &[
+            ("generator_funs", None),
+            ("dead_dependency", Some("dead_dependency <- function() 1")),
+        ],
         Vec::new(),
         export("generator_funs"),
         Vec::new(),
@@ -383,44 +386,29 @@ fn retained_nested_closure_gets_distinct_semantic_identity() {
     binding.object_kind = ObjectKind::List;
     binding.embedded_closures.push(EmbeddedClosureSource {
         path: "$[[1]]".into(),
-        source: Arc::from(".slinker_embedded <- function() 1"),
+        source: Arc::from(".slinker_embedded <- function() dead_dependency()"),
         environment: "namespace:root".into(),
     });
 
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
-    assert!(plan.retained.iter().any(|need| matches!(
-        need,
-        Need::ClosureObject { package, owner_environment: None, owner_binding, path }
-            if package.name == "root" && owner_binding == "generator_funs" && path == "$[[1]]"
-    )));
-    assert_eq!(plan.parsed_nested_closures, 1);
+    assert_eq!(plan.parsed_nested_closures, 0);
+    assert!(!retained_binding(&plan, "root", "dead_dependency"));
 
-    let owner = plan
-        .graph
-        .nodes
+    let graph = plan
+        .object_graphs
         .iter()
-        .find(|node| {
-            node.package == "root"
-                && matches!(&node.kind, NodeKind::Binding { name } if name == "generator_funs")
-        })
-        .unwrap()
-        .id;
-    let nested = plan
-        .graph
-        .nodes
-        .iter()
-        .find(|node| {
-            node.package == "root"
-                && matches!(&node.kind, NodeKind::ClosureObject { owner, path }
-            if owner == "generator_funs" && path == "$[[1]]")
-        })
-        .unwrap()
-        .id;
-    assert!(plan.graph.edges.iter().any(|edge| {
-        edge.from == owner && edge.to == nested && edge.kind == EdgeKind::ClosureCapture
-    }));
+        .find_map(|(package, graph)| (package.name == "root").then_some(graph))
+        .expect("root object graph");
+    let object = graph.namespace_bindings["generator_funs"];
+    let InstalledObject::Structured { members, .. } = &graph.objects[&object] else {
+        panic!("list binding must remain a structured object");
+    };
+    assert!(matches!(
+        graph.objects[&members["$[[1]]"]],
+        InstalledObject::Closure(_)
+    ));
 }
 
 #[test]

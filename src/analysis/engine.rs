@@ -903,22 +903,6 @@ impl<P: PackageProvider> Linker<P> {
             }
         }
 
-        // A retained structured object exposes its nested closure members as
-        // distinct semantic objects. Runtime construction can later narrow
-        // which closure objects become executable without changing identity.
-        for embedded in &binding_image.embedded_closures {
-            self.require(
-                node,
-                Need::ClosureObject {
-                    package: id.clone(),
-                    owner_environment: None,
-                    owner_binding: binding.clone(),
-                    path: embedded.path.clone(),
-                },
-                EdgeKind::ClosureCapture,
-                format!("structured closure member {}", embedded.path),
-            );
-        }
         Ok(())
     }
 
@@ -989,19 +973,6 @@ impl<P: PackageProvider> Linker<P> {
             }
         }
 
-        for embedded in &binding_image.embedded_closures {
-            self.require(
-                node,
-                Need::ClosureObject {
-                    package: id.clone(),
-                    owner_environment: Some(environment.clone()),
-                    owner_binding: binding.clone(),
-                    path: embedded.path.clone(),
-                },
-                EdgeKind::ClosureCapture,
-                format!("structured closure member {}", embedded.path),
-            );
-        }
         Ok(())
     }
 
