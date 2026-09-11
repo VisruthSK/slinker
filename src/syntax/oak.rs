@@ -413,13 +413,26 @@ fn translate_index(
 
         if live_use.callee_kind != CalleeKind::DefinitelyLexical
             && (formal_default_use_is_bound(&function_regions, live_use)
-                || for_body_use_is_bound(index, &for_regions, live_use))
+                || for_body_use_is_bound(index, &for_regions, live_use)
+                || recursive_closure_binding_is_initialized(
+                    text,
+                    index,
+                    &function_regions,
+                    live_use,
+                ))
         {
             live_use.callee_kind = CalleeKind::DefinitelyLexical;
             continue;
         }
         if live_use.callee_kind == CalleeKind::ConditionalFallthrough
-            && conditional_fallthrough_proven_bound(text, context, index, &if_regions, live_use)
+            && conditional_fallthrough_proven_bound(
+                text,
+                context,
+                index,
+                &for_regions,
+                &if_regions,
+                live_use,
+            )
         {
             live_use.callee_kind = CalleeKind::DefinitelyLexical;
         }
@@ -980,6 +993,33 @@ fn for_body_use_is_bound(index: &SemanticIndex, regions: &[ForRegion], live_use:
         })
 }
 
+fn recursive_closure_binding_is_initialized(
+    text: &str,
+    index: &SemanticIndex,
+    functions: &[FunctionRegion],
+    live_use: &LiveUse,
+) -> bool {
+    let Some(function) = innermost_function_region(functions, live_use.start) else {
+        return false;
+    };
+    index
+        .reaching_definitions(live_use.scope, live_use.use_id)
+        .filter(|(scope, _)| *scope != live_use.scope)
+        .any(|(scope, definition_id)| {
+            let definition = &index.definitions(scope)[definition_id];
+            if !matches!(definition.kind(), DefinitionKind::Assignment(_)) {
+                return false;
+            }
+            let symbol = index.symbols(scope).symbol(definition.symbol());
+            if symbol.name() != live_use.name {
+                return false;
+            }
+            let target_end = text_offset(definition.range().end());
+            assignment_rhs_after(text, target_end, "<-")
+                .is_some_and(|(start, _)| start == function.function_start)
+        })
+}
+
 /// Whether a use after a `for` loop must retain the loop's zero-iteration
 /// fallthrough. Oak's current use-def map can report the induction variable as
 /// definitely bound after the loop, but R assigns it only when an iteration
@@ -1136,7 +1176,7 @@ enum SimplePredicate {
         value: PredicateValue,
     },
     IsNull {
-        symbol: String,
+        value: String,
         is_null: bool,
     },
     Static(bool),
@@ -1151,31 +1191,68 @@ fn conditional_fallthrough_proven_bound(
     text: &str,
     context: &OakParseContext,
     index: &SemanticIndex,
+    for_regions: &[ForRegion],
     regions: &[IfRegion],
     live_use: &LiveUse,
 ) -> bool {
     let reaching = index
         .reaching_definitions(live_use.scope, live_use.use_id)
-        .filter(|(scope, _)| *scope == live_use.scope)
         .filter_map(|(scope, definition_id)| {
             let definition = &index.definitions(scope)[definition_id];
             let symbol = index.symbols(scope).symbol(definition.symbol());
-            (symbol.name() == live_use.name
-                && matches!(definition.kind(), DefinitionKind::Assignment(_)))
-            .then_some((definition, text_offset(definition.range().start())))
+            let definition_start = text_offset(definition.range().start());
+            if symbol.name() != live_use.name
+                || !matches!(definition.kind(), DefinitionKind::Assignment(_))
+            {
+                return None;
+            }
+            if scope != live_use.scope {
+                let assumptions = branch_assumptions_at(text, regions, definition_start);
+                let symbols = assumption_symbols(&assumptions);
+                if !captured_condition_symbols_stable(
+                    text,
+                    index,
+                    scope,
+                    definition_start,
+                    text.len(),
+                    &symbols,
+                ) {
+                    return None;
+                }
+            }
+            Some((definition, definition_start, scope))
         })
-        .filter(|(_, start)| *start < live_use.start)
+        .filter(|(_, start, _)| *start < live_use.start)
         .collect::<Vec<_>>();
 
     if reaching.is_empty() {
         return false;
     }
 
-    let use_assumptions = branch_assumptions_at(text, regions, live_use.start);
+    if reaching.iter().any(|(_, definition_start, _)| {
+        definition_must_execute_before_position(
+            text,
+            *definition_start,
+            live_use.start,
+            for_regions,
+            regions,
+        )
+    }) {
+        return true;
+    }
+
+    let mut use_assumptions = branch_assumptions_at(text, regions, live_use.start);
+    expand_boolean_alias_assumptions(
+        text,
+        index,
+        live_use.scope,
+        live_use.start,
+        &mut use_assumptions,
+    );
 
     // Correlate a repeated stable predicate, including equivalent negations
     // such as an `else` of `x == "a"` and a later `x != "a"` branch.
-    for (_definition, definition_start) in &reaching {
+    for (_definition, definition_start, defining_scope) in &reaching {
         if !definition_is_direct_in_branch(text, regions, *definition_start) {
             continue;
         }
@@ -1187,12 +1264,24 @@ fn conditional_fallthrough_proven_bound(
             continue;
         }
         let symbols = assumption_symbols(&definition_assumptions);
-        if condition_symbols_stable(text, index, *definition_start, live_use.start, &symbols) {
+        if condition_facts_stable(
+            text,
+            index,
+            live_use.scope,
+            *defining_scope,
+            *definition_start,
+            live_use.start,
+            &symbols,
+        ) {
             return true;
         }
     }
 
-    let definition_starts = reaching.iter().map(|(_, start)| *start).collect::<Vec<_>>();
+    let definition_starts = reaching
+        .iter()
+        .map(|(_, start, _)| *start)
+        .collect::<Vec<_>>();
+    let defining_scope = reaching.first().map(|(_, _, scope)| *scope);
 
     // Prove an earlier exhaustive dispatch. A chain is sufficient only when
     // each path that can continue after it has a direct reaching assignment to
@@ -1211,7 +1300,17 @@ fn conditional_fallthrough_proven_bound(
             continue;
         }
         let symbols = assumption_symbols(&chain_assumptions);
-        if !condition_symbols_stable(text, index, region.if_start, live_use.start, &symbols) {
+        if !defining_scope.is_some_and(|scope| {
+            condition_facts_stable(
+                text,
+                index,
+                live_use.scope,
+                scope,
+                region.if_start,
+                live_use.start,
+                &symbols,
+            )
+        }) {
             continue;
         }
 
@@ -1247,6 +1346,7 @@ fn conditional_fallthrough_proven_bound(
             live_use,
             &use_assumptions,
             &definition_starts,
+            defining_scope,
         ) {
             return true;
         }
@@ -1316,6 +1416,52 @@ fn effective_predicate(assumption: &BranchAssumption) -> Option<SimplePredicate>
     }
 }
 
+fn expand_boolean_alias_assumptions(
+    text: &str,
+    index: &SemanticIndex,
+    scope: ScopeId,
+    position: usize,
+    assumptions: &mut Vec<BranchAssumption>,
+) {
+    let aliases = assumptions
+        .iter()
+        .filter_map(effective_predicate)
+        .filter_map(|predicate| match predicate {
+            SimplePredicate::Eq {
+                symbol,
+                value: PredicateValue::Logical(value),
+            } => Some((symbol, value)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (symbol, truth) in aliases {
+        let Some(symbol_id) = index.symbols(scope).id(&symbol) else {
+            continue;
+        };
+        let rhs = index
+            .definitions(scope)
+            .iter()
+            .filter(|(_, definition)| {
+                definition.symbol() == symbol_id
+                    && matches!(definition.kind(), DefinitionKind::Assignment(_))
+                    && text_offset(definition.range().start()) < position
+            })
+            .filter_map(|(_, definition)| {
+                assignment_rhs_after(text, text_offset(definition.range().end()), "<-")
+            })
+            .max_by_key(|(start, _)| *start)
+            .and_then(|(start, end)| text.get(start..end));
+        let Some(rhs) = rhs.filter(|rhs| parse_simple_predicate(rhs).is_some()) else {
+            continue;
+        };
+        assumptions.push(BranchAssumption {
+            condition: rhs.to_owned(),
+            truth,
+            symbols: condition_symbols(rhs, 0, rhs.len()),
+        });
+    }
+}
+
 fn predicate_is_repeatable(
     context: &OakParseContext,
     index: &SemanticIndex,
@@ -1336,8 +1482,8 @@ fn negate_predicate(predicate: SimplePredicate) -> SimplePredicate {
     match predicate {
         SimplePredicate::Eq { symbol, value } => SimplePredicate::Ne { symbol, value },
         SimplePredicate::Ne { symbol, value } => SimplePredicate::Eq { symbol, value },
-        SimplePredicate::IsNull { symbol, is_null } => SimplePredicate::IsNull {
-            symbol,
+        SimplePredicate::IsNull { value, is_null } => SimplePredicate::IsNull {
+            value,
             is_null: !is_null,
         },
         SimplePredicate::Static(value) => SimplePredicate::Static(!value),
@@ -1352,12 +1498,19 @@ fn parse_simple_predicate(condition: &str) -> Option<SimplePredicate> {
     if condition == "FALSE" {
         return Some(SimplePredicate::Static(false));
     }
+    if let Some(symbol) = condition.strip_prefix('!').and_then(static_symbol) {
+        return Some(SimplePredicate::Eq {
+            symbol,
+            value: PredicateValue::Logical(false),
+        });
+    }
     if let Some(inner) = condition
         .strip_prefix("!is.null(")
         .and_then(|rest| rest.strip_suffix(')'))
     {
-        return static_symbol(inner).map(|symbol| SimplePredicate::IsNull {
-            symbol,
+        let value = strip_outer_parentheses(inner.trim());
+        return (!value.is_empty()).then(|| SimplePredicate::IsNull {
+            value: value.to_owned(),
             is_null: false,
         });
     }
@@ -1365,8 +1518,9 @@ fn parse_simple_predicate(condition: &str) -> Option<SimplePredicate> {
         .strip_prefix("is.null(")
         .and_then(|rest| rest.strip_suffix(')'))
     {
-        return static_symbol(inner).map(|symbol| SimplePredicate::IsNull {
-            symbol,
+        let value = strip_outer_parentheses(inner.trim());
+        return (!value.is_empty()).then(|| SimplePredicate::IsNull {
+            value: value.to_owned(),
             is_null: true,
         });
     }
@@ -1378,7 +1532,10 @@ fn parse_simple_predicate(condition: &str) -> Option<SimplePredicate> {
         let (symbol, value) = symbol_constant_pair(left, right)?;
         return Some(SimplePredicate::Ne { symbol, value });
     }
-    None
+    static_symbol(condition).map(|symbol| SimplePredicate::Eq {
+        symbol,
+        value: PredicateValue::Logical(true),
+    })
 }
 
 fn strip_outer_parentheses(mut value: &str) -> &str {
@@ -1476,6 +1633,7 @@ fn exhaustive_equality_dispatch_proves_binding(
     live_use: &LiveUse,
     use_assumptions: &[BranchAssumption],
     definition_starts: &[usize],
+    defining_scope: Option<ScopeId>,
 ) -> bool {
     let mut current = region;
     let mut selector = None::<String>;
@@ -1498,7 +1656,7 @@ fn exhaustive_equality_dispatch_proves_binding(
         cases.push((value, current.then_start, current.then_end));
 
         let (Some(else_start), Some(else_end)) = (current.else_start, current.else_end) else {
-            return false;
+            break None;
         };
         if let Some(nested) = regions
             .iter()
@@ -1507,21 +1665,51 @@ fn exhaustive_equality_dispatch_proves_binding(
             current = nested;
             continue;
         }
-        break (else_start, else_end);
+        break Some((else_start, else_end));
     };
 
     let selector = selector.expect("equality chain has at least one selector");
-    if !branch_exits_current_function(text, context, index, regions, final_else.0, final_else.1) {
-        return false;
+    match final_else {
+        Some((start, end)) => {
+            if !branch_exits_current_function(text, context, index, regions, start, end) {
+                return false;
+            }
+        }
+        None => {
+            let Some(allowed) = prior_membership_guard_values(
+                text,
+                context,
+                index,
+                regions,
+                region.if_start,
+                &selector,
+            ) else {
+                return false;
+            };
+            let covered = cases
+                .iter()
+                .filter_map(|(value, _, _)| match value {
+                    PredicateValue::String(value) => Some(value.clone()),
+                    PredicateValue::Logical(_) | PredicateValue::Number(_) => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if covered != allowed {
+                return false;
+            }
+        }
     }
 
-    if !condition_symbols_stable(
-        text,
-        index,
-        region.if_start,
-        live_use.start,
-        &BTreeSet::from([selector.clone()]),
-    ) {
+    if !defining_scope.is_some_and(|scope| {
+        condition_facts_stable(
+            text,
+            index,
+            live_use.scope,
+            scope,
+            region.if_start,
+            live_use.start,
+            &BTreeSet::from([selector.clone()]),
+        )
+    }) {
         return false;
     }
 
@@ -1535,24 +1723,84 @@ fn exhaustive_equality_dispatch_proves_binding(
             continue;
         }
         possible_case = true;
-        if !branch_binds_reaching_definition(
-            text,
-            regions,
-            branch_start,
-            branch_end,
-            definition_starts,
-        ) && !branch_exits_current_function(
+        if !branch_all_paths_bind_or_exit(
             text,
             context,
             index,
             regions,
             branch_start,
             branch_end,
+            definition_starts,
         ) {
             return false;
         }
     }
     possible_case
+}
+
+fn branch_all_paths_bind_or_exit(
+    text: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    start: usize,
+    end: usize,
+    definition_starts: &[usize],
+) -> bool {
+    branch_binds_reaching_definition(text, regions, start, end, definition_starts)
+        || branch_exits_current_function(text, context, index, regions, start, end)
+        || regions.iter().any(|nested| {
+            nested.if_start >= start
+                && nested.if_start < end
+                && definition_is_top_level_in_branch(text, start, end, nested.if_start)
+                && if_chain_all_returning_paths_bind(
+                    text,
+                    context,
+                    index,
+                    regions,
+                    nested,
+                    definition_starts,
+                )
+        })
+}
+
+fn prior_membership_guard_values(
+    text: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    before: usize,
+    selector: &str,
+) -> Option<BTreeSet<String>> {
+    regions
+        .iter()
+        .filter(|region| region.if_start < before && region.then_end <= before)
+        .rev()
+        .find_map(|region| {
+            if !branch_exits_current_function(
+                text,
+                context,
+                index,
+                regions,
+                region.then_start,
+                region.then_end,
+            ) {
+                return None;
+            }
+            let condition = canonical_condition(text, region.condition_start, region.condition_end);
+            let marker = format!("!({selector}%in%c(");
+            let marker_start = condition.find(&marker)?;
+            let open = marker_start + marker.len() - 1;
+            let close = matching_delimiter(&condition, open)?;
+            let values = split_arguments(&condition, open + 1, close)
+                .into_iter()
+                .map(|argument| match argument.static_arg {
+                    Some(StaticArg::String(value)) => Some(value),
+                    Some(StaticArg::Symbol(_)) | None => None,
+                })
+                .collect::<Option<BTreeSet<_>>>()?;
+            (!values.is_empty()).then_some(values)
+        })
 }
 
 fn case_is_consistent_with(
@@ -1727,6 +1975,60 @@ fn condition_symbols_stable(
     // definition. Refuse the correlation proof if either appears between the
     // two sites. This is deliberately conservative; false negatives here keep
     // a PotentialUnboundLocal rather than hiding one.
+    let segment = text.get(start..end).unwrap_or_default();
+    !contains_call_named(segment, "rm") && !contains_call_named(segment, "remove")
+}
+
+fn condition_facts_stable(
+    text: &str,
+    index: &SemanticIndex,
+    use_scope: ScopeId,
+    defining_scope: ScopeId,
+    start: usize,
+    end: usize,
+    symbols: &BTreeSet<String>,
+) -> bool {
+    if use_scope == defining_scope {
+        condition_symbols_stable(text, index, start, end, symbols)
+    } else {
+        captured_condition_symbols_stable(text, index, defining_scope, start, end, symbols)
+    }
+}
+
+fn captured_condition_symbols_stable(
+    text: &str,
+    index: &SemanticIndex,
+    defining_scope: ScopeId,
+    start: usize,
+    end: usize,
+    symbols: &BTreeSet<String>,
+) -> bool {
+    if start >= end || symbols.is_empty() {
+        return true;
+    }
+    for scope in index.scope_ids() {
+        for (_, definition) in index.definitions(scope).iter() {
+            let mutates_capture = matches!(definition.kind(), DefinitionKind::SuperAssignment(_))
+                || (scope == defining_scope
+                    && matches!(
+                        definition.kind(),
+                        DefinitionKind::Assignment(_)
+                            | DefinitionKind::ForVariable(_)
+                            | DefinitionKind::Assign { .. }
+                    ));
+            if !mutates_capture {
+                continue;
+            }
+            let position = text_offset(definition.range().start());
+            if position <= start || position >= end {
+                continue;
+            }
+            let name = index.symbols(scope).symbol(definition.symbol()).name();
+            if symbols.contains(name) {
+                return false;
+            }
+        }
+    }
     let segment = text.get(start..end).unwrap_or_default();
     !contains_call_named(segment, "rm") && !contains_call_named(segment, "remove")
 }
@@ -4170,6 +4472,118 @@ mod tests {
             .find(|effect| effect.target.as_deref() == Some("x"))
             .expect("superassignment effect");
         assert!(effect.target_enclosing_local);
+    }
+
+    #[test]
+    fn assignment_dominates_later_use_inside_same_branch() {
+        let parsed =
+            parse_source("f <- function(flag) { if (flag) { helper <- function() 1; helper() } }");
+        assert!(!reference_names(&parsed).contains(&"helper"));
+    }
+
+    #[test]
+    fn branch_assignment_does_not_dominate_use_after_branch() {
+        let parsed =
+            parse_source("f <- function(flag) { if (flag) helper <- function() 1; helper() }");
+        assert!(reference_names(&parsed).contains(&"helper"));
+    }
+
+    #[test]
+    fn local_recursive_closure_sees_its_completed_binding() {
+        let parsed = parse_source(
+            "f <- function(flag) { if (flag) { recurse <- function(x) if (x) recurse(FALSE); recurse(TRUE) } }",
+        );
+        assert!(!reference_names(&parsed).contains(&"recurse"));
+    }
+
+    #[test]
+    fn repeated_boolean_guard_preserves_exhaustive_inner_assignment() {
+        let parsed = parse_source(
+            "f <- function(enabled, choose_first) { if (enabled) { if (choose_first) value <- 1 else value <- 2 }; if (enabled) print(value) }",
+        );
+        assert!(!reference_names(&parsed).contains(&"value"));
+    }
+
+    #[test]
+    fn boolean_alias_correlates_equivalent_null_guard() {
+        let parsed = parse_source(
+            "f <- function(obj) { present <- !is.null(obj$field); if (!is.null(obj$field)) value <- 1; if (present) print(value) }",
+        );
+        assert!(!reference_names(&parsed).contains(&"value"));
+    }
+
+    #[test]
+    fn captured_conditional_binding_is_safe_under_same_stable_guard() {
+        let parsed = parse_source(
+            "f <- function(enabled, choose_first) { if (enabled) { if (choose_first) callback <- function() 1 else callback <- function() 2 }; invoke <- function() { if (enabled) callback() }; invoke() }",
+        );
+        assert!(!reference_names(&parsed).contains(&"callback"));
+    }
+
+    #[test]
+    fn captured_exhaustive_binding_is_safe_under_same_outer_guard() {
+        let parsed = parse_source(
+            "f <- function(deep, choose_first) { if (deep) { if (choose_first) callback <- function() 1 else callback <- function() 2 }; invoke <- function() { if (deep) callback() }; invoke() }",
+        );
+        assert!(!reference_names(&parsed).contains(&"callback"));
+    }
+
+    #[test]
+    fn captured_exhaustive_binding_handles_compound_inner_condition() {
+        let parsed = parse_source(
+            "f <- function(deep, has_private, candidate) { if (deep) { if (has_private && is.function(candidate)) callback <- candidate else callback <- function() 2 }; invoke <- function() { if (deep) mapply(callback, 1) }; invoke() }",
+        );
+        assert!(!reference_names(&parsed).contains(&"callback"));
+    }
+
+    #[test]
+    fn mutated_guard_does_not_validate_captured_conditional_binding() {
+        let parsed = parse_source(
+            "f <- function(enabled) { if (enabled) callback <- function() 1; invoke <- function() { if (enabled) callback() }; enabled <- !enabled; invoke() }",
+        );
+        assert!(reference_names(&parsed).contains(&"callback"));
+    }
+
+    #[test]
+    fn descendant_local_shadow_does_not_mutate_captured_guard() {
+        let parsed = parse_source(
+            "f <- function(enabled) { if (enabled) callback <- function() 1; shadow <- function() enabled <- FALSE; invoke <- function() { if (enabled) callback() }; invoke() }",
+        );
+        assert!(!reference_names(&parsed).contains(&"callback"));
+    }
+
+    #[test]
+    fn rejecting_guard_makes_following_membership_dispatch_exhaustive() {
+        let parsed = parse_source(
+            r#"f <- function(which, function_value) {
+                if (is.null(which) || !(which %in% c("public", "private", "active"))) stop("bad")
+                if (which == "public") group <- "public_methods"
+                else if (which == "private") group <- "private_methods"
+                else if (which == "active") {
+                    if (function_value) group <- "active" else stop("bad")
+                }
+                print(group)
+            }"#,
+        );
+        assert!(!reference_names(&parsed).contains(&"group"));
+    }
+
+    #[test]
+    fn rejecting_guard_handles_value_assignments_in_membership_dispatch() {
+        let parsed = parse_source(
+            r#"f <- function(which, value) {
+                if (is.null(which) || !(which %in% c("public", "private", "active"))) stop("bad")
+                if (which == "public") {
+                    group <- if (is.function(value)) "public_methods" else "public_fields"
+                } else if (which == "private") {
+                    group <- if (is.function(value)) "private_methods" else "private_fields"
+                } else if (which == "active") {
+                    if (is.function(value)) group <- "active" else stop("bad")
+                }
+                print(group)
+            }"#,
+        );
+        assert!(!reference_names(&parsed).contains(&"group"));
     }
 
     #[test]
