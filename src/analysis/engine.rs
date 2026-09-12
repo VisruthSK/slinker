@@ -17,6 +17,7 @@ use crate::syntax::{
 };
 use crate::{Error, Result};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -82,6 +83,7 @@ pub struct Linker<P: PackageProvider> {
     activation_bindings: HashSet<(PackageId, String)>,
     observations: Vec<SyntaxObservation>,
     diagnostic_keys: HashSet<(NodeId, RejectCode, String)>,
+    contextual_namespace_calls: HashMap<Span, Option<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +106,7 @@ enum AbstractValue {
     Logical(bool),
     Integer(i64),
     String(String),
+    Vector(Vec<AbstractValue>),
     Object(ObjectId),
     Function {
         parameters: Vec<String>,
@@ -130,6 +133,7 @@ struct ExecutionContext<'a> {
     image: &'a PackageImage,
     lexical_environment: &'a str,
     depth: usize,
+    specialized: bool,
 }
 
 impl ExecutionOutcome {
@@ -171,6 +175,7 @@ impl<P: PackageProvider> Linker<P> {
             activation_bindings: HashSet::new(),
             observations: Vec::new(),
             diagnostic_keys: HashSet::new(),
+            contextual_namespace_calls: HashMap::new(),
         }
     }
 
@@ -1150,7 +1155,7 @@ impl<P: PackageProvider> Linker<P> {
                 Ok(outcome)
             }
             ConstructionExprKind::Call { call } => {
-                self.evaluate_construction_call(context, state, call)
+                self.evaluate_construction_call(context, state, call, &expression.span)
             }
             ConstructionExprKind::Member { object, name } => {
                 let object = self.evaluate_construction(context, state, object)?.value;
@@ -1266,6 +1271,18 @@ impl<P: PackageProvider> Linker<P> {
         if let AbstractValue::String(name) = index {
             return self.construction_member(context, object, Some(&name));
         }
+        if let (AbstractValue::Vector(values), AbstractValue::Integer(index)) = (&object, &index) {
+            let Some(offset) = index
+                .checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+            else {
+                return AbstractValue::Unknown;
+            };
+            return values
+                .get(offset)
+                .cloned()
+                .unwrap_or(AbstractValue::Unknown);
+        }
         let (AbstractValue::Object(object), AbstractValue::Integer(index)) = (object, index) else {
             return AbstractValue::Unknown;
         };
@@ -1321,6 +1338,7 @@ impl<P: PackageProvider> Linker<P> {
                     | AbstractValue::Logical(_)
                     | AbstractValue::Integer(_)
                     | AbstractValue::String(_)
+                    | AbstractValue::Vector(_)
                     | AbstractValue::Function { .. } => self
                         .object_graphs
                         .get_mut(&context.package.id)
@@ -1400,6 +1418,7 @@ impl<P: PackageProvider> Linker<P> {
         context: ExecutionContext<'_>,
         state: &mut ExecutionState,
         call: &ConstructionCall,
+        span: &Span,
     ) -> Result<ExecutionOutcome> {
         let mut arguments = Vec::with_capacity(call.arguments.len());
         for argument in &call.arguments {
@@ -1431,7 +1450,7 @@ impl<P: PackageProvider> Linker<P> {
         };
         match resolved {
             ResolvedName::Base(name) => {
-                self.evaluate_base_construction_call(context, state, call, &name, &arguments)
+                self.evaluate_base_construction_call(context, state, call, span, &name, &arguments)
             }
             ResolvedName::PackageBinding { package, binding } if package == context.package.id => {
                 self.evaluate_installed_function(context, call, &arguments, None, &binding)
@@ -1527,6 +1546,9 @@ impl<P: PackageProvider> Linker<P> {
         let nested_context = ExecutionContext {
             lexical_environment: &closure.environment,
             depth: context.depth + 1,
+            specialized: arguments
+                .iter()
+                .any(|value| !matches!(value, AbstractValue::Unknown)),
             ..context
         };
         let mut outcome = ExecutionOutcome::value(AbstractValue::Null);
@@ -1544,6 +1566,7 @@ impl<P: PackageProvider> Linker<P> {
         context: ExecutionContext<'_>,
         state: &mut ExecutionState,
         call: &ConstructionCall,
+        span: &Span,
         name: &str,
         arguments: &[AbstractValue],
     ) -> Result<ExecutionOutcome> {
@@ -1589,6 +1612,7 @@ impl<P: PackageProvider> Linker<P> {
                     AbstractValue::Logical(_)
                     | AbstractValue::Integer(_)
                     | AbstractValue::String(_)
+                    | AbstractValue::Vector(_)
                     | AbstractValue::Object(_)
                     | AbstractValue::Function { .. } => AbstractValue::Logical(false),
                 }),
@@ -1615,6 +1639,33 @@ impl<P: PackageProvider> Linker<P> {
                 }
                 _ => AbstractValue::Unknown,
             },
+            "!" => match arguments {
+                [AbstractValue::Logical(value)] => AbstractValue::Logical(!value),
+                _ => AbstractValue::Unknown,
+            },
+            "c" => {
+                let mut values = Vec::new();
+                for value in arguments {
+                    match value {
+                        AbstractValue::Vector(items) => values.extend(items.iter().cloned()),
+                        AbstractValue::Unknown => {
+                            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+                        }
+                        value => values.push(value.clone()),
+                    }
+                    if values.len() > 32 {
+                        return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+                    }
+                }
+                AbstractValue::Vector(values)
+            }
+            "names" => arguments
+                .first()
+                .and_then(|value| self.abstract_names(context, value))
+                .map_or(AbstractValue::Unknown, AbstractValue::Vector),
+            "paste0" => fold_paste0(arguments),
+            "strsplit" => fold_strsplit(call, arguments),
+            "switch" => fold_switch(call, arguments),
             "return" => {
                 return Ok(ExecutionOutcome {
                     value: arguments.first().cloned().unwrap_or(AbstractValue::Null),
@@ -1694,10 +1745,34 @@ impl<P: PackageProvider> Linker<P> {
                 }
                 AbstractValue::Null
             }
+            "requireNamespace" | "loadNamespace" | "getNamespace" | "asNamespace" => {
+                if context.specialized
+                    && let Some(AbstractValue::String(package)) = construction_argument(
+                        call,
+                        arguments,
+                        namespace_formals(name),
+                        namespace_target(name),
+                    )
+                {
+                    self.record_contextual_namespace_call(span, package);
+                }
+                AbstractValue::Unknown
+            }
             _ => AbstractValue::Unknown,
         };
         let _ = state;
         Ok(ExecutionOutcome::value(value))
+    }
+
+    fn record_contextual_namespace_call(&mut self, span: &Span, package: &str) {
+        self.contextual_namespace_calls
+            .entry(span.clone())
+            .and_modify(|known| {
+                if known.as_deref() != Some(package) {
+                    *known = None;
+                }
+            })
+            .or_insert_with(|| Some(package.to_owned()));
     }
 
     fn abstract_environment(
@@ -1732,6 +1807,7 @@ impl<P: PackageProvider> Linker<P> {
         match value {
             AbstractValue::Null => Some(0),
             AbstractValue::String(_) => Some(1),
+            AbstractValue::Vector(values) => i64::try_from(values.len()).ok(),
             AbstractValue::Object(object) => {
                 match self.object_graphs[&context.package.id].objects.get(object) {
                     Some(InstalledObject::Structured { members, .. }) => {
@@ -1745,6 +1821,30 @@ impl<P: PackageProvider> Linker<P> {
             }
             _ => None,
         }
+    }
+
+    fn abstract_names(
+        &self,
+        context: ExecutionContext<'_>,
+        value: &AbstractValue,
+    ) -> Option<Vec<AbstractValue>> {
+        let AbstractValue::Object(object) = value else {
+            return None;
+        };
+        let Some(InstalledObject::Structured { members, .. }) =
+            self.object_graphs[&context.package.id].objects.get(object)
+        else {
+            return None;
+        };
+        let mut names = Vec::with_capacity(members.len());
+        for path in members.keys() {
+            let name = path.strip_prefix("$$")?;
+            if name.is_empty() || name.chars().any(|character| "$[]".contains(character)) {
+                return None;
+            }
+            names.push(AbstractValue::String(name.to_owned()));
+        }
+        Some(names)
     }
 
     fn evaluate_reenclosing_lapply(
@@ -1908,6 +2008,7 @@ impl<P: PackageProvider> Linker<P> {
                     image,
                     lexical_environment,
                     depth: 0,
+                    specialized: false,
                 },
                 &expression.construction,
             )?;
@@ -3223,7 +3324,14 @@ impl<P: PackageProvider> Linker<P> {
                 );
             }
             "requireNamespace" | "loadNamespace" | "getNamespace" | "asNamespace" => {
-                let Some(name) = static_string_arg(call) else {
+                let name = static_string_arg(call).map(Cow::Borrowed).or_else(|| {
+                    self.contextual_namespace_calls
+                        .get(&call.span)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .map(Cow::Owned)
+                });
+                let Some(name) = name else {
                     self.diagnostic(
                         from,
                         &current.id,
@@ -3244,8 +3352,8 @@ impl<P: PackageProvider> Linker<P> {
                     "asNamespace" => PackageOperation::AsNamespace,
                     _ => unreachable!(),
                 };
-                let suggested = self.package_is_suggested_only(&image.index, name)?;
-                let discovery_policy = if self.optional_package_selected(name) {
+                let suggested = self.package_is_suggested_only(&image.index, &name)?;
+                let discovery_policy = if self.optional_package_selected(&name) {
                     DiscoveryPolicy::Internalize
                 } else if suggested && call.callee == "requireNamespace" {
                     self.rewrites.push(Rewrite::PackageOperation {
@@ -3268,7 +3376,7 @@ impl<P: PackageProvider> Linker<P> {
                         format!("reachable {} for `{name}` is not specialized by policy", call.callee),
                         Some(call.span.clone()),
                     ),
-                    DiscoveryPolicy::TargetProvidedOnly => match self.packages.locate_optional(name)? {
+                    DiscoveryPolicy::TargetProvidedOnly => match self.packages.locate_optional(&name)? {
                         Some(foreign) if self.packages.is_target_provided(&foreign) => {
                             self.target_provided.insert(foreign.id);
                         }
@@ -3290,13 +3398,13 @@ impl<P: PackageProvider> Linker<P> {
                         None => self.record_missing_package(
                             from,
                             &current.id,
-                            name,
+                            &name,
                             EdgeKind::Discovery,
                             format!("{} requires unavailable namespace {name}", call.callee),
                             Some(call.span.clone()),
                         ),
                     },
-                    DiscoveryPolicy::Internalize => match self.packages.locate_optional(name)? {
+                    DiscoveryPolicy::Internalize => match self.packages.locate_optional(&name)? {
                         Some(foreign) if self.packages.is_target_provided(&foreign) => {
                             self.target_provided.insert(foreign.id);
                         }
@@ -3314,7 +3422,7 @@ impl<P: PackageProvider> Linker<P> {
                                 operation,
                             });
                         }
-                        None if call.callee == "requireNamespace" && !self.optional_package_selected(name) => {
+                        None if call.callee == "requireNamespace" && !self.optional_package_selected(&name) => {
                             self.rewrites.push(Rewrite::PackageOperation {
                                 source: call.span.clone(),
                                 package: None,
@@ -3324,7 +3432,7 @@ impl<P: PackageProvider> Linker<P> {
                         None => self.record_missing_package(
                             from,
                             &current.id,
-                            name,
+                            &name,
                             EdgeKind::Discovery,
                             format!("{} requires unavailable namespace {name}", call.callee),
                             Some(call.span.clone()),
@@ -4235,6 +4343,120 @@ fn spans_overlap(left: &Span, right: &Span) -> bool {
     left.source == right.source && left.start < right.end && right.start < left.end
 }
 
+fn fold_paste0(arguments: &[AbstractValue]) -> AbstractValue {
+    let mut columns = Vec::with_capacity(arguments.len());
+    let mut width = 1usize;
+    for argument in arguments {
+        let column = match argument {
+            AbstractValue::String(value) => Some(vec![value.clone()]),
+            AbstractValue::Vector(values) => values
+                .iter()
+                .map(|value| match value {
+                    AbstractValue::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        };
+        let Some(column) = column else {
+            return AbstractValue::Unknown;
+        };
+        if column.is_empty() {
+            return AbstractValue::Vector(Vec::new());
+        }
+        width = width.max(column.len());
+        if width > 32 {
+            return AbstractValue::Unknown;
+        }
+        columns.push(column);
+    }
+    if columns
+        .iter()
+        .any(|column| column.len() != 1 && column.len() != width)
+    {
+        return AbstractValue::Unknown;
+    }
+    let values = (0..width)
+        .map(|index| {
+            columns
+                .iter()
+                .map(|column| &column[index % column.len()])
+                .fold(String::new(), |mut output, value| {
+                    output.push_str(value);
+                    output
+                })
+        })
+        .map(AbstractValue::String)
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [value] => value.clone(),
+        _ => AbstractValue::Vector(values),
+    }
+}
+
+fn fold_strsplit(call: &ConstructionCall, arguments: &[AbstractValue]) -> AbstractValue {
+    let formals = &["x", "split", "fixed", "perl", "useBytes"];
+    let (Some(input), Some(AbstractValue::String(separator)), Some(AbstractValue::Logical(true))) = (
+        construction_argument(call, arguments, formals, "x"),
+        construction_argument(call, arguments, formals, "split"),
+        construction_argument(call, arguments, formals, "fixed"),
+    ) else {
+        return AbstractValue::Unknown;
+    };
+    let inputs = match input {
+        AbstractValue::String(value) => vec![value.as_str()],
+        AbstractValue::Vector(values) => {
+            let Some(values) = values
+                .iter()
+                .map(|value| match value {
+                    AbstractValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return AbstractValue::Unknown;
+            };
+            values
+        }
+        _ => return AbstractValue::Unknown,
+    };
+    if inputs.len() > 32 || separator.is_empty() {
+        return AbstractValue::Unknown;
+    }
+    AbstractValue::Vector(
+        inputs
+            .into_iter()
+            .map(|input| {
+                let parts = input
+                    .split(separator)
+                    .take(33)
+                    .map(|part| AbstractValue::String(part.to_owned()))
+                    .collect::<Vec<_>>();
+                if parts.len() > 32 {
+                    AbstractValue::Unknown
+                } else {
+                    AbstractValue::Vector(parts)
+                }
+            })
+            .collect(),
+    )
+}
+
+fn fold_switch(call: &ConstructionCall, arguments: &[AbstractValue]) -> AbstractValue {
+    let Some(AbstractValue::String(selector)) = arguments.first() else {
+        return AbstractValue::Unknown;
+    };
+    let mut default = None;
+    for (argument, value) in call.arguments.iter().zip(arguments).skip(1) {
+        match argument.name.as_deref() {
+            Some(name) if name == selector => return value.clone(),
+            Some(_) => {}
+            None => default = Some(value.clone()),
+        }
+    }
+    default.unwrap_or(AbstractValue::Null)
+}
+
 trait NamedArguments {
     fn len(&self) -> usize;
     fn name(&self, index: usize) -> Option<&str>;
@@ -4373,9 +4595,13 @@ fn native_selector_span(call: &CallSite) -> Option<&Span> {
 
 fn static_string_arg(call: &CallSite) -> Option<&str> {
     let argument = match call.callee.as_str() {
-        "requireNamespace" | "loadNamespace" => matched_static_arg(call, &["package"], "package"),
-        "getNamespace" => matched_static_arg(call, &["name"], "name"),
-        "asNamespace" => matched_static_arg(call, &["ns"], "ns"),
+        "requireNamespace" | "loadNamespace" | "getNamespace" | "asNamespace" => {
+            matched_static_arg(
+                call,
+                namespace_formals(&call.callee),
+                namespace_target(&call.callee),
+            )
+        }
         "packageVersion" => matched_static_arg(call, &["pkg"], "pkg"),
         "find.package" => matched_static_arg(call, &["package"], "package"),
         _ => call.args.first().and_then(Option::as_ref),
@@ -4383,6 +4609,24 @@ fn static_string_arg(call: &CallSite) -> Option<&str> {
     match argument {
         StaticArg::String(value) => Some(value),
         StaticArg::Symbol(_) => None,
+    }
+}
+
+fn namespace_formals(name: &str) -> &'static [&'static str] {
+    match name {
+        "requireNamespace" | "loadNamespace" => &["package"],
+        "getNamespace" => &["name"],
+        "asNamespace" => &["ns"],
+        _ => &[],
+    }
+}
+
+fn namespace_target(name: &str) -> &'static str {
+    match name {
+        "requireNamespace" | "loadNamespace" => "package",
+        "getNamespace" => "name",
+        "asNamespace" => "ns",
+        _ => "",
     }
 }
 

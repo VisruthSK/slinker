@@ -63,6 +63,10 @@ impl FakeProvider {
                 "c",
                 "list",
                 "paste",
+                "paste0",
+                "strsplit",
+                "switch",
+                "names",
                 "isNamespaceLoaded",
                 "getNamespaceExports",
                 "setHook",
@@ -1589,6 +1593,211 @@ fn namespace_discovery_matches_named_and_mixed_positional_arguments() {
             "static package argument was lost for {source}"
         );
     }
+}
+
+#[test]
+fn constant_argument_specializes_private_namespace_helper() {
+    let root = package_with(
+        "root",
+        &[
+            ("f", Some("f <- function() helper(\"foo\")")),
+            (
+                "helper",
+                Some("helper <- function(package) requireNamespace(package)"),
+            ),
+        ],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let foo = package("foo", &[]);
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]).target("foo"), 1)
+        .with_policy(LinkPolicy {
+            namespace_discovery: DiscoveryPolicy::TargetProvidedOnly,
+        })
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery),
+        "{:?}",
+        plan.diagnostics
+    );
+    assert!(
+        plan.target_provided
+            .iter()
+            .any(|package| package.name == "foo")
+    );
+}
+
+#[test]
+fn unknown_argument_keeps_public_namespace_helper_dynamic() {
+    let root = package(
+        "root",
+        &[(
+            "helper",
+            Some("helper <- function(package) requireNamespace(package)"),
+        )],
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+    );
+}
+
+#[test]
+fn bounded_string_operations_specialize_namespace_helper() {
+    let root = package_with(
+        "root",
+        &[
+            ("f", Some("f <- function() helper(\"foo-extra\")")),
+            (
+                "helper",
+                Some(
+                    "helper <- function(spec) { parts <- strsplit(spec, \"-\", fixed = TRUE)[[1L]]; package <- paste0(parts[[1L]], \"\"); requireNamespace(package) }",
+                ),
+            ),
+        ],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let foo = package("foo", &[]);
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]).target("foo"), 1)
+        .with_policy(LinkPolicy {
+            namespace_discovery: DiscoveryPolicy::TargetProvidedOnly,
+        })
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+    );
+}
+
+#[test]
+fn unknown_string_index_keeps_namespace_discovery_dynamic() {
+    let root = package_with(
+        "root",
+        &[
+            (
+                "f",
+                Some("f <- function(index) helper(\"foo-extra\", index)"),
+            ),
+            (
+                "helper",
+                Some(
+                    "helper <- function(spec, index) { parts <- strsplit(spec, \"-\", fixed = TRUE)[[1L]]; requireNamespace(parts[[index]]) }",
+                ),
+            ),
+        ],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+    );
+}
+
+#[test]
+fn resolved_null_coalescing_helper_propagates_constant() {
+    let root = package_with(
+        "root",
+        &[
+            ("f", Some("f <- function() helper(NULL)")),
+            (
+                "helper",
+                Some("helper <- function(package) requireNamespace(package %||% \"foo\")"),
+            ),
+            (
+                "%||%",
+                Some("`%||%` <- function(left, right) if (!is.null(left)) left else right"),
+            ),
+        ],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let foo = package("foo", &[]);
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]).target("foo"), 1)
+        .with_policy(LinkPolicy {
+            namespace_discovery: DiscoveryPolicy::TargetProvidedOnly,
+        })
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+    );
+}
+
+#[test]
+fn bounded_switch_propagates_selected_package() {
+    let root = package_with(
+        "root",
+        &[
+            ("f", Some("f <- function() helper(\"short\")")),
+            (
+                "helper",
+                Some(
+                    "helper <- function(kind) requireNamespace(switch(kind, short = \"foo\", long = \"bar\"))",
+                ),
+            ),
+        ],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let foo = package("foo", &[]);
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]).target("foo"), 1)
+        .with_policy(LinkPolicy {
+            namespace_discovery: DiscoveryPolicy::TargetProvidedOnly,
+        })
+        .analyze("root")
+        .unwrap();
+
+    assert!(
+        !plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+    );
 }
 
 #[test]

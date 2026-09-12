@@ -712,9 +712,9 @@ fn construction_expr(
             } else {
                 ConstructionExprKind::Call {
                     call: ConstructionCall {
+                        qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
                         callee: operator,
                         callee_kind: CalleeKind::DefinitelyExternal,
-                        qualified_package: Some("base".into()),
                         arguments: vec![
                             ConstructionArgument {
                                 name: None,
@@ -791,6 +791,35 @@ fn construction_expr(
                 index: Box::new(construction_expr(source, text, index, calls)?),
             }
         }
+        AnyRExpression::RSubset(subset) => {
+            let mut arguments = subset
+                .arguments()
+                .ok()?
+                .items()
+                .iter()
+                .filter_map(|item| item.ok());
+            let index = arguments.next()?.value()?;
+            ConstructionExprKind::Index {
+                object: Box::new(construction_expr(
+                    source,
+                    text,
+                    subset.function().ok()?,
+                    calls,
+                )?),
+                index: Box::new(construction_expr(source, text, index, calls)?),
+            }
+        }
+        AnyRExpression::RUnaryExpression(unary) => ConstructionExprKind::Call {
+            call: ConstructionCall {
+                callee: unary.operator().ok()?.text_trimmed().to_owned(),
+                callee_kind: CalleeKind::DefinitelyExternal,
+                qualified_package: Some("base".into()),
+                arguments: vec![ConstructionArgument {
+                    name: None,
+                    value: construction_expr(source, text, unary.argument().ok()?, calls),
+                }],
+            },
+        },
         AnyRExpression::RIfStatement(statement) => ConstructionExprKind::If {
             condition: Box::new(construction_expr(
                 source,
