@@ -41,9 +41,15 @@ Updated: 2026-09-11 (America/Los_Angeles)
    - Oak marks definitely local closure arguments; native callback summaries can point back to the already analyzed owner closure.
    - Real glue 1.8.1 proof used `glue_` callback argument 2 and callback-free `trim_`; `UnknownNativeEffects` disappeared without globally marking the DLL safe.
 
+6. `70f8d33 Propagate bounded helper call values`
+   - Added bounded interprocedural namespace propagation keyed by exact call span.
+   - Supports fixed `strsplit`, bounded `[`/`[[`, `paste0`, `switch`, `c`, `names`, unary `!`, and resolved package-local null coalescing.
+   - Uses the shared R argument matcher, a 16-call-depth budget, and a 32-element vector budget.
+   - Conflicting contexts widen to unknown; unknown public helpers remain dynamic.
+
 ## Verified semantic results
 
-- Full Rust suite after `b479ed7`: 70 lib tests, 7 main tests, 3 CLI tests, 106 demand-linker tests, 0 failures.
+- Full Rust suite after `70f8d33`: 70 lib tests, 7 main tests, 3 CLI tests, 112 demand-linker tests, 0 failures.
 - Real R6 2.6.1 after construction/control work:
   - 42 graph nodes, 79 edges, 41 semantic needs.
   - 13 top-level, 8 private, 0 installed nested, and 10 derived closure bodies parsed.
@@ -59,27 +65,11 @@ Updated: 2026-09-11 (America/Los_Angeles)
 
 ## Current uncommitted work
 
-Only `src/analysis/engine.rs` and `tests/demand_linker.rs` are modified.
-
-The WIP adds bounded interprocedural namespace propagation:
-
-- `ExecutionContext.specialized` distinguishes a concrete helper call from generic root analysis.
-- Exact call spans map a helper's proven string argument to its internal `requireNamespace`/`loadNamespace`/`getNamespace`/`asNamespace` site.
-- Conflicting concrete values widen the site back to unknown.
-- The common R-style argument matcher is reused.
-- `constant_argument_specializes_private_namespace_helper` passes under `TargetProvidedOnly` policy.
-- `unknown_argument_keeps_public_namespace_helper_dynamic` passes.
-
-The same WIP begins `AbstractValue::Vector` support and base folds for `c`, `names`, `paste0`, `strsplit`, `switch`, and indexing, but helper functions for those folds are not finished yet. `cargo check` will fail until `fold_paste0`, `fold_strsplit`, `fold_switch`, and any new exhaustive `AbstractValue` matches are completed. Continue here before committing.
+No tracked implementation files are modified immediately after `70f8d33`. The brief documents remain untracked.
 
 ## Immediate implementation order
 
-1. Finish the current bounded value WIP:
-   - Add Air IR transport for `[` (both `[` and `[[` currently need bounded indexing behavior) and unary `!`.
-   - Implement bounded `c`, `names`, `paste0`, `strsplit`, `switch`, and resolved package-local `%||%` behavior.
-   - Add a 32-element/vector and 16-call-depth budget; unknown/out-of-range inputs stay unknown.
-   - Add positive and negative tests for every fold.
-   - Run full tests and commit the call-context slice.
+1. Build the explanation DAG from `Update the Rust Graph.md`; its detailed requirements are summarized below.
 
 2. Backports:
    - Preserve the public dynamic-package invariant described above.
