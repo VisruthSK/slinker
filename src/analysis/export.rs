@@ -3,7 +3,7 @@ use crate::analysis::diagnostic::RejectCode;
 use crate::analysis::engine::LinkPlan;
 use crate::analysis::graph::{Edge, EdgeKind, Node, NodeKind};
 use crate::syntax::{SourceOrigin, Sources, Span};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -23,13 +23,13 @@ pub struct GraphExport {
     pub stats: GraphStatsExport,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageIdentityExport {
     pub name: String,
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetIdentityExport {
     pub r_version: String,
     pub platform: String,
@@ -42,7 +42,7 @@ pub struct GraphNodeExport {
     pub kind: GraphNodeKindExport,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphNodeKindExport {
     RBinding,
@@ -71,7 +71,7 @@ pub struct GraphEdgeExport {
     pub source: Option<GraphSourceExport>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphEdgeReasonExport {
     ExportRoot,
@@ -94,20 +94,20 @@ pub enum GraphEdgeReasonExport {
     SemanticEffect,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GraphSourceExport {
     pub owner: String,
     pub start: usize,
     pub end: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GraphRootReasonExport {
     pub id: String,
     pub reasons: Vec<GraphEdgeReasonExport>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GraphBlockerExport {
     pub kind: String,
     pub owner: String,
@@ -425,7 +425,7 @@ impl GraphEdgeReasonExport {
     }
 }
 
-fn semantic_node_id(node: &Node) -> String {
+pub(crate) fn semantic_node_id(node: &Node) -> String {
     match &node.kind {
         NodeKind::Binding { name } | NodeKind::ExternalBinding { name } => {
             format!("{}::{name}", node.package)
@@ -461,7 +461,7 @@ fn semantic_node_id(node: &Node) -> String {
     }
 }
 
-fn node_kind(kind: &NodeKind) -> GraphNodeKindExport {
+pub(crate) fn node_kind(kind: &NodeKind) -> GraphNodeKindExport {
     match kind {
         NodeKind::Binding { .. } => GraphNodeKindExport::RBinding,
         NodeKind::PrivateBinding { .. } => GraphNodeKindExport::PrivateBinding,
@@ -479,7 +479,11 @@ fn node_kind(kind: &NodeKind) -> GraphNodeKindExport {
     }
 }
 
-fn edge_reason(edge: &Edge, source: &NodeKind, target: &NodeKind) -> GraphEdgeReasonExport {
+pub(crate) fn edge_reason(
+    edge: &Edge,
+    source: &NodeKind,
+    target: &NodeKind,
+) -> GraphEdgeReasonExport {
     match edge.kind {
         EdgeKind::Root => GraphEdgeReasonExport::ExportRoot,
         EdgeKind::Lexical => GraphEdgeReasonExport::LexicalReference,
@@ -506,7 +510,7 @@ fn edge_reason(edge: &Edge, source: &NodeKind, target: &NodeKind) -> GraphEdgeRe
     }
 }
 
-fn root_reason(kind: &NodeKind) -> Option<GraphEdgeReasonExport> {
+pub(crate) fn root_reason(kind: &NodeKind) -> Option<GraphEdgeReasonExport> {
     match kind {
         NodeKind::Binding { .. } => Some(GraphEdgeReasonExport::ExportRoot),
         NodeKind::Activation => Some(GraphEdgeReasonExport::PackageRoot),
@@ -514,7 +518,7 @@ fn root_reason(kind: &NodeKind) -> Option<GraphEdgeReasonExport> {
     }
 }
 
-fn stable_source(sources: &Sources, span: Option<&Span>) -> Option<GraphSourceExport> {
+pub(crate) fn stable_source(sources: &Sources, span: Option<&Span>) -> Option<GraphSourceExport> {
     let span = span?;
     let source = sources.get(&span.source)?;
     match &source.origin {

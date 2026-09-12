@@ -26,12 +26,12 @@ fn help_documents_analyze_command() {
     assert!(stdout.contains("SLINKER_R"));
     assert!(stdout.contains("--lib PATH"));
     assert!(stdout.contains("--graph"));
-    assert!(stdout.contains("--graph-format FORMAT"));
+    assert!(!stdout.contains("--graph-format"));
     assert!(stdout.contains("never installs, rebuilds, or downloads"));
 }
 
 #[test]
-fn invalid_graph_format_is_rejected_before_analysis() {
+fn removed_graph_format_is_rejected_before_analysis() {
     let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
         .args(["analyze", "glue", "--graph-format", "yaml"])
         .output()
@@ -39,6 +39,5 @@ fn invalid_graph_format_is_rejected_before_analysis() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
-    assert!(stderr.contains("invalid value 'yaml' for '--graph-format'"));
-    assert!(stderr.contains("possible values: text, json"));
+    assert!(stderr.contains("unknown analyze option"));
 }

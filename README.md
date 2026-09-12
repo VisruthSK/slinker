@@ -10,7 +10,7 @@ slinker analyze voucher --lib C:/project/renv/library --lib C:/Users/me/AppData/
 slinker analyze voucher --target-provided cli
 slinker analyze voucher --extra-pkgs posterior distributional
 slinker analyze voucher --graph
-slinker analyze voucher --graph-format json
+slinker analyze voucher --graph
 ```
 
 `PACKAGE` is an installed package name. slinker never installs, rebuilds, or downloads packages. `--lib` is repeatable and ordered; the first installed occurrence wins, matching R library precedence.
@@ -25,9 +25,7 @@ Set `SLINKER_R` when the target R executable is not available as `R`/`R.exe` on 
 
 ### Graph inspection
 
-`--graph` appends a deterministic semantic graph to the normal analysis report. It is shorthand for `--graph-format text`.
-
-`--graph-format json` writes only graph JSON to stdout, so output can be redirected and compared without cleanup. Progress messages remain on stderr. The JSON starts at schema version `1` and contains stable semantic node IDs, node kinds, typed edge reasons, explicit roots, blockers, target/package metadata, and counts derived from the serialized graph. Nodes, edges, reasons, and roots use canonical ordering. The default JSON does not contain timestamps, process IDs, arena indices, pointers, temporary paths, or absolute installation paths in node IDs.
+`--graph` writes only deterministic explanation-DAG JSON to stdout, so output can be redirected and compared without cleanup. Progress messages remain on stderr. The versioned export coalesces parallel evidence, condenses strongly connected components into a DAG, and includes root attribution, package boundaries and entry points, dominators, presentation metadata, and transparent closure paths. The authoritative raw linker graph remains available through `--dump-graph` for exact debugging.
 
 Graph inspection is observational. Enabling it does not request additional bindings, discover packages, change retention, or alter blocker generation. Blocked analyses still have a graph export because blockers are a primary use case for graph inspection.
 

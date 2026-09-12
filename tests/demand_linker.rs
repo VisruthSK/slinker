@@ -1,8 +1,8 @@
 #![cfg(feature = "air")]
 
 use slinker::analysis::{
-    DiscoveryPolicy, EdgeKind, GraphEdgeReasonExport, GraphExport, LinkPolicy, Linker, Need,
-    NodeKind, RejectCode,
+    DiscoveryPolicy, EdgeKind, ExplanationDag, GraphEdgeReasonExport, GraphExport, LinkPolicy,
+    Linker, Need, NodeKind, RejectCode,
 };
 use slinker::package::{
     BindingImage, BindingOrigin, ClosureSource, Digest, EmbeddedClosureSource,
@@ -267,6 +267,18 @@ fn package_with(
 
 fn export(name: &str) -> ExportMap {
     ExportMap::from([(name.to_owned(), name.to_owned())])
+}
+
+fn test_target() -> TargetEnvironment {
+    TargetEnvironment {
+        target: Target {
+            r_version: "4.6.1".into(),
+            os: "mingw32".into(),
+            arch: "x86_64".into(),
+        },
+        libraries: Vec::new(),
+        base_bindings: Default::default(),
+    }
 }
 
 fn retained_binding(plan: &slinker::analysis::LinkPlan, package: &str, binding: &str) -> bool {
@@ -537,6 +549,29 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
         graph.environments[&closure.enclosure]
             .bindings
             .contains_key("self")
+    }));
+    let explanation = ExplanationDag::from_plan(&plan, &test_target(), "root").unwrap();
+    assert!(explanation.projected_edges.iter().any(|edge| {
+        let from = explanation
+            .components
+            .iter()
+            .find(|component| component.id == edge.from)
+            .expect("projected source");
+        let to = explanation
+            .components
+            .iter()
+            .find(|component| component.id == edge.to)
+            .expect("projected target");
+        from.members.iter().any(|member| member.id == "root::f")
+            && to
+                .members
+                .iter()
+                .any(|member| member.id == "root::first_dependency")
+            && edge.via.iter().any(|via| {
+                via.members
+                    .iter()
+                    .any(|member| member.contains("templates$$first"))
+            })
     }));
 }
 
@@ -4190,4 +4225,130 @@ fn graph_export_survives_blocked_analysis() {
     assert!(!export.nodes.is_empty());
     assert!(!export.blockers.is_empty());
     assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+}
+
+#[test]
+fn explanation_dag_is_deterministic_coalesced_and_round_trips() {
+    let analyze = || {
+        let root = package(
+            "root",
+            &[("f", Some("f <- function() { foo::bar(); foo::bar() }"))],
+        );
+        let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
+        Linker::new(FakeProvider::new(vec![root, foo]), 2)
+            .analyze("root")
+            .unwrap()
+    };
+    let first = ExplanationDag::from_plan(&analyze(), &test_target(), "root").unwrap();
+    let second = ExplanationDag::from_plan(&analyze(), &test_target(), "root").unwrap();
+    let json = serde_json::to_string_pretty(&first).unwrap();
+
+    assert_eq!(json, serde_json::to_string_pretty(&second).unwrap());
+    assert_eq!(
+        serde_json::from_str::<ExplanationDag>(&json).unwrap(),
+        first
+    );
+    assert_eq!(first.stats.raw_edges, 4);
+    assert!(first.edges.iter().any(|edge| {
+        edge.occurrences == 2
+            && edge.evidence.iter().all(|evidence| {
+                evidence.from_member == "root::f" && evidence.to_member == "foo::bar"
+            })
+    }));
+    let foo = first
+        .packages
+        .iter()
+        .find(|package| package.name == "foo")
+        .expect("foo summary");
+    assert_eq!(foo.entry_bindings, ["foo::bar"]);
+    assert!(!foo.boundary_edges.is_empty());
+}
+
+#[test]
+fn explanation_dag_condenses_cycles_and_remains_acyclic() {
+    let root = package(
+        "root",
+        &[
+            ("a", Some("a <- function() b()")),
+            ("b", Some("b <- function() a()")),
+        ],
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+    let explanation = ExplanationDag::from_plan(&plan, &test_target(), "root").unwrap();
+    let cycle = explanation
+        .components
+        .iter()
+        .find(|component| {
+            component
+                .members
+                .iter()
+                .any(|member| member.id == "root::a")
+                && component
+                    .members
+                    .iter()
+                    .any(|member| member.id == "root::b")
+        })
+        .expect("a/b component");
+
+    assert!(cycle.cyclic);
+    assert_eq!(cycle.members.len(), 2);
+    assert!(explanation.edges.iter().all(|edge| edge.from != edge.to));
+    let ids = explanation
+        .components
+        .iter()
+        .map(|component| component.id.as_str())
+        .collect::<HashSet<_>>();
+    assert!(
+        explanation
+            .edges
+            .iter()
+            .all(|edge| ids.contains(edge.from.as_str()) && ids.contains(edge.to.as_str()))
+    );
+}
+
+#[test]
+fn explanation_dag_attributes_roots_dominators_and_redundant_edges() {
+    let root = package_with(
+        "root",
+        &[
+            ("f", Some("f <- function() { a(); c() }")),
+            ("g", Some("g <- function() c()")),
+            ("a", Some("a <- function() b()")),
+            ("b", Some("b <- function() c()")),
+            ("c", Some("c <- function() 1")),
+        ],
+        Vec::new(),
+        ExportMap::from([("f".into(), "f".into()), ("g".into(), "g".into())]),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+    let explanation = ExplanationDag::from_plan(&plan, &test_target(), "root").unwrap();
+    let component = |member: &str| {
+        explanation
+            .components
+            .iter()
+            .find(|component| component.members.iter().any(|item| item.id == member))
+            .expect("member component")
+    };
+    let f = component("root::f");
+    let a = component("root::a");
+    let b = component("root::b");
+    let c = component("root::c");
+
+    assert_eq!(b.immediate_dominator.as_deref(), Some(a.id.as_str()));
+    assert!(a.exclusive_downstream_components >= 1);
+    assert_eq!(c.root_causes, ["root::f", "root::g"]);
+    assert!(
+        explanation
+            .edges
+            .iter()
+            .any(|edge| { edge.from == f.id && edge.to == c.id && edge.reachability_redundant })
+    );
 }
