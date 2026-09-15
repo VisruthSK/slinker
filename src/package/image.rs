@@ -1,18 +1,15 @@
-use crate::package::{
-    ExportMap, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent,
-    NativeRegistration, NativeSafety, NativeSymbolBinding, PackageIndex, S3Registration,
-};
-use crate::{Error, Result};
+use crate::package::PackageIndex;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BindingOrigin {
     Code,
     Sysdata,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectKind {
     Closure,
     Null,
@@ -30,6 +27,11 @@ pub enum ObjectKind {
     Environment,
     Builtin,
     Special,
+    Promise,
+    ActiveBinding,
+    Altrep,
+    ExternalPointer,
+    WeakReference,
     Other(String),
     Unavailable,
 }
@@ -63,37 +65,49 @@ impl ObjectKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectIssue {
     pub path: String,
     pub kind: String,
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClosureSource {
     pub source: Arc<str>,
     pub environment: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddedClosureSource {
     pub path: String,
     pub source: Arc<str>,
     pub environment: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddedEnvironmentRef {
     pub path: String,
     pub environment: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BindingRepresentation {
+    Value,
+    LazyLoadPromise,
+    Promise { forced: bool },
+    ActiveBinding,
+    Altrep { class: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BindingImage {
     pub name: String,
     pub origin: BindingOrigin,
-    pub active: bool,
+    pub representation: BindingRepresentation,
+    #[serde(default)]
+    pub classes: Vec<String>,
     pub object_kind: ObjectKind,
     pub closure: Option<ClosureSource>,
     pub environment: Option<String>,
@@ -102,10 +116,12 @@ pub struct BindingImage {
     pub issues: Vec<ObjectIssue>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrivateBindingImage {
     pub name: String,
-    pub active: bool,
+    pub representation: BindingRepresentation,
+    #[serde(default)]
+    pub classes: Vec<String>,
     pub object_kind: ObjectKind,
     pub closure: Option<ClosureSource>,
     pub environment: Option<String>,
@@ -114,7 +130,7 @@ pub struct PrivateBindingImage {
     pub issues: Vec<ObjectIssue>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrivateEnvironmentImage {
     pub id: String,
     pub parent: String,
@@ -214,6 +230,7 @@ pub struct PackageObjectGraph {
     pub codes: BTreeMap<CodeId, Arc<str>>,
     pub environments: BTreeMap<EnvironmentId, EnvironmentObject>,
     environment_by_label: BTreeMap<String, EnvironmentId>,
+    code_by_text: BTreeMap<String, CodeId>,
 }
 
 impl PackageObjectGraph {
@@ -276,10 +293,10 @@ impl PackageObjectGraph {
                 &mut code_by_text,
             );
             graph.namespace_bindings.insert(name.clone(), object);
-            if let Some(namespace_id) = graph.environment_by_label.get(&namespace_label).copied() {
-                if let Some(environment) = graph.environments.get_mut(&namespace_id) {
-                    environment.bindings.insert(name, object);
-                }
+            if let Some(namespace_id) = graph.environment_by_label.get(&namespace_label).copied()
+                && let Some(environment) = graph.environments.get_mut(&namespace_id)
+            {
+                environment.bindings.insert(name, object);
             }
         }
 
@@ -313,7 +330,112 @@ impl PackageObjectGraph {
                 }
             }
         }
+        graph.code_by_text = code_by_text;
         graph
+    }
+
+    /// Merge newly demanded installed bindings without renumbering existing or
+    /// runtime-derived object identities.
+    pub fn merge_image(&mut self, image: &PackageImage) {
+        let namespace_label = format!("namespace:{}", image.index.package.id.name);
+        let mut labels = BTreeSet::from([namespace_label.clone()]);
+        for binding in image.bindings.values() {
+            collect_binding_environments(binding, &mut labels);
+        }
+        for private in image.private_environments.values() {
+            labels.insert(private.id.clone());
+            labels.insert(private.parent.clone());
+            for binding in private.bindings.values() {
+                collect_binding_environments(binding, &mut labels);
+            }
+        }
+        for label in labels {
+            if self.environment_by_label.contains_key(&label) {
+                continue;
+            }
+            let id = EnvironmentId(self.environments.len());
+            self.environment_by_label.insert(label.clone(), id);
+            self.environments.insert(
+                id,
+                EnvironmentObject {
+                    id,
+                    external: label != namespace_label
+                        && !image.private_environments.contains_key(&label),
+                    unknown_fields: label.starts_with("unsupported:"),
+                    label,
+                    parent: None,
+                    bindings: BTreeMap::new(),
+                    derived: false,
+                },
+            );
+        }
+        for private in image.private_environments.values() {
+            let id = self.environment_by_label[&private.id];
+            self.environments
+                .get_mut(&id)
+                .expect("known environment")
+                .parent = self.environment_by_label.get(&private.parent).copied();
+        }
+
+        let mut code_by_text = std::mem::take(&mut self.code_by_text);
+        let mut names = image.bindings.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            if self.namespace_bindings.contains_key(&name) {
+                continue;
+            }
+            let object = self.add_binding_object(
+                &image.bindings[&name],
+                ObjectProvenance {
+                    namespace_binding: Some(name.clone()),
+                    private_environment: None,
+                    private_binding: None,
+                    path: "$".into(),
+                },
+                &mut code_by_text,
+            );
+            self.namespace_bindings.insert(name.clone(), object);
+            let namespace = self.environment_by_label[&namespace_label];
+            self.environments
+                .get_mut(&namespace)
+                .expect("namespace environment")
+                .bindings
+                .insert(name, object);
+        }
+
+        let mut private_ids = image
+            .private_environments
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        private_ids.sort();
+        for private_id in private_ids {
+            let private = &image.private_environments[&private_id];
+            let environment = self.environment_by_label[&private_id];
+            let mut names = private.bindings.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            for name in names {
+                if self.environments[&environment].bindings.contains_key(&name) {
+                    continue;
+                }
+                let object = self.add_private_binding_object(
+                    &private.bindings[&name],
+                    ObjectProvenance {
+                        namespace_binding: None,
+                        private_environment: Some(private_id.clone()),
+                        private_binding: Some(name.clone()),
+                        path: "$".into(),
+                    },
+                    &mut code_by_text,
+                );
+                self.environments
+                    .get_mut(&environment)
+                    .expect("private environment")
+                    .bindings
+                    .insert(name, object);
+            }
+        }
+        self.code_by_text = code_by_text;
     }
 
     fn add_binding_object(
@@ -322,15 +444,7 @@ impl PackageObjectGraph {
         provenance: ObjectProvenance,
         code_by_text: &mut BTreeMap<String, CodeId>,
     ) -> ObjectId {
-        self.add_object(
-            &binding.object_kind,
-            binding.closure.as_ref(),
-            binding.environment.as_deref(),
-            &binding.embedded_closures,
-            &binding.embedded_environments,
-            provenance,
-            code_by_text,
-        )
+        self.add_object(binding, provenance, code_by_text)
     }
 
     fn add_private_binding_object(
@@ -339,54 +453,42 @@ impl PackageObjectGraph {
         provenance: ObjectProvenance,
         code_by_text: &mut BTreeMap<String, CodeId>,
     ) -> ObjectId {
-        self.add_object(
-            &binding.object_kind,
-            binding.closure.as_ref(),
-            binding.environment.as_deref(),
-            &binding.embedded_closures,
-            &binding.embedded_environments,
-            provenance,
-            code_by_text,
-        )
+        self.add_object(binding, provenance, code_by_text)
     }
 
-    fn add_object(
+    fn add_object<T: BindingObjectView>(
         &mut self,
-        kind: &ObjectKind,
-        closure: Option<&ClosureSource>,
-        environment: Option<&str>,
-        embedded_closures: &[EmbeddedClosureSource],
-        embedded_environments: &[EmbeddedEnvironmentRef],
+        binding: &T,
         provenance: ObjectProvenance,
         code_by_text: &mut BTreeMap<String, CodeId>,
     ) -> ObjectId {
-        if let Some(closure) = closure {
+        if let Some(closure) = binding.closure() {
             return self.add_closure(closure, provenance, code_by_text);
         }
-        if let Some(environment) = environment {
-            if let Some(environment_id) = self.environment_by_label.get(environment).copied() {
-                let object = ObjectId(self.objects.len());
-                self.objects
-                    .insert(object, InstalledObject::Environment(environment_id));
-                return object;
-            }
+        if let Some(environment) = binding.environment()
+            && let Some(environment_id) = self.environment_by_label.get(environment).copied()
+        {
+            let object = ObjectId(self.objects.len());
+            self.objects
+                .insert(object, InstalledObject::Environment(environment_id));
+            return object;
         }
 
         let object = ObjectId(self.objects.len());
-        if embedded_closures.is_empty() && embedded_environments.is_empty() {
+        if binding.embedded_closures().is_empty() && binding.embedded_environments().is_empty() {
             self.objects
-                .insert(object, InstalledObject::Atom(kind.clone()));
+                .insert(object, InstalledObject::Atom(binding.object_kind().clone()));
             return object;
         }
 
         self.objects.insert(
             object,
             InstalledObject::Structured {
-                kind: kind.clone(),
+                kind: binding.object_kind().clone(),
                 members: BTreeMap::new(),
             },
         );
-        let mut closure_members = embedded_closures.iter().collect::<Vec<_>>();
+        let mut closure_members = binding.embedded_closures().iter().collect::<Vec<_>>();
         closure_members.sort_by(|left, right| left.path.cmp(&right.path));
         for nested in closure_members {
             let nested_object = self.add_closure(
@@ -402,7 +504,7 @@ impl PackageObjectGraph {
             );
             self.add_member(object, nested.path.clone(), nested_object);
         }
-        let mut environment_members = embedded_environments.iter().collect::<Vec<_>>();
+        let mut environment_members = binding.embedded_environments().iter().collect::<Vec<_>>();
         environment_members.sort_by(|left, right| left.path.cmp(&right.path));
         for nested in environment_members {
             let Some(environment_id) = self.environment_by_label.get(&nested.environment).copied()
@@ -796,6 +898,7 @@ fn collect_binding_environments<T: BindingObjectView>(binding: &T, labels: &mut 
 }
 
 trait BindingObjectView {
+    fn object_kind(&self) -> &ObjectKind;
     fn closure(&self) -> Option<&ClosureSource>;
     fn environment(&self) -> Option<&str>;
     fn embedded_closures(&self) -> &[EmbeddedClosureSource];
@@ -803,6 +906,9 @@ trait BindingObjectView {
 }
 
 impl BindingObjectView for BindingImage {
+    fn object_kind(&self) -> &ObjectKind {
+        &self.object_kind
+    }
     fn closure(&self) -> Option<&ClosureSource> {
         self.closure.as_ref()
     }
@@ -818,6 +924,9 @@ impl BindingObjectView for BindingImage {
 }
 
 impl BindingObjectView for PrivateBindingImage {
+    fn object_kind(&self) -> &ObjectKind {
+        &self.object_kind
+    }
     fn closure(&self) -> Option<&ClosureSource> {
         self.closure.as_ref()
     }
@@ -867,408 +976,4 @@ fn format_provenance(provenance: &ObjectProvenance) -> String {
         return format!("{environment}${binding}{suffix}");
     }
     provenance.path.clone()
-}
-
-pub(crate) fn parse_package_image(text: &str, package: InstalledPackage) -> Result<PackageImage> {
-    let mut header: Option<(String, bool, bool)> = None;
-    let mut exports = ExportMap::new();
-    let mut imports = Vec::<ImportSpec>::new();
-    let mut import_all = HashMap::<String, usize>::new();
-    let mut bindings = HashMap::<String, BindingImage>::new();
-    let mut private_environments = HashMap::<String, PrivateEnvironmentImage>::new();
-    let mut datasets = Vec::new();
-    let mut files = Vec::new();
-    let mut s3 = Vec::new();
-    let mut dynlibs = Vec::new();
-
-    for (line_no, line) in text.lines().enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let kind = fields.next().unwrap_or_default();
-        let values = fields
-            .map(decode_hex)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|message| {
-                Error::Analysis(format!("image protocol line {}: {message}", line_no + 1))
-            })?;
-        match kind {
-            "HEADER" => {
-                require(kind, &values, 4, line_no)?;
-                if values[0] != package.id.name || values[1] != package.id.version.to_string() {
-                    return Err(Error::Analysis(format!(
-                        "installed image identity changed while inspecting {}: expected {} {}, got {} {}",
-                        package.id.name, package.id.name, package.id.version, values[0], values[1]
-                    )));
-                }
-                header = Some((
-                    values[1].clone(),
-                    parse_bool(&values[2])?,
-                    parse_bool(&values[3])?,
-                ));
-            }
-            "EXPORT" => {
-                require(kind, &values, 2, line_no)?;
-                exports.insert(values[0].clone(), values[1].clone());
-            }
-            "IMPORT_ALL" => {
-                require(kind, &values, 1, line_no)?;
-                let index = imports.len();
-                import_all.insert(values[0].clone(), index);
-                imports.push(ImportSpec::All {
-                    package: values[0].clone(),
-                    except: Vec::new(),
-                });
-            }
-            "IMPORT_EXCEPT" => {
-                require(kind, &values, 2, line_no)?;
-                if let Some(index) = import_all.get(&values[0]).copied() {
-                    if let ImportSpec::All { except, .. } = &mut imports[index] {
-                        except.push(values[1].clone());
-                    }
-                }
-            }
-            "IMPORT_FROM" => {
-                require(kind, &values, 3, line_no)?;
-                let package_name = values[0].clone();
-                let binding = ImportBinding {
-                    remote: values[1].clone(),
-                    local: values[2].clone(),
-                };
-                if let Some(ImportSpec::From { bindings, .. }) = imports.iter_mut().find(|item| {
-                    matches!(item, ImportSpec::From { package, .. } if package == &package_name)
-                }) {
-                    bindings.push(binding);
-                } else {
-                    imports.push(ImportSpec::From { package: package_name, bindings: vec![binding] });
-                }
-            }
-            "BINDING" => {
-                require(kind, &values, 4, line_no)?;
-                let origin = match values[1].as_str() {
-                    "code" => BindingOrigin::Code,
-                    "sysdata" => BindingOrigin::Sysdata,
-                    other => {
-                        return Err(Error::Analysis(format!("unknown binding origin {other:?}")));
-                    }
-                };
-                bindings.insert(
-                    values[0].clone(),
-                    BindingImage {
-                        name: values[0].clone(),
-                        origin,
-                        active: parse_bool(&values[3])?,
-                        object_kind: ObjectKind::from_r_type(&values[2]),
-                        closure: None,
-                        environment: None,
-                        embedded_closures: Vec::new(),
-                        embedded_environments: Vec::new(),
-                        issues: Vec::new(),
-                    },
-                );
-            }
-            "BINDING_ENV" => {
-                require(kind, &values, 2, line_no)?;
-                let binding = bindings.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!("BINDING_ENV precedes BINDING for {}", values[0]))
-                })?;
-                binding.environment = Some(values[1].clone());
-            }
-            "CLOSURE" => {
-                require(kind, &values, 3, line_no)?;
-                let binding = bindings.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!("CLOSURE precedes BINDING for {}", values[0]))
-                })?;
-                binding.closure = Some(ClosureSource {
-                    environment: values[1].clone(),
-                    source: Arc::from(values[2].clone()),
-                });
-            }
-            "NESTED_ENV" => {
-                require(kind, &values, 3, line_no)?;
-                let binding = bindings.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!("NESTED_ENV precedes BINDING for {}", values[0]))
-                })?;
-                binding.embedded_environments.push(EmbeddedEnvironmentRef {
-                    path: values[1].clone(),
-                    environment: values[2].clone(),
-                });
-            }
-            "NESTED_CLOSURE" => {
-                require(kind, &values, 4, line_no)?;
-                let binding = bindings.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!("NESTED_CLOSURE precedes BINDING for {}", values[0]))
-                })?;
-                binding.embedded_closures.push(EmbeddedClosureSource {
-                    path: values[1].clone(),
-                    environment: values[2].clone(),
-                    source: Arc::from(values[3].clone()),
-                });
-            }
-            "BINDING_ISSUE" => {
-                require(kind, &values, 4, line_no)?;
-                let binding = bindings.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!("BINDING_ISSUE precedes BINDING for {}", values[0]))
-                })?;
-                binding.issues.push(ObjectIssue {
-                    path: values[1].clone(),
-                    kind: values[2].clone(),
-                    detail: values[3].clone(),
-                });
-            }
-            "PRIVATE_ENV" => {
-                require(kind, &values, 2, line_no)?;
-                private_environments.insert(
-                    values[0].clone(),
-                    PrivateEnvironmentImage {
-                        id: values[0].clone(),
-                        parent: values[1].clone(),
-                        bindings: HashMap::new(),
-                    },
-                );
-            }
-            "PRIVATE_BINDING" => {
-                require(kind, &values, 4, line_no)?;
-                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_BINDING precedes PRIVATE_ENV for {}",
-                        values[0]
-                    ))
-                })?;
-                environment.bindings.insert(
-                    values[1].clone(),
-                    PrivateBindingImage {
-                        name: values[1].clone(),
-                        active: parse_bool(&values[3])?,
-                        object_kind: ObjectKind::from_r_type(&values[2]),
-                        closure: None,
-                        environment: None,
-                        embedded_closures: Vec::new(),
-                        embedded_environments: Vec::new(),
-                        issues: Vec::new(),
-                    },
-                );
-            }
-            "PRIVATE_BINDING_ENV" => {
-                require(kind, &values, 3, line_no)?;
-                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_BINDING_ENV precedes PRIVATE_ENV for {}",
-                        values[0]
-                    ))
-                })?;
-                let binding = environment.bindings.get_mut(&values[1]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_BINDING_ENV precedes PRIVATE_BINDING for {}::{}",
-                        values[0], values[1]
-                    ))
-                })?;
-                binding.environment = Some(values[2].clone());
-            }
-            "PRIVATE_CLOSURE" => {
-                require(kind, &values, 4, line_no)?;
-                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_CLOSURE precedes PRIVATE_ENV for {}",
-                        values[0]
-                    ))
-                })?;
-                let binding = environment.bindings.get_mut(&values[1]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_CLOSURE precedes PRIVATE_BINDING for {}::{}",
-                        values[0], values[1]
-                    ))
-                })?;
-                binding.closure = Some(ClosureSource {
-                    environment: values[2].clone(),
-                    source: Arc::from(values[3].clone()),
-                });
-            }
-            "PRIVATE_NESTED_ENV" => {
-                require(kind, &values, 4, line_no)?;
-                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_NESTED_ENV precedes PRIVATE_ENV for {}",
-                        values[0]
-                    ))
-                })?;
-                let binding = environment.bindings.get_mut(&values[1]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_NESTED_ENV precedes PRIVATE_BINDING for {}::{}",
-                        values[0], values[1]
-                    ))
-                })?;
-                binding.embedded_environments.push(EmbeddedEnvironmentRef {
-                    path: values[2].clone(),
-                    environment: values[3].clone(),
-                });
-            }
-            "PRIVATE_NESTED_CLOSURE" => {
-                require(kind, &values, 5, line_no)?;
-                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_NESTED_CLOSURE precedes PRIVATE_ENV for {}",
-                        values[0]
-                    ))
-                })?;
-                let binding = environment.bindings.get_mut(&values[1]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_NESTED_CLOSURE precedes PRIVATE_BINDING for {}::{}",
-                        values[0], values[1]
-                    ))
-                })?;
-                binding.embedded_closures.push(EmbeddedClosureSource {
-                    path: values[2].clone(),
-                    environment: values[3].clone(),
-                    source: Arc::from(values[4].clone()),
-                });
-            }
-            "PRIVATE_BINDING_ISSUE" => {
-                require(kind, &values, 5, line_no)?;
-                let environment = private_environments.get_mut(&values[0]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_BINDING_ISSUE precedes PRIVATE_ENV for {}",
-                        values[0]
-                    ))
-                })?;
-                let binding = environment.bindings.get_mut(&values[1]).ok_or_else(|| {
-                    Error::Analysis(format!(
-                        "PRIVATE_BINDING_ISSUE precedes PRIVATE_BINDING for {}::{}",
-                        values[0], values[1]
-                    ))
-                })?;
-                binding.issues.push(ObjectIssue {
-                    path: values[2].clone(),
-                    kind: values[3].clone(),
-                    detail: values[4].clone(),
-                });
-            }
-            "DATASET" => {
-                require(kind, &values, 1, line_no)?;
-                datasets.push(values[0].clone());
-            }
-            "S3" => {
-                require(kind, &values, 3, line_no)?;
-                s3.push(S3Registration {
-                    generic: values[0].clone(),
-                    class: values[1].clone(),
-                    method: values[2].clone(),
-                });
-            }
-            "DYNLIB" => {
-                require(kind, &values, 4, line_no)?;
-                let registration = parse_bool(&values[1])?.then(|| NativeRegistration {
-                    prefix: values[2].clone(),
-                    suffix: values[3].clone(),
-                });
-                dynlibs.push(NativeComponent {
-                    name: values[0].clone(),
-                    registration,
-                    symbols: Vec::new(),
-                    safety: NativeSafety::Unanalyzed,
-                });
-            }
-            "NATIVE_SYMBOL" => {
-                require(kind, &values, 3, line_no)?;
-                let native = dynlibs
-                    .iter_mut()
-                    .find(|native| native.name == values[0])
-                    .ok_or_else(|| {
-                        Error::Analysis(format!("NATIVE_SYMBOL precedes DYNLIB for {}", values[0]))
-                    })?;
-                native.symbols.push(NativeSymbolBinding {
-                    binding: values[1].clone(),
-                    symbol: values[2].clone(),
-                });
-            }
-            "FILE" => {
-                require(kind, &values, 1, line_no)?;
-                files.push(values[0].clone());
-            }
-            "PACKAGE_ISSUE" => {
-                // Package-level unsupported object-system metadata is represented
-                // later as an activation diagnostic. Keep the protocol forward-compatible.
-            }
-            other => {
-                return Err(Error::Analysis(format!(
-                    "unknown installed-image record {other:?}"
-                )));
-            }
-        }
-    }
-
-    let (_, on_load, has_sysdata) =
-        header.ok_or_else(|| Error::Analysis("installed image has no HEADER".into()))?;
-    let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
-    binding_names.sort();
-    datasets.sort();
-    files.sort();
-    files.dedup();
-
-    let index = PackageIndex {
-        description: package.description.clone(),
-        package,
-        exports,
-        imports,
-        s3,
-        dynlibs,
-        lifecycle: LifecycleMetadata { on_load },
-        binding_names,
-        datasets,
-        files,
-        has_sysdata,
-    };
-    Ok(PackageImage {
-        index,
-        bindings,
-        private_environments,
-    })
-}
-
-fn require(kind: &str, values: &[String], expected: usize, line_no: usize) -> Result<()> {
-    if values.len() == expected {
-        Ok(())
-    } else {
-        Err(Error::Analysis(format!(
-            "image protocol line {}: {kind} expected {expected} fields, got {}",
-            line_no + 1,
-            values.len()
-        )))
-    }
-}
-
-fn parse_bool(value: &str) -> Result<bool> {
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        other => Err(Error::Analysis(format!(
-            "invalid protocol boolean {other:?}"
-        ))),
-    }
-}
-
-fn decode_hex(value: &str) -> std::result::Result<String, String> {
-    if value.len() % 2 != 0 {
-        return Err(format!("odd-length hex field {value:?}"));
-    }
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut index = 0;
-    while index < bytes.len() {
-        let high = nibble(bytes[index]).ok_or_else(|| format!("invalid hex field {value:?}"))?;
-        let low = nibble(bytes[index + 1]).ok_or_else(|| format!("invalid hex field {value:?}"))?;
-        out.push((high << 4) | low);
-        index += 2;
-    }
-    String::from_utf8(out).map_err(|error| format!("invalid UTF-8 field: {error}"))
-}
-
-fn nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }

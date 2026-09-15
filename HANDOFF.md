@@ -1,6 +1,6 @@
 # slinker implementation handoff
 
-Updated: 2026-09-11 (America/Los_Angeles)
+Updated: 2026-09-15 (America/Los_Angeles)
 
 ## Repository state
 
@@ -8,7 +8,7 @@ Updated: 2026-09-11 (America/Los_Angeles)
 - Rust: `rustc 1.97.1`, `cargo 1.97.1`
 - Acceptance R: `R 4.6.1`, `mingw32`, `x86_64`
 - Installed packages confirmed: R6 2.6.1, backports 1.5.1, glue 1.8.1, pkgconfig 2.0.3, praise 1.0.0, magrittr 2.0.5, here 1.0.2, rprojroot 2.1.1, vctrs 0.7.3.
-- The four `Agent Brief_*.md` files, `slinker harp.md`, and `Update the Rust Graph.md` are user briefs. Keep them untracked and do not commit them.
+- The obsolete brief files were folded into this handoff and deleted as requested.
 - `Cargo.lock`, `.gitignore`, and `.gitattributes` are present and tracked.
 
 ## Completed commits
@@ -47,9 +47,29 @@ Updated: 2026-09-11 (America/Los_Angeles)
    - Uses the shared R argument matcher, a 16-call-depth budget, and a 32-element vector budget.
    - Conflicting contexts widen to unknown; unknown public helpers remain dynamic.
 
+7. `aed5d42 Export deterministic explanation DAG`
+   - Keeps the raw linker `Graph` authoritative and derives schema-versioned explanation JSON.
+   - Coalesces parallel component edges while retaining every reason/detail/source occurrence.
+   - Computes SCC condensation, digest-based component IDs, root attribution, package boundaries and entry summaries, presentation classes, transparent-path projection, immediate dominators, exclusive impact, and reachability-redundant markers.
+   - `--graph` now emits explanation JSON only; removed `--graph-format`. `--dump-graph` remains the raw deterministic debug export.
+   - Round-trip, parallel evidence, cycle condensation, root attribution, dominator, redundancy, package-entry, and transparent-path tests pass.
+
+8. `Swapped to harp` (this commit)
+   - Replaces Rscript/package-wide inspection with an isolated Rust Harp/libr worker and binding-demand requests.
+   - Keeps protocol version 1 as explicitly requested, but breaks its private representation cleanly to typed serde index/binding/object responses with no legacy reader.
+   - Moves retained-object traversal to Rust/Harp, preserving promise, active-binding, ALTREP, class, closure, environment, and private-environment facts without forcing nested promises or executing active bindings.
+   - Uses a dedicated protocol stream so embedded-R console output cannot corrupt JSON framing.
+   - Uses `R RHOME` before the `R_HOME` fallback, canonicalizes and worker-validates R home, and lets R establish default and explicit library paths.
+   - Centralizes disposable typed caches, makes corrupt entries misses, publishes immutable entries atomically, and fingerprints current installed-image bytes.
+
 ## Verified semantic results
 
-- Full Rust suite after `70f8d33`: 70 lib tests, 7 main tests, 3 CLI tests, 112 demand-linker tests, 0 failures.
+- Full Rust suite after `aed5d42`: 70 lib tests, 7 main tests, 3 CLI tests, 115 demand-linker tests, 0 failures.
+- Required real explanation exports succeeded:
+  - praise: 8 components, 7 explanation edges, 0 nontrivial SCCs, 1 package.
+  - pkgconfig: 9 components, 7 explanation edges, 0 nontrivial SCCs, 2 packages.
+  - evaluate: 107 components, 128 explanation edges, 0 nontrivial SCCs, 4 packages.
+  - here: 40 components, 48 explanation edges, 0 nontrivial SCCs, 2 packages.
 - Real R6 2.6.1 after construction/control work:
   - 42 graph nodes, 79 edges, 41 semantic needs.
   - 13 top-level, 8 private, 0 installed nested, and 10 derived closure bodies parsed.
@@ -65,13 +85,18 @@ Updated: 2026-09-11 (America/Los_Angeles)
 
 ## Current uncommitted work
 
-No tracked implementation files are modified immediately after `70f8d33`. The brief documents remain untracked.
+No tracked implementation work should remain immediately after `Swapped to harp`. The two brief documents and `slinker.zip` remain untracked and must not be committed.
+
+Harp validation at the commit boundary:
+
+- `cargo check --locked --all-targets --all-features` passes without project warnings.
+- `cargo test --locked --all-features` passes: 74 library tests, 8 main tests, 3 CLI tests, and 116 demand-linker tests.
+- Cold real R6 runs succeed with both explicit and default libraries through the typed worker. Both retain 42 nodes, 81 edges, 13 top-level closures, 8 private closures, and 10 derived closures. The remaining `object_summaries` potential-unbound-local diagnostic belongs to the subsequent closed-world semantic work.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` passes.
 
 ## Immediate implementation order
 
-1. Build the explanation DAG from `Update the Rust Graph.md`; its detailed requirements are summarized below.
-
-2. Backports:
+1. Backports:
    - Preserve the public dynamic-package invariant described above.
    - Model a proven non-empty bounded sequence before discharging post-loop `i`; keep the zero-iteration negative test.
    - Attach native evidence only through the exact-image manifest or another audited producer.
@@ -84,20 +109,9 @@ No tracked implementation files are modified immediately after `70f8d33`. The br
    - Add isolated fixture packages for re-enclosure, environment population/parent/sharing/self identity, lazy failure isolation, and nested closure demand.
    - Compare object facts with a test-only R subprocess.
 
-5. Harp migration:
-   - `slinker harp.md` was read completely.
-   - Harp/libr would materially simplify and strengthen binding-lazy object extraction, list names, promise/active-binding/ALTREP fidelity, and target-R parsing, but it does not replace the linker construction semantics above.
-   - The pinned Ark checkout contains matching `harp` and `libr` at `37fe33a` and documents the required Windows startup sequence.
-   - Implement it as a separate hidden Rust worker with typed serde framing; preserve the current inspector until parity tests pass. Do not embed R in the main process or execute `.onLoad`.
+5. Implement the new closed-world `LinkIr`, materializer, static/residual S3, schema-2 explanation, and author-facing R client in the phase order from `Agent Brief_ Finish and Clean Up slinker - closed world LinkIr.md`.
 
-6. Explanation DAG (`Update the Rust Graph.md`):
-   - Keep `Graph` authoritative and derive a versioned `ExplanationDag`.
-   - Coalesce parallel edges with every detail/span occurrence, compute SCCs in `O(V + E)`, create deterministic component IDs from sorted semantic member IDs, and emit an acyclic condensation graph.
-   - Add root attribution, package boundaries/entry bindings/summaries, presentation classes, transparent-path projection, immediate dominators, simple exclusive impact, and non-destructive reachability-redundant markers.
-   - CLI requirement from the new brief: `--graph` should emit explanation JSON; remove textual graph output and `--graph-format`, preferably add `slinker explain PACKAGE --output FILE` if it fits cleanly.
-   - Do not add visualization/layout dependencies.
-
-7. Final gate:
+6. Final gate after the remaining brief:
    - `cargo fmt --check`
    - `cargo check --locked --all-targets --all-features`
    - `cargo test --locked --all-features`
@@ -107,15 +121,16 @@ No tracked implementation files are modified immediately after `70f8d33`. The br
 
 ## Clippy note
 
-With Rust 1.97.1, the pre-existing tree fails strict clippy on roughly 29 lints (new `manual_is_multiple_of`, `collapsible_if`, `too_many_arguments`, `enum_variant_names`, and related findings). This predates the latest semantic commits. Fix them before final acceptance; do not hide them with crate-wide allows.
+Strict clippy passes on Rust 1.97.1 without crate-wide lint allowances.
 
 ## Useful commands
 
 ```powershell
-$env:SLINKER_R='C:\Program Files\R\R-4.6.1\bin\x64\R.exe'
+$env:R_HOME='C:\Program Files\R\R-4.6.1' # fallback when `R RHOME` is unavailable
 $env:SLINKER_CACHE_DIR='C:\Users\visru\Documents\Github\slinker\.tmp-cache'
 cargo test --locked --all-features
 cargo build --locked --release
+target\release\slinker.exe analyze R6
 target\release\slinker.exe analyze R6 --lib 'C:\Users\visru\AppData\Local\R\win-library\4.6'
 target\release\slinker.exe analyze backports --lib 'C:\Users\visru\AppData\Local\R\win-library\4.6'
 target\release\slinker.exe analyze glue --lib 'C:\Users\visru\AppData\Local\R\win-library\4.6'

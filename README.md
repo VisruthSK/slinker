@@ -21,7 +21,7 @@ slinker analyze voucher --graph
 
 `--target-provided` leaves named third-party namespaces external after resolving their exact installed identity. Base packages remain part of the target R platform.
 
-Set `SLINKER_R` when the target R executable is not available as `R`/`R.exe` on `PATH`.
+Slinker runs `R RHOME` once as a location-only preflight and falls back to `R_HOME` when `R` is unavailable. It then loads that installation's shared runtime through Harp/libr. No R executable participates in target probing or package analysis.
 
 ### Graph inspection
 
@@ -51,9 +51,9 @@ Air parses reachable installed closure units with the exact parser revision used
 
 Target capture does not enumerate the installed package universe. Package discovery stays demand-driven, and package location plus fingerprinting are parallelized when a frontier introduces independent package names.
 
-Installed package identities use SHA-256 fingerprints. A metadata manifest caches a previously computed content fingerprint so unchanged package trees do not need to be rehashed on every run. Analysis artifacts are stored under cache schema `slinker-binding-linker-v1`.
+Installed package identities use SHA-256 fingerprints computed from current file bytes. Disposable typed index and per-binding analysis artifacts are stored under cache schema `slinker-analysis-v4`; corrupt or stale entries are cache misses.
 
-Each `slinker` run starts at most one persistent R coordinator for installed-image work. The coordinator creates its worker pool lazily and reuses it across index and full-image batches: base-R PSOCK workers on Windows and fork workers on Unix. This removes an `Rscript` startup from each package in a deep dependency chain. A full package-image result also populates the cheap index cache, so a later index need for the same package does not trigger a second R inspection.
+Target capture and installed-image work run in isolated Rust worker processes. Each worker owns one single-threaded embedded R runtime loaded from `R_HOME` through Harp/libr; no live R object enters the linker process. Workers reuse synthetic lazy-load environments across requests and never call `loadNamespace()` or package lifecycle hooks.
 
 Air parsing uses one reusable Rayon pool. Independent reachable closures are parsed in parallel. Oak then supplies semantic scope/evaluation information for those parsed closures; linker-specific package/resource recognition consumes only semantically live sites.
 
@@ -62,7 +62,7 @@ Air parsing uses one reusable Rayon pool. Independent reachable closures are par
 
 Installed `DESCRIPTION` files are parsed by `r-description-parser`; package versions and dependency relations use `r-metadata` types. Slinker does not keep a second DCF/dependency parser.
 
-The semantic stack is deliberately narrow: `air_r_parser`, `air_r_syntax`, `oak_semantic`, `r-description-parser`, and `r-metadata`. Oak is pinned through Ark commit `37fe33a19c4fc678da32c5c23111306b52019f4a`; slinker's direct Air crates are pinned to the same Air revision Oak uses, `d2659d5b158374bf486b594625ca50abbd0ac879`. No Ark runtime/LSP/Jupyter crates, package manager, embedded R runtime, or alternative R parser are part of this integration.
+The semantic stack is deliberately narrow: `harp`, `libr`, `air_r_parser`, `air_r_syntax`, `oak_semantic`, `r-description-parser`, and `r-metadata`. Harp, libr, and Oak share Ark commit `37fe33a19c4fc678da32c5c23111306b52019f4a`; slinker's direct Air crates use Oak's matching Air revision, `d2659d5b158374bf486b594625ca50abbd0ac879`. No Ark LSP/Jupyter crates, package manager, or alternative R parser are included.
 
 ## Native packages
 
@@ -77,7 +77,7 @@ The root package keeps its real installed-package behavior, including package me
 ## Environment
 
 ```text
-SLINKER_R          target R executable
+R_HOME             fallback R installation when `R RHOME` is unavailable
 SLINKER_CACHE_DIR  persistent installed-image analysis cache
 SLINKER_NATIVE_SUMMARIES  audited native-effect manifest for exact installed images
 ```

@@ -148,7 +148,11 @@ impl PackageProvider for FakeProvider {
             .ok_or_else(|| Error::Analysis(format!("missing fake index {}", package.id.name)))
     }
 
-    fn image(&mut self, package: &InstalledPackage) -> Result<Arc<PackageImage>> {
+    fn binding_image(
+        &mut self,
+        package: &InstalledPackage,
+        _name: &str,
+    ) -> Result<Arc<PackageImage>> {
         *self
             .image_counts
             .lock()
@@ -170,7 +174,7 @@ impl PackageProvider for FakeProvider {
     }
 
     fn validate_syntax(
-        &self,
+        &mut self,
         _id: &PackageId,
         _binding: &str,
         _source: &str,
@@ -184,28 +188,59 @@ fn package(name: &str, bindings: &[(&str, Option<&str>)]) -> PackageImage {
         .iter()
         .map(|(binding, _)| ((*binding).to_owned(), (*binding).to_owned()))
         .collect::<ExportMap>();
-    package_with(
+    package_from_fixture(
         name,
         bindings,
-        Vec::new(),
-        exports,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
+        FixtureMetadata {
+            imports: Vec::new(),
+            exports,
+            s3: Vec::new(),
+            dynlibs: Vec::new(),
+            files: Vec::new(),
+            extra_description: String::new(),
+        },
     )
 }
 
-fn package_with(
-    name: &str,
-    bindings: &[(&str, Option<&str>)],
+struct FixtureMetadata {
     imports: Vec<ImportSpec>,
     exports: ExportMap,
     s3: Vec<S3Registration>,
     dynlibs: Vec<NativeComponent>,
     files: Vec<String>,
-    extra_description: &str,
+    extra_description: String,
+}
+
+macro_rules! package_with {
+    ($name:expr, $bindings:expr, $imports:expr, $exports:expr, $s3:expr, $dynlibs:expr, $files:expr, $description:expr $(,)?) => {
+        package_from_fixture(
+            $name,
+            $bindings,
+            FixtureMetadata {
+                imports: $imports,
+                exports: $exports,
+                s3: $s3,
+                dynlibs: $dynlibs,
+                files: $files,
+                extra_description: $description.into(),
+            },
+        )
+    };
+}
+
+fn package_from_fixture(
+    name: &str,
+    bindings: &[(&str, Option<&str>)],
+    metadata: FixtureMetadata,
 ) -> PackageImage {
+    let FixtureMetadata {
+        imports,
+        exports,
+        s3,
+        dynlibs,
+        files,
+        extra_description,
+    } = metadata;
     let description = Description::parse(&format!(
         "Package: {name}\nVersion: 1.0.0\n{extra_description}"
     ));
@@ -230,7 +265,8 @@ fn package_with(
             BindingImage {
                 name: (*binding).into(),
                 origin: BindingOrigin::Code,
-                active: false,
+                representation: slinker::package::BindingRepresentation::Value,
+                classes: Vec::new(),
                 object_kind: if closure.is_some() {
                     ObjectKind::Closure
                 } else {
@@ -271,6 +307,7 @@ fn export(name: &str) -> ExportMap {
 
 fn test_target() -> TargetEnvironment {
     TargetEnvironment {
+        r_home: PathBuf::from("/opt/R"),
         target: Target {
             r_version: "4.6.1".into(),
             os: "mingw32".into(),
@@ -304,7 +341,8 @@ fn retained_private_binding(
 fn private_closure(name: &str, environment: &str, source: &str) -> PrivateBindingImage {
     PrivateBindingImage {
         name: name.into(),
-        active: false,
+        representation: slinker::package::BindingRepresentation::Value,
+        classes: Vec::new(),
         object_kind: ObjectKind::Closure,
         closure: Some(ClosureSource {
             environment: environment.into(),
@@ -353,7 +391,7 @@ fn installed_object_graph_keeps_namespace_binding_and_closure_enclosure_distinct
 
 #[test]
 fn structured_nested_closure_is_an_object_member_not_a_namespace_binding() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("generator_funs", None)],
         Vec::new(),
@@ -391,7 +429,7 @@ fn structured_nested_closure_is_an_object_member_not_a_namespace_binding() {
 
 #[test]
 fn retaining_structured_object_does_not_execute_nested_closure() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[
             ("generator_funs", None),
@@ -435,7 +473,7 @@ fn retaining_structured_object_does_not_execute_nested_closure() {
 
 #[test]
 fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[
             (
@@ -483,7 +521,8 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
             BindingImage {
                 name: format!("{name}_dependency"),
                 origin: BindingOrigin::Code,
-                active: false,
+                representation: slinker::package::BindingRepresentation::Value,
+                classes: Vec::new(),
                 object_kind: ObjectKind::Closure,
                 closure: Some(ClosureSource {
                     source: Arc::from(format!("{name}_dependency <- function() 1")),
@@ -577,7 +616,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
 
 #[test]
 fn environment_object_identity_preserves_self_reference_and_nested_aliases() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("holder", None)],
         Vec::new(),
@@ -602,7 +641,8 @@ fn environment_object_identity_preserves_self_reference_and_nested_aliases() {
                 "self".into(),
                 PrivateBindingImage {
                     name: "self".into(),
-                    active: false,
+                    representation: slinker::package::BindingRepresentation::Value,
+                    classes: Vec::new(),
                     object_kind: ObjectKind::Environment,
                     closure: None,
                     environment: Some("private:1".into()),
@@ -738,7 +778,7 @@ fn closure_reenclosure_creates_a_derived_closure_with_same_code() {
 
 #[test]
 fn structured_reenclosure_transforms_nested_closures_without_mutating_template() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("methods", None)],
         Vec::new(),
@@ -826,7 +866,7 @@ fn derived_environment_lookup_respects_parent_and_unknown_fields() {
 
 #[test]
 fn list2env_style_population_records_known_fields() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("values", None)],
         Vec::new(),
@@ -866,7 +906,7 @@ fn list2env_style_population_records_known_fields() {
 
 #[test]
 fn list2env_preserves_known_names_for_unmodeled_scalar_members() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("values", None)],
         Vec::new(),
@@ -903,7 +943,7 @@ fn list2env_preserves_known_names_for_unmodeled_scalar_members() {
 
 #[test]
 fn list2env_uses_installed_named_member_paths() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("values", None)],
         Vec::new(),
@@ -951,7 +991,7 @@ fn derived_environment_can_retain_self_identity() {
 
 #[test]
 fn list2env_uses_parent_only_when_creating_an_environment() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("values", None)],
         Vec::new(),
@@ -1008,8 +1048,46 @@ fn object_and_graph_dumps_are_deterministic() {
 }
 
 #[test]
+fn incremental_object_merge_preserves_derived_identities() {
+    let mut image = package(
+        "root",
+        &[
+            ("template", Some("template <- function() field")),
+            ("later", Some("later <- function() 1")),
+        ],
+    );
+    let mut first = image.clone();
+    first.bindings.retain(|name, _| name == "template");
+    let mut graph = first.object_graph();
+    let template = graph.namespace_bindings["template"];
+    let InstalledObject::Closure(template_closure) = graph.objects[&template] else {
+        panic!("template closure");
+    };
+    let namespace = graph.environment_id("namespace:root").unwrap();
+    let derived_environment = graph.derive_environment(Some(namespace));
+    let derived = graph
+        .reenclose_closure(template_closure, derived_environment)
+        .unwrap();
+    let InstalledObject::Closure(derived_closure) = graph.objects[&derived] else {
+        panic!("derived closure");
+    };
+    image.bindings.retain(|name, _| name == "later");
+    graph.merge_image(&image);
+
+    assert_eq!(graph.namespace_bindings["template"], template);
+    assert!(
+        matches!(graph.objects[&derived], InstalledObject::Closure(id) if id == derived_closure)
+    );
+    assert_eq!(
+        graph.closures[&derived_closure].enclosure,
+        derived_environment
+    );
+    assert!(graph.namespace_bindings.contains_key("later"));
+}
+
+#[test]
 fn root_starts_from_exports_and_recurses_only_into_referenced_internal_bindings() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("public", Some("public <- function() helper()")),
@@ -1026,7 +1104,7 @@ fn root_starts_from_exports_and_recurses_only_into_referenced_internal_bindings(
         Vec::new(),
         "Suggests: foo\n",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() hidden()")),
@@ -1052,7 +1130,7 @@ fn root_starts_from_exports_and_recurses_only_into_referenced_internal_bindings(
 
 #[test]
 fn closure_private_environment_is_inventory_not_a_root_set() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("public", Some("public <- function() 1"))],
         Vec::new(),
@@ -1095,7 +1173,7 @@ fn closure_private_environment_is_inventory_not_a_root_set() {
 
 #[test]
 fn lexical_lookup_demands_only_the_referenced_private_binding() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("public", Some("public <- function() helper()"))],
         Vec::new(),
@@ -1150,7 +1228,7 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
 
 #[test]
 fn unused_private_binding_issue_does_not_block_owner_closure() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[("public", Some("public <- function() 1"))],
         Vec::new(),
@@ -1176,7 +1254,8 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
                 "bad".into(),
                 PrivateBindingImage {
                     name: "bad".into(),
-                    active: false,
+                    representation: slinker::package::BindingRepresentation::Value,
+                    classes: Vec::new(),
                     object_kind: ObjectKind::Other("externalptr".into()),
                     closure: None,
                     environment: None,
@@ -1204,7 +1283,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
 
 #[test]
 fn onload_can_create_a_missing_exported_active_binding() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[
             ("dummy", Some("dummy <- function() NULL")),
@@ -1236,7 +1315,7 @@ fn onload_can_create_a_missing_exported_active_binding() {
 
 #[test]
 fn dependency_onload_can_create_a_missing_exported_active_binding() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() foo::pb"))],
         Vec::new(),
@@ -1246,7 +1325,7 @@ fn dependency_onload_can_create_a_missing_exported_active_binding() {
         Vec::new(),
         "Imports: foo\n",
     );
-    let mut foo = package_with(
+    let mut foo = package_with!(
         "foo",
         &[
             ("dummy", Some("dummy <- function() NULL")),
@@ -1279,7 +1358,7 @@ fn dependency_onload_can_create_a_missing_exported_active_binding() {
 
 #[test]
 fn runtime_make_active_binding_does_not_satisfy_missing_export() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[(
             "f",
@@ -1303,7 +1382,7 @@ fn runtime_make_active_binding_does_not_satisfy_missing_export() {
 
 #[test]
 fn root_lifecycle_remains_an_entrypoint_even_when_not_exported() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[
             ("public", Some("public <- function() 1")),
@@ -1333,7 +1412,7 @@ fn root_lifecycle_remains_an_entrypoint_even_when_not_exported() {
 
 #[test]
 fn root_reexported_import_is_demanded_without_local_binding() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[],
         vec![ImportSpec::From {
@@ -1349,7 +1428,7 @@ fn root_reexported_import_is_demanded_without_local_binding() {
         Vec::new(),
         "Imports: utils\n",
     );
-    let utils = package_with(
+    let utils = package_with!(
         "utils",
         &[
             ("head", Some("head <- function(x) x")),
@@ -1380,7 +1459,7 @@ fn root_reexported_import_is_demanded_without_local_binding() {
 #[test]
 fn qualified_access_loads_only_demanded_foreign_binding() {
     let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() helper()")),
@@ -1405,7 +1484,7 @@ fn qualified_access_loads_only_demanded_foreign_binding() {
 #[test]
 fn foreign_binding_can_pull_another_package_without_rounds() {
     let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[("bar", Some("bar <- function() baz::qux()"))],
         Vec::new(),
@@ -1415,7 +1494,7 @@ fn foreign_binding_can_pull_another_package_without_rounds() {
         Vec::new(),
         "",
     );
-    let baz = package_with(
+    let baz = package_with!(
         "baz",
         &[
             ("qux", Some("qux <- function() 1")),
@@ -1438,7 +1517,7 @@ fn foreign_binding_can_pull_another_package_without_rounds() {
 
 #[test]
 fn unused_root_import_metadata_does_not_create_reachability() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() 1"))],
         vec![ImportSpec::All {
@@ -1451,7 +1530,7 @@ fn unused_root_import_metadata_does_not_create_reachability() {
         Vec::new(),
         "",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("a", Some("a <- function() 1")),
@@ -1474,7 +1553,7 @@ fn unused_root_import_metadata_does_not_create_reachability() {
 
 #[test]
 fn renamed_import_from_resolves_remote_binding() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() local_x()"))],
         vec![ImportSpec::From {
@@ -1490,7 +1569,7 @@ fn renamed_import_from_resolves_remote_binding() {
         Vec::new(),
         "",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("x", Some("x <- function() 1")),
@@ -1512,7 +1591,7 @@ fn renamed_import_from_resolves_remote_binding() {
 
 #[test]
 fn import_all_resolves_reachable_export_only() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() x()"))],
         vec![ImportSpec::All {
@@ -1525,7 +1604,7 @@ fn import_all_resolves_reachable_export_only() {
         Vec::new(),
         "",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("x", Some("x <- function() 1")),
@@ -1547,7 +1626,7 @@ fn import_all_resolves_reachable_export_only() {
 
 #[test]
 fn depends_metadata_alone_does_not_create_reachability() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() 1"))],
         Vec::new(),
@@ -1568,7 +1647,7 @@ fn depends_metadata_alone_does_not_create_reachability() {
 #[test]
 fn exact_target_provided_package_terminates_internal_traversal() {
     let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() hidden()")),
@@ -1632,7 +1711,7 @@ fn namespace_discovery_matches_named_and_mixed_positional_arguments() {
 
 #[test]
 fn constant_argument_specializes_private_namespace_helper() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("f", Some("f <- function() helper(\"foo\")")),
@@ -1693,7 +1772,7 @@ fn unknown_argument_keeps_public_namespace_helper_dynamic() {
 
 #[test]
 fn bounded_string_operations_specialize_namespace_helper() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("f", Some("f <- function() helper(\"foo-extra\")")),
@@ -1729,7 +1808,7 @@ fn bounded_string_operations_specialize_namespace_helper() {
 
 #[test]
 fn unknown_string_index_keeps_namespace_discovery_dynamic() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             (
@@ -1763,7 +1842,7 @@ fn unknown_string_index_keeps_namespace_discovery_dynamic() {
 
 #[test]
 fn resolved_null_coalescing_helper_propagates_constant() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("f", Some("f <- function() helper(NULL)")),
@@ -1801,7 +1880,7 @@ fn resolved_null_coalescing_helper_propagates_constant() {
 
 #[test]
 fn bounded_switch_propagates_selected_package() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("f", Some("f <- function() helper(\"short\")")),
@@ -1947,7 +2026,7 @@ fn cyclic_local_references_terminate_with_one_node_each() {
 
 #[test]
 fn registered_native_symbol_is_not_an_unresolved_r_binding() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function(x) .Call(croot_f, x)"))],
         Vec::new(),
@@ -1997,7 +2076,7 @@ fn opaque_registered_component() -> NativeComponent {
 
 #[test]
 fn opaque_registered_selector_is_consumed_by_native_call() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function(x) .Call(croot_f, x)"))],
         Vec::new(),
@@ -2030,7 +2109,7 @@ fn opaque_registered_selector_is_consumed_by_native_call() {
 
 #[test]
 fn opaque_native_selector_consumption_is_occurrence_specific() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[(
             "f",
@@ -2067,7 +2146,7 @@ fn opaque_native_selector_consumption_is_occurrence_specific() {
 
 #[test]
 fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function(x) .Call(foo, x)")), ("foo", None)],
         Vec::new(),
@@ -2091,7 +2170,7 @@ fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
 
 #[test]
 fn shadowed_native_primitive_does_not_consume_selector() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function(.Call, x) .Call(croot_f, x)"))],
         Vec::new(),
@@ -2121,7 +2200,7 @@ fn shadowed_native_primitive_does_not_consume_selector() {
 
 #[test]
 fn named_opaque_native_selector_is_matched_by_formal_name() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function(x) .Call(x, .NAME = croot_f)"))],
         Vec::new(),
@@ -2163,7 +2242,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
             callbacks: Vec::new(),
         }),
     };
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             (
@@ -2193,7 +2272,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
 
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[(
             "by_binding",
@@ -2228,7 +2307,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
 
 #[test]
 fn registered_native_symbol_can_be_assigned_into_namespace_state() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("slot", None),
@@ -2276,7 +2355,7 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
 
 #[test]
 fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[
             ("slot", None),
@@ -2324,7 +2403,7 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
 #[test]
 fn native_activation_keeps_component_without_widening_r_bindings() {
     let root = package("root", &[("f", Some("f <- function() foo::a()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("a", Some("a <- function(x) .Call(foo_a, x)")),
@@ -2357,7 +2436,7 @@ fn native_activation_keeps_component_without_widening_r_bindings() {
 #[test]
 fn known_native_callback_adds_binding_edge() {
     let root = package("root", &[("f", Some("f <- function() foo::a()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("a", Some("a <- function() 1")),
@@ -2397,7 +2476,7 @@ fn known_native_callback_adds_binding_edge() {
 
 #[test]
 fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("a", Some("a <- function() .Call(root_a, 1, callback)")),
@@ -2455,7 +2534,7 @@ fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
 
 #[test]
 fn native_summary_accepts_oak_proven_local_closure_callback() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[(
             "a",
@@ -2507,7 +2586,7 @@ fn native_summary_accepts_oak_proven_local_closure_callback() {
 
 #[test]
 fn native_callback_positions_ignore_named_package_and_match_named_selector() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             (
@@ -2551,7 +2630,7 @@ fn native_callback_positions_ignore_named_package_and_match_named_selector() {
 
 #[test]
 fn summarized_native_callbacks_are_not_global_component_roots() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("a", Some("a <- function() 1")),
@@ -2586,7 +2665,7 @@ fn summarized_native_callbacks_are_not_global_component_roots() {
 
 #[test]
 fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("a", Some("a <- function() .Call(root_a, 1)"))],
         Vec::new(),
@@ -2626,7 +2705,7 @@ fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
 #[test]
 fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
     let root = package("root", &[("f", Some("f <- function() foo::a()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("a", Some("a <- function() 1")),
@@ -2664,7 +2743,7 @@ fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
 #[test]
 fn dependency_activation_does_not_root_unreachable_s3_methods() {
     let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("x", Some("x <- function() 1")),
@@ -2674,6 +2753,7 @@ fn dependency_activation_does_not_root_unreachable_s3_methods() {
         export("x"),
         vec![S3Registration {
             generic: "print".into(),
+            generic_package: None,
             class: "foo".into(),
             method: "print.foo".into(),
         }],
@@ -2697,7 +2777,7 @@ fn resource_reference_retains_only_required_path() {
             Some("f <- function() system.file(\"data\", \"x.json\", package = \"foo\")"),
         )],
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[],
         Vec::new(),
@@ -2804,7 +2884,7 @@ fn air_and_target_rejection_is_invalid_installed_representation() {
 #[test]
 fn every_non_root_node_has_an_incoming_reason_and_why_path() {
     let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[("bar", Some("bar <- function() 1"))],
         Vec::new(),
@@ -2853,7 +2933,7 @@ fn missing_packages_are_collated_instead_of_failing_fast() {
 #[test]
 fn unused_dependency_import_does_not_pull_or_report_missing_package() {
     let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[("x", Some("x <- function() 1"))],
         vec![ImportSpec::From {
@@ -2885,7 +2965,7 @@ fn unused_dependency_import_does_not_pull_or_report_missing_package() {
 #[test]
 fn reachable_dependency_import_reports_missing_package_with_provenance() {
     let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[("x", Some("x <- function() span()"))],
         vec![ImportSpec::From {
@@ -2917,7 +2997,7 @@ fn reachable_dependency_import_reports_missing_package_with_provenance() {
 
 #[test]
 fn missing_unused_root_import_is_not_reported() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() 1"))],
         vec![ImportSpec::All {
@@ -2951,7 +3031,7 @@ fn absent_optional_resource_is_not_a_blocker() {
             Some("f <- function() system.file(\"missing\", package = \"foo\")"),
         )],
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[],
         Vec::new(),
@@ -2981,7 +3061,7 @@ fn absent_must_work_resource_is_a_precise_blocker() {
             Some("f <- function() system.file(\"missing\", package = \"foo\", mustWork = TRUE)"),
         )],
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[],
         Vec::new(),
@@ -3003,7 +3083,7 @@ fn absent_must_work_resource_is_a_precise_blocker() {
 
 #[test]
 fn suggests_alone_never_enters_the_graph() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() 1"))],
         Vec::new(),
@@ -3023,7 +3103,7 @@ fn suggests_alone_never_enters_the_graph() {
 
 #[test]
 fn selecting_extra_does_not_root_an_unused_optional_package() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() 1"))],
         Vec::new(),
@@ -3047,7 +3127,7 @@ fn selecting_extra_does_not_root_an_unused_optional_package() {
 
 #[test]
 fn effective_namespace_import_is_required_even_if_description_also_suggests_it() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() imported_bar()"))],
         vec![ImportSpec::From {
@@ -3063,7 +3143,7 @@ fn effective_namespace_import_is_required_even_if_description_also_suggests_it()
         Vec::new(),
         "Suggests: foo\n",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() 1")),
@@ -3086,7 +3166,7 @@ fn effective_namespace_import_is_required_even_if_description_also_suggests_it()
 
 #[test]
 fn config_needs_does_not_enable_a_suggested_runtime_package() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() foo::bar()"))],
         Vec::new(),
@@ -3118,7 +3198,7 @@ fn config_needs_does_not_enable_a_suggested_runtime_package() {
 #[test]
 fn required_description_relationship_wins_over_duplicate_suggests_when_source_uses_package() {
     for required_field in ["Imports", "Depends"] {
-        let root = package_with(
+        let root = package_with!(
             "root",
             &[("f", Some("f <- function() foo::bar()"))],
             Vec::new(),
@@ -3128,7 +3208,7 @@ fn required_description_relationship_wins_over_duplicate_suggests_when_source_us
             Vec::new(),
             &format!("{required_field}: foo\nSuggests: foo\n"),
         );
-        let foo = package_with(
+        let foo = package_with!(
             "foo",
             &[
                 ("bar", Some("bar <- function() 1")),
@@ -3155,7 +3235,7 @@ fn required_description_relationship_wins_over_duplicate_suggests_when_source_us
 
 #[test]
 fn direct_suggested_namespace_access_is_ignored_without_extra_pkgs() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() foo::bar()"))],
         Vec::new(),
@@ -3165,7 +3245,7 @@ fn direct_suggested_namespace_access_is_ignored_without_extra_pkgs() {
         Vec::new(),
         "Suggests: foo\n",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() helper()")),
@@ -3201,7 +3281,7 @@ fn direct_suggested_namespace_access_is_ignored_without_extra_pkgs() {
 
 #[test]
 fn direct_suggested_namespace_access_is_internalized_when_selected() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() foo::bar()"))],
         Vec::new(),
@@ -3211,7 +3291,7 @@ fn direct_suggested_namespace_access_is_internalized_when_selected() {
         Vec::new(),
         "Suggests: foo\n",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() helper()")),
@@ -3237,7 +3317,7 @@ fn direct_suggested_namespace_access_is_internalized_when_selected() {
 
 #[test]
 fn selecting_one_extra_does_not_enable_its_suggests() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() foo::bar()"))],
         Vec::new(),
@@ -3247,7 +3327,7 @@ fn selecting_one_extra_does_not_enable_its_suggests() {
         Vec::new(),
         "Suggests: foo\n",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[("bar", Some("bar <- function() baz::qux()"))],
         Vec::new(),
@@ -3282,7 +3362,7 @@ fn selecting_one_extra_does_not_enable_its_suggests() {
 
 #[test]
 fn cli_like_unreachable_optional_helpers_do_not_expand_suggests() {
-    let root = package_with(
+    let root = package_with!(
         "cli",
         &[
             ("cli_alert", Some("cli_alert <- function() format_alert()")),
@@ -3339,7 +3419,7 @@ fn cli_like_unreachable_optional_helpers_do_not_expand_suggests() {
 
 #[test]
 fn cli_like_required_import_is_demanded_while_suggests_stay_out() {
-    let root = package_with(
+    let root = package_with!(
         "cli",
         &[
             ("cli_head", Some("cli_head <- function(x) head(x)")),
@@ -3369,7 +3449,7 @@ fn cli_like_required_import_is_demanded_while_suggests_stay_out() {
         Vec::new(),
         "Imports:\n    utils\nSuggests:\n    knitr,\n    rlang,\n    testthat\n",
     );
-    let utils = package_with(
+    let utils = package_with!(
         "utils",
         &[
             ("head", Some("head <- function(x) x")),
@@ -3405,7 +3485,7 @@ fn cli_like_required_import_is_demanded_while_suggests_stay_out() {
 
 #[test]
 fn unselected_suggested_resource_does_not_discover_package() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[(
             "f",
@@ -3418,7 +3498,7 @@ fn unselected_suggested_resource_does_not_discover_package() {
         Vec::new(),
         "Suggests: foo\n",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[],
         Vec::new(),
@@ -3441,7 +3521,7 @@ fn unselected_suggested_resource_does_not_discover_package() {
 
 #[test]
 fn unselected_suggested_attachment_call_is_ignored() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[("f", Some("f <- function() require(foo)"))],
         Vec::new(),
@@ -3467,7 +3547,7 @@ fn unselected_suggested_attachment_call_is_ignored() {
 
 #[test]
 fn root_s3_registration_retains_unexported_method_with_stable_reason() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("foo", Some("foo <- function(x) UseMethod(\"foo\")")),
@@ -3477,6 +3557,7 @@ fn root_s3_registration_retains_unexported_method_with_stable_reason() {
         export("foo"),
         vec![S3Registration {
             generic: "foo".into(),
+            generic_package: None,
             class: "bar".into(),
             method: "foo.bar".into(),
         }],
@@ -3500,7 +3581,7 @@ fn root_s3_registration_retains_unexported_method_with_stable_reason() {
 
 #[test]
 fn unselected_suggested_s3_generic_does_not_retain_optional_registration_method() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("public", Some("public <- function() 1")),
@@ -3510,6 +3591,7 @@ fn unselected_suggested_s3_generic_does_not_retain_optional_registration_method(
         export("public"),
         vec![S3Registration {
             generic: "foo::print".into(),
+            generic_package: None,
             class: "foo".into(),
             method: "print.foo".into(),
         }],
@@ -3533,13 +3615,14 @@ fn unselected_suggested_s3_generic_does_not_retain_optional_registration_method(
 #[test]
 fn retained_dependency_method_does_not_pull_unselected_suggested_generic() {
     let root = package("root", &[("f", Some("f <- function() dep::method()"))]);
-    let dep = package_with(
+    let dep = package_with!(
         "dep",
         &[("method", Some("method <- function(x = NULL, ...) x"))],
         Vec::new(),
         export("method"),
         vec![S3Registration {
             generic: "foo::generic".into(),
+            generic_package: None,
             class: "dep_class".into(),
             method: "method".into(),
         }],
@@ -3564,13 +3647,14 @@ fn retained_dependency_method_does_not_pull_unselected_suggested_generic() {
 #[test]
 fn selected_extra_enables_retained_dependency_s3_generic() {
     let root = package("root", &[("f", Some("f <- function() dep::method()"))]);
-    let dep = package_with(
+    let dep = package_with!(
         "dep",
         &[("method", Some("method <- function(x = NULL, ...) x"))],
         Vec::new(),
         export("method"),
         vec![S3Registration {
             generic: "foo::generic".into(),
+            generic_package: None,
             class: "dep_class".into(),
             method: "method".into(),
         }],
@@ -3595,7 +3679,7 @@ fn selected_extra_enables_retained_dependency_s3_generic() {
 
 #[test]
 fn unselected_suggested_guard_prunes_optional_branch() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[(
             "f",
@@ -3608,7 +3692,7 @@ fn unselected_suggested_guard_prunes_optional_branch() {
         Vec::new(),
         "Suggests: foo\n",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() hidden()")),
@@ -3637,7 +3721,7 @@ fn unselected_suggested_guard_prunes_optional_branch() {
 
 #[test]
 fn selected_extra_enables_guarded_optional_branch_without_rooting_whole_package() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[(
             "f",
@@ -3650,7 +3734,7 @@ fn selected_extra_enables_guarded_optional_branch_without_rooting_whole_package(
         Vec::new(),
         "Suggests: foo\n",
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() helper()")),
@@ -3675,7 +3759,7 @@ fn selected_extra_enables_guarded_optional_branch_without_rooting_whole_package(
 
 #[test]
 fn selected_missing_extra_is_reported_as_missing_dependency() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[(
             "f",
@@ -3703,7 +3787,7 @@ fn selected_missing_extra_is_reported_as_missing_dependency() {
 #[test]
 fn optional_onload_hook_does_not_activate_suggested_namespace() {
     let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
-    let mut glue = package_with(
+    let mut glue = package_with!(
         "glue",
         &[
             ("glue", Some("glue <- function(x) x")),
@@ -3737,7 +3821,7 @@ fn optional_onload_hook_does_not_activate_suggested_namespace() {
 #[test]
 fn selected_extra_enables_optional_onload_hook_namespace() {
     let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
-    let mut glue = package_with(
+    let mut glue = package_with!(
         "glue",
         &[
             ("glue", Some("glue <- function(x) x")),
@@ -3756,7 +3840,7 @@ fn selected_extra_enables_optional_onload_hook_namespace() {
         "Suggests: knitr\n",
     );
     glue.index.lifecycle.on_load = true;
-    let knitr = package_with(
+    let knitr = package_with!(
         "knitr",
         &[
             ("knit_engines", None),
@@ -3780,7 +3864,7 @@ fn selected_extra_enables_optional_onload_hook_namespace() {
 #[test]
 fn target_provided_namespace_is_not_assumed_loaded_for_onload_guard() {
     let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
-    let mut glue = package_with(
+    let mut glue = package_with!(
         "glue",
         &[
             ("glue", Some("glue <- function(x) x")),
@@ -3799,7 +3883,7 @@ fn target_provided_namespace_is_not_assumed_loaded_for_onload_guard() {
         "Suggests: knitr\n",
     );
     glue.index.lifecycle.on_load = true;
-    let knitr = package_with(
+    let knitr = package_with!(
         "knitr",
         &[("knit_engines", None)],
         Vec::new(),
@@ -3867,7 +3951,7 @@ fn conditional_special_callee_blocks_path_dependent_specialization() {
             ),
         )],
     );
-    let foo = package_with(
+    let foo = package_with!(
         "foo",
         &[],
         Vec::new(),
@@ -3916,7 +4000,7 @@ fn repeated_predicate_refines_conditional_local_fallthrough() {
 
 #[test]
 fn non_returning_package_helper_refines_exhaustive_dispatch() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             (
@@ -4094,7 +4178,7 @@ fn uncaptured_superassignment_remains_environment_mutation_blocker() {
 
 #[test]
 fn private_non_returning_helper_refines_enclosing_private_closure() {
-    let mut root = package_with(
+    let mut root = package_with!(
         "root",
         &[(
             "public",
@@ -4148,7 +4232,7 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
 fn graph_export_is_deterministic_semantic_and_count_consistent() {
     let analyze = || {
         let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-        let foo = package_with(
+        let foo = package_with!(
             "foo",
             &[("bar", Some("bar <- function() 1"))],
             Vec::new(),
@@ -4165,6 +4249,7 @@ fn graph_export_is_deterministic_semantic_and_count_consistent() {
     let first_plan = analyze();
     let second_plan = analyze();
     let target = TargetEnvironment {
+        r_home: PathBuf::from("/opt/R"),
         target: Target {
             r_version: "4.6.1".into(),
             os: "mingw32".into(),
@@ -4211,6 +4296,7 @@ fn graph_export_survives_blocked_analysis() {
     assert!(!plan.diagnostics.is_empty());
 
     let target = TargetEnvironment {
+        r_home: PathBuf::from("/opt/R"),
         target: Target {
             r_version: "4.6.1".into(),
             os: "mingw32".into(),
@@ -4310,7 +4396,7 @@ fn explanation_dag_condenses_cycles_and_remains_acyclic() {
 
 #[test]
 fn explanation_dag_attributes_roots_dominators_and_redundant_edges() {
-    let root = package_with(
+    let root = package_with!(
         "root",
         &[
             ("f", Some("f <- function() { a(); c() }")),

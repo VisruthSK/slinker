@@ -4,8 +4,8 @@ mod locator;
 mod store;
 
 pub use image::{
-    BindingImage, BindingOrigin, ClosureId, ClosureObject, ClosureSource, CodeId,
-    EmbeddedClosureSource, EmbeddedEnvironmentRef, EnvironmentId, EnvironmentObject,
+    BindingImage, BindingOrigin, BindingRepresentation, ClosureId, ClosureObject, ClosureSource,
+    CodeId, EmbeddedClosureSource, EmbeddedEnvironmentRef, EnvironmentId, EnvironmentObject,
     InstalledObject, ObjectId, ObjectIssue, ObjectKind, ObjectProvenance, PackageImage,
     PackageObjectGraph, PrivateBindingImage, PrivateEnvironmentImage,
 };

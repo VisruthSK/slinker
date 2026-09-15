@@ -808,10 +808,15 @@ fn package_summaries(
                     continue;
                 }
                 boundary_edges.push(edge.id.clone());
-                entry_bindings.extend(components[target].members.iter().filter_map(|member| {
-                    (member.package == name && member.kind == GraphNodeKindExport::RBinding)
-                        .then(|| member.id.clone())
-                }));
+                entry_bindings.extend(
+                    components[target]
+                        .members
+                        .iter()
+                        .filter(|&member| {
+                            member.package == name && member.kind == GraphNodeKindExport::RBinding
+                        })
+                        .map(|member| member.id.clone()),
+                );
             }
             boundary_edges.sort();
             let root_causes = component_indexes

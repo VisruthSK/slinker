@@ -320,6 +320,20 @@ struct IfRegion {
     else_end: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct ControlRegions<'a> {
+    for_regions: &'a [ForRegion],
+    if_regions: &'a [IfRegion],
+}
+
+#[derive(Clone, Copy)]
+struct BindingProofContext<'a> {
+    live_use: &'a LiveUse,
+    use_assumptions: &'a [BranchAssumption],
+    definition_starts: &'a [usize],
+    defining_scope: Option<ScopeId>,
+}
+
 #[derive(Debug, Clone)]
 struct SuperAssignmentParts {
     span_start: usize,
@@ -576,7 +590,7 @@ fn translate_index(
     });
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
 
-    let (parameters, construction) = collect_construction(source.clone(), text, &root, &live_calls);
+    let (parameters, construction) = collect_construction(source.clone(), text, root, &live_calls);
     let calls = live_calls.into_iter().map(|call| call.site).collect();
     let issues = translate_diagnostics(source.clone(), index);
 
@@ -680,9 +694,7 @@ fn construction_expr(
             let value = text.get(span.start..span.end)?.trim();
             if let Some(StaticArg::String(value)) = static_arg(value) {
                 ConstructionExprKind::String { value }
-            } else if let Some(integer) =
-                value.strip_suffix('L').unwrap_or(value).parse::<i64>().ok()
-            {
+            } else if let Ok(integer) = value.strip_suffix('L').unwrap_or(value).parse::<i64>() {
                 ConstructionExprKind::Integer { value: integer }
             } else {
                 ConstructionExprKind::Double {
@@ -1089,8 +1101,10 @@ fn post_for_use_may_fall_through(
             &live_use.name,
             region.variable_start,
             live_use.start,
-            regions,
-            if_regions,
+            ControlRegions {
+                for_regions: regions,
+                if_regions,
+            },
         ) {
             return false;
         }
@@ -1108,8 +1122,7 @@ fn scope_has_definite_binding_before(
     name: &str,
     before: usize,
     use_position: usize,
-    for_regions: &[ForRegion],
-    if_regions: &[IfRegion],
+    regions: ControlRegions<'_>,
 ) -> bool {
     let Some(symbol_id) = index.symbols(scope).id(name) else {
         return false;
@@ -1131,8 +1144,8 @@ fn scope_has_definite_binding_before(
                             text,
                             definition_start,
                             use_position,
-                            for_regions,
-                            if_regions,
+                            regions.for_regions,
+                            regions.if_regions,
                         )
                 }
                 DefinitionKind::ForVariable(_)
@@ -1159,10 +1172,11 @@ fn definition_must_execute_before_position(
     }
 
     for region in for_regions {
-        if definition_start >= region.body_start && definition_start < region.body_end {
-            if !(position >= region.body_start && position < region.body_end) {
-                return false;
-            }
+        if definition_start >= region.body_start
+            && definition_start < region.body_end
+            && !(position >= region.body_start && position < region.body_end)
+        {
+            return false;
         }
     }
 
@@ -1374,10 +1388,12 @@ fn conditional_fallthrough_proven_bound(
             index,
             regions,
             region,
-            live_use,
-            &use_assumptions,
-            &definition_starts,
-            defining_scope,
+            BindingProofContext {
+                live_use,
+                use_assumptions: &use_assumptions,
+                definition_starts: &definition_starts,
+                defining_scope,
+            },
         ) {
             return true;
         }
@@ -1661,11 +1677,14 @@ fn exhaustive_equality_dispatch_proves_binding(
     index: &SemanticIndex,
     regions: &[IfRegion],
     region: &IfRegion,
-    live_use: &LiveUse,
-    use_assumptions: &[BranchAssumption],
-    definition_starts: &[usize],
-    defining_scope: Option<ScopeId>,
+    proof: BindingProofContext<'_>,
 ) -> bool {
+    let BindingProofContext {
+        live_use,
+        use_assumptions,
+        definition_starts,
+        defining_scope,
+    } = proof;
     let mut current = region;
     let mut selector = None::<String>;
     let mut cases = Vec::<(PredicateValue, usize, usize)>::new();
@@ -2743,10 +2762,10 @@ fn environment_target(
     argument: &RawArgument,
     aliases: &BTreeMap<String, StaticEnvironment>,
 ) -> Option<StaticEnvironment> {
-    if let Some(StaticArg::Symbol(name)) = &argument.static_arg {
-        if let Some(target) = aliases.get(name) {
-            return Some(target.clone());
-        }
+    if let Some(StaticArg::Symbol(name)) = &argument.static_arg
+        && let Some(target) = aliases.get(name)
+    {
+        return Some(target.clone());
     }
 
     let nested = calls.iter().find(|call| {
@@ -2827,8 +2846,10 @@ fn collect_superassignments(
                 text,
                 index,
                 function_regions,
-                for_regions,
-                if_regions,
+                ControlRegions {
+                    for_regions,
+                    if_regions,
+                },
                 scope,
                 target_start,
                 &target,
@@ -2851,8 +2872,7 @@ fn superassignment_targets_captured_activation(
     text: &str,
     index: &SemanticIndex,
     function_regions: &[FunctionRegion],
-    for_regions: &[ForRegion],
-    if_regions: &[IfRegion],
+    regions: ControlRegions<'_>,
     scope: ScopeId,
     target_start: usize,
     target: &str,
@@ -2922,14 +2942,14 @@ fn superassignment_targets_captured_activation(
                             text,
                             definition_start,
                             child_start,
-                            for_regions,
-                            if_regions,
+                            regions.for_regions,
+                            regions.if_regions,
                         ) {
                             return true;
                         }
                     }
                     DefinitionKind::ForVariable(_) => {
-                        if for_regions.iter().any(|region| {
+                        if regions.for_regions.iter().any(|region| {
                             region.variable == target
                                 && region.variable_start >= ancestor.body_start
                                 && region.variable_start < ancestor.body_end
@@ -3732,10 +3752,10 @@ fn find_function_regions(text: &str) -> Vec<FunctionRegion> {
             }
             b'\\' => {
                 let open = skip_trivia(text, cursor + 1);
-                if bytes.get(open).copied() == Some(b'(') {
-                    if let Some(region) = function_region_after_open(text, cursor, open) {
-                        regions.push(region);
-                    }
+                if bytes.get(open).copied() == Some(b'(')
+                    && let Some(region) = function_region_after_open(text, cursor, open)
+                {
+                    regions.push(region);
                 }
                 cursor += 1;
             }

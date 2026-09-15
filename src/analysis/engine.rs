@@ -3,9 +3,9 @@ use crate::analysis::{Diagnostic, EdgeKind, Graph, Need, NodeId, NodeKind, Rejec
 use crate::build::{PackageOperation, Rewrite};
 use crate::metadata::{RelationField, relations};
 use crate::package::{
-    BindingImage, ClosureId, ClosureObject, ClosureSource, EnvironmentId, ImportSpec,
-    InstalledObject, InstalledPackage, NativeRoutineSummary, NativeSafety, ObjectId, ObjectKind,
-    PackageId, PackageImage, PackageIndex, PackageObjectGraph, PackageProvider,
+    BindingImage, BindingRepresentation, ClosureId, ClosureObject, ClosureSource, EnvironmentId,
+    ImportSpec, InstalledObject, InstalledPackage, NativeRoutineSummary, NativeSafety, ObjectId,
+    ObjectKind, PackageId, PackageImage, PackageIndex, PackageObjectGraph, PackageProvider,
     PrivateBindingImage, SyntaxValidation,
 };
 use crate::syntax::{
@@ -49,10 +49,27 @@ enum ParseState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParseKind {
-    NamespaceClosure,
-    PrivateClosure,
-    NestedClosure,
-    DerivedClosure,
+    Namespace,
+    Private,
+    Nested,
+    Derived,
+}
+
+struct ParseRequest<'a> {
+    owner_binding: &'a str,
+    source_key: &'a str,
+    owner_node: NodeId,
+    kind: ParseKind,
+}
+
+struct NativeCallbackContext<'a> {
+    owner: NodeId,
+    package: &'a InstalledPackage,
+    image: &'a PackageImage,
+    binding: &'a str,
+    lexical_environment: &'a str,
+    component: &'a str,
+    call: &'a CallSite,
 }
 
 pub struct Linker<P: PackageProvider> {
@@ -241,22 +258,22 @@ impl<P: PackageProvider> Linker<P> {
         let parsed_top_level_closures = self
             .parse_kinds
             .values()
-            .filter(|kind| matches!(kind, ParseKind::NamespaceClosure))
+            .filter(|kind| matches!(kind, ParseKind::Namespace))
             .count();
         let parsed_private_closures = self
             .parse_kinds
             .values()
-            .filter(|kind| matches!(kind, ParseKind::PrivateClosure))
+            .filter(|kind| matches!(kind, ParseKind::Private))
             .count();
         let parsed_nested_closures = self
             .parse_kinds
             .values()
-            .filter(|kind| matches!(kind, ParseKind::NestedClosure))
+            .filter(|kind| matches!(kind, ParseKind::Nested))
             .count();
         let parsed_derived_closures = self
             .parse_kinds
             .values()
-            .filter(|kind| matches!(kind, ParseKind::DerivedClosure))
+            .filter(|kind| matches!(kind, ParseKind::Derived))
             .count();
         Ok(LinkPlan {
             graph: self.graph,
@@ -287,10 +304,6 @@ impl<P: PackageProvider> Linker<P> {
         // New needs discovered while this frontier is processed are deferred
         // to the next frontier. Every item was already justified by a semantic
         // edge; batching changes scheduling only, never reachability.
-        // A full demanded image already contains its PackageIndex. Fetch images
-        // first so activation/native needs for the same package do not trigger a
-        // redundant metadata-only R inspection in this frontier.
-        self.prefetch_frontier_images(frontier)?;
         self.prefetch_frontier_indexes(frontier)?;
         self.preparse_frontier_bindings(frontier)?;
 
@@ -311,11 +324,60 @@ impl<P: PackageProvider> Linker<P> {
         if let Some(image) = self.images.get(&package.id) {
             return Ok(Arc::clone(image));
         }
-        let image = self.packages.image(package)?;
+        let index = self.packages.index(package)?;
+        let image = Arc::new(PackageImage {
+            index: index.as_ref().clone(),
+            bindings: HashMap::new(),
+            private_environments: HashMap::new(),
+        });
         self.object_graphs
             .insert(package.id.clone(), image.object_graph());
         self.images.insert(package.id.clone(), Arc::clone(&image));
         Ok(image)
+    }
+
+    fn binding_image(
+        &mut self,
+        package: &InstalledPackage,
+        binding: &str,
+    ) -> Result<Arc<PackageImage>> {
+        let image = self.image(package)?;
+        if image.binding(binding).is_some() {
+            return Ok(image);
+        }
+        let partial = self.packages.binding_image(package, binding)?;
+        self.object_graphs
+            .get_mut(&package.id)
+            .expect("package object graph initialized with index")
+            .merge_image(&partial);
+        let image = Arc::make_mut(
+            self.images
+                .get_mut(&package.id)
+                .expect("package image initialized with index"),
+        );
+        image.bindings.extend(
+            partial
+                .bindings
+                .iter()
+                .map(|(name, binding)| (name.clone(), binding.clone())),
+        );
+        for (id, environment) in &partial.private_environments {
+            image
+                .private_environments
+                .entry(id.clone())
+                .and_modify(|existing| {
+                    existing.bindings.extend(
+                        environment
+                            .bindings
+                            .iter()
+                            .map(|(name, binding)| (name.clone(), binding.clone())),
+                    );
+                })
+                .or_insert_with(|| environment.clone());
+        }
+        Ok(Arc::clone(
+            self.images.get(&package.id).expect("merged package image"),
+        ))
     }
 
     fn parse_pool(&mut self) -> Result<Option<Arc<rayon::ThreadPool>>> {
@@ -355,32 +417,6 @@ impl<P: PackageProvider> Linker<P> {
         Ok(())
     }
 
-    fn prefetch_frontier_images(&mut self, frontier: usize) -> Result<()> {
-        let mut seen = HashSet::new();
-        let mut names = Vec::new();
-        for need in self.pending.iter().take(frontier) {
-            if !matches!(
-                need,
-                Need::Binding { .. }
-                    | Need::PrivateBinding { .. }
-                    | Need::ClosureExecution { .. }
-                    | Need::Dataset { .. }
-            ) {
-                continue;
-            }
-            let id = need.package();
-            if !self.images.contains_key(id) && seen.insert(id.name.clone()) {
-                names.push(id.name.clone());
-            }
-        }
-        let mut packages = self.packages.locate_many(&names, self.jobs)?;
-        packages.retain(|package| !self.packages.is_target_provided(package));
-        if !packages.is_empty() {
-            self.packages.prefetch(&packages, self.jobs)?;
-        }
-        Ok(())
-    }
-
     fn preparse_frontier_bindings(&mut self, frontier: usize) -> Result<()> {
         struct Work {
             key: (PackageId, String),
@@ -413,7 +449,7 @@ impl<P: PackageProvider> Linker<P> {
                     if self.packages.is_target_provided(&package) {
                         continue;
                     }
-                    let image = self.image(&package)?;
+                    let image = self.binding_image(&package, &binding)?;
                     let Some(binding_image) = image.binding(&binding).cloned() else {
                         continue;
                     };
@@ -431,7 +467,7 @@ impl<P: PackageProvider> Linker<P> {
                         closure,
                         owner_node,
                         image,
-                        ParseKind::NamespaceClosure,
+                        ParseKind::Namespace,
                     )
                 }
                 Need::PrivateBinding {
@@ -465,7 +501,7 @@ impl<P: PackageProvider> Linker<P> {
                         closure,
                         owner_node,
                         image,
-                        ParseKind::PrivateClosure,
+                        ParseKind::Private,
                     )
                 }
                 Need::ClosureExecution {
@@ -487,9 +523,9 @@ impl<P: PackageProvider> Linker<P> {
                         closure,
                     });
                     let parse_kind = if closure_object.derived_from.is_some() {
-                        ParseKind::DerivedClosure
+                        ParseKind::Derived
                     } else {
-                        ParseKind::NestedClosure
+                        ParseKind::Nested
                     };
                     (
                         id,
@@ -651,19 +687,23 @@ impl<P: PackageProvider> Linker<P> {
         }
         let context = self.oak_parse_context(&image, &environment)?;
         let parse_kind = if closure_object.derived_from.is_some() {
-            ParseKind::DerivedClosure
+            ParseKind::Derived
         } else {
-            ParseKind::NestedClosure
+            ParseKind::Nested
         };
         if let Some(parsed) = self.parsed_source(
             &id,
-            &owner_source,
-            &source_key,
-            node,
             Arc::clone(&closure_object.source),
             context,
-            parse_kind,
+            ParseRequest {
+                owner_binding: &owner_source,
+                source_key: &source_key,
+                owner_node: node,
+                kind: parse_kind,
+            },
         )? {
+            let image =
+                self.prepare_construction_image(&package, &image, &environment, parsed.as_ref())?;
             self.process_parsed(
                 node,
                 &package,
@@ -686,7 +726,7 @@ impl<P: PackageProvider> Linker<P> {
             self.target_provided.insert(package.id.clone());
             return Ok(());
         }
-        let image = self.image(&package)?;
+        let image = self.binding_image(&package, &binding)?;
         let Some(binding_image) = image.binding(&binding).cloned() else {
             if binding != ".onLoad" && image.index.lifecycle.on_load {
                 self.ensure_on_load_analyzed(&id)?;
@@ -824,12 +864,11 @@ impl<P: PackageProvider> Linker<P> {
                 .iter()
                 .filter(|registration| registration.method == binding)
             {
-                if let Some((package_name, _generic)) = registration.generic.split_once("::") {
-                    if self.package_is_suggested_only(&image.index, package_name)?
-                        && !self.optional_package_selected(package_name)
-                    {
-                        continue;
-                    }
+                if let Some((package_name, _generic)) = registration.generic.split_once("::")
+                    && self.package_is_suggested_only(&image.index, package_name)?
+                    && !self.optional_package_selected(package_name)
+                {
+                    continue;
                 }
                 self.require(
                     node,
@@ -868,6 +907,19 @@ impl<P: PackageProvider> Linker<P> {
                 None,
             );
         }
+        if matches!(
+            binding_image.representation,
+            BindingRepresentation::ActiveBinding
+        ) {
+            self.diagnostic(
+                node,
+                &id,
+                Some(&binding),
+                RejectCode::ActiveBinding,
+                "active binding is preserved without execution",
+                None,
+            );
+        }
         match &binding_image.object_kind {
             ObjectKind::Other(kind) => self.diagnostic(
                 node,
@@ -903,6 +955,12 @@ impl<P: PackageProvider> Linker<P> {
                 );
             }
             if let Some(parsed) = self.parsed(&id, &binding, &image, &binding_image)? {
+                let image = self.prepare_construction_image(
+                    &package,
+                    &image,
+                    &closure.environment,
+                    parsed.as_ref(),
+                )?;
                 self.process_parsed(
                     node,
                     &package,
@@ -966,13 +1024,21 @@ impl<P: PackageProvider> Linker<P> {
             let context = self.oak_parse_context(&image, &closure.environment)?;
             if let Some(parsed) = self.parsed_source(
                 &id,
-                &source_key,
-                &source_key,
-                node,
                 Arc::clone(&closure.source),
                 context,
-                ParseKind::PrivateClosure,
+                ParseRequest {
+                    owner_binding: &source_key,
+                    source_key: &source_key,
+                    owner_node: node,
+                    kind: ParseKind::Private,
+                },
             )? {
+                let image = self.prepare_construction_image(
+                    &package,
+                    &image,
+                    &closure.environment,
+                    parsed.as_ref(),
+                )?;
                 self.process_parsed(
                     node,
                     &package,
@@ -1012,6 +1078,18 @@ impl<P: PackageProvider> Linker<P> {
                 format!(
                     "private binding {environment}${binding}: {}",
                     object_issues.join("; ")
+                ),
+                None,
+            );
+        }
+        if matches!(image.representation, BindingRepresentation::ActiveBinding) {
+            self.diagnostic(
+                node,
+                id,
+                Some(binding),
+                RejectCode::ActiveBinding,
+                format!(
+                    "private active binding {environment}${binding} is preserved without execution"
                 ),
                 None,
             );
@@ -1099,6 +1177,39 @@ impl<P: PackageProvider> Linker<P> {
             }
         }
         Ok(true)
+    }
+
+    fn prepare_construction_image(
+        &mut self,
+        package: &InstalledPackage,
+        image: &PackageImage,
+        lexical_environment: &str,
+        parsed: &ParsedRFile,
+    ) -> Result<Arc<PackageImage>> {
+        let mut bindings = BTreeSet::new();
+        for expression in &parsed.expressions {
+            if expression.construction.is_empty() {
+                continue;
+            }
+            for reference in &expression.references {
+                if !self.guards_active(image, &reference.guards)? {
+                    continue;
+                }
+                if let ResolvedName::PackageBinding {
+                    package: owner,
+                    binding,
+                } =
+                    self.resolve_lexical_name(package, image, lexical_environment, &reference.name)?
+                    && owner == package.id
+                {
+                    bindings.insert(binding);
+                }
+            }
+        }
+        for binding in bindings {
+            self.binding_image(package, &binding)?;
+        }
+        self.image(package)
     }
 
     fn execute_construction(
@@ -1511,7 +1622,7 @@ impl<P: PackageProvider> Linker<P> {
                 (
                     closure,
                     Self::private_source_key(environment, binding),
-                    ParseKind::PrivateClosure,
+                    ParseKind::Private,
                 )
             }
             None => {
@@ -1522,18 +1633,20 @@ impl<P: PackageProvider> Linker<P> {
                 else {
                     return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
                 };
-                (closure, binding.to_owned(), ParseKind::NamespaceClosure)
+                (closure, binding.to_owned(), ParseKind::Namespace)
             }
         };
         let parse_context = self.oak_parse_context(context.image, &closure.environment)?;
         let Some(parsed) = self.parsed_source(
             &context.package.id,
-            &owner,
-            &owner,
-            context.node,
             closure.source,
             parse_context,
-            kind,
+            ParseRequest {
+                owner_binding: &owner,
+                source_key: &owner,
+                owner_node: context.node,
+                kind,
+            },
         )?
         else {
             return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
@@ -2024,13 +2137,11 @@ impl<P: PackageProvider> Linker<P> {
                     image,
                     lexical_environment,
                     active,
-                )? {
-                    if self
-                        .activation_bindings
-                        .insert((package.id.clone(), active.name.clone()))
-                    {
-                        self.non_returning_bindings.remove(&package.id);
-                    }
+                )? && self
+                    .activation_bindings
+                    .insert((package.id.clone(), active.name.clone()))
+                {
+                    self.non_returning_bindings.remove(&package.id);
                 }
             }
             let mut consumed_native_selectors = Vec::new();
@@ -2173,25 +2284,30 @@ impl<P: PackageProvider> Linker<P> {
         let context = self.oak_parse_context(package_image, &closure.environment)?;
         self.parsed_source(
             id,
-            binding,
-            binding,
-            node,
             Arc::clone(&closure.source),
             context,
-            ParseKind::NamespaceClosure,
+            ParseRequest {
+                owner_binding: binding,
+                source_key: binding,
+                owner_node: node,
+                kind: ParseKind::Namespace,
+            },
         )
     }
 
     fn parsed_source(
         &mut self,
         id: &PackageId,
-        owner_binding: &str,
-        source_key: &str,
-        owner_node: NodeId,
         source_text: Arc<str>,
         context: OakParseContext,
-        parse_kind: ParseKind,
+        request: ParseRequest<'_>,
     ) -> Result<Option<Arc<ParsedRFile>>> {
+        let ParseRequest {
+            owner_binding,
+            source_key,
+            owner_node,
+            kind: parse_kind,
+        } = request;
         let key = (id.clone(), source_key.to_owned());
         if let Some(state) = self.parsed_bindings.get(&key) {
             return Ok(match state {
@@ -2351,12 +2467,11 @@ impl<P: PackageProvider> Linker<P> {
         // exact foreign activation/binding. Unused Imports/Depends stay cold.
         if self.is_root(&id) {
             for registration in &index.s3 {
-                if let Some((package_name, _generic)) = registration.generic.split_once("::") {
-                    if self.package_is_suggested_only(&index, package_name)?
-                        && !self.optional_package_selected(package_name)
-                    {
-                        continue;
-                    }
+                if let Some((package_name, _generic)) = registration.generic.split_once("::")
+                    && self.package_is_suggested_only(&index, package_name)?
+                    && !self.optional_package_selected(package_name)
+                {
+                    continue;
                 }
                 self.require(
                     node,
@@ -2852,14 +2967,17 @@ impl<P: PackageProvider> Linker<P> {
 
     fn process_native_routine_callbacks(
         &mut self,
-        callback_owner: NodeId,
-        current: &InstalledPackage,
-        image: &PackageImage,
-        binding: &str,
-        lexical_environment: &str,
-        component: &str,
-        call: &CallSite,
+        context: NativeCallbackContext<'_>,
     ) -> Result<()> {
+        let NativeCallbackContext {
+            owner: callback_owner,
+            package: current,
+            image,
+            binding,
+            lexical_environment,
+            component,
+            call,
+        } = context;
         let Some(native) = image
             .index
             .dynlibs
@@ -3302,12 +3420,11 @@ impl<P: PackageProvider> Linker<P> {
         match call.callee.as_str() {
             "library" | "require" => {
                 let package = static_package_arg(call);
-                if let Some(name) = package {
-                    if self.package_is_suggested_only(&image.index, name)?
-                        && !self.optional_package_selected(name)
-                    {
-                        return Ok(());
-                    }
+                if let Some(name) = package
+                    && self.package_is_suggested_only(&image.index, name)?
+                    && !self.optional_package_selected(name)
+                {
+                    return Ok(());
                 }
                 self.diagnostic(
                     from,
@@ -3454,15 +3571,15 @@ impl<P: PackageProvider> Linker<P> {
                         format!("reachable {} resolves its static native selector through `{component}`", call.callee),
                         Some(call.span.clone()),
                     );
-                    self.process_native_routine_callbacks(
-                        from,
-                        current,
+                    self.process_native_routine_callbacks(NativeCallbackContext {
+                        owner: from,
+                        package: current,
                         image,
                         binding,
                         lexical_environment,
-                        &component,
+                        component: &component,
                         call,
-                    )?;
+                    })?;
                 } else {
                     self.diagnostic(
                         from,
@@ -3702,7 +3819,7 @@ impl<P: PackageProvider> Linker<P> {
         lexical_environment: &str,
     ) -> Result<OakParseContext> {
         let mut shadowed = BTreeSet::new();
-        shadowed.extend(image.bindings.keys().cloned());
+        shadowed.extend(image.index.binding_names.iter().cloned());
         shadowed.extend(
             self.activation_bindings
                 .iter()
@@ -3837,53 +3954,49 @@ impl<P: PackageProvider> Linker<P> {
                 return Ok(ResolvedName::Unknown(name.to_owned()));
             }
             if environment.starts_with("derived:") {
-                if let Some(graph) = self.object_graphs.get(&current.id) {
-                    if let Some(environment_id) = graph.environment_id(&environment) {
-                        let (object, blocked) =
-                            graph.lookup_environment_binding(environment_id, name);
-                        if let Some(object) = object {
-                            let resolved = match graph.objects.get(&object) {
-                                Some(InstalledObject::Closure(closure)) => {
-                                    let closure_object = &graph.closures[closure];
-                                    let provenance = &closure_object.provenance;
-                                    if closure_object.derived_from.is_some()
-                                        || provenance.path != "$"
-                                    {
-                                        ResolvedName::ClosureObject {
-                                            package: current.id.clone(),
-                                            closure: *closure,
-                                        }
-                                    } else if let Some(binding) = &provenance.namespace_binding {
-                                        ResolvedName::PackageBinding {
-                                            package: current.id.clone(),
-                                            binding: binding.clone(),
-                                        }
-                                    } else if let (Some(environment), Some(binding)) = (
-                                        &provenance.private_environment,
-                                        &provenance.private_binding,
-                                    ) {
-                                        ResolvedName::PrivateBinding {
-                                            package: current.id.clone(),
-                                            environment: environment.clone(),
-                                            binding: binding.clone(),
-                                        }
-                                    } else {
-                                        ResolvedName::Local(name.to_owned())
+                if let Some(graph) = self.object_graphs.get(&current.id)
+                    && let Some(environment_id) = graph.environment_id(&environment)
+                {
+                    let (object, blocked) = graph.lookup_environment_binding(environment_id, name);
+                    if let Some(object) = object {
+                        let resolved = match graph.objects.get(&object) {
+                            Some(InstalledObject::Closure(closure)) => {
+                                let closure_object = &graph.closures[closure];
+                                let provenance = &closure_object.provenance;
+                                if closure_object.derived_from.is_some() || provenance.path != "$" {
+                                    ResolvedName::ClosureObject {
+                                        package: current.id.clone(),
+                                        closure: *closure,
                                     }
+                                } else if let Some(binding) = &provenance.namespace_binding {
+                                    ResolvedName::PackageBinding {
+                                        package: current.id.clone(),
+                                        binding: binding.clone(),
+                                    }
+                                } else if let (Some(environment), Some(binding)) =
+                                    (&provenance.private_environment, &provenance.private_binding)
+                                {
+                                    ResolvedName::PrivateBinding {
+                                        package: current.id.clone(),
+                                        environment: environment.clone(),
+                                        binding: binding.clone(),
+                                    }
+                                } else {
+                                    ResolvedName::Local(name.to_owned())
                                 }
-                                _ => ResolvedName::Local(name.to_owned()),
-                            };
-                            return Ok(resolved);
-                        }
-                        if blocked {
-                            return Ok(ResolvedName::Unknown(name.to_owned()));
-                        }
-                        if let Some(parent) = graph.environments[&environment_id].parent {
-                            environment = graph.environments[&parent].label.clone();
-                            continue;
-                        }
+                            }
+                            _ => ResolvedName::Local(name.to_owned()),
+                        };
+                        return Ok(resolved);
+                    }
+                    if blocked {
                         return Ok(ResolvedName::Unknown(name.to_owned()));
                     }
+                    if let Some(parent) = graph.environments[&environment_id].parent {
+                        environment = graph.environments[&parent].label.clone();
+                        continue;
+                    }
+                    return Ok(ResolvedName::Unknown(name.to_owned()));
                 }
                 return Ok(ResolvedName::Unknown(name.to_owned()));
             }
@@ -3947,7 +4060,11 @@ impl<P: PackageProvider> Linker<P> {
                 name: name.to_owned(),
             });
         }
-        if image.bindings.contains_key(name)
+        if image
+            .index
+            .binding_names
+            .iter()
+            .any(|binding| binding == name)
             || self
                 .activation_bindings
                 .contains(&(current.id.clone(), name.to_owned()))
@@ -4494,25 +4611,25 @@ where
     let mut consumed = vec![false; arguments.len()];
 
     // R first performs exact named matching.
-    for arg_index in 0..arguments.len() {
+    for (arg_index, consumed) in consumed.iter_mut().enumerate() {
         let Some(name) = arguments.name(arg_index) else {
             continue;
         };
-        if let Some(formal_index) = formals.iter().position(|formal| formal.as_ref() == name) {
-            if assigned[formal_index].is_none() {
-                assigned[formal_index] = Some(arg_index);
-                consumed[arg_index] = true;
-            }
+        if let Some(formal_index) = formals.iter().position(|formal| formal.as_ref() == name)
+            && assigned[formal_index].is_none()
+        {
+            assigned[formal_index] = Some(arg_index);
+            *consumed = true;
         }
     }
 
     // Then accept an unambiguous partial name. This bounded matcher is used
     // only for primitives whose relevant formal prefix is known here.
-    for arg_index in 0..arguments.len() {
+    for (arg_index, consumed) in consumed.iter_mut().enumerate() {
         let Some(name) = arguments.name(arg_index) else {
             continue;
         };
-        if consumed[arg_index] {
+        if *consumed {
             continue;
         }
         let candidates = formals
@@ -4526,14 +4643,14 @@ where
         if candidates.len() == 1 {
             let formal_index = candidates[0];
             assigned[formal_index] = Some(arg_index);
-            consumed[arg_index] = true;
+            *consumed = true;
         }
     }
 
     // Remaining unnamed arguments match the remaining formals positionally.
     let mut next_formal = 0;
-    for arg_index in 0..arguments.len() {
-        if arguments.name(arg_index).is_some() || consumed[arg_index] {
+    for (arg_index, consumed) in consumed.iter_mut().enumerate() {
+        if arguments.name(arg_index).is_some() || *consumed {
             continue;
         }
         while next_formal < assigned.len() && assigned[next_formal].is_some() {
@@ -4543,7 +4660,7 @@ where
             break;
         }
         assigned[next_formal] = Some(arg_index);
-        consumed[arg_index] = true;
+        *consumed = true;
         next_formal += 1;
     }
 

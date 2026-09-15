@@ -48,14 +48,14 @@ impl std::error::Error for Error {
 }
 
 mod metadata;
-mod r_runtime;
+pub mod r_worker;
 mod target_env;
-mod toolchain;
 
 #[cfg(feature = "air")]
 pub mod analysis;
 #[cfg(feature = "air")]
 pub mod build;
+pub mod cache;
 #[cfg(feature = "air")]
 pub mod package;
 #[cfg(feature = "air")]
@@ -63,4 +63,3 @@ pub mod syntax;
 
 pub use metadata::{Description, Relation, RelationField, Version};
 pub use target_env::{Target, TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest};
-pub use toolchain::{RToolchain, ToolchainError};

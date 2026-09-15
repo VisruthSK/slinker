@@ -5,13 +5,12 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command as ProcessCommand, ExitCode};
 
 use slinker::analysis::{Edge, ExplanationDag, LinkPlan, Linker, Need, NodeId, NodeKind};
 use slinker::build::Rewrite;
 use slinker::package::PackageStore;
-use slinker::{RToolchain, TargetEnvironment, TargetEnvironmentRequest};
+use slinker::{TargetEnvironment, TargetEnvironmentRequest};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -31,6 +30,13 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__r-worker")) {
+        let protocol = env::args_os()
+            .nth(2)
+            .ok_or("missing R worker protocol path")?;
+        return slinker::r_worker::run(std::path::Path::new(&protocol))
+            .map_err(|error| Box::new(error) as Box<dyn Error>);
+    }
     match parse_args(env::args_os().skip(1))? {
         Command::Help => {
             print_help();
@@ -299,26 +305,16 @@ fn parse_query_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Qu
 }
 
 fn link(args: &AnalyzeArgs) -> Result<(TargetEnvironment, LinkPlan), Box<dyn Error>> {
-    let r = env::var_os("SLINKER_R")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_r_executable);
-    let toolchain = RToolchain::from_r(r);
-    let scratch = ScratchDir::new()?;
-    let mut target_request = TargetEnvironmentRequest::new(scratch.path().join("target"));
+    let r_home = discover_r_home()?;
+    let mut target_request = TargetEnvironmentRequest::new(r_home.clone());
     target_request.libraries = args
         .libraries
         .iter()
         .map(|library| absolute_path(library))
         .collect::<io::Result<Vec<_>>>()?;
-    let target = toolchain.capture_target_environment(&target_request)?;
+    let target = target_request.capture()?;
 
-    let store = PackageStore::new(
-        toolchain,
-        target.clone(),
-        args.target_provided.iter().cloned(),
-        args.jobs,
-        scratch.path().join("linker"),
-    )?;
+    let store = PackageStore::new(r_home, target.clone(), args.target_provided.iter().cloned())?;
     let plan = Linker::new(store, args.jobs)
         .with_extra_packages(args.extra_pkgs.iter().cloned())
         .analyze(&args.root)?;
@@ -933,7 +929,7 @@ fn print_help() {
            --dump-graph PATH              write deterministic semantic graph dump\n\
            --dump-objects PATH            write deterministic installed object/environment dump\n\n\
          Environment:\n\
-           SLINKER_R          target R executable (defaults to R/R.exe from PATH)\n\
+            R_HOME             fallback R installation when `R RHOME` is unavailable\n\
            SLINKER_CACHE_DIR  persistent installed-image analysis cache"
     );
 }
@@ -946,35 +942,30 @@ fn absolute_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn default_r_executable() -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from("R.exe")
-    } else {
-        PathBuf::from("R")
+fn discover_r_home() -> io::Result<PathBuf> {
+    if let Ok(output) = ProcessCommand::new("R").arg("RHOME").output()
+        && output.status.success()
+        && let Some(home) = parse_r_home(&String::from_utf8_lossy(&output.stdout))
+    {
+        return dunce::canonicalize(home);
     }
+    if let Some(home) = env::var_os("R_HOME")
+        && !home.is_empty()
+    {
+        return dunce::canonicalize(home);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "could not select R: `R RHOME` failed and R_HOME is unset",
+    ))
 }
 
-struct ScratchDir {
-    path: PathBuf,
-}
-impl ScratchDir {
-    fn new() -> io::Result<Self> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = env::temp_dir().join(format!("slinker-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
+fn parse_r_home(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("WARNING:"))
 }
 
 #[derive(Debug)]
@@ -992,7 +983,7 @@ impl Error for CliError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalyzeArgs, Command, default_jobs, parse_args};
+    use super::{AnalyzeArgs, Command, default_jobs, parse_args, parse_r_home};
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1108,5 +1099,12 @@ mod tests {
     #[test]
     fn rejects_removed_graph_format() {
         assert!(parse_args(os(&["analyze", "voucher", "--graph-format", "json"])).is_err());
+    }
+
+    #[test]
+    fn r_home_uses_last_non_warning_line() {
+        let stdout =
+            "WARNING: ignoring environment value of R_HOME\nC:/Program Files/R/R-4.6.1\n\n";
+        assert_eq!(parse_r_home(stdout), Some("C:/Program Files/R/R-4.6.1"));
     }
 }

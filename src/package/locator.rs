@@ -3,7 +3,6 @@ use sha2::{Digest as Sha2Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Digest(pub String);
@@ -52,9 +51,9 @@ impl PackageLocator {
             if !description_path.is_file() {
                 continue;
             }
-            let library =
-                fs::canonicalize(candidate_library).unwrap_or_else(|_| candidate_library.clone());
-            let root = fs::canonicalize(&candidate_root).unwrap_or(candidate_root);
+            let library = dunce::canonicalize(candidate_library)
+                .unwrap_or_else(|_| candidate_library.clone());
+            let root = dunce::canonicalize(&candidate_root).unwrap_or(candidate_root);
             let description_text =
                 fs::read_to_string(&description_path).map_err(|source| Error::Io {
                     path: description_path.clone(),
@@ -104,8 +103,6 @@ fn fingerprint_image(root: &Path) -> Result<Digest> {
     struct Entry {
         path: PathBuf,
         relative: String,
-        size: u64,
-        modified_ns: Option<u128>,
     }
 
     let mut files = Vec::<Entry>::new();
@@ -127,65 +124,16 @@ fn fingerprint_image(root: &Path) -> Result<Digest> {
             if file_type.is_dir() {
                 pending.push(path);
             } else if file_type.is_file() {
-                let metadata = entry.metadata().map_err(|source| Error::Io {
-                    path: path.clone(),
-                    source,
-                })?;
                 let relative = path
                     .strip_prefix(root)
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                let modified_ns = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos());
-                files.push(Entry {
-                    path,
-                    relative,
-                    size: metadata.len(),
-                    modified_ns,
-                });
+                files.push(Entry { path, relative });
             }
         }
     }
     files.sort_by(|left, right| left.relative.cmp(&right.relative));
-
-    // The artifact fingerprint itself remains a SHA-256 over file contents.
-    // The manifest is only a cache validator, allowing unchanged installed
-    // images to avoid rereading every byte on each `slinker analyze` invocation.
-    let mut manifest = Sha256::new();
-    manifest.update(b"slinker-installed-manifest-v1\0");
-    let mut cacheable = true;
-    for entry in &files {
-        manifest.update(entry.relative.as_bytes());
-        manifest.update([0]);
-        manifest.update(entry.size.to_le_bytes());
-        match entry.modified_ns {
-            Some(value) => manifest.update(value.to_le_bytes()),
-            None => {
-                cacheable = false;
-                manifest.update([0xff; 16]);
-            }
-        }
-    }
-    let manifest = format!("{:x}", manifest.finalize());
-    let cache = fingerprint_cache_path(root);
-    if cacheable {
-        if let Ok(text) = fs::read_to_string(&cache) {
-            let mut fields = text.trim().split('\t');
-            if fields.next() == Some(manifest.as_str()) {
-                if let Some(fingerprint) = fields.next() {
-                    if fingerprint.len() == 64
-                        && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    {
-                        return Ok(Digest(fingerprint.to_owned()));
-                    }
-                }
-            }
-        }
-    }
 
     let mut hash = Sha256::new();
     hash.update(b"slinker-installed-image-v2\0");
@@ -210,45 +158,7 @@ fn fingerprint_image(root: &Path) -> Result<Digest> {
         }
         hash.update([0xff]);
     }
-    let fingerprint = format!("{:x}", hash.finalize());
-
-    if cacheable {
-        if let Some(parent) = cache.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let temporary = cache.with_extension(format!("tmp-{}", std::process::id()));
-        if fs::write(&temporary, format!("{manifest}\t{fingerprint}\n")).is_ok() {
-            if fs::rename(&temporary, &cache).is_err() {
-                let _ = fs::remove_file(&cache);
-                let _ = fs::rename(&temporary, &cache);
-            }
-        }
-        let _ = fs::remove_file(temporary);
-    }
-    Ok(Digest(fingerprint))
-}
-
-fn fingerprint_cache_path(root: &Path) -> PathBuf {
-    let base = if let Some(path) = std::env::var_os("SLINKER_CACHE_DIR") {
-        PathBuf::from(path)
-    } else if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("slinker")
-            .join("cache")
-    } else if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        PathBuf::from(path).join("slinker")
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".cache").join("slinker")
-    } else {
-        std::env::temp_dir().join("slinker-cache")
-    };
-    let mut key = Sha256::new();
-    key.update(b"slinker-fingerprint-path-v1\0");
-    key.update(root.to_string_lossy().as_bytes());
-    base.join("fingerprints")
-        .join(format!("{:x}.slinker", key.finalize()))
+    Ok(Digest(format!("{:x}", hash.finalize())))
 }
 
 pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<str>>) -> Digest {
@@ -259,4 +169,29 @@ pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<st
         hash.update([0]);
     }
     Digest(format!("{:x}", hash.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn image_fingerprint_reads_current_bytes_even_when_length_is_unchanged() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "slinker-fingerprint-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create fixture root");
+        let path = root.join("object.rdb");
+        fs::write(&path, b"before").expect("write first image");
+        let before = fingerprint_image(&root).expect("fingerprint first image");
+        fs::write(&path, b"after!").expect("rewrite same-length image");
+        let after = fingerprint_image(&root).expect("fingerprint changed image");
+
+        assert_ne!(before, after);
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
 }

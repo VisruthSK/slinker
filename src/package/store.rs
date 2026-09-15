@@ -1,22 +1,38 @@
-use crate::package::image::parse_package_image;
-use crate::package::index::parse_package_index;
+use crate::cache::Cache;
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    InstalledPackage, NativeFacts, NativeRoutineSummary, NativeSafety, PackageId, PackageImage,
-    PackageIndex, PackageLocator,
+    InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
+    PackageId, PackageImage, PackageIndex, PackageLocator,
 };
-use crate::toolchain::RRuntimeServer;
-use crate::{Error, RToolchain, Result, TargetEnvironment};
+use crate::r_worker::client::WorkerClient;
+use crate::r_worker::protocol::{WorkerBinding, WorkerPackageIndex};
+use crate::{Error, Result, TargetEnvironment};
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-object-environment-v3";
+const ANALYSIS_SCHEMA: &str = "slinker-analysis-v4";
+
+#[derive(Deserialize, Serialize)]
+struct CachedIndex {
+    schema: String,
+    target: String,
+    package_fingerprint: String,
+    index: WorkerPackageIndex,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CachedBinding {
+    schema: String,
+    target: String,
+    package_fingerprint: String,
+    binding_name: String,
+    binding: WorkerBinding,
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct NativeSummaryManifest {
@@ -183,11 +199,12 @@ pub trait PackageProvider {
         names.iter().map(|name| self.locate(name)).collect()
     }
     fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>>;
-    fn image(&mut self, package: &InstalledPackage) -> Result<Arc<PackageImage>>;
+    fn binding_image(
+        &mut self,
+        package: &InstalledPackage,
+        name: &str,
+    ) -> Result<Arc<PackageImage>>;
     fn prefetch_indexes(&mut self, _packages: &[InstalledPackage], _jobs: usize) -> Result<()> {
-        Ok(())
-    }
-    fn prefetch(&mut self, _packages: &[InstalledPackage], _jobs: usize) -> Result<()> {
         Ok(())
     }
     fn is_target_provided(&self, package: &InstalledPackage) -> bool;
@@ -200,7 +217,7 @@ pub trait PackageProvider {
             .any(|candidate| candidate == path))
     }
     fn validate_syntax(
-        &self,
+        &mut self,
         id: &PackageId,
         binding: &str,
         source: &str,
@@ -208,41 +225,37 @@ pub trait PackageProvider {
 }
 
 pub struct PackageStore {
-    toolchain: RToolchain,
     locator: PackageLocator,
     explicit_target: HashSet<PackageId>,
     locations: HashMap<String, InstalledPackage>,
     indexes: HashMap<PackageId, Arc<PackageIndex>>,
-    images: HashMap<PackageId, Arc<PackageImage>>,
-    cache_dir: PathBuf,
-    work_dir: PathBuf,
+    bindings: HashMap<(PackageId, String), Arc<PackageImage>>,
+    cache: Cache,
+    r_home: PathBuf,
     target_fingerprint: String,
-    jobs: usize,
-    runtime_server: Option<RRuntimeServer>,
+    worker: Option<WorkerClient>,
     locate_pool: Option<(usize, Arc<rayon::ThreadPool>)>,
-    validations: AtomicUsize,
     native_summaries: NativeSummaryManifest,
 }
 
 impl PackageStore {
     pub fn new(
-        toolchain: RToolchain,
+        r_home: PathBuf,
         target: TargetEnvironment,
         explicit_target: impl IntoIterator<Item = String>,
-        jobs: usize,
-        work_dir: impl Into<PathBuf>,
     ) -> Result<Self> {
         let target_fingerprint = fingerprint_strings(
-            std::iter::once(format!(
-                "R={} OS={} ARCH={}",
-                target.target.r_version, target.target.os, target.target.arch
-            ))
-            .chain(
-                target
-                    .libraries
-                    .iter()
-                    .map(|path| path.to_string_lossy().into_owned()),
-            ),
+            std::iter::once(target.r_home.to_string_lossy().into_owned())
+                .chain(std::iter::once(format!(
+                    "R={} OS={} ARCH={}",
+                    target.target.r_version, target.target.os, target.target.arch
+                )))
+                .chain(
+                    target
+                        .libraries
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                ),
         )
         .0;
         let locator = PackageLocator::new(target);
@@ -253,45 +266,80 @@ impl PackageStore {
             explicit_target_ids.insert(package.id.clone());
             locations.insert(name, package);
         }
-        let cache_dir = default_cache_dir().join("analysis").join(ANALYSIS_SCHEMA);
-        fs::create_dir_all(&cache_dir).map_err(|source| Error::Io {
-            path: cache_dir.clone(),
-            source,
-        })?;
-        let work_dir = work_dir.into();
-        fs::create_dir_all(&work_dir).map_err(|source| Error::Io {
-            path: work_dir.clone(),
-            source,
-        })?;
+        let cache = Cache::new(ANALYSIS_SCHEMA)?;
         let native_summaries = NativeSummaryManifest::load()?;
         Ok(Self {
-            toolchain,
             locator,
             explicit_target: explicit_target_ids,
             locations,
             indexes: HashMap::new(),
-            images: HashMap::new(),
-            cache_dir,
-            work_dir,
+            bindings: HashMap::new(),
+            cache,
+            r_home,
             target_fingerprint,
-            jobs: jobs.max(1),
-            runtime_server: None,
+            worker: None,
             locate_pool: None,
-            validations: AtomicUsize::new(0),
             native_summaries,
         })
     }
 
-    fn parsed_index(&self, text: &str, package: InstalledPackage) -> Result<Arc<PackageIndex>> {
-        let mut index = parse_package_index(text, package)?;
+    fn package_index(
+        &self,
+        worker: WorkerPackageIndex,
+        package: InstalledPackage,
+    ) -> Result<Arc<PackageIndex>> {
+        if worker.name != package.id.name
+            || worker.version != package.id.version.to_string()
+            || worker.image_fingerprint != package.id.image_fingerprint.0
+        {
+            return Err(Error::Analysis(format!(
+                "installed index identity changed while inspecting {}",
+                package.id.name
+            )));
+        }
+        let mut index = PackageIndex {
+            package: package.clone(),
+            description: package.description.clone(),
+            exports: worker.exports,
+            imports: worker.imports,
+            s3: worker.s3,
+            dynlibs: worker.dynlibs,
+            lifecycle: LifecycleMetadata {
+                on_load: worker.on_load,
+            },
+            binding_names: worker.binding_names,
+            datasets: worker.datasets,
+            files: Vec::new(),
+            has_sysdata: worker.has_sysdata,
+        };
         self.native_summaries.apply(&mut index);
         Ok(Arc::new(index))
     }
 
-    fn parsed_image(&self, text: &str, package: InstalledPackage) -> Result<Arc<PackageImage>> {
-        let mut image = parse_package_image(text, package)?;
-        self.native_summaries.apply(&mut image.index);
-        Ok(Arc::new(image))
+    fn package_image(
+        &self,
+        package: InstalledPackage,
+        index: Arc<PackageIndex>,
+        worker: WorkerBinding,
+    ) -> Result<Arc<PackageImage>> {
+        if worker.package_name != package.id.name
+            || worker.package_version != package.id.version.to_string()
+            || worker.image_fingerprint != package.id.image_fingerprint.0
+            || !index
+                .binding_names
+                .iter()
+                .any(|name| name == &worker.binding.name)
+        {
+            return Err(Error::Analysis(format!(
+                "worker returned unindexed binding {}::{}",
+                package.id.name, worker.binding.name
+            )));
+        }
+        Ok(Arc::new(PackageImage {
+            index: (*index).clone(),
+            bindings: HashMap::from([(worker.binding.name.clone(), worker.binding)]),
+            private_environments: worker.private_environments,
+        }))
     }
 
     pub fn target(&self) -> &TargetEnvironment {
@@ -305,7 +353,7 @@ impl PackageStore {
             AIR_VERSION,
             ANALYSIS_SCHEMA,
             package.id.name.as_str(),
-            &package.id.version.to_string(),
+            package.id.version.as_ref(),
             library.as_str(),
             package.id.image_fingerprint.0.as_str(),
         ]);
@@ -313,148 +361,28 @@ impl PackageStore {
     }
 
     fn index_cache_path(&self, package: &InstalledPackage) -> PathBuf {
-        self.cache_dir.join(format!(
+        self.cache.path(format!(
             "{}-{}.index.slinker",
             package.id.name,
             self.cache_key(package)
         ))
     }
 
-    fn image_cache_path(&self, package: &InstalledPackage) -> PathBuf {
-        self.cache_dir.join(format!(
-            "{}-{}.image.slinker",
+    fn binding_cache_path(&self, package: &InstalledPackage, binding: &str) -> PathBuf {
+        let binding = fingerprint_strings([binding]).0;
+        self.cache.path(format!(
+            "{}-{}-{binding}.binding.slinker",
             package.id.name,
             self.cache_key(package)
         ))
     }
 
-    fn persist_index_from_image(&self, package: &InstalledPackage, image_text: &str) -> Result<()> {
-        let path = self.index_cache_path(package);
-        if path.is_file() {
-            return Ok(());
+    fn worker(&mut self) -> Result<&mut WorkerClient> {
+        if self.worker.is_none() {
+            let target = self.locator.target().clone();
+            self.worker = Some(WorkerClient::spawn(self.r_home.clone(), &target)?);
         }
-        let mut index = String::new();
-        for line in image_text.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            let kind = line.split('\t').next().unwrap_or_default();
-            match kind {
-                "HEADER" | "EXPORT" | "IMPORT_ALL" | "IMPORT_EXCEPT" | "IMPORT_FROM"
-                | "DATASET" | "S3" | "DYNLIB" | "NATIVE_SYMBOL" | "FILE" | "PACKAGE_ISSUE" => {
-                    index.push_str(line);
-                    index.push('\n');
-                }
-                "BINDING" => {
-                    if let Some(name) = line.split('\t').nth(1) {
-                        index.push_str("BINDING_NAME\t");
-                        index.push_str(name);
-                        index.push('\n');
-                    }
-                }
-                "CLOSURE" | "NESTED_CLOSURE" | "BINDING_ISSUE" => {}
-                _ => {}
-            }
-        }
-        fs::write(&path, index).map_err(|source| Error::Io { path, source })
-    }
-
-    fn runtime_server(&mut self) -> Result<&mut RRuntimeServer> {
-        if self.runtime_server.is_none() {
-            let server = self
-                .toolchain
-                .spawn_runtime_server(&self.work_dir, self.jobs)
-                .map_err(|error| {
-                    Error::Analysis(format!("failed to start persistent R runtime: {error}"))
-                })?;
-            self.runtime_server = Some(server);
-        }
-        Ok(self
-            .runtime_server
-            .as_mut()
-            .expect("runtime server initialized"))
-    }
-
-    fn write_manifest(
-        &self,
-        name: &str,
-        packages: &[(InstalledPackage, PathBuf)],
-    ) -> Result<PathBuf> {
-        let manifest = self.work_dir.join(format!("{name}.slinker"));
-        let mut text = String::new();
-        for library in &self.locator.target().libraries {
-            text.push_str("LIB\t");
-            text.push_str(&encode_hex(library.to_string_lossy().as_bytes()));
-            text.push('\n');
-        }
-        for (package, output) in packages {
-            text.push_str("JOB\t");
-            text.push_str(&encode_hex(package.id.library.to_string_lossy().as_bytes()));
-            text.push('\t');
-            text.push_str(&encode_hex(package.id.name.as_bytes()));
-            text.push('\t');
-            text.push_str(&encode_hex(output.to_string_lossy().as_bytes()));
-            text.push('\n');
-        }
-        fs::write(&manifest, text).map_err(|source| Error::Io {
-            path: manifest.clone(),
-            source,
-        })?;
-        Ok(manifest)
-    }
-
-    fn inspect_index(&mut self, package: &InstalledPackage, output: &Path) -> Result<()> {
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).map_err(|source| Error::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let manifest =
-            self.write_manifest("index-request", &[(package.clone(), output.to_path_buf())])?;
-        self.runtime_server()?
-            .request(
-                "INDEX",
-                &manifest,
-                60,
-                format!(
-                    "package: {} {}; phase: installed-image index",
-                    package.id.name, package.id.version
-                ),
-            )
-            .map_err(|error| {
-                Error::Analysis(format!(
-                    "installed-image index failed for {} {}: {error}",
-                    package.id.name, package.id.version
-                ))
-            })
-    }
-
-    fn inspect_image(&mut self, package: &InstalledPackage, output: &Path) -> Result<()> {
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent).map_err(|source| Error::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let manifest =
-            self.write_manifest("image-request", &[(package.clone(), output.to_path_buf())])?;
-        self.runtime_server()?
-            .request(
-                "IMAGE",
-                &manifest,
-                300,
-                format!(
-                    "package: {} {}; phase: installed-image inspection",
-                    package.id.name, package.id.version
-                ),
-            )
-            .map_err(|error| {
-                Error::Analysis(format!(
-                    "installed-image inspection failed for {} {}: {error}",
-                    package.id.name, package.id.version
-                ))
-            })
+        Ok(self.worker.as_mut().expect("Harp worker initialized"))
     }
 
     fn load_cached_index(
@@ -468,49 +396,47 @@ impl PackageStore {
         if !cache.is_file() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&cache).map_err(|source| Error::Io {
-            path: cache.clone(),
-            source,
-        })?;
-        match self.parsed_index(&text, package.clone()) {
-            Ok(index) => {
+        let cached = self.cache.read::<CachedIndex>(&cache).filter(|entry| {
+            entry.schema == ANALYSIS_SCHEMA
+                && entry.target == self.target_fingerprint
+                && entry.package_fingerprint == package.id.image_fingerprint.0
+        });
+        match cached.map(|entry| self.package_index(entry.index, package.clone())) {
+            Some(Ok(index)) => {
                 self.indexes.insert(package.id.clone(), Arc::clone(&index));
                 Ok(Some(index))
             }
-            Err(_) => {
-                let _ = fs::remove_file(cache);
-                Ok(None)
-            }
+            _ => Ok(None),
         }
     }
 
-    fn load_cached_image(
+    fn load_cached_binding(
         &mut self,
         package: &InstalledPackage,
+        binding: &str,
     ) -> Result<Option<Arc<PackageImage>>> {
-        if let Some(image) = self.images.get(&package.id) {
+        let key = (package.id.clone(), binding.to_owned());
+        if let Some(image) = self.bindings.get(&key) {
             return Ok(Some(Arc::clone(image)));
         }
-        let cache = self.image_cache_path(package);
+        let cache = self.binding_cache_path(package, binding);
         if !cache.is_file() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&cache).map_err(|source| Error::Io {
-            path: cache.clone(),
-            source,
-        })?;
-        match self.parsed_image(&text, package.clone()) {
-            Ok(image) => {
-                self.persist_index_from_image(package, &text)?;
-                self.indexes
-                    .insert(package.id.clone(), Arc::new(image.index.clone()));
-                self.images.insert(package.id.clone(), Arc::clone(&image));
+        let cached = self.cache.read::<CachedBinding>(&cache).filter(|entry| {
+            entry.schema == ANALYSIS_SCHEMA
+                && entry.target == self.target_fingerprint
+                && entry.package_fingerprint == package.id.image_fingerprint.0
+                && entry.binding_name == binding
+        });
+        match cached {
+            Some(cached) => {
+                let index = self.index(package)?;
+                let image = self.package_image(package.clone(), index, cached.binding)?;
+                self.bindings.insert(key, Arc::clone(&image));
                 Ok(Some(image))
             }
-            Err(_) => {
-                let _ = fs::remove_file(cache);
-                Ok(None)
-            }
+            None => Ok(None),
         }
     }
 }
@@ -610,144 +536,48 @@ impl PackageProvider for PackageStore {
         if let Some(index) = self.load_cached_index(package)? {
             return Ok(index);
         }
-        if let Some(image) = self.images.get(&package.id) {
-            let index = Arc::new(image.index.clone());
-            self.indexes.insert(package.id.clone(), Arc::clone(&index));
-            return Ok(index);
-        }
+        let worker = self.worker()?.package_index(package)?;
+        let index = self.package_index(worker.clone(), package.clone())?;
         let cache = self.index_cache_path(package);
-        self.inspect_index(package, &cache)?;
-        let text = fs::read_to_string(&cache).map_err(|source| Error::Io {
-            path: cache.clone(),
-            source,
-        })?;
-        let index = self.parsed_index(&text, package.clone())?;
+        let cached = CachedIndex {
+            schema: ANALYSIS_SCHEMA.into(),
+            target: self.target_fingerprint.clone(),
+            package_fingerprint: package.id.image_fingerprint.0.clone(),
+            index: worker,
+        };
+        self.cache.publish(&cache, &cached);
         self.indexes.insert(package.id.clone(), Arc::clone(&index));
         Ok(index)
     }
 
-    fn image(&mut self, package: &InstalledPackage) -> Result<Arc<PackageImage>> {
-        if let Some(image) = self.load_cached_image(package)? {
+    fn binding_image(
+        &mut self,
+        package: &InstalledPackage,
+        name: &str,
+    ) -> Result<Arc<PackageImage>> {
+        if let Some(image) = self.load_cached_binding(package, name)? {
             return Ok(image);
         }
-        let cache = self.image_cache_path(package);
-        eprintln!("[slinker] inspect {}", package.id.name);
-        self.inspect_image(package, &cache)?;
-        let text = fs::read_to_string(&cache).map_err(|source| Error::Io {
-            path: cache.clone(),
-            source,
-        })?;
-        let image = self.parsed_image(&text, package.clone())?;
-        self.persist_index_from_image(package, &text)?;
-        self.indexes
-            .insert(package.id.clone(), Arc::new(image.index.clone()));
-        self.images.insert(package.id.clone(), Arc::clone(&image));
+        let index = self.index(package)?;
+        let binding = self.worker()?.binding(package, name)?;
+        let cache = self.binding_cache_path(package, name);
+        let cached = CachedBinding {
+            schema: ANALYSIS_SCHEMA.into(),
+            target: self.target_fingerprint.clone(),
+            package_fingerprint: package.id.image_fingerprint.0.clone(),
+            binding_name: name.into(),
+            binding: binding.clone(),
+        };
+        self.cache.publish(&cache, &cached);
+        let image = self.package_image(package.clone(), index, binding)?;
+        self.bindings
+            .insert((package.id.clone(), name.to_owned()), Arc::clone(&image));
         Ok(image)
     }
 
     fn prefetch_indexes(&mut self, packages: &[InstalledPackage], _jobs: usize) -> Result<()> {
-        let mut missing = Vec::new();
         for package in packages {
-            if self.load_cached_index(package)?.is_none() {
-                missing.push(package.clone());
-            }
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-
-        let jobs = missing
-            .iter()
-            .map(|package| (package.clone(), self.index_cache_path(package)))
-            .collect::<Vec<_>>();
-        let manifest = self.write_manifest("index-prefetch", &jobs)?;
-        if missing.len() > 1 {
-            eprintln!(
-                "[slinker] index {} demanded packages in parallel",
-                missing.len()
-            );
-        }
-        self.runtime_server()?
-            .request(
-                "INDEX",
-                &manifest,
-                180,
-                format!(
-                    "phase: installed-image index batch; packages: {}",
-                    missing
-                        .iter()
-                        .map(|package| package.id.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
-            .map_err(|error| {
-                Error::Analysis(format!("installed-image index batch failed: {error}"))
-            })?;
-
-        for package in &missing {
-            let cache = self.index_cache_path(package);
-            let text = fs::read_to_string(&cache).map_err(|source| Error::Io {
-                path: cache.clone(),
-                source,
-            })?;
-            let index = self.parsed_index(&text, package.clone())?;
-            self.indexes.insert(package.id.clone(), index);
-        }
-        Ok(())
-    }
-
-    fn prefetch(&mut self, packages: &[InstalledPackage], _jobs: usize) -> Result<()> {
-        let mut missing = Vec::new();
-        for package in packages {
-            if self.load_cached_image(package)?.is_none() {
-                missing.push(package.clone());
-            }
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-
-        let jobs = missing
-            .iter()
-            .map(|package| (package.clone(), self.image_cache_path(package)))
-            .collect::<Vec<_>>();
-        let manifest = self.write_manifest("image-prefetch", &jobs)?;
-        if missing.len() > 1 {
-            eprintln!(
-                "[slinker] inspect {} demanded packages in parallel",
-                missing.len()
-            );
-        }
-        self.runtime_server()?
-            .request(
-                "IMAGE",
-                &manifest,
-                600,
-                format!(
-                    "phase: installed-image batch inspection; packages: {}",
-                    missing
-                        .iter()
-                        .map(|package| package.id.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
-            .map_err(|error| {
-                Error::Analysis(format!("installed-image batch inspection failed: {error}"))
-            })?;
-
-        for package in &missing {
-            let cache = self.image_cache_path(package);
-            let text = fs::read_to_string(&cache).map_err(|source| Error::Io {
-                path: cache.clone(),
-                source,
-            })?;
-            let image = self.parsed_image(&text, package.clone())?;
-            self.persist_index_from_image(package, &text)?;
-            self.indexes
-                .insert(package.id.clone(), Arc::new(image.index.clone()));
-            self.images.insert(package.id.clone(), image);
+            self.index(package)?;
         }
         Ok(())
     }
@@ -781,113 +611,12 @@ impl PackageProvider for PackageStore {
     }
 
     fn validate_syntax(
-        &self,
-        id: &PackageId,
-        binding: &str,
+        &mut self,
+        _id: &PackageId,
+        _binding: &str,
         source: &str,
     ) -> Result<SyntaxValidation> {
-        let ordinal = self.validations.fetch_add(1, Ordering::Relaxed);
-        let dir = self.work_dir.join("syntax-validation");
-        fs::create_dir_all(&dir).map_err(|source_error| Error::Io {
-            path: dir.clone(),
-            source: source_error,
-        })?;
-        let source_path = dir.join(format!("{ordinal}.txt"));
-        let result_path = dir.join(format!("{ordinal}.result"));
-        fs::write(&source_path, source).map_err(|source_error| Error::Io {
-            path: source_path.clone(),
-            source: source_error,
-        })?;
-        let args = [source_path.as_os_str(), result_path.as_os_str()];
-        let result = self
-            .toolchain
-            .run_runtime_timeout(
-                &self.work_dir,
-                "validate-syntax",
-                args,
-                false,
-                30,
-                format!(
-                    "package: {}; binding: {binding}; phase: target-R syntax validation",
-                    id.name
-                ),
-            )
-            .map_err(|error| {
-                Error::Analysis(format!(
-                    "target-R syntax validation failed for {}::{binding}: {error}",
-                    id.name
-                ))
-            });
-        let _ = fs::remove_file(&source_path);
-        result?;
-        let text = fs::read_to_string(&result_path).map_err(|source_error| Error::Io {
-            path: result_path.clone(),
-            source: source_error,
-        })?;
-        let _ = fs::remove_file(&result_path);
-        if text.trim() == "OK" {
-            Ok(SyntaxValidation::Accepted)
-        } else if let Some(encoded) = text.trim().strip_prefix("ERROR\t") {
-            Ok(SyntaxValidation::Rejected(decode_hex(encoded)?))
-        } else {
-            Err(Error::Analysis(format!(
-                "invalid syntax-validation result {text:?}"
-            )))
-        }
-    }
-}
-
-fn default_cache_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("SLINKER_CACHE_DIR") {
-        return PathBuf::from(path);
-    }
-    if cfg!(windows) {
-        if let Some(path) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(path).join("slinker").join("cache");
-        }
-    } else if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(path).join("slinker");
-    } else if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("slinker");
-    }
-    std::env::temp_dir().join("slinker-cache")
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn decode_hex(value: &str) -> Result<String> {
-    if value.len() % 2 != 0 {
-        return Err(Error::Analysis("odd-length syntax diagnostic".into()));
-    }
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len() / 2);
-    let mut index = 0;
-    while index < bytes.len() {
-        let high = nibble(bytes[index])
-            .ok_or_else(|| Error::Analysis("invalid syntax diagnostic".into()))?;
-        let low = nibble(bytes[index + 1])
-            .ok_or_else(|| Error::Analysis("invalid syntax diagnostic".into()))?;
-        output.push((high << 4) | low);
-        index += 2;
-    }
-    String::from_utf8(output)
-        .map_err(|error| Error::Analysis(format!("invalid syntax diagnostic UTF-8: {error}")))
-}
-
-fn nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
+        self.worker()?.validate_syntax(source)
     }
 }
 
