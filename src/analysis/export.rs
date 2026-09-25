@@ -1,6 +1,6 @@
 use crate::TargetEnvironment;
+use crate::analysis::LinkIr;
 use crate::analysis::diagnostic::RejectCode;
-use crate::analysis::engine::LinkIr;
 use crate::analysis::graph::{Edge, EdgeKind, Node, NodeKind};
 use crate::syntax::{SourceOrigin, Sources, Span};
 use serde::{Deserialize, Serialize};

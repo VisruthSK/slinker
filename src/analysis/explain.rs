@@ -1,6 +1,6 @@
 use crate::TargetEnvironment;
 use crate::analysis::Graph;
-use crate::analysis::engine::LinkIr;
+use crate::analysis::LinkIr;
 use crate::analysis::export::{
     GraphBlockerExport, GraphEdgeReasonExport, GraphExport, GraphNodeKindExport, GraphSourceExport,
     PackageIdentityExport, TargetIdentityExport, edge_reason, node_kind, root_reason,

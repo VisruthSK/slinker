@@ -1,6 +1,5 @@
 pub mod facts;
 pub mod oak;
-pub mod resolve;
 pub mod source;
 
 pub use facts::{
@@ -13,5 +12,4 @@ pub(crate) use oak::{
     NamespaceImportResolution, NamespaceImports, closure_definitely_non_returning,
 };
 pub use oak::{OakParseContext, OakParser, RParser};
-pub use resolve::ResolvedName;
 pub use source::{SourceId, SourceOrigin, Sources, Span};

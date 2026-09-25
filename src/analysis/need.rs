@@ -1,4 +1,5 @@
-use crate::package::{ClosureId, PackageId};
+use crate::analysis::object_world::ClosureId;
+use crate::package::PackageId;
 
 pub type BindingName = String;
 pub type ResourceId = String;
