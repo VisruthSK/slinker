@@ -233,6 +233,47 @@ fn explicit_external_promotes_declared_suggests_contract() {
     );
 }
 
+#[test]
+fn real_pure_r_packages_build_install_and_run() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    for package in ["praise", "pkgconfig"] {
+        let output = fixture.path().join(package);
+        let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+            .args(["build", "--output"])
+            .arg(&output)
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures")
+                    .join(package),
+            )
+            .env("R_HOME", &r_home)
+            .output()
+            .expect("run slinker build");
+        assert_success(&result, package);
+        install_package(&r_home, &output, &validation);
+    }
+    run_r(
+        &r_home,
+        &validation,
+        r#"
+        library(praise)
+        stopifnot(exists(".slinker_target", envir = asNamespace("praise"), inherits = FALSE))
+        stopifnot(grepl("^You are [a-z]+!$", praise()))
+        stopifnot(grepl("^[A-Z]+ [a-z]+$", praise("${ADVERB} ${adjective}")))
+        library(pkgconfig)
+        configure <- function() {
+          set_config(greeting = "hello")
+          get_config("greeting")
+        }
+        stopifnot(identical(configure(), "hello"))
+        stopifnot(identical(get_config("missing", fallback = "fallback"), "fallback"))
+        "#,
+    );
+}
+
 fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &str) {
     fs::create_dir_all(root.join("R")).expect("R directory");
     fs::write(
@@ -263,18 +304,17 @@ fn run_r(r_home: &Path, library: &Path, expression: &str) {
 }
 
 fn run_r_output(r_home: &Path, library: &Path, expression: &str) -> Output {
+    let script = tempfile::Builder::new()
+        .suffix(".R")
+        .tempfile()
+        .expect("R script");
+    fs::write(script.path(), expression).expect("write R script");
     Command::new(r_executable(r_home))
-        .args([
-            "--slave",
-            "--no-save",
-            "--no-restore",
-            "--vanilla",
-            "-e",
-            expression,
-        ])
+        .args(["--slave", "--no-save", "--no-restore", "--vanilla", "-f"])
+        .arg(script.path())
         .env("R_HOME", r_home)
         .env("R_LIBS", library)
-        .env_remove("R_LIBS_USER")
+        .env("R_LIBS_USER", library)
         .env_remove("R_LIBS_SITE")
         .output()
         .expect("run target R")
