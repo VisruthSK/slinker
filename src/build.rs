@@ -1,8 +1,8 @@
 use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::ir::{
-    LinkBindingState, LinkNamespaceState, PackageOperationIr, PayloadRef, ProgramIr, Relocation,
-    ResourceId, Value,
+    LinkBindingState, LinkNamespaceState, PackageOperationIr, ProgramIr, Relocation, ResourceId,
+    Value,
 };
 use crate::package::{BindingName, PackageId};
 use crate::r_worker::client::WorkerClient;
@@ -84,7 +84,7 @@ pub struct BuildContext {
 /// Exact installed bytes redeemed from the selected images before preflight.
 #[derive(Debug)]
 struct FrozenInputs {
-    payloads: BTreeMap<PayloadRef, Vec<u8>>,
+    bundles: BTreeMap<PackageId, Vec<u8>>,
     resources: BTreeMap<ResourceId, PathBuf>,
     _directory: TempDir,
 }
@@ -114,29 +114,30 @@ impl BuildContext {
                 .root
         };
 
-        let payload_refs = program
-            .values()
-            .iter()
-            .filter_map(|value| match value {
-                Value::Payload(payload) => Some(payload),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let mut payloads = BTreeMap::new();
-        if !payload_refs.is_empty() {
+        let mut payloads = BTreeMap::<PackageId, BTreeSet<String>>::new();
+        for value in program.values() {
+            if let Value::Payload(payload) = value {
+                payloads
+                    .entry(payload.package)
+                    .or_default()
+                    .insert(payload.locator.root.clone());
+            }
+        }
+        let mut bundles = BTreeMap::new();
+        if !payloads.is_empty() {
             let mut worker = WorkerClient::spawn(r_home.clone(), &target)?;
-            for payload in payload_refs {
-                let identity = program.package(payload.package).identity();
-                let bytes = worker.serialize_binding(
-                    PackageSpec {
-                        name: identity.name.clone(),
-                        version: identity.version.to_string(),
-                        image_fingerprint: identity.image_fingerprint.0.clone(),
-                        root: location(payload.package).clone(),
-                    },
-                    &payload.locator.root,
-                )?;
-                payloads.insert(payload.clone(), bytes);
+            for (package, names) in payloads {
+                let identity = program.package(package).identity();
+                let spec = PackageSpec {
+                    name: identity.name.clone(),
+                    version: identity.version.to_string(),
+                    image_fingerprint: identity.image_fingerprint.0.clone(),
+                    root: location(package).clone(),
+                };
+                bundles.insert(
+                    package,
+                    worker.serialize_bundle(spec, names.into_iter().collect())?,
+                );
             }
         }
 
@@ -160,7 +161,7 @@ impl BuildContext {
             _staged_root: staged_root,
             target_runtime: TargetRuntimeHandle::new(r_home, target),
             frozen: FrozenInputs {
-                payloads,
+                bundles,
                 resources,
                 _directory: directory,
             },
@@ -207,8 +208,8 @@ impl MaterializationContext<'_> {
         self.target_runtime
     }
 
-    fn payload(&self, payload: &PayloadRef) -> &[u8] {
-        &self.frozen.payloads[payload]
+    fn bundle(&self, package: PackageId) -> &[u8] {
+        &self.frozen.bundles[&package]
     }
 
     fn resource(&self, resource: ResourceId) -> &Path {
@@ -350,11 +351,14 @@ pub fn materialize(
     )?;
     let payload_directory = package_root.join("inst/slinker/payload");
     fs::create_dir_all(&payload_directory)?;
-    for value in buildable.program.values() {
-        if let Value::Payload(payload) = value {
+    for namespace in buildable.program.namespaces() {
+        if has_payloads(buildable.program, namespace) {
             fs::write(
-                payload_directory.join(format!("{}.rds", payload_key(buildable.program, payload))),
-                buildable.materialization.payload(payload),
+                payload_directory.join(format!(
+                    "{}.rds",
+                    buildable.program.package(namespace.package).identity().name
+                )),
+                buildable.materialization.bundle(namespace.package),
             )?;
         }
     }
@@ -402,166 +406,195 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         r_string(&program.package(program.root_package()).identity().name)
     )
     .expect("String writes cannot fail");
-    let root_namespace = program.root_namespace();
-    let root_on_load = match &root_namespace.state {
+    let root = program.root_namespace();
+    let root_on_load = match &root.state {
         LinkNamespaceState::Root(state) => state
             .activation
             .and_then(|activation| program.activation(activation).on_load.as_ref())
             .map(|on_load| on_load.closure),
         LinkNamespaceState::Linked(_) | LinkNamespaceState::External { .. } => None,
     };
-
-    for (name, binding) in &root_namespace.bindings {
-        let LinkBindingState::Materialized { initial, .. } = &program.binding(*binding).state
-        else {
-            continue;
-        };
-        let crate::ir::InitialBindingState::Value(value) = initial else {
-            continue;
-        };
-        match program.value(*value) {
-            Value::Closure(closure) => {
-                let source = relocated_source(program, program.closure(*closure).code)?;
-                if Some(*closure) == root_on_load {
-                    out.push_str(&rename_assignment(&source, ".slinker_original_on_load"));
-                } else {
-                    out.push_str(&source);
-                }
-            }
-            Value::Payload(payload) => {
-                writeln!(
-                    out,
-                    "{} <- .slinker_payload({})",
-                    r_binding_name(name),
-                    r_string(&payload_key(program, payload))
-                )
-                .expect("String writes cannot fail");
-            }
-            _ => continue,
+    for closure in namespace_closures(program, root) {
+        let source = relocated_source(program, program.closure(closure).code)?;
+        if Some(closure) == root_on_load {
+            out.push_str(&rename_assignment(&source, ".slinker_original_on_load"));
+        } else {
+            out.push_str(&source);
         }
         out.push('\n');
     }
 
-    for namespace_id in &program.root_artifact().bootstrap_namespaces {
-        let namespace = program.namespace(*namespace_id);
-        let package = program.package(namespace.package).identity();
-        writeln!(
-            out,
-            ".slinker_spec_{} <- function() {{",
-            safe_identifier(&package.name)
-        )
-        .expect("String writes cannot fail");
-        writeln!(
-            out,
-            "  ns <- .slinker_new_namespace({}, {})",
-            r_string(&package.name),
-            r_string(package.version.as_ref())
-        )
-        .expect("String writes cannot fail");
-        out.push_str("  imports <- parent.env(ns)\n");
-        for import in &namespace.imports {
-            let target = program.binding(import.target);
-            let target_namespace = program.binding_namespace(import.target);
-            let target_state = &program.namespace(target_namespace).state;
-            let target_package = program
-                .package(program.namespace(target_namespace).package)
-                .identity();
-            let value = match target_state {
-                LinkNamespaceState::External { .. } => format!(
-                    "getExportedValue({}, {})",
-                    r_string(&target_package.name),
-                    r_string(&target.name)
-                ),
-                LinkNamespaceState::Root(_) | LinkNamespaceState::Linked(_) => format!(
-                    ".slinker_binding({}, {})",
-                    r_string(&target_package.name),
-                    r_string(&target.name)
-                ),
-            };
-            writeln!(
-                out,
-                "  assign({}, {}, envir = imports)",
-                r_string(&import.local),
-                value
-            )
-            .expect("String writes cannot fail");
-        }
-        for binding in namespace.bindings.values() {
-            let LinkBindingState::Materialized { initial, .. } = &program.binding(*binding).state
-            else {
-                continue;
-            };
-            let crate::ir::InitialBindingState::Value(value) = initial else {
-                continue;
-            };
-            match program.value(*value) {
-                Value::Closure(closure) => {
-                    let source = relocated_source(program, program.closure(*closure).code)?;
-                    writeln!(
-                        out,
-                        "  eval(parse(text = {}), envir = ns)",
-                        r_string(&source)
-                    )
-                    .expect("String writes cannot fail");
-                }
-                Value::Payload(payload) => {
-                    writeln!(
-                        out,
-                        "  assign({}, .slinker_payload({}), envir = ns)",
-                        r_string(&program.binding(*binding).name),
-                        r_string(&payload_key(program, payload))
-                    )
-                    .expect("String writes cannot fail");
-                }
-                _ => {}
-            }
-        }
-        let exports = match &namespace.state {
-            LinkNamespaceState::Linked(state) => state.exports.bindings(),
-            _ => &[],
-        };
-        let export_names = exports
-            .iter()
-            .map(|binding| r_string(&program.binding(*binding).name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(out, "  .slinker_finish_namespace(ns, c({export_names}))")
-            .expect("String writes cannot fail");
-        out.push_str("}\n");
-    }
-
     out.push_str(".onLoad <- function(libname, pkgname) {\n  .slinker_check_target()\n");
-    for namespace in &program.root_artifact().bootstrap_namespaces {
+    out.push_str("  root <- environment(.onLoad)\n  linked <- list()\n");
+    let bootstrap = &program.root_artifact().bootstrap_namespaces;
+    for namespace in bootstrap {
         let package = program
             .package(program.namespace(*namespace).package)
             .identity();
-        writeln!(out, "  .slinker_spec_{}()", safe_identifier(&package.name))
-            .expect("String writes cannot fail");
+        writeln!(
+            out,
+            "  linked[[{name}]] <- .slinker_new_namespace({name}, {})",
+            r_string(package.version.as_ref()),
+            name = r_string(&package.name),
+        )
+        .expect("String writes cannot fail");
     }
-    for import in &root_namespace.imports {
-        let target = program.binding(import.target);
-        let target_namespace = program.binding_namespace(import.target);
-        if matches!(
-            program.namespace(target_namespace).state,
-            LinkNamespaceState::Linked(_)
-        ) {
-            let target_package = program
-                .package(program.namespace(target_namespace).package)
-                .identity();
+    for namespace in bootstrap.iter().map(|id| program.namespace(*id)) {
+        let name = &program.package(namespace.package).identity().name;
+        writeln!(
+            out,
+            "  local({{\n    ns <- linked[[{}]]\n    imports <- parent.env(ns)",
+            r_string(name)
+        )
+        .expect("String writes cannot fail");
+        for import in &namespace.imports {
             writeln!(
                 out,
-                "  assign({}, .slinker_binding({}, {}), envir = parent.env(environment(.onLoad)))",
+                "    assign({}, {}, envir = imports)",
                 r_string(&import.local),
-                r_string(&target_package.name),
-                r_string(&target.name)
+                binding_reference(program, import.target)
+            )
+            .expect("String writes cannot fail");
+        }
+        for closure in namespace_closures(program, namespace) {
+            let source = relocated_source(program, program.closure(closure).code)?;
+            writeln!(
+                out,
+                "    eval(parse(text = {}), envir = ns)",
+                r_string(&source)
+            )
+            .expect("String writes cannot fail");
+        }
+        if has_payloads(program, namespace) {
+            writeln!(out, "    .slinker_populate(ns, {})", r_string(name))
+                .expect("String writes cannot fail");
+        }
+        let LinkNamespaceState::Linked(state) = &namespace.state else {
+            unreachable!("bootstrap activates only Linked namespaces");
+        };
+        writeln!(
+            out,
+            "    .slinker_activate(ns, {}, {})\n  }})",
+            r_vector(
+                state
+                    .exports
+                    .bindings()
+                    .iter()
+                    .map(|binding| program.binding(*binding).name.as_str())
+            ),
+            s3_matrix(program, namespace)
+        )
+        .expect("String writes cannot fail");
+    }
+    for import in &root.imports {
+        if matches!(
+            program
+                .namespace(program.binding_namespace(import.target))
+                .state,
+            LinkNamespaceState::Linked(_)
+        ) {
+            writeln!(
+                out,
+                "  assign({}, {}, envir = parent.env(root))",
+                r_string(&import.local),
+                binding_reference(program, import.target)
             )
             .expect("String writes cannot fail");
         }
     }
-    out.push_str(
-        "  root_ns <- environment(.onLoad)\n  if (exists('.slinker_original_on_load', envir = root_ns, inherits = FALSE)) get('.slinker_original_on_load', envir = root_ns, inherits = FALSE)(libname, pkgname)\n}\n",
-    );
+    if has_payloads(program, root) {
+        writeln!(
+            out,
+            "  .slinker_populate(root, {})",
+            r_string(&program.package(root.package).identity().name)
+        )
+        .expect("String writes cannot fail");
+    }
+    if root_on_load.is_some() {
+        out.push_str("  .slinker_original_on_load(libname, pkgname)\n");
+    }
+    out.push_str("}\n");
     Ok(out)
+}
+
+fn namespace_closures(
+    program: &ProgramIr,
+    namespace: &crate::ir::Namespace<crate::ir::LinkPhase>,
+) -> impl Iterator<Item = crate::ir::ClosureId> {
+    namespace.bindings.values().filter_map(|binding| {
+        match initial_value(program, *binding).map(|value| program.value(value)) {
+            Some(Value::Closure(closure)) => Some(*closure),
+            _ => None,
+        }
+    })
+}
+
+fn has_payloads(
+    program: &ProgramIr,
+    namespace: &crate::ir::Namespace<crate::ir::LinkPhase>,
+) -> bool {
+    namespace.bindings.values().any(|binding| {
+        matches!(
+            initial_value(program, *binding).map(|value| program.value(value)),
+            Some(Value::Payload(_))
+        )
+    })
+}
+
+fn initial_value(program: &ProgramIr, binding: crate::ir::BindingId) -> Option<crate::ir::ValueId> {
+    match &program.binding(binding).state {
+        LinkBindingState::Materialized {
+            initial: crate::ir::InitialBindingState::Value(value),
+            ..
+        } => Some(*value),
+        LinkBindingState::Materialized { .. } | LinkBindingState::External { .. } => None,
+    }
+}
+
+fn binding_reference(program: &ProgramIr, binding: crate::ir::BindingId) -> String {
+    let namespace = program.namespace(program.binding_namespace(binding));
+    let package = r_string(&program.package(namespace.package).identity().name);
+    let name = r_string(&program.binding(binding).name);
+    match namespace.state {
+        LinkNamespaceState::External { .. } => format!("getExportedValue({package}, {name})"),
+        LinkNamespaceState::Root(_) | LinkNamespaceState::Linked(_) => {
+            format!("get({name}, envir = asNamespace({package}), inherits = FALSE)")
+        }
+    }
+}
+
+fn s3_matrix(
+    program: &ProgramIr,
+    namespace: &crate::ir::Namespace<crate::ir::LinkPhase>,
+) -> String {
+    let rows = namespace
+        .s3_registrations
+        .iter()
+        .map(|registration| program.s3_registration(*registration))
+        .collect::<Vec<_>>();
+    let cells = rows
+        .iter()
+        .map(|row| r_string(&row.generic.name))
+        .chain(rows.iter().map(|row| r_string(&row.class)))
+        .chain(
+            rows.iter()
+                .map(|row| r_string(&program.binding(row.method).name)),
+        )
+        .chain(rows.iter().map(|row| {
+            row.generic.package.map_or_else(
+                || "NA_character_".to_owned(),
+                |package| r_string(&program.package(package).identity().name),
+            )
+        }))
+        .collect::<Vec<_>>();
+    format!("matrix(as.character(c({})), ncol = 4L)", cells.join(", "))
+}
+
+fn r_vector<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    format!(
+        "as.character(c({}))",
+        values.map(r_string).collect::<Vec<_>>().join(", ")
+    )
 }
 
 fn render_namespace(program: &ProgramIr) -> String {
@@ -630,32 +663,17 @@ fn relocated_source(
     for (site, relocation) in relocations {
         let occurrence = code_ir.occurrence(site.occurrence);
         let replacement = match relocation {
-            Relocation::Binding { target, access, .. } => {
-                let binding = program.binding(*target);
-                let namespace = program.namespace(program.binding_namespace(*target));
-                let package = program.package(namespace.package).identity();
-                match namespace.state {
-                    LinkNamespaceState::Linked(_) => format!(
-                        ".slinker_binding({}, {})",
-                        r_string(&package.name),
-                        r_string(&binding.name)
-                    ),
-                    LinkNamespaceState::Root(_) | LinkNamespaceState::External { .. } => {
-                        match access {
-                            crate::ir::ExternalBindingAccess::Exported => format!(
-                                "getExportedValue({}, {})",
-                                r_string(&package.name),
-                                r_string(&binding.name)
-                            ),
-                            crate::ir::ExternalBindingAccess::Internal => format!(
-                                "get({}, envir = asNamespace({}), inherits = FALSE)",
-                                r_string(&binding.name),
-                                r_string(&package.name)
-                            ),
-                        }
-                    }
+            Relocation::Binding { target, access, .. } => match access {
+                crate::ir::ExternalBindingAccess::Exported => binding_reference(program, *target),
+                crate::ir::ExternalBindingAccess::Internal => {
+                    let namespace = program.namespace(program.binding_namespace(*target));
+                    format!(
+                        "get({}, envir = asNamespace({}), inherits = FALSE)",
+                        r_string(&program.binding(*target).name),
+                        r_string(&program.package(namespace.package).identity().name)
+                    )
                 }
-            }
+            },
             Relocation::Namespace { target, .. } => {
                 let package = program
                     .package(program.namespace(*target).package)
@@ -690,9 +708,10 @@ fn relocated_source(
                 let resource = program.resource(*target);
                 let package = program.package(resource.package).identity();
                 format!(
-                    ".slinker_resource({}, {})",
+                    "system.file(\"slinker\", \"resources\", {}, {}, package = {})",
                     r_string(&package.name),
-                    r_string(&resource.path)
+                    r_string(&resource.path),
+                    r_string(&program.package(program.root_package()).identity().name)
                 )
             }
         };
@@ -804,19 +823,6 @@ fn rename_assignment(source: &str, replacement: &str) -> String {
     )
 }
 
-fn safe_identifier(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn r_string(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -843,22 +849,6 @@ fn r_binding_name(value: &str) -> String {
     } else {
         format!("`{}`", value.replace('`', "\\`"))
     }
-}
-
-fn payload_key(program: &ProgramIr, payload: &PayloadRef) -> String {
-    use sha2::Digest as _;
-    let identity = program.package(payload.package).identity();
-    let mut hash = sha2::Sha256::new();
-    hash.update(identity.name.as_bytes());
-    hash.update([0]);
-    hash.update(identity.image_fingerprint.0.as_bytes());
-    hash.update([0]);
-    hash.update(payload.locator.root.as_bytes());
-    for step in &payload.locator.path {
-        hash.update(format!("{step:?}").as_bytes());
-        hash.update([0]);
-    }
-    hex::encode(hash.finalize())
 }
 
 const GENERATED_RUNTIME: &str = r#"
@@ -889,16 +879,19 @@ const GENERATED_RUNTIME: &str = r#"
   .Internal(registerNamespace(name, namespace))
   namespace
 }
-.slinker_binding <- function(package, name) get(name, envir = asNamespace(package), inherits = FALSE)
-.slinker_payload <- function(key) readRDS(system.file("slinker", "payload", paste0(key, ".rds"), package = .slinker_root_package))
-.slinker_finish_namespace <- function(namespace, exports) {
-  if (length(exports)) namespaceExport(namespace, exports)
+.slinker_populate <- function(namespace, package) {
+  bundle <- system.file("slinker", "payload", paste0(package, ".rds"), package = .slinker_root_package, mustWork = TRUE)
+  invisible(list2env(readRDS(bundle), envir = namespace))
+}
+.slinker_activate <- function(namespace, exports, s3) {
+  name <- unname(getNamespaceName(namespace))
+  if (nrow(s3)) registerS3methods(s3, name, namespace)
   if (exists(".onLoad", envir = namespace, inherits = FALSE)) {
-    get(".onLoad", envir = namespace, inherits = FALSE)("", unname(getNamespaceName(namespace)))
+    get(".onLoad", envir = namespace, inherits = FALSE)("", name)
   }
+  if (length(exports)) namespaceExport(namespace, exports)
   lockEnvironment(namespace, TRUE)
   lockEnvironment(parent.env(namespace), TRUE)
   invisible(namespace)
 }
-.slinker_resource <- function(package, path) system.file("slinker", "resources", package, path, package = environmentName(topenv(parent.frame())))
 "#;

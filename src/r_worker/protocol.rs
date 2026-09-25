@@ -73,10 +73,10 @@ pub enum WorkerRequest {
         package: PackageSpec,
         name: String,
     },
-    SerializeBinding {
+    SerializeBundle {
         request_id: u64,
         package: PackageSpec,
-        name: String,
+        names: Vec<String>,
     },
     ValidateSyntax {
         request_id: u64,

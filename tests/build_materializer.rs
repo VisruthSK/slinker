@@ -234,6 +234,59 @@ fn explicit_external_promotes_declared_suggests_contract() {
 }
 
 #[test]
+fn private_environments_and_registrations_survive_linking() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let state_code = "counter <- local({\n  n <- 0L\n  function() {\n    n <<- n + 1L\n    n\n  }\n})\nstore <- local({\n  value <- NULL\n  list(get = function() value, set = function(x) value <<- x)\n})\nget_value <- store$get\nset_value <- store$set\nmake <- function() structure(list(), class = 'tinystate')\nformat.tinystate <- function(x, ...) 'formatted tinystate'\nunused <- function() stop('never linked')\n";
+    let dependency_source = fixture.path().join("tinystate");
+    write_package(
+        &dependency_source,
+        "tinystate",
+        "",
+        "export(counter, get_value, set_value, make, unused)\nS3method(format, tinystate)\n",
+        state_code,
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+
+    let root_source = fixture.path().join("stateroot");
+    write_package(
+        &root_source,
+        "stateroot",
+        "Imports: tinystate\n",
+        "importFrom(tinystate, counter, get_value, set_value, make)\nexport(run, local_counter)\n",
+        "run <- function() {\n  counter()\n  set_value(7)\n  c(counter(), get_value(), format(make()))\n}\nlocal_counter <- local({\n  n <- 10L\n  function() {\n    n <<- n + 1L\n    n\n  }\n})\n",
+    );
+    let output = fixture.path().join("generated-stateroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .env("R_HOME", &r_home)
+        .output()
+        .expect("run private environment build");
+    assert_success(&result, "slinker build private environment fixture");
+
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &output, &validation);
+    run_r(
+        &r_home,
+        &validation,
+        r#"
+        library(stateroot)
+        stopifnot(identical(run(), c("2", "7", "formatted tinystate")))
+        stopifnot(identical(local_counter(), 11L), identical(local_counter(), 12L))
+        stopifnot(!exists("unused", envir = asNamespace("tinystate"), inherits = FALSE))
+        stopifnot(length(find.package("tinystate", quiet = TRUE)) == 0L)
+        "#,
+    );
+}
+
+#[test]
 fn real_pure_r_packages_build_install_and_run() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");
@@ -261,8 +314,11 @@ fn real_pure_r_packages_build_install_and_run() {
         r#"
         library(praise)
         stopifnot(exists(".slinker_target", envir = asNamespace("praise"), inherits = FALSE))
-        stopifnot(grepl("^You are [a-z]+!$", praise()))
-        stopifnot(grepl("^[A-Z]+ [a-z]+$", praise("${ADVERB} ${adjective}")))
+        parts <- praise:::praise_parts
+        stopifnot(praise("${adjective}") %in% parts$adjective)
+        exclamation <- praise("${EXCLAMATION}")
+        stopifnot(identical(exclamation, toupper(exclamation)))
+        stopifnot(tolower(exclamation) %in% parts$exclamation)
         library(pkgconfig)
         configure <- function() {
           set_config(greeting = "hello")

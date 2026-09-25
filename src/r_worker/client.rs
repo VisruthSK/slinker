@@ -152,16 +152,16 @@ impl WorkerClient {
         }
     }
 
-    pub(crate) fn serialize_binding(
+    pub(crate) fn serialize_bundle(
         &mut self,
         package: PackageSpec,
-        name: &str,
+        names: Vec<String>,
     ) -> Result<Vec<u8>> {
         let request_id = self.request_id();
-        match self.exchange(&WorkerRequest::SerializeBinding {
+        match self.exchange(&WorkerRequest::SerializeBundle {
             request_id,
             package,
-            name: name.to_owned(),
+            names,
         })? {
             WorkerResponse::Payload {
                 request_id: response_id,
@@ -276,13 +276,16 @@ fn request_context(request: &WorkerRequest) -> String {
             "request {request_id} binding {}::{name} {} {}",
             package.name, package.version, package.image_fingerprint
         ),
-        WorkerRequest::SerializeBinding {
+        WorkerRequest::SerializeBundle {
             request_id,
             package,
-            name,
+            names,
         } => format!(
-            "request {request_id} payload {}::{name} {} {}",
-            package.name, package.version, package.image_fingerprint
+            "request {request_id} payload bundle of {} {} bindings {} {}",
+            package.name,
+            names.len(),
+            package.version,
+            package.image_fingerprint
         ),
         WorkerRequest::ValidateSyntax { request_id, .. } => {
             format!("request {request_id} target syntax validation")

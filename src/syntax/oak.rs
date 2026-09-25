@@ -630,10 +630,29 @@ fn translate_index(
         &for_regions,
         &if_regions,
     );
+    let is_suppressed = |reference: &NameRef, (name, start, end): &(String, usize, usize)| {
+        reference.name == *name && reference.span.start == *start && reference.span.end == *end
+    };
+    for effect in &mut effects {
+        let span = &effect.span;
+        let free = |symbol: &String| {
+            suppressed_reference_spans.iter().any(|value| {
+                value.0 == *symbol
+                    && span.start <= value.1
+                    && value.2 <= span.end
+                    && references
+                        .iter()
+                        .any(|reference| is_suppressed(reference, value))
+            })
+        };
+        if !effect.value_symbol.as_ref().is_some_and(free) {
+            effect.value_symbol = None;
+        }
+    }
     references.retain(|reference| {
-        !suppressed_reference_spans.iter().any(|(name, start, end)| {
-            reference.name == *name && reference.span.start == *start && reference.span.end == *end
-        })
+        !suppressed_reference_spans
+            .iter()
+            .any(|value| is_suppressed(reference, value))
     });
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
 
@@ -4217,6 +4236,30 @@ mod tests {
     fn local_parameter_never_becomes_external_reference() {
         let parsed = parse_source("f <- function(x) x");
         assert!(!reference_names(&parsed).contains(&"x"));
+    }
+
+    #[test]
+    fn superassigned_value_is_a_dependency_only_when_free() {
+        let values = |text| {
+            parse_source(text).expressions[0]
+                .effects
+                .iter()
+                .map(|effect| (effect.kind, effect.value_symbol.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let local = values("set <- function(x) value <<- x");
+        let free = values("set <- function() value <<- other");
+
+        assert!(!local.is_empty() && !free.is_empty());
+        assert!(
+            local
+                .iter()
+                .all(|effect| *effect == (SyntaxEffectKind::SuperAssignment, None))
+        );
+        assert!(free.iter().all(|effect| {
+            *effect == (SyntaxEffectKind::SuperAssignment, Some("other".to_owned()))
+        }));
     }
 
     #[test]

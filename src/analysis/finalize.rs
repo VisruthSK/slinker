@@ -8,7 +8,7 @@ use crate::ir::{
     ProgramIr, RootArtifactIr, TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
-use crate::package::{Digest, ImportSpec, PackageAvailability, PackageId, PackageProvider};
+use crate::package::{ImportSpec, PackageAvailability, PackageId, PackageProvider};
 use crate::source::generated_description;
 use crate::syntax::{SourceOrigin, Sources, Span};
 use std::collections::{BTreeSet, HashMap};
@@ -75,6 +75,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .iter()
             .map(|package| (*package, self.packages.role(*package)))
             .collect::<Vec<_>>();
+        let mut retained_bindings = HashMap::<PackageId, BTreeSet<String>>::new();
+        for need in &self.processed {
+            if let Need::Binding { package, binding } = need {
+                retained_bindings
+                    .entry(*package)
+                    .or_default()
+                    .insert(binding.clone());
+            }
+        }
         let mut issues = Vec::new();
         let mut contracts = Vec::new();
         let mut declared = self.declared_external_requirements(&ordered);
@@ -141,31 +150,39 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .namespace_builders
                 .get(&package)
                 .expect("Root/Linked namespace builder");
-            let names = namespace_builder.bindings.clone();
+            let namespace_label = format!("namespace:{package_name}");
+            let mut names = retained_bindings.remove(&package).unwrap_or_default();
+            names.extend(
+                namespace_builder
+                    .registrations
+                    .iter()
+                    .map(|registration| registration.method.clone()),
+            );
             let slots = names.iter().map(|name| {
-                let source =
-                    image
-                        .binding(name)
-                        .map_or(MaterializedSlotSource::Unbound, |binding| {
-                            let locator = InstalledObjectLocator {
-                                root: name.clone(),
-                                path: Vec::new(),
-                            };
-                            binding.closure.as_ref().map_or(
-                                MaterializedSlotSource::Payload {
-                                    locator: locator.clone(),
-                                },
-                                |closure| MaterializedSlotSource::Closure {
+                let source = match image.binding(name) {
+                    None => MaterializedSlotSource::Unbound,
+                    Some(binding) => {
+                        let locator = InstalledObjectLocator {
+                            root: name.clone(),
+                            path: Vec::new(),
+                        };
+                        match (
+                            &binding.closure,
+                            self.normalized_shapes.get(&(package, name.clone())),
+                        ) {
+                            (Some(closure), Some(normalized_shape))
+                                if closure.environment == namespace_label =>
+                            {
+                                MaterializedSlotSource::Closure {
                                     source: Arc::clone(&closure.source),
-                                    normalized_shape: self
-                                        .normalized_shapes
-                                        .get(&(package, name.clone()))
-                                        .cloned()
-                                        .unwrap_or_else(|| Digest::of(closure.source.as_bytes())),
+                                    normalized_shape: normalized_shape.clone(),
                                     locator,
-                                },
-                            )
-                        });
+                                }
+                            }
+                            _ => MaterializedSlotSource::Payload { locator },
+                        }
+                    }
+                };
                 MaterializedSlot {
                     name: name.clone(),
                     source,
@@ -305,29 +322,37 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             })
                         })
                 })
-                .unwrap_or_else(|| *remaining.iter().next().expect("remaining namespace"));
+                .unwrap_or_else(|| {
+                    issues.push(
+                        "Linked namespaces import each other cyclically, which R cannot load"
+                            .into(),
+                    );
+                    *remaining.iter().next().expect("remaining namespace")
+                });
             remaining.remove(&next);
             ordered_linked.push(next);
         }
         for relocation in &self.pending_relocations {
             let source = pending_relocation_span(relocation);
-            let Some(entry) = self.sources.get(&source.source) else {
-                continue;
-            };
             let SourceOrigin::InstalledBinding {
                 package: owner_package,
                 binding: owner_binding,
-            } = &entry.origin
+            } = &self
+                .sources
+                .get(&source.source)
+                .expect("relocation spans come from registered sources")
+                .origin
             else {
-                continue;
+                unreachable!("relocations are planned only inside installed bindings");
             };
-            let Some(owner_namespace) = namespace_ids.get(owner_package) else {
-                continue;
-            };
-            let Some(&owner_binding) = owner_namespace.bindings.get(owner_binding) else {
-                continue;
-            };
-            let Some(code) = builder.binding_code(owner_binding) else {
+            let Some(code) = namespace_ids[owner_package.as_str()]
+                .bindings
+                .get(owner_binding)
+                .and_then(|binding| builder.binding_code(*binding))
+            else {
+                issues.push(format!(
+                    "`{owner_package}::{owner_binding}` needs a code relocation but is not emitted as relocatable source"
+                ));
                 continue;
             };
             let site = builder.add_code_occurrence(code, source.start, source.end);

@@ -64,3 +64,11 @@
     ), collapse = "\n")
   }, character(1L), USE.NAMES = FALSE), collapse = "\n")
 }
+
+.slinker_bundle <- function(image_env, names) {
+  active <- vapply(names, bindingIsActive, logical(1L), env = image_env)
+  if (any(active)) {
+    stop(sprintf("active binding %s cannot be serialized without execution", names[active][[1L]]), call. = FALSE)
+  }
+  serialize(mget(names, envir = image_env, inherits = FALSE), NULL, version = 3L)
+}

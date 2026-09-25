@@ -257,10 +257,10 @@ impl WorkerRuntime {
         })
     }
 
-    fn serialize_binding(
+    fn serialize_bundle(
         &mut self,
         package: &protocol::PackageSpec,
-        name: &str,
+        names: &[String],
     ) -> std::result::Result<Vec<u8>, WorkerOperationError> {
         self.package_index(package)
             .map_err(|message| WorkerOperationError {
@@ -276,51 +276,15 @@ impl WorkerRuntime {
                 code: WorkerErrorCode::PackageMetadata,
                 message,
             })?;
-        let environment = harp::environment::Environment::new(image_environment);
-        if !environment.exists(name) {
-            return Err(WorkerOperationError {
-                code: WorkerErrorCode::MissingBinding,
-                message: format!("installed image has no binding {name}"),
-            });
-        }
-        let binding =
-            harp::environment_iter::Binding::new(&environment, name.into()).map_err(|error| {
-                WorkerOperationError {
-                    code: WorkerErrorCode::BindingForce,
-                    message: error.to_string(),
-                }
-            })?;
-        let object = match binding.value {
-            harp::environment_iter::BindingValue::Active { .. } => {
-                return Err(WorkerOperationError {
-                    code: WorkerErrorCode::BindingForce,
-                    message: "active binding cannot be serialized without execution".into(),
-                });
-            }
-            harp::environment_iter::BindingValue::Promise { promise } => {
-                harp::utils::r_promise_force_with_rollback(promise.sexp).map_err(|error| {
-                    WorkerOperationError {
-                        code: WorkerErrorCode::BindingForce,
-                        message: error.to_string(),
-                    }
-                })?
-            }
-            harp::environment_iter::BindingValue::Altrep { object, .. }
-            | harp::environment_iter::BindingValue::Standard { object } => object,
-        };
-        let serialized = harp::RFunction::new("base", "serialize")
-            .add(object)
-            .add(unsafe { libr::R_NilValue })
-            .param("version", 3)
+        harp::RFunction::new("", ".slinker_bundle")
+            .add(image_environment)
+            .add(names.to_vec())
             .call()
+            .and_then(|bundle| Vec::<u8>::try_from(&bundle))
             .map_err(|error| WorkerOperationError {
                 code: WorkerErrorCode::BindingForce,
-                message: format!("failed to serialize {name}: {error}"),
-            })?;
-        Vec::<u8>::try_from(&serialized).map_err(|error| WorkerOperationError {
-            code: WorkerErrorCode::BindingForce,
-            message: format!("failed to copy serialized {name}: {error}"),
-        })
+                message: format!("failed to serialize payload bundle: {error}"),
+            })
     }
 }
 
@@ -1234,19 +1198,19 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                     Some(name),
                 ),
             },
-            WorkerRequest::SerializeBinding {
+            WorkerRequest::SerializeBundle {
                 request_id,
                 package,
-                name,
+                names,
             } => match runtime.as_mut() {
-                Some(runtime) => match runtime.serialize_binding(&package, &name) {
+                Some(runtime) => match runtime.serialize_bundle(&package, &names) {
                     Ok(bytes) => WorkerResponse::Payload { request_id, bytes },
                     Err(error) => worker_failure(
                         Some(request_id),
                         error.code,
                         error.message,
                         Some(&package),
-                        Some(name),
+                        None,
                     ),
                 },
                 None => worker_failure(
@@ -1254,7 +1218,7 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                     WorkerErrorCode::RuntimeStartup,
                     "Harp worker must receive hello before semantic requests",
                     Some(&package),
-                    Some(name),
+                    None,
                 ),
             },
         };

@@ -985,6 +985,10 @@ impl ProgramBuilder {
         Some(self.closures[closure.index()].code)
     }
 
+    pub fn binding_name(&self, binding: BindingId) -> &str {
+        &self.bindings[binding.index()].name
+    }
+
     pub fn binding_namespace(&self, binding: BindingId) -> NamespaceId {
         match &self.bindings[binding.index()].state {
             LinkBindingState::Materialized { namespace, .. }
