@@ -21,7 +21,6 @@ fn build_defaults_to_current_package_and_emits_installable_source() {
         .arg("--output")
         .arg(&output)
         .current_dir(&source)
-        .env("R_HOME", &r_home)
         .output()
         .expect("run slinker build");
     assert_success(&result, "slinker build root-only");
@@ -75,7 +74,6 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
         .args(["--output"])
         .arg(&output)
         .arg(&root_source)
-        .env("R_HOME", &r_home)
         .output()
         .expect("run linked build");
     assert_success(&result, "slinker build linked fixture");
@@ -137,7 +135,6 @@ fn build_preserves_transitive_external_contract() {
         .args(["--external", "tinyexternal", "--output"])
         .arg(&output)
         .arg(&root_source)
-        .env("R_HOME", &r_home)
         .output()
         .expect("run external build");
     assert_success(&result, "slinker build external fixture");
@@ -200,7 +197,6 @@ fn explicit_external_promotes_declared_suggests_contract() {
         .args(["--external", "suggestedexternal", "--output"])
         .arg(&output)
         .arg(&root_source)
-        .env("R_HOME", &r_home)
         .output()
         .expect("run explicit Suggests build");
     assert_success(&result, "slinker build explicit Suggests");
@@ -235,7 +231,6 @@ fn explicit_external_promotes_declared_suggests_contract() {
 
 #[test]
 fn blocked_preflight_reports_every_blocker_and_publishes_nothing() {
-    let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");
     let source = fixture.path().join("blockedroot");
     write_package(
@@ -250,7 +245,6 @@ fn blocked_preflight_reports_every_blocker_and_publishes_nothing() {
         .args(["build", "--output"])
         .arg(&output)
         .arg(&source)
-        .env("R_HOME", &r_home)
         .output()
         .expect("run blocked build");
 
@@ -301,7 +295,6 @@ fn private_environments_and_registrations_survive_linking() {
         .arg("--output")
         .arg(&output)
         .arg(&root_source)
-        .env("R_HOME", &r_home)
         .output()
         .expect("run private environment build");
     assert_success(&result, "slinker build private environment fixture");
@@ -338,7 +331,6 @@ fn real_pure_r_packages_build_install_and_run() {
                     .join("tests/fixtures")
                     .join(package),
             )
-            .env("R_HOME", &r_home)
             .output()
             .expect("run slinker build");
         assert_success(&result, package);
@@ -384,7 +376,6 @@ fn install_package(r_home: &Path, package: &Path, library: &Path) {
         .args(["CMD", "INSTALL", "--no-test-load"])
         .arg(format!("--library={}", library.display()))
         .arg(package)
-        .env("R_HOME", r_home)
         .output()
         .expect("R CMD INSTALL");
     assert_success(&output, "R CMD INSTALL");
@@ -404,7 +395,6 @@ fn run_r_output(r_home: &Path, library: &Path, expression: &str) -> Output {
     Command::new(r_executable(r_home))
         .args(["--slave", "--no-save", "--no-restore", "--vanilla", "-f"])
         .arg(script.path())
-        .env("R_HOME", r_home)
         .env("R_LIBS", library)
         .env("R_LIBS_USER", library)
         .env_remove("R_LIBS_SITE")

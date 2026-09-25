@@ -44,11 +44,11 @@ pub fn stage_root(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("R_HOME", r_home)
         .env(
             "R_ENVIRON_USER",
             r_home.join("etc/__slinker_no_user_Renviron__"),
         )
+        .env_remove("R_HOME")
         .env_remove("R_PROFILE_USER")
         .env_remove("R_LIBS_USER")
         .env_remove("R_LIBS_SITE");

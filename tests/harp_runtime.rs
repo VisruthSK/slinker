@@ -159,7 +159,6 @@ fn target_r_libraries(r_home: &Path) -> Vec<PathBuf> {
             "-e",
             "cat(.libPaths(), sep='\\n')",
         ])
-        .env("R_HOME", r_home)
         .env("R_ENVIRON_USER", missing_user)
         .env_remove("R_LIBS")
         .env_remove("R_LIBS_USER")

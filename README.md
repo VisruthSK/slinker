@@ -2,6 +2,18 @@
 
 `slinker` links an R package against the exact installed R library selected by the target R process. Analysis is binding-level and demand-driven: packages and bindings enter the graph only when reachable semantics require them.
 
+## Build
+
+```text
+cd path/to/rootpkg
+slinker build
+slinker build path/to/rootpkg --lib C:/project/renv/library --external dplyr --output out/rootpkg
+```
+
+`build` turns an R source package into another source package whose Linked dependencies are absorbed into it. The source tree is frozen, stage-installed into a private library with the selected R, analyzed, checked against the `PureRStatic` profile, and written to `target/slinker/<Package>` (or `--output`) only if every step succeeds. The result installs with `R CMD INSTALL` and needs only its External dependencies at runtime.
+
+Third-party dependencies are Linked by default; base-priority packages and every `--external` package stay External. The generated `DESCRIPTION` drops Linked packages and declares the intersection of every retained requirement on each External package. A build that the profile cannot realize exactly fails with one report listing every blocker.
+
 ## Analyze
 
 ```text
@@ -48,9 +60,9 @@ Air parses reachable installed closure units with the exact parser revision used
 
 ## Performance
 
-Target capture does not enumerate the installed package universe. Package discovery stays demand-driven, and package location plus fingerprinting are parallelized when a frontier introduces independent package names.
+Target capture does not enumerate the installed package universe. Package discovery stays demand-driven: each package name is located and fingerprinted once, the first time retained code needs it, and that answer, including absence, is frozen for the invocation.
 
-Installed package identities use SHA-256 fingerprints computed from current file bytes. Disposable typed index and per-binding analysis artifacts are stored under cache schema `slinker-analysis-v4`; corrupt or stale entries are cache misses.
+Installed package identities use SHA-256 fingerprints computed from current file bytes. Disposable typed index and per-binding analysis artifacts are stored under cache schema `slinker-analysis-v5`; corrupt or stale entries are cache misses. Binding fragments that mention worker-local private-environment labels are never cached, because those labels identify objects only within one inspection epoch.
 
 Target capture and installed-image work run in isolated Rust worker processes. Each worker owns one single-threaded embedded R runtime loaded from `R_HOME` through Harp/libr; no live R object enters the linker process. Workers reuse synthetic lazy-load environments across requests and never call `loadNamespace()` or package lifecycle hooks.
 
