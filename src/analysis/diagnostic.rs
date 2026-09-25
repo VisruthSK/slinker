@@ -11,6 +11,7 @@ pub enum RejectCode {
     ActiveBinding,
     ArbitraryEvaluation,
     DynamicLookup,
+    InvalidDeclaration,
     DynamicPackageDiscovery,
     DependsAttachmentUnsupported,
     EnvironmentMutation,

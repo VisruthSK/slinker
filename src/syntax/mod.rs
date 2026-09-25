@@ -3,8 +3,9 @@ pub mod oak;
 pub mod source;
 
 pub use facts::{
-    ActiveBindingDef, BindingCertainty, BindingDef, CallSite, CalleeKind, ConstructionArgument,
-    ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, EvalPhase,
+    ActiveBindingDef, BindingCertainty, BindingDeclaration, BindingDef, CallSite, CalleeKind,
+    ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
+    ConstructionTarget, DeclaredDomain, DeclaredValue, EvalPhase, LexicalBindingId, LexicalScopeId,
     NameRef, NameRefKind, PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourceRef,
     SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };

@@ -216,6 +216,37 @@ Sound rules stay unconditional: `registerS3method(..., envir = asNamespace(pkg))
 payload relocations into registered namespaces, Root bindings. Source declarations
 (`declare(slinker(...))`) are programmer contracts, not heuristics, and apply in both modes.
 
+### Source declarations
+
+`declare(slinker(...))` inside a retained closure is a lexical programmer contract, trusted in both
+strict and loose mode:
+
+```r
+f <- function(x) {
+  declare(slinker(x = one_of(s3("foo"), s3("bar", "parent"))))
+  foo::criterion(x)
+}
+```
+
+- Recognized only when `declare` resolves to base (or is `base::declare`); all its arguments are
+  inert (no references, calls, or package references). Unknown declaration languages are ignored.
+- `s3("a", "b")` is one exact class vector; `one_of(...)` lists alternatives. Classes must be
+  literal strings; anything else is an `InvalidDeclaration` issue.
+- Placement inside the function does not matter. Nested functions that capture the same binding
+  intersect their declarations (they can narrow, never widen); a formal of the same name is a
+  different binding. Identity comes from Oak (`LexicalScopeId`, and a `LexicalBindingId` for each
+  `CallSite` symbol argument), and `ParsedRFile::domain_for` computes the effective domain.
+- Calls to an exact namespace callable record an invocation with each argument's domain. A
+  `UseMethod` in a namespace generic records an `S3GenericKey { package, name }` summary with its
+  selector formal. When every invocation of the generic is known, only `g.<class>` for the
+  declared classes and `g.default` are retained; an unknown argument, a non-call use of the
+  generic (escape), or a Root export keeps the broad `g.*` sweep. External openness is checked per
+  typed generic and per reachable class.
+- Installed S3 registrations are still retained wholesale (first patch). Separating registration
+  availability from registration demanded by dispatch is the next S3 step, after operators and
+  group generics use the same class domains. The construction interpreter still evaluates the
+  inert `declare()` arguments as unknown calls with no effects.
+
 ### Milestone: slink testthat
 
 A Linked namespace is registered under its original name, and activation fails with

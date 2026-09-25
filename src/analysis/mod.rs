@@ -11,6 +11,7 @@ pub mod need;
 mod object_world;
 pub mod policy;
 mod resolution;
+mod s3;
 mod state;
 
 use crate::Result;

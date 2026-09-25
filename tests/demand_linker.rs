@@ -89,6 +89,7 @@ impl FakeProvider {
                     "match.fun",
                     "do.call",
                     "reg.finalizer",
+                    "declare",
                     "registerS3method",
                     "is.function",
                     "length",
@@ -3420,6 +3421,64 @@ fn closed_generic_retains_every_registered_and_lexical_method() {
         assert!(retained_binding(&plan, "foo", method), "{method}");
     }
     assert!(!retained_binding(&plan, "foo", "unrelated"));
+}
+
+#[test]
+fn declared_receiver_class_narrows_generic_methods() {
+    let analyze = |caller: &str| {
+        let root = package("root", &[("f", Some(caller))]);
+        let foo = package_with!(
+            "foo",
+            &[
+                (
+                    "criterion",
+                    Some("criterion <- function(x) UseMethod(\"criterion\")")
+                ),
+                (
+                    "criterion.character",
+                    Some("criterion.character <- function(x) helper(x)")
+                ),
+                (
+                    "criterion.root_criterion",
+                    Some("criterion.root_criterion <- function(x) special(x)")
+                ),
+                (
+                    "criterion.default",
+                    Some("criterion.default <- function(x) x")
+                ),
+                ("helper", Some("helper <- function(x) x")),
+                ("special", Some("special <- function(x) x")),
+            ],
+            Vec::new(),
+            export("criterion"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "",
+        );
+        Linker::new(FakeProvider::new(vec![root, foo]), 1)
+            .analyze("root")
+            .unwrap()
+    };
+
+    let declared = analyze(
+        "f <- function(x) { declare(slinker(x = s3(\"root_criterion\"))); foo::criterion(x) }",
+    );
+    assert!(declared.blockers().is_empty(), "{:?}", declared.blockers());
+    for retained in ["criterion.root_criterion", "special", "criterion.default"] {
+        assert!(retained_binding(&declared, "foo", retained), "{retained}");
+    }
+    for pruned in ["criterion.character", "helper"] {
+        assert!(!retained_binding(&declared, "foo", pruned), "{pruned}");
+    }
+
+    let undeclared = analyze("f <- function(x) foo::criterion(x)");
+    assert!(retained_binding(&undeclared, "foo", "criterion.character"));
+
+    let escaped = analyze(
+        "f <- function(x) { declare(slinker(x = s3(\"root_criterion\"))); lapply(list(x), foo::criterion) }",
+    );
+    assert!(retained_binding(&escaped, "foo", "criterion.character"));
 }
 
 #[test]

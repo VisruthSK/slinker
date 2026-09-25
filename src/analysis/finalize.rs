@@ -540,21 +540,27 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn finalize_s3_dispatch(&mut self, retained: &BTreeSet<PackageId>) {
         let mut open_registrations = Vec::new();
         for &package in retained {
-            if self.closed_generics.is_empty()
+            if self.s3_generics.is_empty()
                 || self.packages.role(package) != LinkedPackageRole::External
                 || self.packages.is_platform(package)
             {
                 continue;
             }
             match self.packages.index(package) {
-                Ok(index) => open_registrations.extend(
-                    index
-                        .s3
-                        .iter()
-                        .map(|registration| registration.generic.name.clone())
-                        .filter(|generic| self.closed_generics.contains_key(generic))
-                        .map(|generic| (package, generic)),
-                ),
+                Ok(index) => {
+                    open_registrations.extend(index.s3.iter().flat_map(|registration| {
+                        self.s3_generics
+                            .iter()
+                            .filter(|(key, generic)| {
+                                key.name == registration.generic.name
+                                    && registration.generic.package.as_deref().is_none_or(|owner| {
+                                        owner == self.packages.name(key.package)
+                                    })
+                                    && generic.dispatch.reaches(&registration.class)
+                            })
+                            .map(move |(key, _)| (package, key.clone()))
+                    }))
+                }
                 Err(error) => {
                     let node = self.need_node(&Need::Activation { package });
                     self.diagnostic(
@@ -570,10 +576,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         for (external, generic) in open_registrations {
             let message = format!(
-                "External package `{}` registers S3 methods for `{generic}`, so its method set is open",
-                self.packages.name(external)
+                "External package `{}` registers S3 methods for `{}`, so its method set is open",
+                self.packages.name(external),
+                generic.name
             );
-            for (node, package, span) in self.closed_generics[&generic].clone() {
+            for (node, package, span) in self.s3_generics[&generic].sites.clone() {
                 self.diagnostic(
                     node,
                     package,

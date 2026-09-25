@@ -6,6 +6,7 @@ use super::execute::{AbstractValue, ExecutionContext};
 use super::namespace::NamespaceBuilder;
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
+use super::s3::{CallableId, Invocation, S3Generic, S3GenericKey, callable_target};
 use crate::analysis::policy::{DiscoveryPolicy, LinkPolicy};
 use crate::analysis::{
     Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode, S3Id,
@@ -71,7 +72,9 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) assumptions: Vec<Diagnostic>,
     pub(super) pending_relocations: Vec<PendingRelocation>,
     pub(super) dynamic_resource_lookups: Vec<(NodeId, PackageId, Span)>,
-    pub(super) closed_generics: HashMap<String, Vec<(NodeId, PackageId, Span)>>,
+    pub(super) s3_generics: BTreeMap<S3GenericKey, S3Generic>,
+    pub(super) callable_generics: HashMap<CallableId, S3GenericKey>,
+    pub(super) invocations: HashMap<CallableId, Vec<Option<Invocation>>>,
     pub(super) closed_methods: HashSet<(PackageId, String)>,
     pub(super) next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
     pub(super) value_closures: HashSet<NodeId>,
@@ -127,7 +130,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             assumptions: Vec::new(),
             pending_relocations: Vec::new(),
             dynamic_resource_lookups: Vec::new(),
-            closed_generics: HashMap::new(),
+            s3_generics: BTreeMap::new(),
+            callable_generics: HashMap::new(),
+            invocations: HashMap::new(),
             closed_methods: HashSet::new(),
             next_method_calls: Vec::new(),
             value_closures: HashSet::new(),
@@ -1064,6 +1069,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 SemanticIssueKind::AmbiguousAttachOrder => RejectCode::SemanticAmbiguity,
                 SemanticIssueKind::UninstalledPackage => RejectCode::MissingDependency,
                 SemanticIssueKind::SourceCycle => RejectCode::SemanticAmbiguity,
+                SemanticIssueKind::InvalidDeclaration => RejectCode::InvalidDeclaration,
             };
             self.diagnostic(
                 node,
@@ -1158,6 +1164,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 {
                     continue;
                 }
+                if let Some(callable) = callable_target(&resolved)
+                    && !expression.calls.iter().any(|call| {
+                        call.qualified_package.is_none() && call.span.start == reference.span.start
+                    })
+                {
+                    self.record_escape(callable)?;
+                }
                 self.require_resolved(
                     node,
                     package,
@@ -1171,6 +1184,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     continue;
                 }
                 self.namespace_access(node, package, reference)?;
+                if let Some(foreign) = self.known_package(&reference.package)
+                    && !expression.calls.iter().any(|call| {
+                        call.qualified_package.is_some() && call.span.start == reference.span.start
+                    })
+                {
+                    self.record_escape(CallableId {
+                        package: foreign,
+                        binding: reference.symbol.clone(),
+                    })?;
+                }
             }
             for resource in &expression.resource_refs {
                 if !self.guards_active(package, image, &resource.guards)? {
@@ -1190,6 +1213,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 if !self.guards_active(package, image, &call.guards)? {
                     continue;
                 }
+                if let Some(callable) =
+                    self.call_target(package, image, lexical_environment, call)?
+                {
+                    self.record_invocation(parsed, callable, call)?;
+                }
                 if matches!(call.callee.as_str(), "UseMethod" | "NextMethod")
                     && call.qualified_package.is_none()
                     && matches!(
@@ -1202,7 +1230,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         Resolution::Static(BindingTarget::Base)
                     )
                 {
-                    self.s3_dispatch(node, package, binding, call)?;
+                    self.s3_dispatch(
+                        node,
+                        package,
+                        binding,
+                        lexical_environment,
+                        Some(&expression.parameters),
+                        call,
+                    )?;
                     continue;
                 }
                 self.semantic_call(node, package, image, binding, lexical_environment, call)?;
@@ -1238,78 +1273,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }
                 }
             }
-        }
-        Ok(())
-    }
-
-    pub(super) fn s3_dispatch(
-        &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
-        call: &CallSite,
-    ) -> Result<()> {
-        if call.callee == "NextMethod" {
-            self.next_method_calls
-                .push((from, current, binding.to_owned(), call.span.clone()));
-            return Ok(());
-        }
-        let Some(generic) = static_string_arg(call) else {
-            self.diagnostic(
-                from,
-                current,
-                Some(binding),
-                RejectCode::ObjectSystem,
-                "UseMethod generic is not a static string",
-                Some(call.span.clone()),
-            );
-            return Ok(());
-        };
-        let sites = self.closed_generics.entry(generic.to_owned()).or_default();
-        sites.push((from, current, call.span.clone()));
-        if sites.len() > 1 {
-            return Ok(());
-        }
-        let mut namespaces = self
-            .images
-            .keys()
-            .copied()
-            .filter(|package| !self.packages.is_external(*package))
-            .collect::<Vec<_>>();
-        namespaces.sort_unstable();
-        for namespace in namespaces {
-            self.retain_s3_methods(from, namespace, generic)?;
-        }
-        Ok(())
-    }
-
-    fn retain_s3_methods(&mut self, from: NodeId, package: PackageId, generic: &str) -> Result<()> {
-        let image = self.image(package)?;
-        let prefix = format!("{generic}.");
-        let registered = self.namespace_builders[&package]
-            .registrations
-            .iter()
-            .filter(|registration| registration.generic.name == generic)
-            .map(|registration| (registration.method.clone(), EdgeKind::S3Registration));
-        let methods = image
-            .index
-            .binding_names
-            .iter()
-            .filter(|name| name.starts_with(&prefix))
-            .map(|name| (name.clone(), EdgeKind::Lexical))
-            .chain(registered)
-            .collect::<BTreeMap<_, _>>();
-        for (method, kind) in methods {
-            self.closed_methods.insert((package, method.clone()));
-            self.require(
-                from,
-                Need::Binding {
-                    package,
-                    binding: method.clone(),
-                },
-                kind,
-                format!("closed S3 generic `{generic}` can dispatch to `{method}`"),
-            );
         }
         Ok(())
     }
@@ -1575,14 +1538,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
         }
 
-        let closed_generics = self
-            .closed_generics
-            .iter()
-            .map(|(generic, sites)| (generic.clone(), sites[0].0))
-            .collect::<Vec<_>>();
-        for (generic, from) in closed_generics {
-            self.retain_s3_methods(from, id, &generic)?;
-        }
+        self.retain_s3_methods_on_activation(id)?;
 
         for native in &index.dynlibs {
             self.require(
@@ -2497,7 +2453,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             "packageVersion" => self.identity_query(from, current, call, true)?,
             "find.package" => self.identity_query(from, current, call, false)?,
-            "UseMethod" | "NextMethod" => self.s3_dispatch(from, current, binding, call)?,
+            "UseMethod" | "NextMethod" => {
+                self.s3_dispatch(from, current, binding, lexical_environment, None, call)?;
+            }
             ".Call" | ".External" | ".C" | ".Fortran" => {
                 if let Some(target) =
                     self.native_component_for_call(current, image, lexical_environment, call)?

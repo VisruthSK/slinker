@@ -11,10 +11,11 @@
 //! environment or general control-flow evaluator.
 
 use crate::syntax::facts::{
-    ActiveBindingDef, CallSite, CalleeKind, ConstructionArgument, ConstructionCall,
-    ConstructionExpr, ConstructionExprKind, ConstructionTarget, EvalPhase, NameRef, NameRefKind,
-    PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourceRef, SemanticIssue,
-    SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    ActiveBindingDef, BindingDeclaration, CallSite, CalleeKind, ConstructionArgument,
+    ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredDomain,
+    DeclaredValue, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind, PackageGuard,
+    PackageRef, ParsedExpression, ParsedRFile, ResourceRef, SemanticIssue, SemanticIssueKind,
+    StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span};
 use crate::{Error, Result};
@@ -26,7 +27,7 @@ use oak_semantic::semantic_index::{
     UseId,
 };
 use oak_semantic::{EffectsHandlers, ImportsResolver, SourceResolution, build_index};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub trait RParser {
     fn parse(&self, source: SourceId, text: &str) -> Result<ParsedRFile>;
@@ -479,6 +480,224 @@ fn base_callee(
     identifier_callee(call).filter(|(name, _)| context.resolves_to_base(name))
 }
 
+struct LexicalScopes {
+    ids: HashMap<ScopeId, LexicalScopeId>,
+    parents: Vec<Option<LexicalScopeId>>,
+}
+
+impl LexicalScopes {
+    fn new(index: &SemanticIndex) -> Self {
+        let ids = index
+            .scope_ids()
+            .enumerate()
+            .map(|(position, scope)| (scope, LexicalScopeId(position as u32)))
+            .collect::<HashMap<_, _>>();
+        let parents = index
+            .scope_ids()
+            .map(|scope| index.scope(scope).parent().map(|parent| ids[&parent]))
+            .collect();
+        Self { ids, parents }
+    }
+
+    fn at(&self, index: &SemanticIndex, offset: usize) -> (ScopeId, LexicalScopeId) {
+        let (scope, _) = index.scope_at((offset as u32).into());
+        (scope, self.ids[&scope])
+    }
+
+    fn binding(
+        &self,
+        index: &SemanticIndex,
+        name: &str,
+        scope: ScopeId,
+    ) -> Option<LexicalBindingId> {
+        index
+            .resolve(name, scope)
+            .map(|(owner, _, _)| LexicalBindingId {
+                defining_scope: self.ids[&owner],
+                name: name.to_owned(),
+            })
+    }
+
+    fn call_context(
+        &self,
+        index: &SemanticIndex,
+        offset: usize,
+        args: &[Option<StaticArg>],
+    ) -> (LexicalScopeId, Vec<Option<LexicalBindingId>>) {
+        let (scope, lexical) = self.at(index, offset);
+        let bindings = args
+            .iter()
+            .map(|argument| match argument {
+                Some(StaticArg::Symbol(name)) => self.binding(index, name, scope),
+                Some(StaticArg::String(_)) | None => None,
+            })
+            .collect();
+        (lexical, bindings)
+    }
+}
+
+struct Declarations {
+    declarations: Vec<BindingDeclaration>,
+    inert: Vec<std::ops::Range<usize>>,
+    issues: Vec<SemanticIssue>,
+}
+
+impl Declarations {
+    fn is_inert(&self, offset: usize) -> bool {
+        self.inert.iter().any(|range| range.contains(&offset))
+    }
+}
+
+fn collect_declarations(
+    source: &SourceId,
+    text: &str,
+    root: &RRoot,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    scopes: &LexicalScopes,
+) -> Declarations {
+    let mut collected = Declarations {
+        declarations: Vec::new(),
+        inert: Vec::new(),
+        issues: Vec::new(),
+    };
+    for call in root.syntax().descendants().filter_map(RCall::cast) {
+        let start = text_offset(call.syntax().text_trimmed_range().start());
+        let (scope, lexical) = scopes.at(index, start);
+        let Ok(function) = call.function() else {
+            continue;
+        };
+        let is_declare = match &function {
+            AnyRExpression::RIdentifier(_) => identifier_callee(&call).is_some_and(|(name, _)| {
+                name == "declare"
+                    && context.resolves_to_base(&name)
+                    && index.resolve(&name, scope).is_none()
+            }),
+            _ => ast_text(text, &function) == "base::declare",
+        };
+        let Ok(arguments) = call.arguments() else {
+            continue;
+        };
+        if !is_declare {
+            continue;
+        }
+        for argument in arguments
+            .items()
+            .iter()
+            .filter_map(|argument| argument.ok())
+        {
+            let Some(value) = argument.value() else {
+                continue;
+            };
+            let range = value.syntax().text_trimmed_range();
+            collected
+                .inert
+                .push(text_offset(range.start())..text_offset(range.end()));
+            let AnyRExpression::RCall(language) = value else {
+                continue;
+            };
+            if identifier_callee(&language).is_none_or(|(name, _)| name != "slinker") {
+                continue;
+            }
+            collect_slinker_declaration(
+                source,
+                text,
+                index,
+                scopes,
+                (scope, lexical),
+                &language,
+                &mut collected,
+            );
+        }
+    }
+    collected
+}
+
+fn collect_slinker_declaration(
+    source: &SourceId,
+    text: &str,
+    index: &SemanticIndex,
+    scopes: &LexicalScopes,
+    (scope, lexical): (ScopeId, LexicalScopeId),
+    language: &RCall,
+    collected: &mut Declarations,
+) {
+    let Ok(arguments) = language.arguments() else {
+        return;
+    };
+    for argument in arguments
+        .items()
+        .iter()
+        .filter_map(|argument| argument.ok())
+    {
+        let span = ast_span(source, &argument);
+        let name = argument
+            .name_clause()
+            .and_then(|clause| clause.name().ok())
+            .map(|name| ast_text(text, &name));
+        let domain = argument
+            .value()
+            .and_then(|value| declared_values(text, &value));
+        let issue = match (name, domain) {
+            (Some(name), Some(values)) => match scopes.binding(index, &name, scope) {
+                Some(binding) => {
+                    collected.declarations.push(BindingDeclaration {
+                        declaring_scope: lexical,
+                        binding,
+                        domain: DeclaredDomain::Exact(values),
+                        span,
+                    });
+                    continue;
+                }
+                None => format!("declared name `{name}` is not a lexical binding in this function"),
+            },
+            (None, _) => "slinker() declarations must name the binding they constrain".to_owned(),
+            (Some(name), None) => format!(
+                "declaration for `{name}` must be s3(\"class\", ...) or one_of(s3(...), ...) with literal classes"
+            ),
+        };
+        collected.issues.push(SemanticIssue {
+            kind: SemanticIssueKind::InvalidDeclaration,
+            message: issue,
+            span: Some(span),
+        });
+    }
+}
+
+fn declared_values(text: &str, value: &AnyRExpression) -> Option<Vec<DeclaredValue>> {
+    let AnyRExpression::RCall(call) = value else {
+        return None;
+    };
+    let (callee, _) = identifier_callee(call)?;
+    let arguments = call
+        .arguments()
+        .ok()?
+        .items()
+        .iter()
+        .map(|argument| {
+            let argument = argument.ok()?;
+            argument.name_clause().is_none().then_some(())?;
+            argument.value()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    match callee.as_str() {
+        "s3" if !arguments.is_empty() => arguments
+            .iter()
+            .map(|class| match static_arg(ast_text(text, class).trim()) {
+                Some(StaticArg::String(class)) => Some(class),
+                Some(StaticArg::Symbol(_)) | None => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|classes| vec![DeclaredValue::S3Class(classes)]),
+        "one_of" if !arguments.is_empty() => arguments
+            .iter()
+            .map(|alternative| declared_values(text, alternative))
+            .collect::<Option<Vec<_>>>()
+            .map(|alternatives| alternatives.into_iter().flatten().collect()),
+        _ => None,
+    }
+}
+
 fn sole_positional_argument(call: &RCall) -> Option<AnyRExpression> {
     let arguments = call.arguments().ok()?.items();
     let mut items = arguments.iter();
@@ -500,11 +719,16 @@ fn translate_index(
     root: &RRoot,
     index: &SemanticIndex,
 ) -> ParsedRFile {
+    let scopes = LexicalScopes::new(index);
+    let declarations = collect_declarations(&source, text, root, context, index, &scopes);
     let mut live_uses = Vec::new();
 
     for scope in index.scope_ids() {
         let phase = phase_for_scope(index, scope);
         for (use_id, use_site) in index.uses(scope).iter() {
+            if declarations.is_inert(text_offset(use_site.range().start())) {
+                continue;
+            }
             let symbol = index.symbols(scope).symbol(use_site.symbol());
             let name = symbol.name().to_owned();
             if is_frame_intrinsic(&name) {
@@ -626,16 +850,14 @@ fn translate_index(
         let Some(raw) = call_after_name(text, live_use.start, live_use.end) else {
             continue;
         };
+        let args = static_args(&raw);
+        let (scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
         live_calls.push(LiveCall {
             site: CallSite {
                 callee: live_use.name.clone(),
                 callee_kind: live_use.callee_kind,
                 qualified_package: None,
-                args: raw
-                    .args
-                    .iter()
-                    .map(|argument| argument.static_arg.clone())
-                    .collect(),
+                args,
                 arg_names: raw
                     .args
                     .iter()
@@ -643,6 +865,8 @@ fn translate_index(
                     .collect(),
                 arg_spans: argument_spans(&source, &raw.args),
                 local_closure_args: local_closure_arguments(text, index, &live_uses, &raw.args),
+                scope,
+                arg_bindings,
                 phase: live_use.phase,
                 guards: Vec::new(),
                 span: Span::new(source.clone(), raw.start, raw.end),
@@ -653,6 +877,9 @@ fn translate_index(
 
     for access in index.namespace_accesses() {
         let start = text_offset(access.offset());
+        if declarations.is_inert(start) {
+            continue;
+        }
         let (access_end, internal) = namespace_extent(text, start).unwrap_or_else(|| {
             let operator = match access.kind() {
                 NamespaceAccessKind::Export => 2,
@@ -673,16 +900,14 @@ fn translate_index(
 
         if let Some(raw) = call_after_name(text, start, access_end) {
             let (scope, _) = index.scope_at(access.offset());
+            let args = static_args(&raw);
+            let (lexical_scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
             live_calls.push(LiveCall {
                 site: CallSite {
                     callee: access.symbol().to_owned(),
                     callee_kind: CalleeKind::DefinitelyExternal,
                     qualified_package: Some(access.package().to_owned()),
-                    args: raw
-                        .args
-                        .iter()
-                        .map(|argument| argument.static_arg.clone())
-                        .collect(),
+                    args,
                     arg_names: raw
                         .args
                         .iter()
@@ -690,6 +915,8 @@ fn translate_index(
                         .collect(),
                     arg_spans: argument_spans(&source, &raw.args),
                     local_closure_args: local_closure_arguments(text, index, &live_uses, &raw.args),
+                    scope: lexical_scope,
+                    arg_bindings,
                     phase: phase_for_scope(index, scope),
                     guards: Vec::new(),
                     span: Span::new(source.clone(), raw.start, raw.end),
@@ -715,6 +942,9 @@ fn translate_index(
             continue;
         };
         let span = ast_span(&source, &binary);
+        if declarations.is_inert(span.start) {
+            continue;
+        }
         let (scope, _) = index.scope_at(binary.range().start());
         if operator.len() > 2 && operator.starts_with('%') && operator.ends_with('%') {
             let range = operator_token.text_trimmed_range();
@@ -739,15 +969,19 @@ fn translate_index(
         };
         let (left_arg, left_span) = argument(&left);
         let (right_arg, right_span) = argument(&right);
+        let args = vec![left_arg, right_arg];
+        let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &args);
         live_calls.push(LiveCall {
             site: CallSite {
                 callee: operator.clone(),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
-                args: vec![left_arg, right_arg],
+                args,
                 arg_names: vec![None, None],
                 arg_spans: vec![left_span, right_span],
                 local_closure_args: vec![false, false],
+                scope: lexical_scope,
+                arg_bindings,
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
                 span: span.clone(),
@@ -818,7 +1052,8 @@ fn translate_index(
 
     let (parameters, construction) = collect_construction(source.clone(), text, root, &live_calls);
     let calls = live_calls.into_iter().map(|call| call.site).collect();
-    let issues = translate_diagnostics(source.clone(), index);
+    let mut issues = translate_diagnostics(source.clone(), index);
+    issues.extend(declarations.issues);
 
     ParsedRFile {
         expressions: vec![ParsedExpression {
@@ -834,6 +1069,8 @@ fn translate_index(
             construction,
         }],
         issues,
+        scope_parents: scopes.parents,
+        declarations: declarations.declarations,
     }
 }
 
@@ -3565,6 +3802,13 @@ fn static_symbol_range(text: &str, start: usize, end: usize) -> Option<(String, 
     }
 }
 
+fn static_args(raw: &RawCall) -> Vec<Option<StaticArg>> {
+    raw.args
+        .iter()
+        .map(|argument| argument.static_arg.clone())
+        .collect()
+}
+
 fn call_after_name(text: &str, name_start: usize, name_end: usize) -> Option<RawCall> {
     let open = skip_trivia(text, name_end);
     if text.as_bytes().get(open).copied()? != b'(' {
@@ -4451,6 +4695,78 @@ mod tests {
         let names = reference_names(&parsed);
         assert!(names.contains(&"substr2<-"));
         assert!(!names.contains(&"substr2"));
+    }
+
+    #[test]
+    fn slinker_declaration_is_an_inert_lexical_contract() {
+        let parsed = parse_source(
+            "f <- function(x) { print(x); declare(slinker(x = one_of(s3('foo'), s3('bar', 'parent')))) }",
+        );
+        let names = reference_names(&parsed);
+        for inert in ["slinker", "one_of", "s3"] {
+            assert!(!names.contains(&inert), "{inert}");
+        }
+        assert!(
+            parsed.expressions[0]
+                .calls
+                .iter()
+                .all(|call| !["slinker", "s3", "one_of"].contains(&call.callee.as_str()))
+        );
+        let [declaration] = parsed.declarations.as_slice() else {
+            panic!("{:?}", parsed.declarations);
+        };
+        assert_eq!(declaration.binding.name, "x");
+        assert_eq!(
+            declaration.domain,
+            DeclaredDomain::Exact(vec![
+                DeclaredValue::S3Class(vec!["foo".into()]),
+                DeclaredValue::S3Class(vec!["bar".into(), "parent".into()]),
+            ])
+        );
+        let print = parsed.expressions[0]
+            .calls
+            .iter()
+            .find(|call| call.callee == "print")
+            .unwrap();
+        assert_eq!(
+            parsed.domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+            Some(vec![
+                DeclaredValue::S3Class(vec!["foo".into()]),
+                DeclaredValue::S3Class(vec!["bar".into(), "parent".into()]),
+            ])
+        );
+    }
+
+    #[test]
+    fn nested_declaration_narrows_the_captured_binding() {
+        let parsed = parse_source(
+            "f <- function(x) { declare(slinker(x = one_of(s3('foo'), s3('bar')))); g <- function() { declare(slinker(x = s3('foo'))); print(x) } }",
+        );
+        let print = parsed.expressions[0]
+            .calls
+            .iter()
+            .find(|call| call.callee == "print")
+            .unwrap();
+        assert_eq!(
+            parsed.domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+            Some(vec![DeclaredValue::S3Class(vec!["foo".into()])])
+        );
+    }
+
+    #[test]
+    fn shadowed_or_malformed_declarations_are_not_contracts() {
+        let shadowed = parse_source(
+            "f <- function(x) { declare <- function(...) NULL; declare(slinker(x = s3('foo'))) }",
+        );
+        assert!(shadowed.declarations.is_empty());
+        let malformed = parse_source("f <- function(x) declare(slinker(x = s3(klass)))");
+        assert!(malformed.declarations.is_empty());
+        assert!(
+            malformed
+                .issues
+                .iter()
+                .any(|issue| issue.kind == SemanticIssueKind::InvalidDeclaration)
+        );
     }
 
     #[test]

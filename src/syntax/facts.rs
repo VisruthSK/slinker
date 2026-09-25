@@ -101,6 +101,10 @@ pub struct CallSite {
     /// Whether Oak proves the aligned symbol argument is a locally assigned closure.
     #[serde(default)]
     pub local_closure_args: Vec<bool>,
+    #[serde(default)]
+    pub scope: LexicalScopeId,
+    #[serde(default)]
+    pub arg_bindings: Vec<Option<LexicalBindingId>>,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
     pub span: Span,
@@ -249,6 +253,7 @@ pub enum SemanticIssueKind {
     AmbiguousAttachOrder,
     UninstalledPackage,
     SourceCycle,
+    InvalidDeclaration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +284,10 @@ pub struct ParsedRFile {
     pub expressions: Vec<ParsedExpression>,
     #[serde(default)]
     pub issues: Vec<SemanticIssue>,
+    #[serde(default)]
+    pub scope_parents: Vec<Option<LexicalScopeId>>,
+    #[serde(default)]
+    pub declarations: Vec<BindingDeclaration>,
 }
 
 impl ParsedRFile {
@@ -286,5 +295,73 @@ impl ParsedRFile {
         self.expressions
             .iter()
             .flat_map(|expr| expr.definitions.iter())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct LexicalScopeId(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LexicalBindingId {
+    pub defining_scope: LexicalScopeId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingDeclaration {
+    pub declaring_scope: LexicalScopeId,
+    pub binding: LexicalBindingId,
+    pub domain: DeclaredDomain,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeclaredDomain {
+    Exact(Vec<DeclaredValue>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeclaredValue {
+    S3Class(Vec<String>),
+}
+
+impl ParsedRFile {
+    pub fn scope_is_within(&self, scope: LexicalScopeId, ancestor: LexicalScopeId) -> bool {
+        let mut current = Some(scope);
+        while let Some(candidate) = current {
+            if candidate == ancestor {
+                return true;
+            }
+            current = self
+                .scope_parents
+                .get(candidate.0 as usize)
+                .copied()
+                .flatten();
+        }
+        false
+    }
+
+    pub fn domain_for(
+        &self,
+        binding: &LexicalBindingId,
+        use_scope: LexicalScopeId,
+    ) -> Option<Vec<DeclaredValue>> {
+        self.declarations
+            .iter()
+            .filter(|declaration| {
+                &declaration.binding == binding
+                    && self.scope_is_within(use_scope, declaration.declaring_scope)
+            })
+            .map(|declaration| match &declaration.domain {
+                DeclaredDomain::Exact(values) => values.clone(),
+            })
+            .reduce(|domain, values| {
+                domain
+                    .into_iter()
+                    .filter(|value| values.contains(value))
+                    .collect()
+            })
     }
 }
