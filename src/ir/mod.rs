@@ -1,11 +1,12 @@
 //! Immutable linked-program representation consumed by build preflight and materialization.
 
 use crate::analysis::{Diagnostic, Edge, Graph, Node, NodeId};
+pub use crate::package::{PackageId, PackageIdentity, PackageRole};
+
 use crate::package::Digest;
-use crate::{Version, syntax::Span};
+use crate::syntax::Span;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 macro_rules! id_type {
@@ -25,7 +26,6 @@ macro_rules! id_type {
     };
 }
 
-id_type!(PackageId);
 id_type!(NamespaceId);
 id_type!(BindingId);
 id_type!(EnvironmentBindingId);
@@ -77,29 +77,6 @@ impl RuntimePhase for LinkPhase {
     type CodeId = CodeId;
     type BindingState = LinkBindingState;
     type NamespaceState = LinkNamespaceState;
-}
-
-/// Exact build-time semantic identity of a package image.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PackageIdentity {
-    pub name: String,
-    pub version: Version,
-    pub image_fingerprint: Digest,
-}
-
-/// Build-time physical location, intentionally absent from [`ProgramIr`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PackageLocation {
-    pub library: PathBuf,
-    pub root: PathBuf,
-}
-
-/// How a package participates in the generated artifact.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PackageRole {
-    Root,
-    Linked,
-    External,
 }
 
 /// Final package runtime contract.
@@ -481,7 +458,7 @@ pub struct TargetContract {
 pub struct ProgramIr {
     target: TargetContract,
     root_package: PackageId,
-    packages: Vec<PackageIr>,
+    packages: BTreeMap<PackageId, PackageIr>,
     namespaces: Vec<Namespace<LinkPhase>>,
     bindings: Vec<Binding<LinkPhase>>,
     environment_bindings: Vec<EnvironmentBinding<LinkPhase>>,
@@ -512,12 +489,8 @@ impl ProgramIr {
         self.root_package
     }
 
-    pub fn packages(&self) -> &[PackageIr] {
-        &self.packages
-    }
-
-    pub fn package_ids(&self) -> impl Iterator<Item = PackageId> + '_ {
-        (0..self.packages.len()).map(PackageId::from_index)
+    pub fn packages(&self) -> impl Iterator<Item = (PackageId, &PackageIr)> {
+        self.packages.iter().map(|(id, package)| (*id, package))
     }
 
     pub fn namespaces(&self) -> &[Namespace<LinkPhase>] {
@@ -571,6 +544,13 @@ impl ProgramIr {
         &self.resources
     }
 
+    pub fn indexed_resources(&self) -> impl Iterator<Item = (ResourceId, &ResourceIr)> {
+        self.resources
+            .iter()
+            .enumerate()
+            .map(|(index, resource)| (ResourceId::from_index(index), resource))
+    }
+
     pub fn roots(&self) -> &[Root] {
         &self.roots
     }
@@ -588,7 +568,7 @@ impl ProgramIr {
     }
 
     pub fn package(&self, id: PackageId) -> &PackageIr {
-        &self.packages[id.index()]
+        &self.packages[&id]
     }
 
     pub fn namespace(&self, id: NamespaceId) -> &Namespace<LinkPhase> {
@@ -646,7 +626,7 @@ impl ProgramIr {
 /// Analysis finalizer; the only constructor for [`ProgramIr`].
 pub struct ProgramBuilder {
     target: TargetContract,
-    packages: Vec<PackageIr>,
+    packages: BTreeMap<PackageId, PackageIr>,
     namespaces: Vec<Namespace<LinkPhase>>,
     bindings: Vec<Binding<LinkPhase>>,
     environment_bindings: Vec<EnvironmentBinding<LinkPhase>>,
@@ -699,7 +679,7 @@ impl ProgramBuilder {
     fn new(target: TargetContract) -> Self {
         Self {
             target,
-            packages: Vec::new(),
+            packages: BTreeMap::new(),
             namespaces: Vec::new(),
             bindings: Vec::new(),
             environment_bindings: Vec::new(),
@@ -719,16 +699,17 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn add_package(&mut self, package: PackageIr) -> PackageId {
-        let id = PackageId::from_index(self.packages.len());
+    pub fn add_package(&mut self, id: PackageId, package: PackageIr) {
         if package.role() == PackageRole::Root {
             assert!(
                 self.root_package.replace(id).is_none(),
                 "one Root package per ProgramIr"
             );
         }
-        self.packages.push(package);
-        id
+        assert!(
+            self.packages.insert(id, package).is_none(),
+            "one PackageIr per PackageId"
+        );
     }
 
     pub fn add_namespace(&mut self, namespace: Namespace<LinkPhase>) -> NamespaceId {
@@ -806,7 +787,7 @@ impl ProgramBuilder {
                 dependencies: Vec::new(),
                 on_load: Some(OnLoadIr {
                     closure: *closure,
-                    package_name: self.packages[package.index()].identity().name.clone(),
+                    package_name: self.packages[&package].identity().name.clone(),
                     libname: LinkedLibnameUse::SemanticallyUnused,
                 }),
             }))

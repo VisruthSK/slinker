@@ -25,6 +25,7 @@ use std::io::{self, BufRead, Write};
 
 struct PackageImageContext {
     image: harp::object::RObject,
+    epoch: u64,
     private_ids: HashMap<libr::SEXP, String>,
 }
 
@@ -157,6 +158,7 @@ impl WorkerRuntime {
                 key.clone(),
                 PackageImageContext {
                     image: context,
+                    epoch: inspection_epoch(),
                     private_ids: HashMap::new(),
                 },
             );
@@ -236,6 +238,7 @@ impl WorkerRuntime {
             environment.inner.sexp,
             package.name.clone(),
             context.private_ids.clone(),
+            context.epoch,
         );
         let binding = scanner.top_binding(name, origin, binding.value)?;
         context.private_ids = scanner.private_ids.clone();
@@ -325,6 +328,13 @@ impl WorkerRuntime {
 struct WorkerOperationError {
     code: WorkerErrorCode,
     message: String,
+}
+
+fn inspection_epoch() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.finish()
 }
 
 fn r_error(error: impl std::fmt::Display) -> String {
@@ -526,6 +536,7 @@ struct ObjectScanner {
     image_environment: libr::SEXP,
     package: String,
     private_ids: HashMap<libr::SEXP, String>,
+    epoch: u64,
     visiting: HashSet<libr::SEXP>,
     walking: HashSet<libr::SEXP>,
     private_environments: HashMap<String, PrivateEnvironmentImage>,
@@ -536,11 +547,13 @@ impl ObjectScanner {
         image_environment: libr::SEXP,
         package: String,
         private_ids: HashMap<libr::SEXP, String>,
+        epoch: u64,
     ) -> Self {
         Self {
             image_environment,
             package,
             private_ids,
+            epoch,
             visiting: HashSet::new(),
             walking: HashSet::new(),
             private_environments: HashMap::new(),
@@ -891,7 +904,7 @@ impl ObjectScanner {
         if let Some(id) = self.private_ids.get(&pointer) {
             return Ok(id.clone());
         }
-        let id = format!("private:{}", self.private_ids.len() + 1);
+        let id = format!("private:{:016x}:{}", self.epoch, self.private_ids.len() + 1);
         self.private_ids.insert(pointer, id.clone());
         self.inventory_private(environment, &id)?;
         Ok(id)
@@ -1409,7 +1422,7 @@ mod tests {
 
         let lazy = harp::environment_iter::Binding::new(&image_environment, "lazy".into())
             .expect("lazy binding");
-        let mut scanner = ObjectScanner::new(image.sexp, "fixture".into(), HashMap::new());
+        let mut scanner = ObjectScanner::new(image.sexp, "fixture".into(), HashMap::new(), 0);
         let lazy = scanner
             .top_binding("lazy", BindingOrigin::Code, lazy.value)
             .expect("inspect demanded promise");
@@ -1446,6 +1459,19 @@ mod tests {
         assert_eq!(
             private.bindings["self"].environment.as_deref(),
             Some(private.id.as_str())
+        );
+        let mut later_epoch = ObjectScanner::new(image.sexp, "fixture".into(), HashMap::new(), 1);
+        let rescanned = harp::environment_iter::Binding::new(&image_environment, "holder".into())
+            .expect("holder binding");
+        later_epoch
+            .top_binding("holder", BindingOrigin::Code, rescanned.value)
+            .expect("inspect holder in a later epoch");
+        assert!(
+            later_epoch
+                .private_environments
+                .keys()
+                .all(|label| !scanner.private_environments.contains_key(label)),
+            "private labels from separate inspection epochs alias"
         );
         let private_environment = harp::environment::Environment::new(
             field(&fixture, "private").expect("private fixture environment"),

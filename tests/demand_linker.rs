@@ -8,9 +8,9 @@ use slinker::package::{
     BindingImage, BindingOrigin, ClosureSource, Digest, EmbeddedClosureSource,
     EmbeddedEnvironmentRef, ExportMap, ImportBinding, ImportSpec, InstalledObject,
     InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeRegistration,
-    NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectIssue, ObjectKind, PackageId,
-    PackageImage, PackageIndex, PackageLocation, PackageProvider, PrivateBindingImage,
-    PrivateEnvironmentImage, S3Registration, SyntaxValidation,
+    NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectIssue, ObjectKind,
+    PackageIdentity, PackageImage, PackageIndex, PackageLocation, PackageProvider,
+    PrivateBindingImage, PrivateEnvironmentImage, S3Registration, SyntaxValidation,
 };
 use slinker::{Description, Error, Result, Target, TargetEnvironment};
 use std::collections::{HashMap, HashSet};
@@ -31,7 +31,7 @@ impl FakeProvider {
         Self {
             packages: images
                 .into_iter()
-                .map(|image| (image.index.package.id.name.clone(), Arc::new(image)))
+                .map(|image| (image.index.identity.name.clone(), Arc::new(image)))
                 .collect(),
             image_counts: Arc::new(Mutex::new(HashMap::new())),
             optional_locate_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -125,34 +125,25 @@ impl FakeProvider {
 }
 
 impl PackageProvider for FakeProvider {
-    fn target_environment(&self) -> Option<&TargetEnvironment> {
-        Some(&self.target_environment)
-    }
-    fn locate(&mut self, name: &str) -> Result<InstalledPackage> {
-        self.packages
-            .get(name)
-            .map(|image| image.index.package.clone())
-            .ok_or_else(|| Error::Analysis(format!("missing fake package {name}")))
+    fn target_environment(&self) -> &TargetEnvironment {
+        &self.target_environment
     }
 
-    fn locate_optional(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
+    fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
         *self
             .optional_locate_counts
             .lock()
             .unwrap()
             .entry(name.to_owned())
             .or_default() += 1;
-        Ok(self
-            .packages
-            .get(name)
-            .map(|image| image.index.package.clone()))
+        Ok(self.packages.get(name).map(|image| installed(&image.index)))
     }
 
     fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         self.packages
-            .get(&package.id.name)
-            .map(|image| Arc::new(image.index.clone()))
-            .ok_or_else(|| Error::Analysis(format!("missing fake index {}", package.id.name)))
+            .get(&package.identity.name)
+            .map(|image| Arc::clone(&image.index))
+            .ok_or_else(|| Error::Analysis(format!("missing fake index {}", package.identity.name)))
     }
 
     fn binding_image(
@@ -164,20 +155,15 @@ impl PackageProvider for FakeProvider {
             .image_counts
             .lock()
             .unwrap()
-            .entry(package.id.name.clone())
+            .entry(package.identity.name.clone())
             .or_default() += 1;
         self.packages
-            .get(&package.id.name)
+            .get(&package.identity.name)
             .cloned()
-            .ok_or_else(|| Error::Analysis(format!("missing fake image {}", package.id.name)))
+            .ok_or_else(|| Error::Analysis(format!("missing fake image {}", package.identity.name)))
     }
 
-    fn validate_syntax(
-        &mut self,
-        _id: &PackageId,
-        _binding: &str,
-        _source: &str,
-    ) -> Result<SyntaxValidation> {
+    fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {
         Ok(self.validation.clone())
     }
 
@@ -247,18 +233,6 @@ fn package_from_fixture(
     let description = Description::parse(&format!(
         "Package: {name}\nVersion: 1.0.0\n{extra_description}"
     ));
-    let installed = InstalledPackage {
-        id: PackageId {
-            name: name.into(),
-            version: "1.0.0".parse().expect("valid test package version"),
-            image_fingerprint: Digest(format!("fp-{name}")),
-        },
-        location: PackageLocation {
-            library: PathBuf::from(format!("/lib/{name}")),
-            root: PathBuf::from(format!("/lib/{name}/{name}")),
-        },
-        description: description.clone(),
-    };
     let mut images = HashMap::new();
     for (binding, source) in bindings {
         let closure = source.map(|source| ClosureSource {
@@ -288,8 +262,12 @@ fn package_from_fixture(
     let mut names = images.keys().cloned().collect::<Vec<_>>();
     names.sort();
     PackageImage {
-        index: PackageIndex {
-            package: installed,
+        index: Arc::new(PackageIndex {
+            identity: PackageIdentity {
+                name: name.into(),
+                version: "1.0.0".parse().expect("valid test package version"),
+                image_fingerprint: Digest(format!("fp-{name}")),
+            },
             description,
             exports,
             imports,
@@ -300,9 +278,21 @@ fn package_from_fixture(
             datasets: Vec::new(),
             files,
             has_sysdata: false,
-        },
+        }),
         bindings: images,
         private_environments: HashMap::new(),
+    }
+}
+
+fn installed(index: &PackageIndex) -> InstalledPackage {
+    let name = &index.identity.name;
+    InstalledPackage {
+        identity: index.identity.clone(),
+        location: PackageLocation {
+            library: PathBuf::from(format!("/lib/{name}")),
+            root: PathBuf::from(format!("/lib/{name}/{name}")),
+        },
+        description: index.description.clone(),
     }
 }
 
@@ -578,7 +568,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
             ]),
         },
     );
-    root.index.binding_names = root.bindings.keys().cloned().collect();
+    Arc::make_mut(&mut root.index).binding_names = root.bindings.keys().cloned().collect();
 
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
@@ -1298,7 +1288,7 @@ fn onload_can_create_a_missing_exported_active_binding() {
         Vec::new(),
         "",
     );
-    root.index.lifecycle.on_load = true;
+    Arc::make_mut(&mut root.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1340,7 +1330,7 @@ fn dependency_onload_can_create_a_missing_exported_active_binding() {
         Vec::new(),
         "",
     );
-    foo.index.lifecycle.on_load = true;
+    Arc::make_mut(&mut foo.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -1396,7 +1386,7 @@ fn root_lifecycle_remains_an_entrypoint_even_when_not_exported() {
         Vec::new(),
         "",
     );
-    root.index.lifecycle.on_load = true;
+    Arc::make_mut(&mut root.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1767,8 +1757,7 @@ fn constant_argument_specializes_private_namespace_helper() {
     assert!(
         plan.program()
             .packages()
-            .iter()
-            .any(|package| package.identity().name == "foo"
+            .any(|(_, package)| package.identity().name == "foo"
                 && package.role() == slinker::ir::PackageRole::External)
     );
 }
@@ -2385,7 +2374,7 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
         "",
     );
     let mut root = root;
-    root.index.lifecycle.on_load = true;
+    Arc::make_mut(&mut root.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -2428,7 +2417,7 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
         Vec::new(),
         "",
     );
-    root.index.lifecycle.on_load = true;
+    Arc::make_mut(&mut root.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -4044,7 +4033,7 @@ fn optional_onload_hook_does_not_activate_suggested_namespace() {
         Vec::new(),
         "Suggests: knitr\n",
     );
-    glue.index.lifecycle.on_load = true;
+    Arc::make_mut(&mut glue.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root, glue]), 4)
         .analyze("root")
         .unwrap();
@@ -4085,7 +4074,7 @@ fn selected_extra_enables_optional_onload_hook_namespace() {
         Vec::new(),
         "Suggests: knitr\n",
     );
-    glue.index.lifecycle.on_load = true;
+    Arc::make_mut(&mut glue.index).lifecycle.on_load = true;
     let knitr = package_with!(
         "knitr",
         &[
@@ -4128,7 +4117,7 @@ fn external_namespace_is_not_assumed_loaded_for_onload_guard() {
         Vec::new(),
         "Suggests: knitr\n",
     );
-    glue.index.lifecycle.on_load = true;
+    Arc::make_mut(&mut glue.index).lifecycle.on_load = true;
     let knitr = package_with!(
         "knitr",
         &[("knit_engines", None)],

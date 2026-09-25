@@ -5,15 +5,14 @@ use crate::analysis::{
 use crate::build::{PackageOperation, PendingRelocation};
 use crate::ir::{
     ExternalBindingAccess, ExternalPackageContract, InstalledObjectLocator, MaterializedSlot,
-    MaterializedSlotSource, PackageIdentity as LinkedPackageIdentity, PackageIr,
-    PackageOperationIr, PackageRole as LinkedPackageRole, ProgramIr, RootArtifactIr,
-    TargetContract,
+    MaterializedSlotSource, PackageIr, PackageOperationIr, PackageRole as LinkedPackageRole,
+    ProgramIr, RootArtifactIr, TargetContract,
 };
 use crate::metadata::{RelationField, relations};
 use crate::package::{
     BindingImage, BindingRepresentation, ClosureId, ClosureObject, ClosureSource, Digest,
-    EnvironmentId, ImportSpec, InstalledObject, InstalledPackage, NativeRoutineSummary,
-    NativeSafety, ObjectId, ObjectKind, PackageId, PackageImage, PackageIndex, PackageObjectGraph,
+    EnvironmentId, ImportSpec, InstalledObject, NativeRoutineSummary, NativeSafety, ObjectId,
+    ObjectKind, PackageAvailability, PackageId, PackageImage, PackageIndex, PackageObjectGraph,
     PackageProvider, PrivateBindingImage, SyntaxValidation, TargetUniverse,
 };
 use crate::syntax::{
@@ -31,6 +30,7 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct LinkIr {
+    packages: crate::package::PackageSources,
     program: ProgramIr,
     provenance: crate::ir::ProvenanceIr,
     blockers: crate::ir::AnalysisBlockerSet,
@@ -60,7 +60,7 @@ struct ParseRequest<'a> {
 
 struct NativeCallbackContext<'a> {
     owner: NodeId,
-    package: &'a InstalledPackage,
+    package: PackageId,
     image: &'a PackageImage,
     binding: &'a str,
     lexical_environment: &'a str,
@@ -179,7 +179,7 @@ struct ExecutionOutcome {
 #[derive(Clone, Copy)]
 struct ExecutionContext<'a> {
     node: NodeId,
-    package: &'a InstalledPackage,
+    package: PackageId,
     image: &'a PackageImage,
     lexical_environment: &'a str,
     depth: usize,
@@ -260,25 +260,23 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     pub fn analyze(mut self, root_name: &str) -> Result<LinkIr> {
-        self.packages.set_root(root_name.to_owned());
-        let root = self.packages.locate(root_name)?;
-        if self.packages.is_external(&root) {
+        if self.explicit_external_packages.contains(root_name) {
             return Err(Error::Analysis(format!(
                 "root package `{root_name}` cannot be External"
             )));
         }
-        self.root = Some(root.id.clone());
-        self.encountered.insert(root.id.clone());
-        let root_image = self.image(&root)?;
+        self.packages.set_root(root_name);
+        let root = self.packages.require(root_name)?;
+        self.root = Some(root);
+        self.encountered.insert(root);
+        let root_image = self.image(root)?;
 
         // Package activation and the public/runtime entry points form the root
         // contract. Internal namespace bindings are reached only when retained
         // code, lifecycle hooks, S3 registrations, or native obligations demand
         // them. DESCRIPTION/NAMESPACE dependency metadata informs resolution;
         // it does not make every declared package or every root binding live.
-        self.require_root(Need::Activation {
-            package: root.id.clone(),
-        });
+        self.require_root(Need::Activation { package: root });
         while !self.pending.is_empty() {
             self.process_frontier()?;
         }
@@ -293,7 +291,7 @@ impl<P: PackageProvider> Linker<P> {
         entry_bindings.dedup();
         for binding in entry_bindings {
             self.require_root(Need::Binding {
-                package: root.id.clone(),
+                package: root,
                 binding,
             });
         }
@@ -303,27 +301,13 @@ impl<P: PackageProvider> Linker<P> {
         }
 
         self.finalize_syntax_observations();
-        let root_package = self
-            .root
-            .clone()
-            .expect("root package established before analysis");
-        let mut packages = self
+        let root_package = self.root.expect("root package established before analysis");
+        let retained = self
             .encountered
-            .iter()
-            .cloned()
-            .map(|package| {
-                let role = if package == root_package {
-                    LinkedPackageRole::Root
-                } else {
-                    LinkedPackageRole::Linked
-                };
-                (package, role)
-            })
-            .collect::<HashMap<_, _>>();
-        for package in &self.external {
-            packages.insert(package.clone(), LinkedPackageRole::External);
-        }
-        let program = self.finalize_program(&root_package, &packages);
+            .union(&self.external)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let program = self.finalize_program(root_package, &retained);
         let provenance = crate::ir::ProvenanceIr::from_analysis(
             self.graph.clone(),
             self.roots.clone(),
@@ -338,46 +322,32 @@ impl<P: PackageProvider> Linker<P> {
             provenance,
             blockers,
             sources: self.sources,
+            packages: self.packages.sources(retained),
         })
     }
 
-    fn finalize_program(
-        &self,
-        root: &PackageId,
-        roles: &HashMap<PackageId, LinkedPackageRole>,
-    ) -> ProgramIr {
-        let target = self.packages.target_environment();
+    fn finalize_program(&self, root: PackageId, retained: &BTreeSet<PackageId>) -> ProgramIr {
+        let target = &self.packages.target_environment().target;
         let mut builder = ProgramIr::builder(TargetContract {
-            r_version: target
-                .map(|target| target.target.r_version.clone())
-                .unwrap_or_else(|| "test".into()),
-            platform: target
-                .map(|target| target.target.os.clone())
-                .unwrap_or_else(|| std::env::consts::OS.into()),
-            arch: target
-                .map(|target| target.target.arch.clone())
-                .unwrap_or_else(|| std::env::consts::ARCH.into()),
+            r_version: target.r_version.clone(),
+            platform: target.os.clone(),
+            arch: target.arch.clone(),
         });
-        let mut ordered = roles.iter().collect::<Vec<_>>();
-        ordered.sort_by(|(left, _), (right, _)| {
-            left.name
-                .cmp(&right.name)
-                .then_with(|| left.version.cmp(&right.version))
-                .then_with(|| left.image_fingerprint.0.cmp(&right.image_fingerprint.0))
-        });
-        // Root receives ID zero deterministically, independent of package discovery order.
-        ordered.sort_by_key(|(package, _)| (*package != root, package.name.clone()));
-        let external_names = roles
+        let ordered = retained
             .iter()
-            .filter(|(_, role)| **role == LinkedPackageRole::External)
-            .map(|(package, _)| package.name.as_str())
+            .map(|package| (*package, self.packages.role(*package)))
+            .collect::<Vec<_>>();
+        let external_names = ordered
+            .iter()
+            .filter(|(_, role)| *role == LinkedPackageRole::External)
+            .map(|(package, _)| self.packages.name(*package))
             .collect::<HashSet<_>>();
         let mut external_requirements = BTreeMap::<String, BTreeSet<String>>::new();
         for (package, role) in &ordered {
             if !matches!(role, LinkedPackageRole::Root | LinkedPackageRole::Linked) {
                 continue;
             }
-            let Some(image) = self.images.get(*package) else {
+            let Some(image) = self.images.get(package) else {
                 continue;
             };
             if let Ok(imports) = relations(&image.index.description, RelationField::Imports) {
@@ -403,13 +373,8 @@ impl<P: PackageProvider> Linker<P> {
                 }
             }
         }
-        let mut package_ids = HashMap::new();
         for (package, role) in &ordered {
-            let identity = LinkedPackageIdentity {
-                name: package.name.clone(),
-                version: package.version.clone(),
-                image_fingerprint: package.image_fingerprint.clone(),
-            };
+            let identity = self.packages.identity(*package).clone();
             let package_ir = match role {
                 LinkedPackageRole::Root => PackageIr::Root {
                     build_identity: identity,
@@ -418,41 +383,41 @@ impl<P: PackageProvider> Linker<P> {
                     build_identity: identity,
                 },
                 LinkedPackageRole::External => PackageIr::External {
-                    analyzed_identity: identity,
                     contract: ExternalPackageContract {
-                        package: package.name.clone(),
+                        package: identity.name.clone(),
                         requirements: external_requirements
-                            .get(&package.name)
+                            .get(&identity.name)
                             .map(|requirements| requirements.iter().cloned().collect())
                             .unwrap_or_default(),
                     },
+                    analyzed_identity: identity,
                 },
             };
-            package_ids.insert((*package).clone(), builder.add_package(package_ir));
+            builder.add_package(*package, package_ir);
         }
 
         let mut linked_namespaces = Vec::new();
         let mut namespace_ids = HashMap::new();
         for (package, role) in ordered {
-            let linked_package = package_ids[package];
-            if *role == LinkedPackageRole::External {
+            let package_name = self.packages.name(package);
+            if role == LinkedPackageRole::External {
                 let bindings = self.graph.nodes.iter().filter_map(|node| match &node.kind {
-                    NodeKind::ExternalBinding { name } if node.package == package.name => {
+                    NodeKind::ExternalBinding { name } if node.package == package_name => {
                         Some((name.clone(), ExternalBindingAccess::Exported))
                     }
                     _ => None,
                 });
-                let namespace = builder.finish_external_namespace(linked_package, bindings);
-                namespace_ids.insert(package.name.clone(), namespace);
+                let namespace = builder.finish_external_namespace(package, bindings);
+                namespace_ids.insert(package_name.to_owned(), namespace);
                 continue;
             }
             let image = self
                 .images
-                .get(package)
+                .get(&package)
                 .expect("Root/Linked package has an initialized image");
             let namespace_builder = self
                 .namespace_builders
-                .get(package)
+                .get(&package)
                 .expect("Root/Linked namespace builder");
             let names = namespace_builder.bindings.clone();
             let slots = names.iter().map(|name| {
@@ -472,7 +437,7 @@ impl<P: PackageProvider> Linker<P> {
                                     source: Arc::clone(&closure.source),
                                     normalized_shape: self
                                         .normalized_shapes
-                                        .get(&(package.clone(), name.clone()))
+                                        .get(&(package, name.clone()))
                                         .cloned()
                                         .unwrap_or_else(|| Digest::of(closure.source.as_bytes())),
                                     locator,
@@ -491,12 +456,8 @@ impl<P: PackageProvider> Linker<P> {
                 .filter(|name| names.contains(*name))
                 .cloned();
             let namespace = builder.finish_materialized_namespace(
-                linked_package,
-                match role {
-                    LinkedPackageRole::Root => LinkedPackageRole::Root,
-                    LinkedPackageRole::Linked => LinkedPackageRole::Linked,
-                    LinkedPackageRole::External => unreachable!(),
-                },
+                package,
+                role,
                 slots,
                 exports,
                 image.index.lifecycle.on_load.then(|| ".onLoad".into()),
@@ -511,8 +472,7 @@ impl<P: PackageProvider> Linker<P> {
                         package: registration
                             .generic
                             .package
-                            .as_ref()
-                            .and_then(|package| package_ids.get(package).copied()),
+                            .filter(|package| retained.contains(package)),
                         name: registration.generic.name.clone(),
                     },
                     registration.class.clone(),
@@ -522,21 +482,21 @@ impl<P: PackageProvider> Linker<P> {
             for native in &image.index.dynlibs {
                 builder.attach_native_component(namespace.namespace, native.name.clone());
             }
-            if *role == LinkedPackageRole::Linked {
+            if role == LinkedPackageRole::Linked {
                 linked_namespaces.push(namespace.namespace);
             }
-            namespace_ids.insert(package.name.clone(), namespace);
+            namespace_ids.insert(package_name.to_owned(), namespace);
         }
         let mut namespace_dependencies =
             HashMap::<crate::ir::NamespaceId, BTreeSet<crate::ir::NamespaceId>>::new();
-        for (package, role) in roles {
-            if *role == LinkedPackageRole::External {
+        for &package in retained {
+            if self.packages.is_external(package) {
                 continue;
             }
-            let Some(image) = self.images.get(package) else {
+            let Some(image) = self.images.get(&package) else {
                 continue;
             };
-            let owner = namespace_ids[&package.name].namespace;
+            let owner = namespace_ids[self.packages.name(package)].namespace;
             for import in &image.index.imports {
                 let (target_name, pairs) = match import {
                     ImportSpec::From {
@@ -553,10 +513,12 @@ impl<P: PackageProvider> Linker<P> {
                         package: target,
                         except,
                     } => {
-                        let exported = roles
-                            .keys()
-                            .find(|package| package.name == *target)
-                            .and_then(|package| self.images.get(package))
+                        let exported = self
+                            .packages
+                            .availability(target)
+                            .and_then(PackageAvailability::package)
+                            .filter(|package| retained.contains(package))
+                            .and_then(|package| self.images.get(&package))
                             .map(|image| image.index.exports.values().cloned().collect::<Vec<_>>())
                             .unwrap_or_else(|| {
                                 self.graph
@@ -619,8 +581,8 @@ impl<P: PackageProvider> Linker<P> {
             remaining.remove(&next);
             ordered_linked.push(next);
         }
-        let root_image = self.images.get(root).expect("Root image finalized");
-        let root_namespace = &namespace_ids[&root.name];
+        let root_image = self.images.get(&root).expect("Root image finalized");
+        let root_namespace = &namespace_ids[self.packages.name(root)];
         let mut namespace_source = String::new();
         for binding in root_image.index.exports.values() {
             if root_namespace.bindings.contains_key(binding) {
@@ -655,10 +617,12 @@ impl<P: PackageProvider> Linker<P> {
             let Some(namespace) = namespace_ids.get(name) else {
                 continue;
             };
-            match roles
-                .iter()
-                .find(|(package, _)| package.name == *name)
-                .map(|(_, role)| *role)
+            match self
+                .packages
+                .availability(name)
+                .and_then(PackageAvailability::package)
+                .filter(|package| retained.contains(package))
+                .map(|package| self.packages.role(package))
             {
                 Some(LinkedPackageRole::External) => {
                     match import {
@@ -723,7 +687,8 @@ impl<P: PackageProvider> Linker<P> {
                     internal,
                     ..
                 } => {
-                    let Some(target_namespace) = namespace_ids.get(&package.name) else {
+                    let Some(target_namespace) = namespace_ids.get(self.packages.name(*package))
+                    else {
                         continue;
                     };
                     let Some(&target) = target_namespace.bindings.get(binding) else {
@@ -743,7 +708,7 @@ impl<P: PackageProvider> Linker<P> {
                     package, resource, ..
                 } => {
                     let resource_id = builder.add_resource(crate::ir::ResourceIr {
-                        package: package_ids[package],
+                        package: *package,
                         path: resource.clone(),
                     });
                     retained_resources.push(resource_id);
@@ -756,7 +721,7 @@ impl<P: PackageProvider> Linker<P> {
                     package, operation, ..
                 } => builder.add_relocation(crate::ir::Relocation::Package {
                     site,
-                    target: package.as_ref().map(|package| package_ids[package]),
+                    target: *package,
                     operation: match operation {
                         PackageOperation::RequireNamespace { result } => {
                             PackageOperationIr::RequireNamespace { result: *result }
@@ -800,7 +765,6 @@ impl<P: PackageProvider> Linker<P> {
         // New needs discovered while this frontier is processed are deferred
         // to the next frontier. Every item was already justified by a semantic
         // edge; batching changes scheduling only, never reachability.
-        self.prefetch_frontier_indexes(frontier)?;
         self.preparse_frontier_bindings(frontier)?;
 
         for _ in 0..frontier {
@@ -816,41 +780,36 @@ impl<P: PackageProvider> Linker<P> {
         Ok(())
     }
 
-    fn image(&mut self, package: &InstalledPackage) -> Result<Arc<PackageImage>> {
-        if let Some(image) = self.images.get(&package.id) {
+    fn image(&mut self, package: PackageId) -> Result<Arc<PackageImage>> {
+        if let Some(image) = self.images.get(&package) {
             return Ok(Arc::clone(image));
         }
         let index = self.packages.index(package)?;
         let image = Arc::new(PackageImage {
-            index: index.as_ref().clone(),
+            index: Arc::clone(&index),
             bindings: HashMap::new(),
             private_environments: HashMap::new(),
         });
         self.namespace_builders
-            .insert(package.id.clone(), NamespaceBuilder::new(&index));
-        self.object_graphs
-            .insert(package.id.clone(), image.object_graph());
-        self.images.insert(package.id.clone(), Arc::clone(&image));
+            .insert(package, NamespaceBuilder::new(&index));
+        self.object_graphs.insert(package, image.object_graph());
+        self.images.insert(package, Arc::clone(&image));
         Ok(image)
     }
 
-    fn binding_image(
-        &mut self,
-        package: &InstalledPackage,
-        binding: &str,
-    ) -> Result<Arc<PackageImage>> {
+    fn binding_image(&mut self, package: PackageId, binding: &str) -> Result<Arc<PackageImage>> {
         let image = self.image(package)?;
         if image.binding(binding).is_some() {
             return Ok(image);
         }
         let partial = self.packages.binding_image(package, binding)?;
         self.object_graphs
-            .get_mut(&package.id)
+            .get_mut(&package)
             .expect("package object graph initialized with index")
             .merge_image(&partial);
         let image = Arc::make_mut(
             self.images
-                .get_mut(&package.id)
+                .get_mut(&package)
                 .expect("package image initialized with index"),
         );
         image.bindings.extend(
@@ -874,7 +833,7 @@ impl<P: PackageProvider> Linker<P> {
                 .or_insert_with(|| environment.clone());
         }
         Ok(Arc::clone(
-            self.images.get(&package.id).expect("merged package image"),
+            self.images.get(&package).expect("merged package image"),
         ))
     }
 
@@ -893,26 +852,6 @@ impl<P: PackageProvider> Linker<P> {
             self.parse_pool = Some(Arc::new(pool));
         }
         Ok(self.parse_pool.as_ref().map(Arc::clone))
-    }
-
-    fn prefetch_frontier_indexes(&mut self, frontier: usize) -> Result<()> {
-        let mut seen = HashSet::new();
-        let mut names = Vec::new();
-        for need in self.pending.iter().take(frontier) {
-            if !matches!(need, Need::Activation { .. } | Need::Native { .. }) {
-                continue;
-            }
-            let id = need.package();
-            if seen.insert(id.name.clone()) {
-                names.push(id.name.clone());
-            }
-        }
-        let mut packages = self.packages.locate_many(&names, self.jobs)?;
-        packages.retain(|package| !self.packages.is_external(package));
-        if !packages.is_empty() {
-            self.packages.prefetch_indexes(&packages, self.jobs)?;
-        }
-        Ok(())
     }
 
     fn preparse_frontier_bindings(&mut self, frontier: usize) -> Result<()> {
@@ -943,11 +882,10 @@ impl<P: PackageProvider> Linker<P> {
                     package: id,
                     binding,
                 } => {
-                    let package = self.packages.locate(&id.name)?;
-                    if self.packages.is_external(&package) {
+                    if self.packages.is_external(id) {
                         continue;
                     }
-                    let image = self.binding_image(&package, &binding)?;
+                    let image = self.binding_image(id, &binding)?;
                     let Some(binding_image) = image.binding(&binding).cloned() else {
                         continue;
                     };
@@ -955,7 +893,7 @@ impl<P: PackageProvider> Linker<P> {
                         continue;
                     };
                     let owner_node = self.need_node(&Need::Binding {
-                        package: id.clone(),
+                        package: id,
                         binding: binding.clone(),
                     });
                     (
@@ -973,11 +911,10 @@ impl<P: PackageProvider> Linker<P> {
                     environment,
                     binding,
                 } => {
-                    let package = self.packages.locate(&id.name)?;
-                    if self.packages.is_external(&package) {
+                    if self.packages.is_external(id) {
                         continue;
                     }
-                    let image = self.image(&package)?;
+                    let image = self.image(id)?;
                     let Some(binding_image) =
                         image.private_binding(&environment, &binding).cloned()
                     else {
@@ -987,7 +924,7 @@ impl<P: PackageProvider> Linker<P> {
                         continue;
                     };
                     let owner_node = self.need_node(&Need::PrivateBinding {
-                        package: id.clone(),
+                        package: id,
                         environment: environment.clone(),
                         binding: binding.clone(),
                     });
@@ -1006,18 +943,17 @@ impl<P: PackageProvider> Linker<P> {
                     package: id,
                     closure,
                 } => {
-                    let package = self.packages.locate(&id.name)?;
-                    if self.packages.is_external(&package) {
+                    if self.packages.is_external(id) {
                         continue;
                     }
-                    let image = self.image(&package)?;
+                    let image = self.image(id)?;
                     let Some((closure_object, owner_source, source_key, environment)) =
-                        self.closure_execution_source(&id, closure)
+                        self.closure_execution_source(id, closure)
                     else {
                         continue;
                     };
                     let owner_node = self.need_node(&Need::ClosureExecution {
-                        package: id.clone(),
+                        package: id,
                         closure,
                     });
                     let parse_kind = if closure_object.derived_from.is_some() {
@@ -1041,12 +977,12 @@ impl<P: PackageProvider> Linker<P> {
                 _ => continue,
             };
 
-            let key = (id.clone(), source_key.clone());
+            let key = (id, source_key.clone());
             if self.parsed_bindings.contains_key(&key) || !scheduled.insert(key.clone()) {
                 continue;
             }
             let source = self.sources.add_binding(
-                id.name.clone(),
+                self.packages.name(id).to_owned(),
                 source_key.clone(),
                 Arc::clone(&closure.source),
             );
@@ -1056,7 +992,7 @@ impl<P: PackageProvider> Linker<P> {
             if normalized != normalized_again {
                 self.diagnostic(
                     owner_node,
-                    &id,
+                    id,
                     Some(&owner_binding),
                     RejectCode::InvalidInstalledRepresentation,
                     format!(
@@ -1076,7 +1012,7 @@ impl<P: PackageProvider> Linker<P> {
                 owner_node,
                 source,
                 text: Arc::clone(&closure.source),
-                context: self.oak_parse_context(&image, &closure.environment)?,
+                context: self.oak_parse_context(id, &image, &closure.environment)?,
                 kind: parse_kind,
             });
         }
@@ -1130,7 +1066,7 @@ impl<P: PackageProvider> Linker<P> {
                 }
                 Err(error) => {
                     self.handle_air_rejection(
-                        &item.key.0,
+                        item.key.0,
                         &item.owner_binding,
                         &item.source_key,
                         item.owner_node,
@@ -1166,23 +1102,22 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn process_closure_execution(&mut self, id: PackageId, closure: ClosureId) -> Result<()> {
-        let package = self.packages.locate(&id.name)?;
         let need = Need::ClosureExecution {
-            package: id.clone(),
+            package: id,
             closure,
         };
         let node = self.need_node(&need);
-        if self.packages.is_external(&package) {
-            self.external.insert(package.id.clone());
+        if self.packages.is_external(id) {
+            self.external.insert(id);
             return Ok(());
         }
-        let image = self.image(&package)?;
+        let image = self.image(id)?;
         let Some((closure_object, owner_source, source_key, environment)) =
-            self.closure_execution_source(&id, closure)
+            self.closure_execution_source(id, closure)
         else {
             self.diagnostic(
                 node,
-                &id,
+                id,
                 None,
                 RejectCode::UnsupportedObject,
                 "executable closure is missing from the package object graph",
@@ -1194,21 +1129,21 @@ impl<P: PackageProvider> Linker<P> {
         if environment.starts_with("unsupported:") {
             self.diagnostic(
                 node,
-                &id,
+                id,
                 Some(&owner_source),
                 RejectCode::UnknownClosureEnclosure,
                 format!("executable closure has unknown enclosure `{environment}`"),
                 None,
             );
         }
-        let context = self.oak_parse_context(&image, &environment)?;
+        let context = self.oak_parse_context(id, &image, &environment)?;
         let parse_kind = if closure_object.derived_from.is_some() {
             ParseKind::Derived
         } else {
             ParseKind::Nested
         };
         if let Some(parsed) = self.parsed_source(
-            &id,
+            id,
             Arc::clone(&closure_object.source),
             context,
             ParseRequest {
@@ -1219,10 +1154,10 @@ impl<P: PackageProvider> Linker<P> {
             },
         )? {
             let image =
-                self.prepare_construction_image(&package, &image, &environment, parsed.as_ref())?;
+                self.prepare_construction_image(id, &image, &environment, parsed.as_ref())?;
             self.process_parsed(
                 node,
-                &package,
+                id,
                 &image,
                 &owner_source,
                 &environment,
@@ -1233,19 +1168,18 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn process_binding(&mut self, id: PackageId, binding: String) -> Result<()> {
-        let package = self.packages.locate(&id.name)?;
         let node = self.need_node(&Need::Binding {
-            package: id.clone(),
+            package: id,
             binding: binding.clone(),
         });
-        if self.packages.is_external(&package) {
-            self.external.insert(package.id.clone());
+        if self.packages.is_external(id) {
+            self.external.insert(id);
             return Ok(());
         }
-        let image = self.binding_image(&package, &binding)?;
+        let image = self.binding_image(id, &binding)?;
         let Some(binding_image) = image.binding(&binding).cloned() else {
             if binding != ".onLoad" && image.index.lifecycle.on_load {
-                self.ensure_on_load_analyzed(&id)?;
+                self.ensure_on_load_analyzed(id)?;
             }
             if self
                 .namespace_builders
@@ -1254,7 +1188,7 @@ impl<P: PackageProvider> Linker<P> {
                 && !image.index.binding_names.contains(&binding)
             {
                 let lifecycle = self.need_node(&Need::Lifecycle {
-                    package: id.clone(),
+                    package: id,
                     hook: ".onLoad".into(),
                 });
                 self.graph.add_edge(
@@ -1265,14 +1199,14 @@ impl<P: PackageProvider> Linker<P> {
                 );
                 return Ok(());
             }
-            if self.is_root(&id)
+            if self.is_root(id)
                 && image
                     .index
                     .exports
                     .values()
                     .any(|exported_binding| exported_binding == &binding)
             {
-                let resolved = self.resolve_name(&package, &image, &binding)?;
+                let resolved = self.resolve_name(id, &image, &binding)?;
                 match resolved {
                     ResolvedName::Imported {
                         package,
@@ -1280,9 +1214,7 @@ impl<P: PackageProvider> Linker<P> {
                     } => {
                         self.require(
                             node,
-                            Need::Activation {
-                                package: package.clone(),
-                            },
+                            Need::Activation { package },
                             EdgeKind::Export,
                             format!("root re-export `{binding}` requires namespace activation"),
                         );
@@ -1299,7 +1231,7 @@ impl<P: PackageProvider> Linker<P> {
                         binding: foreign_binding,
                     } => {
                         let external = self.graph.add_node(
-                            package.name.clone(),
+                            self.packages.name(package).to_owned(),
                             NodeKind::ExternalBinding {
                                 name: foreign_binding.clone(),
                             },
@@ -1337,7 +1269,7 @@ impl<P: PackageProvider> Linker<P> {
                             .unwrap_or_else(|| format!("root re-export `{binding}` requires missing namespace {package}"));
                         self.record_missing_package(
                             node,
-                            &id,
+                            id,
                             &package,
                             EdgeKind::Export,
                             detail,
@@ -1348,7 +1280,7 @@ impl<P: PackageProvider> Linker<P> {
                     ResolvedName::Unknown(name) => {
                         self.diagnostic(
                             node,
-                            &id,
+                            id,
                             Some(&binding),
                             RejectCode::UnresolvedBinding,
                             format!(
@@ -1366,7 +1298,7 @@ impl<P: PackageProvider> Linker<P> {
             }
             self.diagnostic(
                 node,
-                &id,
+                id,
                 Some(&binding),
                 RejectCode::UnresolvedBinding,
                 format!("installed namespace has no binding `{binding}`"),
@@ -1386,7 +1318,7 @@ impl<P: PackageProvider> Linker<P> {
         if !object_issues.is_empty() {
             self.diagnostic(
                 node,
-                &id,
+                id,
                 Some(&binding),
                 RejectCode::UnsupportedObject,
                 object_issues.join("; "),
@@ -1399,7 +1331,7 @@ impl<P: PackageProvider> Linker<P> {
         ) {
             self.diagnostic(
                 node,
-                &id,
+                id,
                 Some(&binding),
                 RejectCode::ActiveBinding,
                 "active binding is preserved without execution",
@@ -1409,7 +1341,7 @@ impl<P: PackageProvider> Linker<P> {
         match &binding_image.object_kind {
             ObjectKind::Other(kind) => self.diagnostic(
                 node,
-                &id,
+                id,
                 Some(&binding),
                 RejectCode::UnsupportedObject,
                 format!("unsupported installed object type `{kind}`"),
@@ -1417,7 +1349,7 @@ impl<P: PackageProvider> Linker<P> {
             ),
             ObjectKind::Unavailable => self.diagnostic(
                 node,
-                &id,
+                id,
                 Some(&binding),
                 RejectCode::UnsupportedObject,
                 "installed binding could not be forced",
@@ -1430,7 +1362,7 @@ impl<P: PackageProvider> Linker<P> {
             if closure.environment.starts_with("unsupported:") {
                 self.diagnostic(
                     node,
-                    &id,
+                    id,
                     Some(&binding),
                     RejectCode::UnknownClosureEnclosure,
                     format!(
@@ -1440,16 +1372,16 @@ impl<P: PackageProvider> Linker<P> {
                     None,
                 );
             }
-            if let Some(parsed) = self.parsed(&id, &binding, &image, &binding_image)? {
+            if let Some(parsed) = self.parsed(id, &binding, &image, &binding_image)? {
                 let image = self.prepare_construction_image(
-                    &package,
+                    id,
                     &image,
                     &closure.environment,
                     parsed.as_ref(),
                 )?;
                 self.process_parsed(
                     node,
-                    &package,
+                    id,
                     &image,
                     &binding,
                     &closure.environment,
@@ -1467,21 +1399,20 @@ impl<P: PackageProvider> Linker<P> {
         environment: String,
         binding: String,
     ) -> Result<()> {
-        let package = self.packages.locate(&id.name)?;
         let node = self.need_node(&Need::PrivateBinding {
-            package: id.clone(),
+            package: id,
             environment: environment.clone(),
             binding: binding.clone(),
         });
-        if self.packages.is_external(&package) {
-            self.external.insert(package.id.clone());
+        if self.packages.is_external(id) {
+            self.external.insert(id);
             return Ok(());
         }
-        let image = self.image(&package)?;
+        let image = self.image(id)?;
         let Some(binding_image) = image.private_binding(&environment, &binding).cloned() else {
             self.diagnostic(
                 node,
-                &id,
+                id,
                 Some(&binding),
                 RejectCode::UnresolvedBinding,
                 format!("private environment `{environment}` has no binding `{binding}`"),
@@ -1490,14 +1421,14 @@ impl<P: PackageProvider> Linker<P> {
             return Ok(());
         };
 
-        self.diagnose_private_object(node, &id, &environment, &binding, &binding_image);
+        self.diagnose_private_object(node, id, &environment, &binding, &binding_image);
 
         let source_key = Self::private_source_key(&environment, &binding);
         if let Some(closure) = &binding_image.closure {
             if closure.environment.starts_with("unsupported:") {
                 self.diagnostic(
                     node,
-                    &id,
+                    id,
                     Some(&binding),
                     RejectCode::UnknownClosureEnclosure,
                     format!(
@@ -1507,9 +1438,9 @@ impl<P: PackageProvider> Linker<P> {
                     None,
                 );
             }
-            let context = self.oak_parse_context(&image, &closure.environment)?;
+            let context = self.oak_parse_context(id, &image, &closure.environment)?;
             if let Some(parsed) = self.parsed_source(
-                &id,
+                id,
                 Arc::clone(&closure.source),
                 context,
                 ParseRequest {
@@ -1520,14 +1451,14 @@ impl<P: PackageProvider> Linker<P> {
                 },
             )? {
                 let image = self.prepare_construction_image(
-                    &package,
+                    id,
                     &image,
                     &closure.environment,
                     parsed.as_ref(),
                 )?;
                 self.process_parsed(
                     node,
-                    &package,
+                    id,
                     &image,
                     &source_key,
                     &closure.environment,
@@ -1542,7 +1473,7 @@ impl<P: PackageProvider> Linker<P> {
     fn diagnose_private_object(
         &mut self,
         node: NodeId,
-        id: &PackageId,
+        id: PackageId,
         environment: &str,
         binding: &str,
         image: &PrivateBindingImage,
@@ -1603,7 +1534,12 @@ impl<P: PackageProvider> Linker<P> {
         }
     }
 
-    fn guards_active(&mut self, image: &PackageImage, guards: &[PackageGuard]) -> Result<bool> {
+    fn guards_active(
+        &mut self,
+        owner: PackageId,
+        image: &PackageImage,
+        guards: &[PackageGuard],
+    ) -> Result<bool> {
         if guards.is_empty() {
             return Ok(true);
         }
@@ -1629,7 +1565,7 @@ impl<P: PackageProvider> Linker<P> {
             if self.optional_package_selected(package) {
                 continue;
             }
-            if self.package_is_suggested_only(&image.index, package)? {
+            if self.package_is_suggested_only(owner, package)? {
                 return Ok(false);
             }
             let imported = image.index.imports.iter().any(|import| match import {
@@ -1653,9 +1589,9 @@ impl<P: PackageProvider> Linker<P> {
                     if imported {
                         continue;
                     }
-                    match self.packages.locate_optional(package)? {
-                        Some(candidate) if self.packages.is_external(&candidate) => {
-                            self.external.insert(candidate.id);
+                    match self.packages.resolve(package)? {
+                        Some(candidate) if self.packages.is_external(candidate) => {
+                            self.external.insert(candidate);
                         }
                         _ => return Ok(false),
                     }
@@ -1667,7 +1603,7 @@ impl<P: PackageProvider> Linker<P> {
 
     fn prepare_construction_image(
         &mut self,
-        package: &InstalledPackage,
+        package: PackageId,
         image: &PackageImage,
         lexical_environment: &str,
         parsed: &ParsedRFile,
@@ -1678,7 +1614,7 @@ impl<P: PackageProvider> Linker<P> {
                 continue;
             }
             for reference in &expression.references {
-                if !self.guards_active(image, &reference.guards)? {
+                if !self.guards_active(package, image, &reference.guards)? {
                     continue;
                 }
                 if let ResolvedName::PackageBinding {
@@ -1686,7 +1622,7 @@ impl<P: PackageProvider> Linker<P> {
                     binding,
                 } =
                     self.resolve_lexical_name(package, image, lexical_environment, &reference.name)?
-                    && owner == package.id
+                    && owner == package
                 {
                     bindings.insert(binding);
                 }
@@ -1816,20 +1752,20 @@ impl<P: PackageProvider> Linker<P> {
             context.lexical_environment,
             name,
         )?;
-        let graph = &self.object_graphs[&context.package.id];
+        let graph = &self.object_graphs[&context.package];
         let object = match resolved {
-            ResolvedName::PackageBinding { package, binding } if package == context.package.id => {
+            ResolvedName::PackageBinding { package, binding } if package == context.package => {
                 graph.namespace_bindings.get(&binding).copied()
             }
             ResolvedName::PrivateBinding {
                 package,
                 environment,
                 binding,
-            } if package == context.package.id => graph
+            } if package == context.package => graph
                 .environment_id(&environment)
                 .and_then(|environment| graph.environments[&environment].bindings.get(&binding))
                 .copied(),
-            ResolvedName::ClosureObject { package, closure } if package == context.package.id => {
+            ResolvedName::ClosureObject { package, closure } if package == context.package => {
                 graph.closures.get(&closure).map(|closure| closure.object)
             }
             _ => None,
@@ -1846,7 +1782,7 @@ impl<P: PackageProvider> Linker<P> {
         let (AbstractValue::Object(object), Some(name)) = (object, name) else {
             return AbstractValue::Unknown;
         };
-        let graph = &self.object_graphs[&context.package.id];
+        let graph = &self.object_graphs[&context.package];
         let member = match graph.objects.get(&object) {
             Some(InstalledObject::Environment(environment)) => {
                 graph.lookup_environment_binding(*environment, name).0
@@ -1886,7 +1822,7 @@ impl<P: PackageProvider> Linker<P> {
         let Ok(index) = usize::try_from(index) else {
             return AbstractValue::Unknown;
         };
-        let graph = &self.object_graphs[&context.package.id];
+        let graph = &self.object_graphs[&context.package];
         let Some(InstalledObject::Structured { members, .. }) = graph.objects.get(&object) else {
             return AbstractValue::Unknown;
         };
@@ -1913,8 +1849,7 @@ impl<P: PackageProvider> Linker<P> {
                 let AbstractValue::Object(target) = target else {
                     return Ok(());
                 };
-                let environment = match self.object_graphs[&context.package.id].objects.get(&target)
-                {
+                let environment = match self.object_graphs[&context.package].objects.get(&target) {
                     Some(InstalledObject::Environment(environment)) => Some(*environment),
                     _ => None,
                 };
@@ -1923,7 +1858,7 @@ impl<P: PackageProvider> Linker<P> {
                 };
                 let Some(name) = name else {
                     self.object_graphs
-                        .get_mut(&context.package.id)
+                        .get_mut(&context.package)
                         .expect("package object graph")
                         .mark_environment_unknown_fields(environment);
                     return Ok(());
@@ -1938,12 +1873,12 @@ impl<P: PackageProvider> Linker<P> {
                     | AbstractValue::Vector(_)
                     | AbstractValue::Function { .. } => self
                         .object_graphs
-                        .get_mut(&context.package.id)
+                        .get_mut(&context.package)
                         .expect("package object graph")
                         .abstract_value(),
                 };
                 self.object_graphs
-                    .get_mut(&context.package.id)
+                    .get_mut(&context.package)
                     .expect("package object graph")
                     .set_environment_binding(environment, name, object);
                 self.schedule_executable_object(context, object, span);
@@ -1957,7 +1892,7 @@ impl<P: PackageProvider> Linker<P> {
                 else {
                     return Ok(());
                 };
-                let graph = &self.object_graphs[&context.package.id];
+                let graph = &self.object_graphs[&context.package];
                 let closure_id = match graph.objects.get(&closure_object) {
                     Some(InstalledObject::Closure(closure)) => Some(*closure),
                     _ => None,
@@ -1971,7 +1906,7 @@ impl<P: PackageProvider> Linker<P> {
                 };
                 let derived = self
                     .object_graphs
-                    .get_mut(&context.package.id)
+                    .get_mut(&context.package)
                     .expect("package object graph")
                     .reenclose_closure(closure_id, environment)
                     .expect("known closure and environment");
@@ -1992,7 +1927,7 @@ impl<P: PackageProvider> Linker<P> {
         object: ObjectId,
         span: &Span,
     ) {
-        let closure = match self.object_graphs[&context.package.id].objects.get(&object) {
+        let closure = match self.object_graphs[&context.package].objects.get(&object) {
             Some(InstalledObject::Closure(closure)) => Some(*closure),
             _ => None,
         };
@@ -2000,7 +1935,7 @@ impl<P: PackageProvider> Linker<P> {
             self.require_at(
                 context.node,
                 Need::ClosureExecution {
-                    package: context.package.id.clone(),
+                    package: context.package,
                     closure,
                 },
                 EdgeKind::ClosureExecution,
@@ -2049,14 +1984,14 @@ impl<P: PackageProvider> Linker<P> {
             ResolvedName::Base(name) => {
                 self.evaluate_base_construction_call(context, state, call, span, &name, &arguments)
             }
-            ResolvedName::PackageBinding { package, binding } if package == context.package.id => {
+            ResolvedName::PackageBinding { package, binding } if package == context.package => {
                 self.evaluate_installed_function(context, call, &arguments, None, &binding)
             }
             ResolvedName::PrivateBinding {
                 package,
                 environment,
                 binding,
-            } if package == context.package.id => self.evaluate_installed_function(
+            } if package == context.package => self.evaluate_installed_function(
                 context,
                 call,
                 &arguments,
@@ -2122,9 +2057,10 @@ impl<P: PackageProvider> Linker<P> {
                 (closure, binding.to_owned(), ParseKind::Namespace)
             }
         };
-        let parse_context = self.oak_parse_context(context.image, &closure.environment)?;
+        let parse_context =
+            self.oak_parse_context(context.package, context.image, &closure.environment)?;
         let Some(parsed) = self.parsed_source(
-            &context.package.id,
+            context.package,
             closure.source,
             parse_context,
             ParseRequest {
@@ -2176,12 +2112,12 @@ impl<P: PackageProvider> Linker<P> {
                         .and_then(|value| self.abstract_environment(context, value));
                 let environment = self
                     .object_graphs
-                    .get_mut(&context.package.id)
+                    .get_mut(&context.package)
                     .expect("package object graph")
                     .derive_environment(parent);
                 let object = self
                     .object_graphs
-                    .get_mut(&context.package.id)
+                    .get_mut(&context.package)
                     .expect("package object graph")
                     .environment_object(environment)
                     .expect("derived environment has an object");
@@ -2191,14 +2127,14 @@ impl<P: PackageProvider> Linker<P> {
                 .first()
                 .and_then(|value| self.abstract_closure(context, value))
                 .and_then(|closure| {
-                    self.object_graphs[&context.package.id]
+                    self.object_graphs[&context.package]
                         .closures
                         .get(&closure)
                         .map(|closure| closure.enclosure)
                 })
                 .and_then(|environment| {
                     self.object_graphs
-                        .get_mut(&context.package.id)
+                        .get_mut(&context.package)
                         .expect("package object graph")
                         .environment_object(environment)
                 })
@@ -2294,13 +2230,13 @@ impl<P: PackageProvider> Linker<P> {
                 .and_then(|value| self.abstract_environment(context, value));
                 let environment = self
                     .object_graphs
-                    .get_mut(&context.package.id)
+                    .get_mut(&context.package)
                     .expect("package object graph")
                     .list2env(*values, None, environment, parent);
                 self.schedule_environment_closures(context, environment, &call.arguments);
                 let object = self
                     .object_graphs
-                    .get_mut(&context.package.id)
+                    .get_mut(&context.package)
                     .expect("package object graph")
                     .environment_object(environment)
                     .expect("list2env result environment");
@@ -2333,12 +2269,12 @@ impl<P: PackageProvider> Linker<P> {
                 ) = (field, value, environment)
                 {
                     self.object_graphs
-                        .get_mut(&context.package.id)
+                        .get_mut(&context.package)
                         .expect("package object graph")
                         .set_environment_binding(environment, field, *value);
                 } else if let Some(environment) = environment {
                     self.object_graphs
-                        .get_mut(&context.package.id)
+                        .get_mut(&context.package)
                         .expect("package object graph")
                         .mark_environment_unknown_fields(environment);
                 }
@@ -2382,7 +2318,7 @@ impl<P: PackageProvider> Linker<P> {
         let AbstractValue::Object(object) = value else {
             return None;
         };
-        match self.object_graphs[&context.package.id].objects.get(object) {
+        match self.object_graphs[&context.package].objects.get(object) {
             Some(InstalledObject::Environment(environment)) => Some(*environment),
             _ => None,
         }
@@ -2396,7 +2332,7 @@ impl<P: PackageProvider> Linker<P> {
         let AbstractValue::Object(object) = value else {
             return None;
         };
-        match self.object_graphs[&context.package.id].objects.get(object) {
+        match self.object_graphs[&context.package].objects.get(object) {
             Some(InstalledObject::Closure(closure)) => Some(*closure),
             _ => None,
         }
@@ -2408,7 +2344,7 @@ impl<P: PackageProvider> Linker<P> {
             AbstractValue::String(_) => Some(1),
             AbstractValue::Vector(values) => i64::try_from(values.len()).ok(),
             AbstractValue::Object(object) => {
-                match self.object_graphs[&context.package.id].objects.get(object) {
+                match self.object_graphs[&context.package].objects.get(object) {
                     Some(InstalledObject::Structured { members, .. }) => {
                         i64::try_from(members.len()).ok()
                     }
@@ -2431,7 +2367,7 @@ impl<P: PackageProvider> Linker<P> {
             return None;
         };
         let Some(InstalledObject::Structured { members, .. }) =
-            self.object_graphs[&context.package.id].objects.get(object)
+            self.object_graphs[&context.package].objects.get(object)
         else {
             return None;
         };
@@ -2458,7 +2394,7 @@ impl<P: PackageProvider> Linker<P> {
             return AbstractValue::Unknown;
         };
         self.object_graphs
-            .get_mut(&context.package.id)
+            .get_mut(&context.package)
             .expect("package object graph")
             .reenclose_structured_closures(*object, environment)
             .map_or(AbstractValue::Unknown, AbstractValue::Object)
@@ -2544,15 +2480,15 @@ impl<P: PackageProvider> Linker<P> {
         environment: EnvironmentId,
         arguments: &[ConstructionArgument],
     ) {
-        let closures = self.object_graphs[&context.package.id].environments[&environment]
+        let closures = self.object_graphs[&context.package].environments[&environment]
             .bindings
             .values()
-            .filter_map(|object| {
-                match self.object_graphs[&context.package.id].objects.get(object) {
+            .filter_map(
+                |object| match self.object_graphs[&context.package].objects.get(object) {
                     Some(InstalledObject::Closure(closure)) => Some(*closure),
                     _ => None,
-                }
-            })
+                },
+            )
             .collect::<Vec<_>>();
         let span = arguments
             .first()
@@ -2562,7 +2498,7 @@ impl<P: PackageProvider> Linker<P> {
             self.require_at(
                 context.node,
                 Need::ClosureExecution {
-                    package: context.package.id.clone(),
+                    package: context.package,
                     closure,
                 },
                 EdgeKind::ClosureExecution,
@@ -2575,7 +2511,7 @@ impl<P: PackageProvider> Linker<P> {
     fn process_parsed(
         &mut self,
         node: NodeId,
-        package: &InstalledPackage,
+        package: PackageId,
         image: &PackageImage,
         binding: &str,
         lexical_environment: &str,
@@ -2591,7 +2527,7 @@ impl<P: PackageProvider> Linker<P> {
             };
             self.diagnostic(
                 node,
-                &package.id,
+                package,
                 Some(binding),
                 code,
                 issue.message.clone(),
@@ -2615,7 +2551,7 @@ impl<P: PackageProvider> Linker<P> {
                 if binding != ".onLoad" || !active.certain {
                     continue;
                 }
-                if !self.guards_active(image, &active.guards)? {
+                if !self.guards_active(package, image, &active.guards)? {
                     continue;
                 }
                 if self.active_binding_targets_current_namespace(
@@ -2625,16 +2561,16 @@ impl<P: PackageProvider> Linker<P> {
                     active,
                 )? && self
                     .namespace_builders
-                    .get_mut(&package.id)
+                    .get_mut(&package)
                     .expect("namespace builder initialized")
                     .add_binding(active.name.clone())
                 {
-                    self.non_returning_bindings.remove(&package.id);
+                    self.non_returning_bindings.remove(&package);
                 }
             }
             let mut consumed_native_selectors = Vec::new();
             for call in &expression.calls {
-                if !self.guards_active(image, &call.guards)?
+                if !self.guards_active(package, image, &call.guards)?
                     || !matches!(
                         call.callee.as_str(),
                         ".Call" | ".External" | ".C" | ".Fortran"
@@ -2660,7 +2596,7 @@ impl<P: PackageProvider> Linker<P> {
                 }
             }
             for reference in &expression.references {
-                if !self.guards_active(image, &reference.guards)? {
+                if !self.guards_active(package, image, &reference.guards)? {
                     continue;
                 }
                 if consumed_native_selectors.contains(&reference.span) {
@@ -2680,7 +2616,7 @@ impl<P: PackageProvider> Linker<P> {
                 {
                     self.diagnostic(
                         node,
-                        &package.id,
+                        package,
                         Some(binding),
                         RejectCode::PotentialUnboundLocal,
                         format!(
@@ -2693,26 +2629,26 @@ impl<P: PackageProvider> Linker<P> {
                 }
                 self.require_resolved(
                     node,
-                    &package.id,
+                    package,
                     Some(binding),
                     resolved,
                     reference.span.clone(),
                 )?;
             }
             for reference in &expression.package_refs {
-                if !self.guards_active(image, &reference.guards)? {
+                if !self.guards_active(package, image, &reference.guards)? {
                     continue;
                 }
-                self.namespace_access(node, package, image, reference)?;
+                self.namespace_access(node, package, reference)?;
             }
             for resource in &expression.resource_refs {
-                if !self.guards_active(image, &resource.guards)? {
+                if !self.guards_active(package, image, &resource.guards)? {
                     continue;
                 }
-                self.resource_access(node, package, image, resource)?;
+                self.resource_access(node, package, resource)?;
             }
             for call in &expression.calls {
-                if !self.guards_active(image, &call.guards)? {
+                if !self.guards_active(package, image, &call.guards)? {
                     continue;
                 }
                 self.block_s3_dispatch(node, package, image, binding, lexical_environment, call)?;
@@ -2730,7 +2666,7 @@ impl<P: PackageProvider> Linker<P> {
                 {
                     self.diagnostic(
                         node,
-                        &package.id,
+                        package,
                         Some(binding),
                         RejectCode::ObjectSystem,
                         format!(
@@ -2744,7 +2680,7 @@ impl<P: PackageProvider> Linker<P> {
                 self.semantic_call(node, package, image, binding, lexical_environment, call)?;
             }
             for effect in &expression.effects {
-                if !self.guards_active(image, &effect.guards)? {
+                if !self.guards_active(package, image, &effect.guards)? {
                     continue;
                 }
                 match effect.kind {
@@ -2765,7 +2701,7 @@ impl<P: PackageProvider> Linker<P> {
                     | SyntaxEffectKind::UnsupportedAssignmentTarget => {
                         self.diagnostic(
                             node,
-                            &package.id,
+                            package,
                             Some(binding),
                             RejectCode::UnsupportedTopLevelEffect,
                             format!("unsupported R effect: {:?}", effect.kind),
@@ -2781,7 +2717,7 @@ impl<P: PackageProvider> Linker<P> {
     fn block_s3_dispatch(
         &mut self,
         from: NodeId,
-        current: &InstalledPackage,
+        current: PackageId,
         image: &PackageImage,
         owner_binding: &str,
         lexical_environment: &str,
@@ -2795,8 +2731,7 @@ impl<P: PackageProvider> Linker<P> {
         else {
             return Ok(());
         };
-        let receiver_package = self.packages.locate(&package.name)?;
-        let receiver_image = self.binding_image(&receiver_package, &binding)?;
+        let receiver_image = self.binding_image(package, &binding)?;
         let Some(receiver) = receiver_image.binding(&binding) else {
             return Ok(());
         };
@@ -2811,7 +2746,7 @@ impl<P: PackageProvider> Linker<P> {
                     .registrations
                     .iter()
                     .filter(|registration| registration.generic.name == call.callee)
-                    .map(|registration| (package.clone(), registration.clone()))
+                    .map(|registration| (*package, registration.clone()))
             })
             .collect::<Vec<_>>();
         for class in &receiver.classes {
@@ -2821,12 +2756,14 @@ impl<P: PackageProvider> Linker<P> {
             {
                 self.diagnostic(
                     from,
-                    &current.id,
+                    current,
                     Some(owner_binding),
                     RejectCode::ObjectSystem,
                     format!(
                         "reachable S3 dispatch {}/{} -> {} is outside PureRStatic",
-                        registration.generic, class, registration.method
+                        self.generic_label(&registration.generic),
+                        class,
+                        registration.method
                     ),
                     Some(call.span.clone()),
                 );
@@ -2838,7 +2775,7 @@ impl<P: PackageProvider> Linker<P> {
 
     fn parsed(
         &mut self,
-        id: &PackageId,
+        id: PackageId,
         binding: &str,
         package_image: &PackageImage,
         image: &BindingImage,
@@ -2846,14 +2783,14 @@ impl<P: PackageProvider> Linker<P> {
         let closure = image.closure.as_ref().ok_or_else(|| {
             Error::Analysis(format!(
                 "closure binding {}::{binding} has no source",
-                id.name
+                self.packages.name(id)
             ))
         })?;
         let node = self.need_node(&Need::Binding {
-            package: id.clone(),
+            package: id,
             binding: binding.to_owned(),
         });
-        let context = self.oak_parse_context(package_image, &closure.environment)?;
+        let context = self.oak_parse_context(id, package_image, &closure.environment)?;
         self.parsed_source(
             id,
             Arc::clone(&closure.source),
@@ -2869,7 +2806,7 @@ impl<P: PackageProvider> Linker<P> {
 
     fn parsed_source(
         &mut self,
-        id: &PackageId,
+        id: PackageId,
         source_text: Arc<str>,
         context: OakParseContext,
         request: ParseRequest<'_>,
@@ -2880,7 +2817,7 @@ impl<P: PackageProvider> Linker<P> {
             owner_node,
             kind: parse_kind,
         } = request;
-        let key = (id.clone(), source_key.to_owned());
+        let key = (id, source_key.to_owned());
         if let Some(state) = self.parsed_bindings.get(&key) {
             return Ok(match state {
                 ParseState::Parsed(parsed) => Some(Arc::clone(parsed)),
@@ -2888,7 +2825,7 @@ impl<P: PackageProvider> Linker<P> {
             });
         }
         let source = self.sources.add_binding(
-            id.name.clone(),
+            self.packages.name(id).to_owned(),
             source_key.to_owned(),
             Arc::clone(&source_text),
         );
@@ -2928,17 +2865,17 @@ impl<P: PackageProvider> Linker<P> {
 
     fn handle_air_rejection(
         &mut self,
-        id: &PackageId,
+        id: PackageId,
         owner_binding: &str,
         source_key: &str,
         owner_node: NodeId,
         air_error: String,
     ) -> Result<()> {
-        let key = (id.clone(), source_key.to_owned());
+        let key = (id, source_key.to_owned());
         let source_id = self.source_ids.get(&key).cloned().ok_or_else(|| {
             Error::Analysis(format!(
                 "missing virtual source for {}::{source_key}",
-                id.name
+                self.packages.name(id)
             ))
         })?;
         let source_text = Arc::clone(
@@ -2948,9 +2885,7 @@ impl<P: PackageProvider> Linker<P> {
                 .ok_or_else(|| Error::Analysis("missing source entry".into()))?
                 .text,
         );
-        let validation = self
-            .packages
-            .validate_syntax(id, source_key, source_text.as_ref())?;
+        let validation = self.packages.validate_syntax(source_text.as_ref())?;
         let span = Some(Span::new(source_id, 0, source_text.len()));
         match validation {
             SyntaxValidation::Accepted => self.diagnostic(
@@ -2978,53 +2913,47 @@ impl<P: PackageProvider> Linker<P> {
         Ok(())
     }
 
-    fn ensure_on_load_analyzed(&mut self, id: &PackageId) -> Result<()> {
-        let package = self.packages.locate(&id.name)?;
-        if self.packages.is_external(&package) {
-            return Ok(());
-        }
-        let image = self.image(&package)?;
-        let index = Arc::new(image.index.clone());
-        if !index.lifecycle.on_load {
+    fn ensure_on_load_analyzed(&mut self, id: PackageId) -> Result<()> {
+        if self.packages.is_external(id) || !self.image(id)?.index.lifecycle.on_load {
             return Ok(());
         }
 
         let lifecycle = Need::Lifecycle {
-            package: id.clone(),
+            package: id,
             hook: ".onLoad".into(),
         };
         if self.processed.insert(lifecycle.clone()) {
             self.queued.remove(&lifecycle);
-            self.process_lifecycle(id.clone(), ".onLoad".into())?;
+            self.process_lifecycle(id, ".onLoad".into())?;
         }
 
         let hook = Need::Binding {
-            package: id.clone(),
+            package: id,
             binding: ".onLoad".into(),
         };
         if self.processed.insert(hook.clone()) {
             self.queued.remove(&hook);
-            self.process_binding(id.clone(), ".onLoad".into())?;
+            self.process_binding(id, ".onLoad".into())?;
         }
         Ok(())
     }
 
     fn active_binding_targets_current_namespace(
         &mut self,
-        package: &InstalledPackage,
+        package: PackageId,
         image: &PackageImage,
         lexical_environment: &str,
         active: &ActiveBindingDef,
     ) -> Result<bool> {
-        let expected = format!("namespace:{}", package.id.name);
+        let expected = format!("namespace:{}", self.packages.name(package));
         Ok(match &active.target {
-            StaticEnvironment::Namespace(name) => name == &package.id.name,
+            StaticEnvironment::Namespace(name) => name == self.packages.name(package),
             StaticEnvironment::ClosureBinding(name) => {
                 match self.resolve_lexical_name(package, image, lexical_environment, name)? {
                     ResolvedName::PackageBinding {
                         package: owner,
                         binding,
-                    } if owner == package.id => image
+                    } if owner == package => image
                         .binding(&binding)
                         .and_then(|binding| binding.closure.as_ref())
                         .is_some_and(|closure| closure.environment == expected),
@@ -3032,7 +2961,7 @@ impl<P: PackageProvider> Linker<P> {
                         package: owner,
                         environment,
                         binding,
-                    } if owner == package.id => image
+                    } if owner == package => image
                         .private_binding(&environment, &binding)
                         .and_then(|binding| binding.closure.as_ref())
                         .is_some_and(|closure| closure.environment == expected),
@@ -3043,34 +2972,31 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn process_activation(&mut self, id: PackageId) -> Result<()> {
-        let package = self.packages.locate(&id.name)?;
-        if self.packages.is_external(&package) {
-            self.external.insert(package.id.clone());
+        if self.packages.is_external(id) {
+            self.external.insert(id);
             return Ok(());
         }
-        let image = self.image(&package)?;
+        let image = self.image(id)?;
         let index = Arc::new(image.index.clone());
-        let node = self.need_node(&Need::Activation {
-            package: id.clone(),
-        });
+        let node = self.need_node(&Need::Activation { package: id });
 
         // Dependency declarations are lookup metadata, not reachability roots.
         // A retained binding that resolves through an import will demand the
         // exact foreign activation/binding. Unused Imports/Depends stay cold.
         for registration in &index.s3 {
             if let Some(package_name) = registration.generic.package.as_deref()
-                && self.package_is_suggested_only(&index, package_name)?
+                && self.package_is_suggested_only(id, package_name)?
                 && !self.optional_package_selected(package_name)
             {
                 continue;
             }
             let generic_package = match registration.generic.package.as_deref() {
-                Some(name) => match self.packages.locate_optional(name)? {
-                    Some(package) => Some(package.id),
+                Some(name) => match self.packages.resolve(name)? {
+                    Some(id) => Some(id),
                     None => {
                         self.record_missing_package(
                             node,
-                            &id,
+                            id,
                             name,
                             EdgeKind::S3Registration,
                             format!(
@@ -3086,7 +3012,7 @@ impl<P: PackageProvider> Linker<P> {
             };
             // Registration availability is namespace state. Fetch the exact method payload so
             // finalization can materialize the slot without treating it as executable reachability.
-            let _ = self.binding_image(&package, &registration.method)?;
+            let _ = self.binding_image(id, &registration.method)?;
             let registration_id = S3Id {
                 generic: GenericId {
                     package: generic_package,
@@ -3103,7 +3029,7 @@ impl<P: PackageProvider> Linker<P> {
             self.require(
                 node,
                 Need::S3Registration {
-                    package: id.clone(),
+                    package: id,
                     registration: registration_id,
                 },
                 EdgeKind::S3Registration,
@@ -3118,7 +3044,7 @@ impl<P: PackageProvider> Linker<P> {
             self.require(
                 node,
                 Need::Native {
-                    package: id.clone(),
+                    package: id,
                     component: native.name.clone(),
                 },
                 EdgeKind::Native,
@@ -3129,7 +3055,7 @@ impl<P: PackageProvider> Linker<P> {
             self.require(
                 node,
                 Need::Lifecycle {
-                    package: id.clone(),
+                    package: id,
                     hook: ".onLoad".into(),
                 },
                 EdgeKind::Lifecycle,
@@ -3140,13 +3066,12 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn process_resource(&mut self, id: PackageId, resource: String) -> Result<()> {
-        let package = self.packages.locate(&id.name)?;
-        if self.packages.is_external(&package) {
-            self.external.insert(package.id.clone());
+        if self.packages.is_external(id) {
+            self.external.insert(id);
             return Ok(());
         }
-        let _ = self.image(&package)?;
-        let _present = self.packages.resource_exists(&package, &resource)?;
+        let _ = self.image(id)?;
+        let _present = self.packages.resource_exists(id, &resource)?;
         // An absent system.file() path is a valid result when mustWork is false
         // (the default). The reference is retained only when the installed
         // image actually contains the requested path.
@@ -3154,20 +3079,19 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn process_dataset(&mut self, id: PackageId, dataset: String) -> Result<()> {
-        let package = self.packages.locate(&id.name)?;
-        if self.packages.is_external(&package) {
-            self.external.insert(package.id.clone());
+        if self.packages.is_external(id) {
+            self.external.insert(id);
             return Ok(());
         }
-        let image = self.image(&package)?;
+        let image = self.image(id)?;
         let node = self.need_node(&Need::Dataset {
-            package: id.clone(),
+            package: id,
             dataset: dataset.clone(),
         });
         if !image.index.datasets.iter().any(|name| name == &dataset) {
             self.diagnostic(
                 node,
-                &id,
+                id,
                 None,
                 RejectCode::UnresolvedBinding,
                 format!("dataset `{dataset}` is absent from installed image"),
@@ -3179,19 +3103,19 @@ impl<P: PackageProvider> Linker<P> {
 
     fn process_s3(&mut self, id: PackageId, registration: S3Id) -> Result<()> {
         let node = self.need_node(&Need::S3Registration {
-            package: id.clone(),
+            package: id,
             registration: registration.clone(),
         });
         if let Some(generic_package) = &registration.generic.package {
             self.require(
                 node,
                 Need::Activation {
-                    package: generic_package.clone(),
+                    package: *generic_package,
                 },
                 EdgeKind::S3Registration,
                 format!(
                     "S3 generic `{}` requires its namespace",
-                    registration.generic
+                    self.generic_label(&registration.generic)
                 ),
             );
         }
@@ -3199,21 +3123,20 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn process_native(&mut self, id: PackageId, component: String) -> Result<()> {
-        let package = self.packages.locate(&id.name)?;
-        if self.packages.is_external(&package) {
-            self.external.insert(package.id.clone());
+        if self.packages.is_external(id) {
+            self.external.insert(id);
             return Ok(());
         }
-        let index = self.packages.index(&package)?;
+        let index = self.packages.index(id)?;
         let node = self.need_node(&Need::Native {
-            package: id.clone(),
+            package: id,
             component: component.clone(),
         });
         if let Some(native) = index.dynlibs.iter().find(|native| native.name == component) {
             match &native.safety {
                 NativeSafety::Unanalyzed => self.diagnostic(
                     node,
-                    &id,
+                    id,
                     None,
                     RejectCode::UnknownNativeEffects,
                     format!("native component `{component}` is registered but its R callbacks and runtime effects have not been analyzed"),
@@ -3223,7 +3146,7 @@ impl<P: PackageProvider> Linker<P> {
                     for callback in &facts.callbacks {
                         self.require(
                             node,
-                            Need::Binding { package: id.clone(), binding: callback.clone() },
+                            Need::Binding { package: id, binding: callback.clone() },
                             EdgeKind::Callback,
                             format!("native component `{component}` calls R binding `{callback}`"),
                         );
@@ -3232,7 +3155,7 @@ impl<P: PackageProvider> Linker<P> {
                 NativeSafety::Summarized(_) => {}
                 NativeSafety::Unsupported(issues) => self.diagnostic(
                     node,
-                    &id,
+                    id,
                     None,
                     RejectCode::UnknownNativeEffects,
                     format!("native component `{component}` has unsupported runtime effects: {}", issues.join("; ")),
@@ -3242,7 +3165,7 @@ impl<P: PackageProvider> Linker<P> {
         } else {
             self.diagnostic(
                 node,
-                &id,
+                id,
                 None,
                 RejectCode::UnknownNativeLookup,
                 format!("effective namespace metadata has no native component `{component}`"),
@@ -3254,7 +3177,7 @@ impl<P: PackageProvider> Linker<P> {
 
     fn process_lifecycle(&mut self, id: PackageId, hook: String) -> Result<()> {
         let node = self.need_node(&Need::Lifecycle {
-            package: id.clone(),
+            package: id,
             hook: hook.clone(),
         });
         self.require(
@@ -3272,14 +3195,13 @@ impl<P: PackageProvider> Linker<P> {
     fn namespace_access(
         &mut self,
         from: NodeId,
-        current: &InstalledPackage,
-        image: &PackageImage,
+        current: PackageId,
         reference: &crate::syntax::PackageRef,
     ) -> Result<()> {
         if reference.package == "base" {
             return Ok(());
         }
-        if self.package_is_suggested_only(&image.index, &reference.package)?
+        if self.package_is_suggested_only(current, &reference.package)?
             && !self.optional_package_selected(&reference.package)
         {
             // Suggests-only packages are deliberately outside the selected
@@ -3288,10 +3210,10 @@ impl<P: PackageProvider> Linker<P> {
             // that package unless the user enables it with --extra-pkgs.
             return Ok(());
         }
-        let Some(foreign) = self.packages.locate_optional(&reference.package)? else {
+        let Some(foreign) = self.packages.resolve(&reference.package)? else {
             self.record_missing_package(
                 from,
-                &current.id,
+                current,
                 &reference.package,
                 EdgeKind::PackageQualified,
                 format!(
@@ -3304,11 +3226,11 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         };
-        if self.is_root(&current.id) && foreign.id == current.id {
+        if self.is_root(current) && foreign == current {
             let binding = if reference.internal {
                 reference.symbol.clone()
             } else {
-                let index = self.packages.index(&foreign)?;
+                let index = self.packages.index(foreign)?;
                 index
                     .exports
                     .get(&reference.symbol)
@@ -3318,7 +3240,7 @@ impl<P: PackageProvider> Linker<P> {
             self.require_at(
                 from,
                 Need::Binding {
-                    package: current.id.clone(),
+                    package: current,
                     binding: binding.clone(),
                 },
                 EdgeKind::PackageQualified,
@@ -3332,10 +3254,10 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         }
-        if self.packages.is_external(&foreign) {
-            self.external.insert(foreign.id.clone());
+        if self.packages.is_external(foreign) {
+            self.external.insert(foreign);
             let external = self.graph.add_node(
-                &foreign.id.name,
+                self.packages.name(foreign),
                 NodeKind::ExternalBinding {
                     name: reference.symbol.clone(),
                 },
@@ -3353,7 +3275,7 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         }
-        let index = self.packages.index(&foreign)?;
+        let index = self.packages.index(foreign)?;
         let binding = if reference.internal {
             reference.symbol.clone()
         } else {
@@ -3365,9 +3287,7 @@ impl<P: PackageProvider> Linker<P> {
         };
         self.require_at(
             from,
-            Need::Activation {
-                package: foreign.id.clone(),
-            },
+            Need::Activation { package: foreign },
             EdgeKind::NamespaceLoad,
             "qualified namespace access requires activation",
             Some(reference.span.clone()),
@@ -3375,7 +3295,7 @@ impl<P: PackageProvider> Linker<P> {
         self.require_at(
             from,
             Need::Binding {
-                package: foreign.id.clone(),
+                package: foreign,
                 binding: binding.clone(),
             },
             EdgeKind::PackageQualified,
@@ -3390,7 +3310,7 @@ impl<P: PackageProvider> Linker<P> {
         self.pending_relocations
             .push(PendingRelocation::NamespaceAccess {
                 source: reference.span.clone(),
-                package: foreign.id,
+                package: foreign,
                 binding,
                 internal: reference.internal,
             });
@@ -3400,15 +3320,14 @@ impl<P: PackageProvider> Linker<P> {
     fn resource_access(
         &mut self,
         from: NodeId,
-        current: &InstalledPackage,
-        image: &PackageImage,
+        current: PackageId,
         resource: &crate::syntax::ResourceRef,
     ) -> Result<()> {
         let Some(package_name) = &resource.package else {
             if resource.path.is_none() {
                 self.diagnostic(
                     from,
-                    &current.id,
+                    current,
                     None,
                     RejectCode::DynamicLookup,
                     "dynamic system.file() resource path",
@@ -3421,20 +3340,20 @@ impl<P: PackageProvider> Linker<P> {
         // The root remains a real installed package. Preserve its own package
         // path/help/Meta semantics exactly; no synthetic resource rewrite is
         // required for system.file(..., package = <root>).
-        if self.is_root(&current.id) && package_name == &current.id.name {
+        if self.is_root(current) && package_name == self.packages.name(current) {
             return Ok(());
         }
 
-        if self.package_is_suggested_only(&image.index, package_name)?
+        if self.package_is_suggested_only(current, package_name)?
             && !self.optional_package_selected(package_name)
         {
             return Ok(());
         }
 
-        let Some(foreign) = self.packages.locate_optional(package_name)? else {
+        let Some(foreign) = self.packages.resolve(package_name)? else {
             self.record_missing_package(
                 from,
-                &current.id,
+                current,
                 package_name,
                 EdgeKind::Resource,
                 format!("system.file references package {package_name}"),
@@ -3442,14 +3361,14 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         };
-        if self.packages.is_external(&foreign) {
-            self.external.insert(foreign.id.clone());
+        if self.packages.is_external(foreign) {
+            self.external.insert(foreign);
             return Ok(());
         }
         let Some(path) = &resource.path else {
             self.diagnostic(
                 from,
-                &current.id,
+                current,
                 None,
                 RejectCode::DynamicLookup,
                 format!("dynamic system.file() path for package {package_name}"),
@@ -3457,13 +3376,13 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         };
-        if !self.packages.resource_exists(&foreign, path)? {
+        if !self.packages.resource_exists(foreign, path)? {
             match resource.must_work {
                 Some(false) => return Ok(()),
                 Some(true) => {
                     self.diagnostic(
                         from,
-                        &current.id,
+                        current,
                         None,
                         RejectCode::MissingResource,
                         format!("system.file(..., mustWork = TRUE) requires absent path {package_name}/{path}"),
@@ -3474,7 +3393,7 @@ impl<P: PackageProvider> Linker<P> {
                 None => {
                     self.diagnostic(
                         from,
-                        &current.id,
+                        current,
                         None,
                         RejectCode::DynamicLookup,
                         format!("dynamic mustWork controls absent system.file path {package_name}/{path}"),
@@ -3487,7 +3406,7 @@ impl<P: PackageProvider> Linker<P> {
         self.require_at(
             from,
             Need::Resource {
-                package: foreign.id.clone(),
+                package: foreign,
                 resource: path.clone(),
             },
             EdgeKind::Resource,
@@ -3497,7 +3416,7 @@ impl<P: PackageProvider> Linker<P> {
         self.pending_relocations
             .push(PendingRelocation::ResourceAccess {
                 source: resource.span.clone(),
-                package: foreign.id,
+                package: foreign,
                 resource: path.clone(),
             });
         Ok(())
@@ -3507,8 +3426,9 @@ impl<P: PackageProvider> Linker<P> {
         self.extra_packages.contains(name) || self.explicit_external_packages.contains(name)
     }
 
-    fn package_is_suggested_only(&mut self, index: &PackageIndex, name: &str) -> Result<bool> {
-        if !self.suggested_only.contains_key(&index.package.id) {
+    fn package_is_suggested_only(&mut self, package: PackageId, name: &str) -> Result<bool> {
+        if !self.suggested_only.contains_key(&package) {
+            let index = Arc::clone(&self.images[&package].index);
             let mut required = HashSet::new();
             for import in &index.imports {
                 let package = match import {
@@ -3535,12 +3455,11 @@ impl<P: PackageProvider> Linker<P> {
                     (!required.contains(&name)).then_some(name)
                 })
                 .collect::<HashSet<_>>();
-            self.suggested_only
-                .insert(index.package.id.clone(), suggested);
+            self.suggested_only.insert(package, suggested);
         }
         Ok(self
             .suggested_only
-            .get(&index.package.id)
+            .get(&package)
             .is_some_and(|packages| packages.contains(name)))
     }
 
@@ -3593,13 +3512,13 @@ impl<P: PackageProvider> Linker<P> {
             return Ok(());
         };
         let native_node = self.need_node(&Need::Native {
-            package: current.id.clone(),
+            package: current,
             component: component.to_owned(),
         });
         let Some(summary) = Self::native_summary_for_selector(native, selector, summaries) else {
             self.diagnostic(
                 native_node,
-                &current.id,
+                current,
                 Some(binding),
                 RejectCode::UnknownNativeEffects,
                 format!("native routine `{selector}` in `{component}` has no semantic summary"),
@@ -3612,7 +3531,7 @@ impl<P: PackageProvider> Linker<P> {
             if position == 0 {
                 self.diagnostic(
                     native_node,
-                    &current.id,
+                    current,
                     Some(binding),
                     RejectCode::UnknownNativeEffects,
                     format!("native routine `{selector}` has invalid callback argument position 0"),
@@ -3625,7 +3544,7 @@ impl<P: PackageProvider> Linker<P> {
             let Some(StaticArg::Symbol(callback_name)) = callback else {
                 self.diagnostic(
                     native_node,
-                    &current.id,
+                    current,
                     Some(binding),
                     RejectCode::UnknownNativeEffects,
                     format!(
@@ -3675,7 +3594,7 @@ impl<P: PackageProvider> Linker<P> {
                 ResolvedName::Imported { package, binding: callback } => {
                     self.require_at(
                         native_node,
-                        Need::Activation { package: package.clone() },
+                        Need::Activation { package },
                         EdgeKind::Callback,
                         format!("native callback `{callback}` requires imported namespace activation"),
                         Some(call.span.clone()),
@@ -3690,7 +3609,7 @@ impl<P: PackageProvider> Linker<P> {
                 }
                 ResolvedName::External { package, binding: callback } => {
                     let target = self.graph.add_node(
-                        package.name,
+                        self.packages.name(package).to_owned(),
                         NodeKind::ExternalBinding { name: callback.clone() },
                         Some(call.span.clone()),
                     );
@@ -3709,7 +3628,7 @@ impl<P: PackageProvider> Linker<P> {
                 | ResolvedName::MissingPackage { .. }
                 | ResolvedName::Unknown(_) => self.diagnostic(
                     native_node,
-                    &current.id,
+                    current,
                     Some(binding),
                     RejectCode::UnknownNativeEffects,
                     format!(
@@ -3741,7 +3660,7 @@ impl<P: PackageProvider> Linker<P> {
 
     fn native_component_for_call(
         &mut self,
-        current: &InstalledPackage,
+        current: PackageId,
         image: &PackageImage,
         lexical_environment: &str,
         call: &CallSite,
@@ -3830,7 +3749,7 @@ impl<P: PackageProvider> Linker<P> {
     fn handle_superassignment(
         &mut self,
         from: NodeId,
-        package: &InstalledPackage,
+        package: PackageId,
         image: &PackageImage,
         binding: &str,
         lexical_environment: &str,
@@ -3852,7 +3771,7 @@ impl<P: PackageProvider> Linker<P> {
                     // this cannot turn an unknown symbol into an accepted link.
                     self.require_at(
                         from,
-                        Need::Native { package: package.id.clone(), component: component.to_owned() },
+                        Need::Native { package, component: component.to_owned() },
                         EdgeKind::Native,
                         format!(".onLoad may receive registered native symbol `{value}` from `{component}`"),
                         Some(effect.span.clone()),
@@ -3860,20 +3779,14 @@ impl<P: PackageProvider> Linker<P> {
                 } else {
                     self.require_resolved(
                         from,
-                        &package.id,
+                        package,
                         Some(binding),
                         resolved,
                         effect.span.clone(),
                     )?;
                 }
             } else {
-                self.require_resolved(
-                    from,
-                    &package.id,
-                    Some(binding),
-                    resolved,
-                    effect.span.clone(),
-                )?;
+                self.require_resolved(from, package, Some(binding), resolved, effect.span.clone())?;
             }
         }
 
@@ -3884,7 +3797,7 @@ impl<P: PackageProvider> Linker<P> {
         let Some(target) = &effect.target else {
             self.diagnostic(
                 from,
-                &package.id,
+                package,
                 Some(binding),
                 RejectCode::EnvironmentMutation,
                 "dynamic superassignment target cannot be resolved",
@@ -3919,7 +3832,7 @@ impl<P: PackageProvider> Linker<P> {
             | ResolvedName::Local(_)
             | ResolvedName::Unknown(_) => self.diagnostic(
                 from,
-                &package.id,
+                package,
                 Some(binding),
                 RejectCode::EnvironmentMutation,
                 format!("superassignment target `{target}` does not resolve to a mutable enclosing lexical/package/private binding"),
@@ -3962,7 +3875,7 @@ impl<P: PackageProvider> Linker<P> {
     fn semantic_call(
         &mut self,
         from: NodeId,
-        current: &InstalledPackage,
+        current: PackageId,
         image: &PackageImage,
         binding: &str,
         lexical_environment: &str,
@@ -3994,7 +3907,7 @@ impl<P: PackageProvider> Linker<P> {
                 {
                     self.diagnostic(
                         from,
-                        &current.id,
+                        current,
                         Some(binding),
                         RejectCode::SemanticAmbiguity,
                         format!(
@@ -4023,14 +3936,14 @@ impl<P: PackageProvider> Linker<P> {
             "library" | "require" => {
                 let package = static_package_arg(call);
                 if let Some(name) = package
-                    && self.package_is_suggested_only(&image.index, name)?
+                    && self.package_is_suggested_only(current, name)?
                     && !self.optional_package_selected(name)
                 {
                     return Ok(());
                 }
                 self.diagnostic(
                     from,
-                    &current.id,
+                    current,
                     None,
                     RejectCode::PackageAttachmentUnsupported,
                     match package {
@@ -4053,7 +3966,7 @@ impl<P: PackageProvider> Linker<P> {
                 let Some(name) = name else {
                     self.diagnostic(
                         from,
-                        &current.id,
+                        current,
                         None,
                         RejectCode::DynamicPackageDiscovery,
                         "dynamic namespace discovery",
@@ -4061,7 +3974,7 @@ impl<P: PackageProvider> Linker<P> {
                     );
                     return Ok(());
                 };
-                if name == current.id.name {
+                if name == self.packages.name(current) {
                     return Ok(());
                 }
                 let operation = match call.callee.as_str() {
@@ -4071,7 +3984,7 @@ impl<P: PackageProvider> Linker<P> {
                     "asNamespace" => PackageOperation::AsNamespace,
                     _ => unreachable!(),
                 };
-                let suggested = self.package_is_suggested_only(&image.index, &name)?;
+                let suggested = self.package_is_suggested_only(current, &name)?;
                 let discovery_policy = if self.optional_package_selected(&name) {
                     DiscoveryPolicy::Internalize
                 } else if suggested && call.callee == "requireNamespace" {
@@ -4090,7 +4003,7 @@ impl<P: PackageProvider> Linker<P> {
                 match discovery_policy {
                     DiscoveryPolicy::Reject => self.diagnostic(
                         from,
-                        &current.id,
+                        current,
                         None,
                         RejectCode::DynamicPackageDiscovery,
                         format!(
@@ -4099,13 +4012,13 @@ impl<P: PackageProvider> Linker<P> {
                         ),
                         Some(call.span.clone()),
                     ),
-                    DiscoveryPolicy::ExternalOnly => match self.packages.locate_optional(&name)? {
-                        Some(foreign) if self.packages.is_external(&foreign) => {
-                            self.external.insert(foreign.id);
+                    DiscoveryPolicy::ExternalOnly => match self.packages.resolve(&name)? {
+                        Some(foreign) if self.packages.is_external(foreign) => {
+                            self.external.insert(foreign);
                         }
                         Some(_) => self.diagnostic(
                             from,
-                            &current.id,
+                            current,
                             None,
                             RejectCode::DynamicPackageDiscovery,
                             format!("`{name}` is installed but is not configured External"),
@@ -4121,23 +4034,21 @@ impl<P: PackageProvider> Linker<P> {
                         }
                         None => self.record_missing_package(
                             from,
-                            &current.id,
+                            current,
                             &name,
                             EdgeKind::Discovery,
                             format!("{} requires unavailable namespace {name}", call.callee),
                             Some(call.span.clone()),
                         ),
                     },
-                    DiscoveryPolicy::Internalize => match self.packages.locate_optional(&name)? {
-                        Some(foreign) if self.packages.is_external(&foreign) => {
-                            self.external.insert(foreign.id);
+                    DiscoveryPolicy::Internalize => match self.packages.resolve(&name)? {
+                        Some(foreign) if self.packages.is_external(foreign) => {
+                            self.external.insert(foreign);
                         }
                         Some(foreign) => {
                             self.require_at(
                                 from,
-                                Need::Activation {
-                                    package: foreign.id.clone(),
-                                },
+                                Need::Activation { package: foreign },
                                 EdgeKind::Discovery,
                                 format!("specialized {} requires `{name}`", call.callee),
                                 Some(call.span.clone()),
@@ -4145,7 +4056,7 @@ impl<P: PackageProvider> Linker<P> {
                             self.pending_relocations
                                 .push(PendingRelocation::PackageOperation {
                                     source: call.span.clone(),
-                                    package: Some(foreign.id),
+                                    package: Some(foreign),
                                     operation,
                                 });
                         }
@@ -4161,7 +4072,7 @@ impl<P: PackageProvider> Linker<P> {
                         }
                         None => self.record_missing_package(
                             from,
-                            &current.id,
+                            current,
                             &name,
                             EdgeKind::Discovery,
                             format!("{} requires unavailable namespace {name}", call.callee),
@@ -4170,11 +4081,11 @@ impl<P: PackageProvider> Linker<P> {
                     },
                 }
             }
-            "packageVersion" => self.identity_query(from, current, image, call, true)?,
-            "find.package" => self.identity_query(from, current, image, call, false)?,
+            "packageVersion" => self.identity_query(from, current, call, true)?,
+            "find.package" => self.identity_query(from, current, call, false)?,
             "UseMethod" | "NextMethod" => self.diagnostic(
                 from,
-                &current.id,
+                current,
                 Some(binding),
                 RejectCode::ObjectSystem,
                 format!(
@@ -4190,7 +4101,7 @@ impl<P: PackageProvider> Linker<P> {
                     let component = target.component;
                     self.require_at(
                         from,
-                        Need::Native { package: current.id.clone(), component: component.clone() },
+                        Need::Native { package: current, component: component.clone() },
                         EdgeKind::Native,
                         format!("reachable {} resolves its static native selector through `{component}`", call.callee),
                         Some(call.span.clone()),
@@ -4207,7 +4118,7 @@ impl<P: PackageProvider> Linker<P> {
                 } else {
                     self.diagnostic(
                         from,
-                        &current.id,
+                        current,
                         None,
                         RejectCode::UnknownNativeLookup,
                         format!(
@@ -4220,7 +4131,7 @@ impl<P: PackageProvider> Linker<P> {
             }
             "deparse" | "substitute" | "match.call" => self.observations.push(SyntaxObservation {
                 node: from,
-                package: current.id.clone(),
+                package: current,
                 span: call.span.clone(),
                 kind: call.callee.clone(),
             }),
@@ -4231,7 +4142,7 @@ impl<P: PackageProvider> Linker<P> {
 
     fn call_resolves_definitely_to_base(
         &mut self,
-        current: &InstalledPackage,
+        current: PackageId,
         image: &PackageImage,
         lexical_environment: &str,
         call: &CallSite,
@@ -4252,15 +4163,14 @@ impl<P: PackageProvider> Linker<P> {
     fn identity_query(
         &mut self,
         from: NodeId,
-        current: &InstalledPackage,
-        image: &PackageImage,
+        current: PackageId,
         call: &CallSite,
         version: bool,
     ) -> Result<()> {
         let Some(name) = static_string_arg(call) else {
             self.diagnostic(
                 from,
-                &current.id,
+                current,
                 None,
                 RejectCode::DynamicPackageDiscovery,
                 "dynamic package identity query",
@@ -4268,12 +4178,10 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         };
-        if self.is_root(&current.id) && name == current.id.name {
+        if self.is_root(current) && name == self.packages.name(current) {
             return Ok(());
         }
-        if self.package_is_suggested_only(&image.index, name)?
-            && !self.optional_package_selected(name)
-        {
+        if self.package_is_suggested_only(current, name)? && !self.optional_package_selected(name) {
             return Ok(());
         }
         let discovery_policy = if self.optional_package_selected(name) {
@@ -4284,7 +4192,7 @@ impl<P: PackageProvider> Linker<P> {
         match discovery_policy {
             DiscoveryPolicy::Reject => self.diagnostic(
                 from,
-                &current.id,
+                current,
                 None,
                 RejectCode::DynamicPackageDiscovery,
                 format!(
@@ -4292,13 +4200,13 @@ impl<P: PackageProvider> Linker<P> {
                 ),
                 Some(call.span.clone()),
             ),
-            DiscoveryPolicy::ExternalOnly => match self.packages.locate_optional(name)? {
-                Some(foreign) if self.packages.is_external(&foreign) => {
-                    self.external.insert(foreign.id);
+            DiscoveryPolicy::ExternalOnly => match self.packages.resolve(name)? {
+                Some(foreign) if self.packages.is_external(foreign) => {
+                    self.external.insert(foreign);
                 }
                 Some(_) => self.diagnostic(
                     from,
-                    &current.id,
+                    current,
                     None,
                     RejectCode::DynamicPackageDiscovery,
                     format!("package identity query for `{name}` is not External"),
@@ -4306,21 +4214,21 @@ impl<P: PackageProvider> Linker<P> {
                 ),
                 None => self.record_missing_package(
                     from,
-                    &current.id,
+                    current,
                     name,
                     EdgeKind::Discovery,
                     format!("{} requires unavailable package {name}", call.callee),
                     Some(call.span.clone()),
                 ),
             },
-            DiscoveryPolicy::Internalize => match self.packages.locate_optional(name)? {
-                Some(foreign) if self.packages.is_external(&foreign) => {
-                    self.external.insert(foreign.id);
+            DiscoveryPolicy::Internalize => match self.packages.resolve(name)? {
+                Some(foreign) if self.packages.is_external(foreign) => {
+                    self.external.insert(foreign);
                 }
                 Some(foreign) => {
                     let operation = if version {
                         PackageOperation::PackageVersion {
-                            version: foreign.id.version.to_string(),
+                            version: self.packages.identity(foreign).version.to_string(),
                         }
                     } else {
                         PackageOperation::FindPackage
@@ -4328,13 +4236,13 @@ impl<P: PackageProvider> Linker<P> {
                     self.pending_relocations
                         .push(PendingRelocation::PackageOperation {
                             source: call.span.clone(),
-                            package: Some(foreign.id),
+                            package: Some(foreign),
                             operation,
                         });
                 }
                 None => self.record_missing_package(
                     from,
-                    &current.id,
+                    current,
                     name,
                     EdgeKind::Discovery,
                     format!("{} requires unavailable package {name}", call.callee),
@@ -4345,8 +4253,12 @@ impl<P: PackageProvider> Linker<P> {
         Ok(())
     }
 
-    fn namespace_imports(&mut self, image: &PackageImage) -> Result<NamespaceImports> {
-        if let Some(imports) = self.namespace_imports.get(&image.index.package.id) {
+    fn namespace_imports(
+        &mut self,
+        package: PackageId,
+        image: &PackageImage,
+    ) -> Result<NamespaceImports> {
+        if let Some(imports) = self.namespace_imports.get(&package) {
             return Ok(imports.clone());
         }
 
@@ -4367,35 +4279,30 @@ impl<P: PackageProvider> Linker<P> {
             else {
                 continue;
             };
-            let exports = match self.packages.locate_optional(package_name)? {
-                Some(foreign) => Some(self.packages.index(&foreign)?.exports.clone()),
+            let exports = match self.packages.resolve(package_name)? {
+                Some(foreign) => Some(self.packages.index(foreign)?.exports.clone()),
                 None => None,
             };
             imports.add_import_all(package_name, exports, except.iter().cloned());
         }
 
-        self.namespace_imports
-            .insert(image.index.package.id.clone(), imports.clone());
+        self.namespace_imports.insert(package, imports.clone());
         Ok(imports)
     }
 
     fn inferred_non_returning_bindings(
         &mut self,
+        package: PackageId,
         image: &PackageImage,
         imports: &NamespaceImports,
     ) -> BTreeSet<String> {
-        if let Some(bindings) = self.non_returning_bindings.get(&image.index.package.id) {
+        if let Some(bindings) = self.non_returning_bindings.get(&package) {
             return bindings.clone();
         }
 
         let mut namespace_shadowed = BTreeSet::new();
         namespace_shadowed.extend(image.bindings.keys().cloned());
-        namespace_shadowed.extend(
-            self.namespace_builders[&image.index.package.id]
-                .bindings
-                .iter()
-                .cloned(),
-        );
+        namespace_shadowed.extend(self.namespace_builders[&package].bindings.iter().cloned());
         for component in &image.index.dynlibs {
             namespace_shadowed.extend(
                 component
@@ -4405,7 +4312,7 @@ impl<P: PackageProvider> Linker<P> {
             );
         }
 
-        let namespace_environment = format!("namespace:{}", image.index.package.id.name);
+        let namespace_environment = format!("namespace:{}", self.packages.name(package));
         let mut proven = BTreeSet::new();
         loop {
             let context = OakParseContext::with_imports(
@@ -4433,24 +4340,19 @@ impl<P: PackageProvider> Linker<P> {
             }
         }
 
-        self.non_returning_bindings
-            .insert(image.index.package.id.clone(), proven.clone());
+        self.non_returning_bindings.insert(package, proven.clone());
         proven
     }
 
     fn oak_parse_context(
         &mut self,
+        package: PackageId,
         image: &PackageImage,
         lexical_environment: &str,
     ) -> Result<OakParseContext> {
         let mut shadowed = BTreeSet::new();
         shadowed.extend(image.index.binding_names.iter().cloned());
-        shadowed.extend(
-            self.namespace_builders[&image.index.package.id]
-                .bindings
-                .iter()
-                .cloned(),
-        );
+        shadowed.extend(self.namespace_builders[&package].bindings.iter().cloned());
         for component in &image.index.dynlibs {
             shadowed.extend(
                 component
@@ -4463,7 +4365,7 @@ impl<P: PackageProvider> Linker<P> {
         let mut private_shadowed = BTreeSet::new();
         let mut visible_private = BTreeMap::new();
         let mut environment = lexical_environment.to_owned();
-        if let Some(graph) = self.object_graphs.get(&image.index.package.id)
+        if let Some(graph) = self.object_graphs.get(&package)
             && let Some(mut environment_id) = graph.environment_id(&environment)
         {
             let mut seen = BTreeSet::new();
@@ -4501,8 +4403,8 @@ impl<P: PackageProvider> Linker<P> {
             environment = private.parent.clone();
         }
 
-        let imports = self.namespace_imports(image)?;
-        let mut non_returning = self.inferred_non_returning_bindings(image, &imports);
+        let imports = self.namespace_imports(package, image)?;
+        let mut non_returning = self.inferred_non_returning_bindings(package, image, &imports);
         // A visible private binding masks a package-namespace helper with the
         // same name, so do not inherit the package summary through it.
         non_returning.retain(|name| !private_shadowed.contains(name));
@@ -4546,10 +4448,10 @@ impl<P: PackageProvider> Linker<P> {
 
     fn closure_execution_source(
         &self,
-        package: &PackageId,
+        package: PackageId,
         closure: ClosureId,
     ) -> Option<(ClosureObject, String, String, String)> {
-        let graph = self.object_graphs.get(package)?;
+        let graph = self.object_graphs.get(&package)?;
         let closure = graph.closures.get(&closure)?.clone();
         let environment = graph.environments.get(&closure.enclosure)?.label.clone();
         let owner = match (
@@ -4567,7 +4469,7 @@ impl<P: PackageProvider> Linker<P> {
 
     fn resolve_lexical_name(
         &mut self,
-        current: &InstalledPackage,
+        current: PackageId,
         image: &PackageImage,
         lexical_environment: &str,
         name: &str,
@@ -4579,7 +4481,7 @@ impl<P: PackageProvider> Linker<P> {
                 return Ok(ResolvedName::Unknown(name.to_owned()));
             }
             if environment.starts_with("derived:") {
-                if let Some(graph) = self.object_graphs.get(&current.id)
+                if let Some(graph) = self.object_graphs.get(&current)
                     && let Some(environment_id) = graph.environment_id(&environment)
                 {
                     let (object, blocked) = graph.lookup_environment_binding(environment_id, name);
@@ -4590,19 +4492,19 @@ impl<P: PackageProvider> Linker<P> {
                                 let provenance = &closure_object.provenance;
                                 if closure_object.derived_from.is_some() || provenance.path != "$" {
                                     ResolvedName::ClosureObject {
-                                        package: current.id.clone(),
+                                        package: current,
                                         closure: *closure,
                                     }
                                 } else if let Some(binding) = &provenance.namespace_binding {
                                     ResolvedName::PackageBinding {
-                                        package: current.id.clone(),
+                                        package: current,
                                         binding: binding.clone(),
                                     }
                                 } else if let (Some(environment), Some(binding)) =
                                     (&provenance.private_environment, &provenance.private_binding)
                                 {
                                     ResolvedName::PrivateBinding {
-                                        package: current.id.clone(),
+                                        package: current,
                                         environment: environment.clone(),
                                         binding: binding.clone(),
                                     }
@@ -4628,7 +4530,7 @@ impl<P: PackageProvider> Linker<P> {
             if let Some(private) = image.private_environment(&environment) {
                 if private.bindings.contains_key(name) {
                     return Ok(ResolvedName::PrivateBinding {
-                        package: current.id.clone(),
+                        package: current,
                         environment: private.id.clone(),
                         binding: name.to_owned(),
                     });
@@ -4636,25 +4538,25 @@ impl<P: PackageProvider> Linker<P> {
                 environment = private.parent.clone();
                 continue;
             }
-            if environment == format!("namespace:{}", current.id.name) {
+            if environment == format!("namespace:{}", self.packages.name(current)) {
                 return self.resolve_name(current, image, name);
             }
             if let Some(namespace) = environment.strip_prefix("namespace:") {
-                let Some(foreign) = self.packages.locate_optional(namespace)? else {
+                let Some(foreign) = self.packages.resolve(namespace)? else {
                     return Ok(ResolvedName::MissingPackage {
                         package: namespace.to_owned(),
                         binding: Some(name.to_owned()),
                     });
                 };
-                if self.packages.is_external(&foreign) {
-                    self.external.insert(foreign.id.clone());
+                if self.packages.is_external(foreign) {
+                    self.external.insert(foreign);
                     return Ok(ResolvedName::External {
-                        package: foreign.id,
+                        package: foreign,
                         binding: name.to_owned(),
                     });
                 }
-                let foreign_image = self.image(&foreign)?;
-                return self.resolve_name(&foreign, &foreign_image, name);
+                let foreign_image = self.image(foreign)?;
+                return self.resolve_name(foreign, &foreign_image, name);
             }
             if environment == "base:base" || environment == "base:empty" {
                 return Ok(if self.packages.is_base_binding(name) {
@@ -4669,19 +4571,19 @@ impl<P: PackageProvider> Linker<P> {
 
     fn resolve_name(
         &mut self,
-        current: &InstalledPackage,
+        current: PackageId,
         image: &PackageImage,
         name: &str,
     ) -> Result<ResolvedName> {
         if matches!(name, ".packageName" | ".__S3MethodsTable__.") {
             return Ok(ResolvedName::PackageMetadata {
-                package: current.id.clone(),
+                package: current,
                 name: name.to_owned(),
             });
         }
         if name == ".__NAMESPACE__." {
             return Ok(ResolvedName::PackageMetadata {
-                package: current.id.clone(),
+                package: current,
                 name: name.to_owned(),
             });
         }
@@ -4692,44 +4594,44 @@ impl<P: PackageProvider> Linker<P> {
             .any(|binding| binding == name)
             || self
                 .namespace_builders
-                .get(&current.id)
+                .get(&current)
                 .is_some_and(|namespace| namespace.contains(name))
         {
             return Ok(ResolvedName::PackageBinding {
-                package: current.id.clone(),
+                package: current,
                 binding: name.to_owned(),
             });
         }
 
         if let Some(component) = Self::native_component_for_binding(&image.index, name) {
             return Ok(ResolvedName::NativeSymbol {
-                package: current.id.clone(),
+                package: current,
                 component: component.to_owned(),
                 binding: name.to_owned(),
             });
         }
 
-        match self.namespace_imports(image)?.resolve(name) {
+        match self.namespace_imports(current, image)?.resolve(name) {
             NamespaceImportResolution::Imported {
                 package: package_name,
                 binding,
                 ..
             } => {
-                let Some(foreign) = self.packages.locate_optional(&package_name)? else {
+                let Some(foreign) = self.packages.resolve(&package_name)? else {
                     return Ok(ResolvedName::MissingPackage {
                         package: package_name,
                         binding: Some(binding),
                     });
                 };
-                return Ok(if self.packages.is_external(&foreign) {
-                    self.external.insert(foreign.id.clone());
+                return Ok(if self.packages.is_external(foreign) {
+                    self.external.insert(foreign);
                     ResolvedName::External {
-                        package: foreign.id,
+                        package: foreign,
                         binding,
                     }
                 } else {
                     ResolvedName::Imported {
-                        package: foreign.id,
+                        package: foreign,
                         binding,
                     }
                 });
@@ -4753,7 +4655,7 @@ impl<P: PackageProvider> Linker<P> {
     fn require_resolved(
         &mut self,
         from: NodeId,
-        requester: &PackageId,
+        requester: PackageId,
         binding: Option<&str>,
         resolved: ResolvedName,
         span: Span,
@@ -4808,9 +4710,7 @@ impl<P: PackageProvider> Linker<P> {
             ResolvedName::Imported { package, binding } => {
                 self.require_at(
                     from,
-                    Need::Activation {
-                        package: package.clone(),
-                    },
+                    Need::Activation { package },
                     EdgeKind::Import,
                     "imported binding requires namespace activation",
                     Some(span.clone()),
@@ -4828,7 +4728,7 @@ impl<P: PackageProvider> Linker<P> {
             }
             ResolvedName::External { package, binding } => {
                 let node = self.graph.add_node(
-                    package.name.clone(),
+                    self.packages.name(package).to_owned(),
                     NodeKind::ExternalBinding {
                         name: binding.clone(),
                     },
@@ -4844,7 +4744,7 @@ impl<P: PackageProvider> Linker<P> {
             }
             ResolvedName::PackageMetadata { package, name } => {
                 let node = self.graph.add_node(
-                    package.name.clone(),
+                    self.packages.name(package).to_owned(),
                     NodeKind::PackageMetadata { name: name.clone() },
                     Some(span.clone()),
                 );
@@ -4855,7 +4755,7 @@ impl<P: PackageProvider> Linker<P> {
                     format!("package metadata reference `{name}`"),
                     Some(span.clone()),
                 );
-                if name == ".__NAMESPACE__." && !self.is_root(&package) {
+                if name == ".__NAMESPACE__." && !self.is_root(package) {
                     self.diagnostic(
                         from,
                         requester,
@@ -4900,7 +4800,7 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn require_root(&mut self, need: Need) {
-        self.encountered.insert(need.package().clone());
+        self.encountered.insert(need.package());
         let node = self.need_node(&need);
         if !self.roots.contains(&node) {
             self.roots.push(node);
@@ -4922,7 +4822,7 @@ impl<P: PackageProvider> Linker<P> {
         reason: impl Into<String>,
         span: Option<Span>,
     ) {
-        self.encountered.insert(need.package().clone());
+        self.encountered.insert(need.package());
         let to = self.need_node(&need);
         self.graph.add_edge_at(from, to, kind, reason, span);
         if !self.processed.contains(&need) && self.queued.insert(need.clone()) {
@@ -4931,7 +4831,7 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn need_node(&mut self, need: &Need) -> NodeId {
-        let package = &need.package().name;
+        let package = self.packages.name(need.package()).to_owned();
         let kind = match need {
             Need::Binding { binding, .. } => NodeKind::Binding {
                 name: binding.clone(),
@@ -4946,7 +4846,7 @@ impl<P: PackageProvider> Linker<P> {
             },
             Need::ClosureExecution { package, closure } => {
                 let (closure, owner, _, enclosure) = self
-                    .closure_execution_source(package, *closure)
+                    .closure_execution_source(*package, *closure)
                     .expect("closure execution need references the package object graph");
                 NodeKind::ClosureObject {
                     owner,
@@ -4963,7 +4863,7 @@ impl<P: PackageProvider> Linker<P> {
                 name: dataset.clone(),
             },
             Need::S3Registration { registration, .. } => NodeKind::S3Registration {
-                generic: registration.generic.to_string(),
+                generic: self.generic_label(&registration.generic),
                 class: registration.class.clone(),
             },
             Need::Native { component, .. } => NodeKind::NativeComponent {
@@ -4977,7 +4877,7 @@ impl<P: PackageProvider> Linker<P> {
     fn diagnostic(
         &mut self,
         node: NodeId,
-        package: &PackageId,
+        package: PackageId,
         binding: Option<&str>,
         code: RejectCode,
         message: impl Into<String>,
@@ -4988,7 +4888,7 @@ impl<P: PackageProvider> Linker<P> {
             return;
         }
         self.diagnostics.push(Diagnostic {
-            package: package.name.clone(),
+            package: self.packages.name(package).to_owned(),
             binding: binding.map(str::to_owned),
             code,
             message,
@@ -4998,14 +4898,21 @@ impl<P: PackageProvider> Linker<P> {
         });
     }
 
-    fn is_root(&self, id: &PackageId) -> bool {
-        self.root.as_ref().is_some_and(|root| root == id)
+    fn generic_label(&self, generic: &GenericId) -> String {
+        match generic.package {
+            Some(package) => format!("{}::{}", self.packages.name(package), generic.name),
+            None => generic.name.clone(),
+        }
+    }
+
+    fn is_root(&self, id: PackageId) -> bool {
+        self.root == Some(id)
     }
 
     fn record_missing_package(
         &mut self,
         from: NodeId,
-        requester: &PackageId,
+        requester: PackageId,
         missing: &str,
         kind: EdgeKind,
         reason: impl Into<String>,
@@ -5044,7 +4951,7 @@ impl<P: PackageProvider> Linker<P> {
             {
                 self.diagnostic(
                     observation.node,
-                    &observation.package,
+                    observation.package,
                     None,
                     RejectCode::SyntaxObservation,
                     format!(
@@ -5072,6 +4979,11 @@ impl LinkIr {
     /// Complete accumulated semantic blockers.
     pub fn blockers(&self) -> &crate::ir::AnalysisBlockerSet {
         &self.blockers
+    }
+
+    /// Exact selected installed image and build-time location of every finalized package.
+    pub fn package_sources(&self) -> &crate::package::PackageSources {
+        &self.packages
     }
 
     /// Diagnostic source map retained for provenance rendering only.

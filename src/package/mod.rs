@@ -1,9 +1,13 @@
+mod identity;
 mod image;
 mod index;
 mod locator;
 mod store;
 mod universe;
 
+pub use identity::{
+    Digest, InstalledPackage, PackageId, PackageIdentity, PackageLocation, PackageRole,
+};
 pub use image::{
     BindingImage, BindingOrigin, BindingRepresentation, ClosureId, ClosureObject, ClosureSource,
     CodeId, EmbeddedClosureSource, EmbeddedEnvironmentRef, EnvironmentId, EnvironmentObject,
@@ -15,9 +19,9 @@ pub use index::{
     NativeFacts, NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding,
     PackageIndex, S3Registration,
 };
-pub use locator::{Digest, InstalledPackage, PackageId, PackageLocation, PackageLocator};
+pub use locator::PackageLocator;
+pub(crate) use locator::fingerprint_image;
 pub use store::{PackageProvider, PackageStore, SyntaxValidation};
-pub use universe::{PackageAvailability, TargetUniverse};
+pub use universe::{PackageAvailability, PackageSources, TargetUniverse};
 
 pub type BindingName = String;
-pub type BindingKey = (PackageId, BindingName);

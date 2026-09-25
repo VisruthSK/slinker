@@ -1,41 +1,9 @@
-use crate::{Description, Error, Result, TargetEnvironment, Version};
-use sha2::{Digest as Sha2Digest, Sha256};
+use crate::package::{Digest, InstalledPackage, PackageIdentity, PackageLocation};
+use crate::{Description, Error, Result, TargetEnvironment};
+use sha2::{Digest as _, Sha256};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Digest(pub String);
-
-impl Digest {
-    pub fn of(bytes: impl AsRef<[u8]>) -> Self {
-        Self::finish(Sha256::new_with_prefix(bytes))
-    }
-
-    pub(crate) fn finish(hash: Sha256) -> Self {
-        Self(hex::encode(hash.finalize()))
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct PackageId {
-    pub name: String,
-    pub version: Version,
-    pub image_fingerprint: Digest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PackageLocation {
-    pub library: PathBuf,
-    pub root: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-pub struct InstalledPackage {
-    pub id: PackageId,
-    pub location: PackageLocation,
-    pub description: Description,
-}
 
 #[derive(Clone, Debug)]
 pub struct PackageLocator {
@@ -51,15 +19,7 @@ impl PackageLocator {
         &self.target
     }
 
-    pub fn locate(&self, name: &str) -> Result<InstalledPackage> {
-        self.locate_optional(name)?.ok_or_else(|| {
-            Error::Analysis(format!(
-                "installed package `{name}` is not present in the selected target library universe"
-            ))
-        })
-    }
-
-    pub fn locate_optional(&self, name: &str) -> Result<Option<InstalledPackage>> {
+    pub fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
         for candidate_library in &self.target.libraries {
             let candidate_root = candidate_library.join(name);
             let description_path = candidate_root.join("DESCRIPTION");
@@ -98,12 +58,12 @@ impl PackageLocator {
                     path: description_path.clone(),
                     message: format!("invalid Version field: {error}"),
                 })?;
-            let fingerprint = fingerprint_image(&root)?;
+            let image_fingerprint = fingerprint_image(&root)?;
             return Ok(Some(InstalledPackage {
-                id: PackageId {
+                identity: PackageIdentity {
                     name: name.to_owned(),
                     version,
-                    image_fingerprint: fingerprint,
+                    image_fingerprint,
                 },
                 location: PackageLocation { library, root },
                 description,
@@ -113,28 +73,18 @@ impl PackageLocator {
     }
 }
 
-fn fingerprint_image(root: &Path) -> Result<Digest> {
-    struct Entry {
-        path: PathBuf,
-        relative: String,
-    }
-
-    let mut files = Vec::<Entry>::new();
+pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
+    let mut files = Vec::<(String, PathBuf)>::new();
     let mut pending = vec![root.to_path_buf()];
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| Error::Io { path, source }
+    };
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory).map_err(|source| Error::Io {
-            path: directory.clone(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| Error::Io {
-                path: directory.clone(),
-                source,
-            })?;
+        for entry in fs::read_dir(&directory).map_err(io(&directory))? {
+            let entry = entry.map_err(io(&directory))?;
             let path = entry.path();
-            let file_type = entry.file_type().map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?;
+            let file_type = entry.file_type().map_err(io(&path))?;
             if file_type.is_dir() {
                 pending.push(path);
             } else if file_type.is_file() {
@@ -143,28 +93,21 @@ fn fingerprint_image(root: &Path) -> Result<Digest> {
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                files.push(Entry { path, relative });
+                files.push((relative, path));
             }
         }
     }
-    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
     let mut hash = Sha256::new();
     hash.update(b"slinker-installed-image-v2\0");
-    for entry in &files {
-        hash.update(entry.relative.as_bytes());
+    let mut buffer = vec![0u8; 128 * 1024];
+    for (relative, path) in &files {
+        hash.update(relative.as_bytes());
         hash.update([0]);
-        let file = File::open(&entry.path).map_err(|source| Error::Io {
-            path: entry.path.clone(),
-            source,
-        })?;
-        let mut reader = BufReader::new(file);
-        let mut buffer = [0u8; 128 * 1024];
+        let mut reader = BufReader::new(File::open(path).map_err(io(path))?);
         loop {
-            let read = reader.read(&mut buffer).map_err(|source| Error::Io {
-                path: entry.path.clone(),
-                source,
-            })?;
+            let read = reader.read(&mut buffer).map_err(io(path))?;
             if read == 0 {
                 break;
             }
@@ -188,24 +131,51 @@ pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn image_fingerprint_reads_current_bytes_even_when_length_is_unchanged() {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "slinker-fingerprint-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).expect("create fixture root");
-        let path = root.join("object.rdb");
+        let root = tempfile::tempdir().expect("fixture root");
+        let path = root.path().join("object.rdb");
         fs::write(&path, b"before").expect("write first image");
-        let before = fingerprint_image(&root).expect("fingerprint first image");
+        let before = fingerprint_image(root.path()).expect("fingerprint first image");
         fs::write(&path, b"after!").expect("rewrite same-length image");
-        let after = fingerprint_image(&root).expect("fingerprint changed image");
+        let after = fingerprint_image(root.path()).expect("fingerprint changed image");
 
         assert_ne!(before, after);
-        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn identity_excludes_physical_location() {
+        let first = tempfile::tempdir().expect("first library");
+        let second = tempfile::tempdir().expect("second library");
+        for library in [first.path(), second.path()] {
+            let root = library.join("fixture");
+            fs::create_dir(&root).expect("package root");
+            fs::write(
+                root.join("DESCRIPTION"),
+                "Package: fixture\nVersion: 1.0.0\n",
+            )
+            .expect("DESCRIPTION");
+        }
+        let locate = |library: &Path| {
+            PackageLocator::new(TargetEnvironment {
+                r_home: PathBuf::new(),
+                target: crate::Target {
+                    r_version: String::new(),
+                    os: String::new(),
+                    arch: String::new(),
+                },
+                libraries: vec![library.to_path_buf()],
+                base_bindings: Default::default(),
+            })
+            .locate("fixture")
+            .expect("locate fixture")
+            .expect("fixture present")
+        };
+
+        let (first, second) = (locate(first.path()), locate(second.path()));
+
+        assert_eq!(first.identity, second.identity);
+        assert_ne!(first.location, second.location);
     }
 }

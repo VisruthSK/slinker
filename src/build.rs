@@ -1,10 +1,9 @@
 use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::ir::{
-    LinkBindingState, LinkNamespaceState, PackageId as LinkedPackageId, PackageOperationIr,
-    PackageRole, PayloadRef, ProgramIr, Relocation, Value,
+    LinkBindingState, LinkNamespaceState, PackageOperationIr, PayloadRef, ProgramIr, Relocation,
+    ResourceId, Value,
 };
-use crate::package::PackageLocator;
 use crate::package::{BindingName, PackageId};
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::PackageSpec;
@@ -16,6 +15,7 @@ use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use tempfile::TempDir;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,76 +73,94 @@ impl TargetRuntimeHandle {
 #[derive(Debug)]
 pub struct BuildContext {
     source: SourcePackageSnapshot,
-    staged_root: StagedRoot,
+    _staged_root: StagedRoot,
     target_runtime: TargetRuntimeHandle,
-    package_sources: BTreeMap<LinkedPackageId, PathBuf>,
-    payload_store: PayloadStore,
+    frozen: FrozenInputs,
+}
+
+/// Exact installed bytes redeemed from the selected images before preflight.
+#[derive(Debug)]
+struct FrozenInputs {
+    payloads: BTreeMap<PayloadRef, Vec<u8>>,
+    resources: BTreeMap<ResourceId, PathBuf>,
+    _directory: TempDir,
 }
 
 impl BuildContext {
+    /// Redeem every physical input `ProgramIr` needs, then prove that no selected image changed
+    /// since analysis fingerprinted it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when payload serialization or resource copying fails, or with
+    /// [`BuildContextError::TargetUniverseChanged`] when a selected image no longer matches.
     pub fn new(
         source: SourcePackageSnapshot,
         staged_root: StagedRoot,
         r_home: PathBuf,
         target: TargetEnvironment,
-        program: &ProgramIr,
+        ir: &LinkIr,
     ) -> Result<Self, BuildContextError> {
-        let locator = PackageLocator::new(target.clone());
-        let mut package_sources = BTreeMap::new();
-        for package in program.package_ids() {
-            let package_ir = program.package(package);
-            let identity = package_ir.identity();
-            let root = if package_ir.role() == PackageRole::Root {
-                staged_root.package_root().to_path_buf()
-            } else {
-                let installed = locator
-                    .locate(&identity.name)
-                    .map_err(|error| BuildContextError::Package(error.to_string()))?;
-                if installed.id.version != identity.version
-                    || installed.id.image_fingerprint != identity.image_fingerprint
-                {
-                    return Err(BuildContextError::TargetUniverseChanged(
-                        identity.name.clone(),
-                    ));
-                }
-                installed.location.root
-            };
-            package_sources.insert(package, root);
-        }
-        let mut payload_store = PayloadStore::default();
-        let payloads = program
+        let program = ir.program();
+        let sources = ir.package_sources();
+        let location = |package| {
+            &sources
+                .get(package)
+                .expect("finalized package has a frozen physical source")
+                .1
+                .root
+        };
+
+        let payload_refs = program
             .values()
             .iter()
             .filter_map(|value| match value {
-                Value::Payload(payload) => Some(payload.clone()),
+                Value::Payload(payload) => Some(payload),
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        if !payloads.is_empty() {
-            let mut worker = WorkerClient::spawn(r_home.clone(), &target)
-                .map_err(|error| BuildContextError::Package(error.to_string()))?;
-            for payload in payloads {
+        let mut payloads = BTreeMap::new();
+        if !payload_refs.is_empty() {
+            let mut worker = WorkerClient::spawn(r_home.clone(), &target)?;
+            for payload in payload_refs {
                 let identity = program.package(payload.package).identity();
-                let bytes = worker
-                    .serialize_binding(
-                        PackageSpec {
-                            name: identity.name.clone(),
-                            version: identity.version.to_string(),
-                            image_fingerprint: identity.image_fingerprint.0.clone(),
-                            root: package_sources[&payload.package].clone(),
-                        },
-                        &payload.locator.root,
-                    )
-                    .map_err(|error| BuildContextError::Package(error.to_string()))?;
-                payload_store.payloads.insert(payload, bytes);
+                let bytes = worker.serialize_binding(
+                    PackageSpec {
+                        name: identity.name.clone(),
+                        version: identity.version.to_string(),
+                        image_fingerprint: identity.image_fingerprint.0.clone(),
+                        root: location(payload.package).clone(),
+                    },
+                    &payload.locator.root,
+                )?;
+                payloads.insert(payload.clone(), bytes);
             }
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("slinker-frozen-")
+            .tempdir()?;
+        let mut resources = BTreeMap::new();
+        for (ordinal, (id, resource)) in program.indexed_resources().enumerate() {
+            let frozen = directory.path().join(ordinal.to_string());
+            copy_entry(&location(resource.package).join(&resource.path), &frozen)?;
+            resources.insert(id, frozen);
+        }
+
+        if let Some(changed) = sources.changed()? {
+            return Err(BuildContextError::TargetUniverseChanged(
+                changed.name.clone(),
+            ));
         }
         Ok(Self {
             source,
-            staged_root,
+            _staged_root: staged_root,
             target_runtime: TargetRuntimeHandle::new(r_home, target),
-            package_sources,
-            payload_store,
+            frozen: FrozenInputs {
+                payloads,
+                resources,
+                _directory: directory,
+            },
         })
     }
 
@@ -150,29 +168,21 @@ impl BuildContext {
         &self.source
     }
 
-    pub fn staged_root(&self) -> &StagedRoot {
-        &self.staged_root
-    }
-
     fn materialization(&self) -> MaterializationContext<'_> {
         MaterializationContext {
             source_files: self.source.files(),
             target_runtime: &self.target_runtime,
-            package_sources: &self.package_sources,
-            payload_store: &self.payload_store,
+            frozen: &self.frozen,
         }
     }
 }
 
-#[derive(Debug, Default)]
-struct PayloadStore {
-    payloads: BTreeMap<PayloadRef, Vec<u8>>,
-}
-
 #[derive(Debug, Error)]
 pub enum BuildContextError {
-    #[error("failed to freeze package source: {0}")]
-    Package(String),
+    #[error("failed to freeze package input: {0}")]
+    Package(#[from] crate::Error),
+    #[error("failed to freeze package input: {0}")]
+    Io(#[from] std::io::Error),
     #[error("selected package image changed during the invocation: {0}")]
     TargetUniverseChanged(String),
 }
@@ -182,8 +192,7 @@ pub enum BuildContextError {
 pub struct MaterializationContext<'a> {
     source_files: &'a FrozenSourceFiles,
     target_runtime: &'a TargetRuntimeHandle,
-    package_sources: &'a BTreeMap<LinkedPackageId, PathBuf>,
-    payload_store: &'a PayloadStore,
+    frozen: &'a FrozenInputs,
 }
 
 impl MaterializationContext<'_> {
@@ -195,12 +204,12 @@ impl MaterializationContext<'_> {
         self.target_runtime
     }
 
-    fn package_root(&self, package: LinkedPackageId) -> &Path {
-        &self.package_sources[&package]
+    fn payload(&self, payload: &PayloadRef) -> &[u8] {
+        &self.frozen.payloads[payload]
     }
 
-    fn payload(&self, payload: &PayloadRef) -> &[u8] {
-        &self.payload_store.payloads[payload]
+    fn resource(&self, resource: ResourceId) -> &Path {
+        &self.frozen.resources[&resource]
     }
 }
 
@@ -232,7 +241,7 @@ impl PureRStatic {
         if ir.program().root_artifact().description.is_empty() {
             blockers.insert("Root source-package DESCRIPTION plan is missing".into());
         }
-        for package in ir.program().packages() {
+        for (_, package) in ir.program().packages() {
             if let crate::ir::PackageIr::External { contract, .. } = package
                 && contract.requirements.is_empty()
             {
@@ -731,14 +740,14 @@ fn copy_linked_resources(
     context: MaterializationContext<'_>,
     output: &Path,
 ) -> Result<(), std::io::Error> {
-    for resource in program.resources() {
+    for (id, resource) in program.indexed_resources() {
         let package = program.package(resource.package).identity();
-        let source = context.package_root(resource.package).join(&resource.path);
+        let source = context.resource(id);
         let target = output
             .join("inst/slinker/resources")
             .join(&package.name)
             .join(&resource.path);
-        copy_entry(&source, &target)?;
+        copy_entry(source, &target)?;
     }
     Ok(())
 }

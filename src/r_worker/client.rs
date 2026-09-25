@@ -322,9 +322,9 @@ fn protocol_path() -> PathBuf {
 
 fn package_spec(package: &InstalledPackage) -> PackageSpec {
     PackageSpec {
-        name: package.id.name.clone(),
-        version: package.id.version.to_string(),
-        image_fingerprint: package.id.image_fingerprint.0.clone(),
+        name: package.identity.name.clone(),
+        version: package.identity.version.to_string(),
+        image_fingerprint: package.identity.image_fingerprint.0.clone(),
         root: package.location.root.clone(),
     }
 }

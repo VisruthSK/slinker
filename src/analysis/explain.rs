@@ -483,7 +483,7 @@ fn package_identities(
     plan: &LinkIr,
 ) -> Result<BTreeMap<String, PackageIdentityExport>, ExplanationError> {
     let mut identities = BTreeMap::new();
-    for package in plan.program().packages() {
+    for (_, package) in plan.program().packages() {
         let package = package.identity();
         let identity = PackageIdentityExport {
             name: package.name.clone(),
@@ -704,9 +704,8 @@ fn package_summaries(
     let target_names = plan
         .program()
         .packages()
-        .iter()
-        .filter(|package| package.role() == PackageRole::External)
-        .map(|package| package.identity().name.as_str())
+        .filter(|(_, package)| package.role() == PackageRole::External)
+        .map(|(_, package)| package.identity().name.as_str())
         .collect::<BTreeSet<_>>();
     let names = components
         .iter()

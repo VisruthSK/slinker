@@ -139,7 +139,7 @@ pub struct PrivateEnvironmentImage {
 
 #[derive(Clone, Debug)]
 pub struct PackageImage {
-    pub index: PackageIndex,
+    pub index: Arc<PackageIndex>,
     pub bindings: HashMap<String, BindingImage>,
     pub private_environments: HashMap<String, PrivateEnvironmentImage>,
 }
@@ -235,7 +235,7 @@ pub struct PackageObjectGraph {
 
 impl PackageObjectGraph {
     fn from_image(image: &PackageImage) -> Self {
-        let namespace_label = format!("namespace:{}", image.index.package.id.name);
+        let namespace_label = format!("namespace:{}", image.index.identity.name);
         let mut labels = BTreeSet::from([namespace_label.clone()]);
         for private in image.private_environments.values() {
             labels.insert(private.id.clone());
@@ -337,7 +337,7 @@ impl PackageObjectGraph {
     /// Merge newly demanded installed bindings without renumbering existing or
     /// runtime-derived object identities.
     pub fn merge_image(&mut self, image: &PackageImage) {
-        let namespace_label = format!("namespace:{}", image.index.package.id.name);
+        let namespace_label = format!("namespace:{}", image.index.identity.name);
         let mut labels = BTreeSet::from([namespace_label.clone()]);
         for binding in image.bindings.values() {
             collect_binding_environments(binding, &mut labels);

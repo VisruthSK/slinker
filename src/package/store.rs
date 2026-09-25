@@ -2,12 +2,11 @@ use crate::cache::Cache;
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
     InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
-    PackageId, PackageImage, PackageIndex, PackageLocator,
+    PackageIdentity, PackageImage, PackageIndex, PackageLocator,
 };
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{WorkerBinding, WorkerPackageIndex};
 use crate::{Error, Result, TargetEnvironment};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -15,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-analysis-v4";
+const ANALYSIS_SCHEMA: &str = "slinker-analysis-v5";
 
 #[derive(Deserialize, Serialize)]
 struct CachedIndex {
@@ -151,9 +150,9 @@ impl NativeSummaryManifest {
 
     fn apply(&self, index: &mut PackageIndex) {
         let Some(package) = self.packages.iter().find(|summary| {
-            summary.package == index.package.id.name
-                && summary.version == index.package.id.version.as_ref()
-                && summary.image_fingerprint == index.package.id.image_fingerprint.0
+            summary.package == index.identity.name
+                && summary.version == index.identity.version.as_ref()
+                && summary.image_fingerprint == index.identity.image_fingerprint.0
         }) else {
             return;
         };
@@ -192,24 +191,17 @@ pub enum SyntaxValidation {
     Rejected(String),
 }
 
+/// Physical installed-image service. Package roles and name policy belong to
+/// [`TargetUniverse`](crate::package::TargetUniverse).
 pub trait PackageProvider {
-    fn target_environment(&self) -> Option<&TargetEnvironment> {
-        None
-    }
-    fn locate(&mut self, name: &str) -> Result<InstalledPackage>;
-    fn locate_optional(&mut self, name: &str) -> Result<Option<InstalledPackage>>;
-    fn locate_many(&mut self, names: &[String], _jobs: usize) -> Result<Vec<InstalledPackage>> {
-        names.iter().map(|name| self.locate(name)).collect()
-    }
+    fn target_environment(&self) -> &TargetEnvironment;
+    fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>>;
     fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>>;
     fn binding_image(
         &mut self,
         package: &InstalledPackage,
         name: &str,
     ) -> Result<Arc<PackageImage>>;
-    fn prefetch_indexes(&mut self, _packages: &[InstalledPackage], _jobs: usize) -> Result<()> {
-        Ok(())
-    }
     fn resource_exists(&mut self, package: &InstalledPackage, path: &str) -> Result<bool> {
         Ok(self
             .index(package)?
@@ -217,25 +209,18 @@ pub trait PackageProvider {
             .iter()
             .any(|candidate| candidate == path))
     }
-    fn validate_syntax(
-        &mut self,
-        id: &PackageId,
-        binding: &str,
-        source: &str,
-    ) -> Result<SyntaxValidation>;
+    fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation>;
     fn normalize_syntax(&mut self, source: &str) -> Result<String>;
 }
 
 pub struct PackageStore {
     locator: PackageLocator,
-    locations: HashMap<String, InstalledPackage>,
-    indexes: HashMap<PackageId, Arc<PackageIndex>>,
-    bindings: HashMap<(PackageId, String), Arc<PackageImage>>,
+    indexes: HashMap<PackageIdentity, Arc<PackageIndex>>,
+    bindings: HashMap<(PackageIdentity, String), Arc<PackageImage>>,
     cache: Cache,
     r_home: PathBuf,
     target_fingerprint: String,
     worker: Option<WorkerClient>,
-    locate_pool: Option<(usize, Arc<rayon::ThreadPool>)>,
     native_summaries: NativeSummaryManifest,
 }
 
@@ -255,39 +240,35 @@ impl PackageStore {
                 ),
         )
         .0;
-        let locator = PackageLocator::new(target);
-        let cache = Cache::new(ANALYSIS_SCHEMA)?;
-        let native_summaries = NativeSummaryManifest::load()?;
         Ok(Self {
-            locator,
-            locations: HashMap::new(),
+            locator: PackageLocator::new(target),
             indexes: HashMap::new(),
             bindings: HashMap::new(),
-            cache,
+            cache: Cache::new(ANALYSIS_SCHEMA)?,
             r_home,
             target_fingerprint,
             worker: None,
-            locate_pool: None,
-            native_summaries,
+            native_summaries: NativeSummaryManifest::load()?,
         })
     }
 
     fn package_index(
         &self,
         worker: WorkerPackageIndex,
-        package: InstalledPackage,
+        package: &InstalledPackage,
     ) -> Result<Arc<PackageIndex>> {
-        if worker.name != package.id.name
-            || worker.version != package.id.version.to_string()
-            || worker.image_fingerprint != package.id.image_fingerprint.0
+        let identity = &package.identity;
+        if worker.name != identity.name
+            || worker.version != identity.version.to_string()
+            || worker.image_fingerprint != identity.image_fingerprint.0
         {
             return Err(Error::Analysis(format!(
                 "installed index identity changed while inspecting {}",
-                package.id.name
+                identity.name
             )));
         }
         let mut index = PackageIndex {
-            package: package.clone(),
+            identity: identity.clone(),
             description: package.description.clone(),
             exports: worker.exports,
             imports: worker.imports,
@@ -306,14 +287,13 @@ impl PackageStore {
     }
 
     fn package_image(
-        &self,
-        package: InstalledPackage,
+        identity: &PackageIdentity,
         index: Arc<PackageIndex>,
         worker: WorkerBinding,
     ) -> Result<Arc<PackageImage>> {
-        if worker.package_name != package.id.name
-            || worker.package_version != package.id.version.to_string()
-            || worker.image_fingerprint != package.id.image_fingerprint.0
+        if worker.package_name != identity.name
+            || worker.package_version != identity.version.to_string()
+            || worker.image_fingerprint != identity.image_fingerprint.0
             || !index
                 .binding_names
                 .iter()
@@ -321,11 +301,11 @@ impl PackageStore {
         {
             return Err(Error::Analysis(format!(
                 "worker returned unindexed binding {}::{}",
-                package.id.name, worker.binding.name
+                identity.name, worker.binding.name
             )));
         }
         Ok(Arc::new(PackageImage {
-            index: (*index).clone(),
+            index,
             bindings: HashMap::from([(worker.binding.name.clone(), worker.binding)]),
             private_environments: worker.private_environments,
         }))
@@ -335,32 +315,32 @@ impl PackageStore {
         self.locator.target()
     }
 
-    fn cache_key(&self, package: &InstalledPackage) -> String {
-        let key = fingerprint_strings([
+    fn cache_key(&self, identity: &PackageIdentity) -> String {
+        fingerprint_strings([
             self.target_fingerprint.as_str(),
             AIR_VERSION,
             ANALYSIS_SCHEMA,
-            package.id.name.as_str(),
-            package.id.version.as_ref(),
-            package.id.image_fingerprint.0.as_str(),
-        ]);
-        key.0
+            identity.name.as_str(),
+            identity.version.as_ref(),
+            identity.image_fingerprint.0.as_str(),
+        ])
+        .0
     }
 
-    fn index_cache_path(&self, package: &InstalledPackage) -> PathBuf {
+    fn index_cache_path(&self, identity: &PackageIdentity) -> PathBuf {
         self.cache.path(format!(
             "{}-{}.index.slinker",
-            package.id.name,
-            self.cache_key(package)
+            identity.name,
+            self.cache_key(identity)
         ))
     }
 
-    fn binding_cache_path(&self, package: &InstalledPackage, binding: &str) -> PathBuf {
+    fn binding_cache_path(&self, identity: &PackageIdentity, binding: &str) -> PathBuf {
         let binding = fingerprint_strings([binding]).0;
         self.cache.path(format!(
             "{}-{}-{binding}.binding.slinker",
-            package.id.name,
-            self.cache_key(package)
+            identity.name,
+            self.cache_key(identity)
         ))
     }
 
@@ -372,29 +352,16 @@ impl PackageStore {
         Ok(self.worker.as_mut().expect("Harp worker initialized"))
     }
 
-    fn load_cached_index(
-        &mut self,
-        package: &InstalledPackage,
-    ) -> Result<Option<Arc<PackageIndex>>> {
-        if let Some(index) = self.indexes.get(&package.id) {
-            return Ok(Some(Arc::clone(index)));
-        }
-        let cache = self.index_cache_path(package);
-        if !cache.is_file() {
-            return Ok(None);
-        }
-        let cached = self.cache.read::<CachedIndex>(&cache).filter(|entry| {
-            entry.schema == ANALYSIS_SCHEMA
-                && entry.target == self.target_fingerprint
-                && entry.package_fingerprint == package.id.image_fingerprint.0
-        });
-        match cached.map(|entry| self.package_index(entry.index, package.clone())) {
-            Some(Ok(index)) => {
-                self.indexes.insert(package.id.clone(), Arc::clone(&index));
-                Ok(Some(index))
-            }
-            _ => Ok(None),
-        }
+    fn load_cached_index(&self, package: &InstalledPackage) -> Option<Arc<PackageIndex>> {
+        let cached = self
+            .cache
+            .read::<CachedIndex>(&self.index_cache_path(&package.identity))
+            .filter(|entry| {
+                entry.schema == ANALYSIS_SCHEMA
+                    && entry.target == self.target_fingerprint
+                    && entry.package_fingerprint == package.identity.image_fingerprint.0
+            })?;
+        self.package_index(cached.index, package).ok()
     }
 
     fn load_cached_binding(
@@ -402,141 +369,80 @@ impl PackageStore {
         package: &InstalledPackage,
         binding: &str,
     ) -> Result<Option<Arc<PackageImage>>> {
-        let key = (package.id.clone(), binding.to_owned());
-        if let Some(image) = self.bindings.get(&key) {
-            return Ok(Some(Arc::clone(image)));
-        }
-        let cache = self.binding_cache_path(package, binding);
-        if !cache.is_file() {
+        let Some(cached) = self
+            .cache
+            .read::<CachedBinding>(&self.binding_cache_path(&package.identity, binding))
+            .filter(|entry| {
+                entry.schema == ANALYSIS_SCHEMA
+                    && entry.target == self.target_fingerprint
+                    && entry.package_fingerprint == package.identity.image_fingerprint.0
+                    && entry.binding_name == binding
+                    && is_epoch_independent(&entry.binding)
+            })
+        else {
             return Ok(None);
-        }
-        let cached = self.cache.read::<CachedBinding>(&cache).filter(|entry| {
-            entry.schema == ANALYSIS_SCHEMA
-                && entry.target == self.target_fingerprint
-                && entry.package_fingerprint == package.id.image_fingerprint.0
-                && entry.binding_name == binding
-        });
-        match cached {
-            Some(cached) => {
-                let index = self.index(package)?;
-                let image = self.package_image(package.clone(), index, cached.binding)?;
-                self.bindings.insert(key, Arc::clone(&image));
-                Ok(Some(image))
-            }
-            None => Ok(None),
-        }
+        };
+        let index = self.index(package)?;
+        Self::package_image(&package.identity, index, cached.binding).map(Some)
     }
 }
 
-impl PackageProvider for PackageStore {
-    fn target_environment(&self) -> Option<&TargetEnvironment> {
-        Some(self.locator.target())
-    }
-    fn locate(&mut self, name: &str) -> Result<InstalledPackage> {
-        if let Some(package) = self.locations.get(name) {
-            return Ok(package.clone());
-        }
-        eprintln!("[slinker] index {name}");
-        let package = self.locator.locate(name)?;
-        self.locations.insert(name.to_owned(), package.clone());
-        Ok(package)
-    }
-
-    fn locate_optional(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
-        if let Some(package) = self.locations.get(name) {
-            return Ok(Some(package.clone()));
-        }
-        let Some(package) = self.locator.locate_optional(name)? else {
-            return Ok(None);
-        };
-        eprintln!("[slinker] index {name}");
-        self.locations.insert(name.to_owned(), package.clone());
-        Ok(Some(package))
-    }
-
-    fn locate_many(&mut self, names: &[String], jobs: usize) -> Result<Vec<InstalledPackage>> {
-        if names.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut missing = Vec::new();
-        let mut seen = HashSet::new();
-        for name in names {
-            if !self.locations.contains_key(name) && seen.insert(name.clone()) {
-                missing.push(name.clone());
-            }
-        }
-
-        if !missing.is_empty() {
-            let locator = self.locator.clone();
-            let locate = || {
-                missing
-                    .par_iter()
-                    .map(|name| (name.clone(), locator.locate(name)))
-                    .collect::<Vec<_>>()
-            };
-            let results = if jobs > 1 && missing.len() > 1 {
-                let threads = jobs.min(missing.len());
-                let rebuild = self
-                    .locate_pool
-                    .as_ref()
-                    .is_none_or(|(configured, _)| *configured != threads);
-                if rebuild {
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads)
-                        .thread_name(|index| format!("slinker-locate-{index}"))
-                        .build()
-                        .map_err(|error| {
-                            Error::Analysis(format!(
-                                "failed to create package locator pool: {error}"
-                            ))
-                        })?;
-                    self.locate_pool = Some((threads, Arc::new(pool)));
-                }
-                self.locate_pool
-                    .as_ref()
-                    .expect("locator pool initialized")
-                    .1
-                    .install(locate)
-            } else {
-                missing
-                    .iter()
-                    .map(|name| (name.clone(), self.locator.locate(name)))
-                    .collect()
-            };
-
-            for (name, package) in results {
-                let package = package?;
-                eprintln!("[slinker] index {name}");
-                self.locations.insert(name, package);
-            }
-        }
-
-        names
+/// Worker private-environment labels identify objects only within one inspection epoch, so a
+/// fragment that mentions them must never be merged with fragments inspected in another epoch.
+fn is_epoch_independent(binding: &WorkerBinding) -> bool {
+    let image = &binding.binding;
+    binding.private_environments.is_empty()
+        && image
+            .closure
             .iter()
-            .map(|name| {
-                self.locations.get(name).cloned().ok_or_else(|| {
-                    Error::Analysis(format!("package `{name}` disappeared after location"))
-                })
-            })
-            .collect()
+            .map(|closure| closure.environment.as_str())
+            .chain(image.environment.as_deref())
+            .chain(
+                image
+                    .embedded_closures
+                    .iter()
+                    .map(|closure| closure.environment.as_str()),
+            )
+            .chain(
+                image
+                    .embedded_environments
+                    .iter()
+                    .map(|environment| environment.environment.as_str()),
+            )
+            .all(|label| !label.starts_with("private:"))
+}
+
+impl PackageProvider for PackageStore {
+    fn target_environment(&self) -> &TargetEnvironment {
+        self.locator.target()
+    }
+
+    fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
+        self.locator.locate(name)
     }
 
     fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
-        if let Some(index) = self.load_cached_index(package)? {
-            return Ok(index);
+        if let Some(index) = self.indexes.get(&package.identity) {
+            return Ok(Arc::clone(index));
         }
-        let worker = self.worker()?.package_index(package)?;
-        let index = self.package_index(worker.clone(), package.clone())?;
-        let cache = self.index_cache_path(package);
-        let cached = CachedIndex {
-            schema: ANALYSIS_SCHEMA.into(),
-            target: self.target_fingerprint.clone(),
-            package_fingerprint: package.id.image_fingerprint.0.clone(),
-            index: worker,
+        let index = match self.load_cached_index(package) {
+            Some(index) => index,
+            None => {
+                let worker = self.worker()?.package_index(package)?;
+                let index = self.package_index(worker.clone(), package)?;
+                let cached = CachedIndex {
+                    schema: ANALYSIS_SCHEMA.into(),
+                    target: self.target_fingerprint.clone(),
+                    package_fingerprint: package.identity.image_fingerprint.0.clone(),
+                    index: worker,
+                };
+                self.cache
+                    .publish(&self.index_cache_path(&package.identity), &cached);
+                index
+            }
         };
-        self.cache.publish(&cache, &cached);
-        self.indexes.insert(package.id.clone(), Arc::clone(&index));
+        self.indexes
+            .insert(package.identity.clone(), Arc::clone(&index));
         Ok(index)
     }
 
@@ -545,31 +451,31 @@ impl PackageProvider for PackageStore {
         package: &InstalledPackage,
         name: &str,
     ) -> Result<Arc<PackageImage>> {
-        if let Some(image) = self.load_cached_binding(package, name)? {
-            return Ok(image);
+        let key = (package.identity.clone(), name.to_owned());
+        if let Some(image) = self.bindings.get(&key) {
+            return Ok(Arc::clone(image));
         }
-        let index = self.index(package)?;
-        let binding = self.worker()?.binding(package, name)?;
-        let cache = self.binding_cache_path(package, name);
-        let cached = CachedBinding {
-            schema: ANALYSIS_SCHEMA.into(),
-            target: self.target_fingerprint.clone(),
-            package_fingerprint: package.id.image_fingerprint.0.clone(),
-            binding_name: name.into(),
-            binding: binding.clone(),
+        let image = match self.load_cached_binding(package, name)? {
+            Some(image) => image,
+            None => {
+                let index = self.index(package)?;
+                let binding = self.worker()?.binding(package, name)?;
+                if is_epoch_independent(&binding) {
+                    let cached = CachedBinding {
+                        schema: ANALYSIS_SCHEMA.into(),
+                        target: self.target_fingerprint.clone(),
+                        package_fingerprint: package.identity.image_fingerprint.0.clone(),
+                        binding_name: name.into(),
+                        binding: binding.clone(),
+                    };
+                    self.cache
+                        .publish(&self.binding_cache_path(&package.identity, name), &cached);
+                }
+                Self::package_image(&package.identity, index, binding)?
+            }
         };
-        self.cache.publish(&cache, &cached);
-        let image = self.package_image(package.clone(), index, binding)?;
-        self.bindings
-            .insert((package.id.clone(), name.to_owned()), Arc::clone(&image));
+        self.bindings.insert(key, Arc::clone(&image));
         Ok(image)
-    }
-
-    fn prefetch_indexes(&mut self, packages: &[InstalledPackage], _jobs: usize) -> Result<()> {
-        for package in packages {
-            self.index(package)?;
-        }
-        Ok(())
     }
 
     fn resource_exists(&mut self, package: &InstalledPackage, path: &str) -> Result<bool> {
@@ -588,12 +494,7 @@ impl PackageProvider for PackageStore {
         Ok(package.location.root.join(relative).exists())
     }
 
-    fn validate_syntax(
-        &mut self,
-        _id: &PackageId,
-        _binding: &str,
-        source: &str,
-    ) -> Result<SyntaxValidation> {
+    fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation> {
         self.worker()?.validate_syntax(source)
     }
 
@@ -606,24 +507,16 @@ impl PackageProvider for PackageStore {
 mod tests {
     use super::*;
     use crate::Description;
-    use crate::package::{Digest, LifecycleMetadata, NativeComponent, PackageLocation};
+    use crate::package::{Digest, LifecycleMetadata, NativeComponent};
 
     fn package_index() -> PackageIndex {
-        let description = Description::parse("Package: fixture\nVersion: 1.0.0\n");
         PackageIndex {
-            package: InstalledPackage {
-                id: PackageId {
-                    name: "fixture".into(),
-                    version: "1.0.0".parse().expect("version"),
-                    image_fingerprint: Digest("exact-image".into()),
-                },
-                location: PackageLocation {
-                    library: PathBuf::from("/library"),
-                    root: PathBuf::from("/library/fixture"),
-                },
-                description: description.clone(),
+            identity: PackageIdentity {
+                name: "fixture".into(),
+                version: "1.0.0".parse().expect("version"),
+                image_fingerprint: Digest("exact-image".into()),
             },
-            description,
+            description: Description::parse("Package: fixture\nVersion: 1.0.0\n"),
             exports: Default::default(),
             imports: Vec::new(),
             s3: Vec::new(),
@@ -671,6 +564,36 @@ mod tests {
                     callback_arguments: vec![2],
                 }]
         ));
+    }
+
+    #[test]
+    fn only_epoch_independent_binding_fragments_are_cacheable() {
+        let fragment = |environment: &str| WorkerBinding {
+            package_name: "fixture".into(),
+            package_version: "1.0.0".into(),
+            image_fingerprint: "exact-image".into(),
+            binding: crate::package::BindingImage {
+                name: "f".into(),
+                origin: crate::package::BindingOrigin::Code,
+                representation: crate::package::BindingRepresentation::Value,
+                classes: Vec::new(),
+                object_kind: crate::package::ObjectKind::Closure,
+                closure: Some(crate::package::ClosureSource {
+                    source: "function() 1".into(),
+                    environment: environment.into(),
+                }),
+                environment: None,
+                embedded_closures: Vec::new(),
+                embedded_environments: Vec::new(),
+                issues: Vec::new(),
+            },
+            private_environments: HashMap::new(),
+        };
+
+        assert!(is_epoch_independent(&fragment("namespace:fixture")));
+        assert!(!is_epoch_independent(&fragment(
+            "private:00000000000000ab:1"
+        )));
     }
 
     #[test]

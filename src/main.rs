@@ -179,7 +179,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
         .with_external_packages(args.universe.external.iter().cloned())
         .with_root_source(source.description_source())
         .analyze(source.package())?;
-    let context = BuildContext::new(source, staged, r_home, target, ir.program())?;
+    let context = BuildContext::new(source, staged, r_home, target, &ir)?;
     let output = args.output.clone().unwrap_or_else(|| {
         context
             .source()
@@ -434,7 +434,7 @@ fn print_analysis(target: &TargetEnvironment, plan: &LinkIr) {
     );
     println!();
     println!("package roles");
-    for package in program.packages() {
+    for (_, package) in program.packages() {
         println!(
             "  {} {}: {:?}",
             package.identity().name,

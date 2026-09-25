@@ -1,5 +1,5 @@
 use crate::Description;
-use crate::package::{BindingName, InstalledPackage};
+use crate::package::{BindingName, PackageIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -97,7 +97,7 @@ pub struct LifecycleMetadata {
 
 #[derive(Clone, Debug)]
 pub struct PackageIndex {
-    pub package: InstalledPackage,
+    pub identity: PackageIdentity,
     pub description: Description,
     pub exports: ExportMap,
     pub imports: Vec<ImportSpec>,

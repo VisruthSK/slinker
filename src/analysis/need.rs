@@ -18,16 +18,6 @@ pub struct GenericId {
     pub name: String,
 }
 
-impl std::fmt::Display for GenericId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(package) = &self.package {
-            write!(formatter, "{}::{}", package.name, self.name)
-        } else {
-            formatter.write_str(&self.name)
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Need {
     Binding {
@@ -69,7 +59,7 @@ pub enum Need {
 }
 
 impl Need {
-    pub fn package(&self) -> &PackageId {
+    pub fn package(&self) -> PackageId {
         match self {
             Self::Binding { package, .. }
             | Self::PrivateBinding { package, .. }
@@ -79,7 +69,7 @@ impl Need {
             | Self::Dataset { package, .. }
             | Self::S3Registration { package, .. }
             | Self::Native { package, .. }
-            | Self::Lifecycle { package, .. } => package,
+            | Self::Lifecycle { package, .. } => *package,
         }
     }
 }
