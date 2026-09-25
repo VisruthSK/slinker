@@ -12,6 +12,7 @@ fn rebus_numbers_suite_passes_with_rebus_base_linked() {
     LinkedSuite {
         package: "rebus.numbers",
         linked: &["rebus.base"],
+        check: Check::Testthat,
     }
     .assert_passes();
 }
@@ -21,6 +22,7 @@ fn rslurm_suite_passes_with_whisker_linked() {
     LinkedSuite {
         package: "rslurm",
         linked: &["whisker"],
+        check: Check::Testthat,
     }
     .assert_passes();
 }
@@ -30,6 +32,7 @@ fn represtools_suite_passes_with_whisker_linked() {
     LinkedSuite {
         package: "represtools",
         linked: &["whisker"],
+        check: Check::Testthat,
     }
     .assert_passes();
 }
@@ -39,6 +42,7 @@ fn qrcode_suite_passes_with_assertthat_linked() {
     LinkedSuite {
         package: "qrcode",
         linked: &["assertthat"],
+        check: Check::Testthat,
     }
     .assert_passes();
 }
@@ -48,6 +52,7 @@ fn pkgcond_suite_passes_with_assertthat_linked() {
     LinkedSuite {
         package: "pkgcond",
         linked: &["assertthat"],
+        check: Check::Testthat,
     }
     .assert_passes();
 }
@@ -57,6 +62,31 @@ fn doubt_suite_passes_with_unglue_linked() {
     LinkedSuite {
         package: "doubt",
         linked: &["unglue"],
+        check: Check::Testthat,
+    }
+    .assert_passes();
+}
+
+#[test]
+fn here_works_with_rprojroot_linked() {
+    LinkedSuite {
+        package: "here",
+        linked: &["rprojroot"],
+        check: Check::Script(
+            r#"
+            project <- normalizePath(file.path(tempdir(), "project"), winslash = "/", mustWork = FALSE)
+            dir.create(file.path(project, "analysis"), recursive = TRUE)
+            file.create(file.path(project, ".here"))
+            writeLines("", file.path(project, "analysis", "report.R"))
+            setwd(file.path(project, "analysis"))
+            library(here)
+            stopifnot(identical(normalizePath(here(), winslash = "/"), project))
+            stopifnot(identical(here("data", "x.csv"), file.path(here(), "data", "x.csv")))
+            stopifnot(grepl("contains a file '.here'", paste(capture.output(dr_here(), type = "message"), collapse = "\n"), fixed = TRUE))
+            i_am("analysis/report.R")
+            stopifnot(identical(normalizePath(here(), winslash = "/"), project))
+            "#,
+        ),
     }
     .assert_passes();
 }
@@ -64,6 +94,12 @@ fn doubt_suite_passes_with_unglue_linked() {
 struct LinkedSuite<'a> {
     package: &'a str,
     linked: &'a [&'a str],
+    check: Check<'a>,
+}
+
+enum Check<'a> {
+    Testthat,
+    Script(&'a str),
 }
 
 struct Provisioned {
@@ -101,13 +137,9 @@ impl LinkedSuite<'_> {
         install_package(&r_home, &output, &installed);
         let libraries =
             std::env::join_paths([&installed, &provisioned.runtime]).expect("runtime library path");
-        run_r(
-            &r_home,
-            libraries,
-            &format!(
+        let check = match self.check {
+            Check::Testthat => format!(
                 r#"
-                linked <- {linked}
-                stopifnot(!nzchar(vapply(linked, function(p) system.file(package = p), "")))
                 Sys.setenv(NOT_CRAN = "true")
                 testthat::test_dir(
                   {tests},
@@ -116,9 +148,21 @@ impl LinkedSuite<'_> {
                   stop_on_failure = TRUE
                 )
                 "#,
-                linked = r_vector(self.linked),
                 tests = r_string(provisioned.source.join("tests").join("testthat")),
                 package = r_string(self.package),
+            ),
+            Check::Script(script) => script.to_owned(),
+        };
+        run_r(
+            &r_home,
+            libraries,
+            &format!(
+                r#"
+                linked <- {linked}
+                stopifnot(!nzchar(vapply(linked, function(p) system.file(package = p), "")))
+                {check}
+                "#,
+                linked = r_vector(self.linked),
             ),
         );
     }
@@ -140,6 +184,7 @@ impl LinkedSuite<'_> {
                 r#"
                 package <- {package}
                 linked <- {linked}
+                testthat <- {testthat}
                 if (identical(unname(getOption("repos")["CRAN"]), "@CRAN@")) {{
                   options(repos = c(CRAN = "https://cloud.r-project.org"))
                 }}
@@ -162,10 +207,10 @@ impl LinkedSuite<'_> {
                 hard <- setdiff(closure(package), package)
                 stopifnot(all(linked %in% hard))
                 external <- setdiff(hard, linked)
-                required <- closure(c(external, "testthat"))
+                required <- closure(c(external, if (testthat) "testthat"))
                 overlap <- intersect(required, linked)
                 if (length(overlap)) stop("the test runtime needs Linked packages: ", toString(overlap))
-                suggests <- intersect(tools::package_dependencies(package, db = db, which = "Suggests")[[1]], rownames(db))
+                suggests <- if (testthat) intersect(tools::package_dependencies(package, db = db, which = "Suggests")[[1]], rownames(db)) else character()
                 usable <- suggests[!vapply(
                   tools::package_dependencies(suggests, db = db, which = fields, recursive = TRUE),
                   function(dependencies) any(linked %in% dependencies),
@@ -181,6 +226,11 @@ impl LinkedSuite<'_> {
                 "#,
                 package = r_string(self.package),
                 linked = r_vector(self.linked),
+                testthat = if matches!(self.check, Check::Testthat) {
+                    "TRUE"
+                } else {
+                    "FALSE"
+                },
                 dependencies = r_string(&provisioned.dependencies),
                 runtime_library = r_string(&provisioned.runtime),
                 source = r_string(&provisioned.source),
