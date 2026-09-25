@@ -31,7 +31,7 @@ pub enum BindingCertainty {
 pub enum NameRefKind {
     External,
     ConditionalFallthrough,
-    ShadowedCallee,
+    MaybeLocal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

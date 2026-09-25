@@ -19,7 +19,6 @@ pub enum RejectCode {
     MissingResource,
     ObjectSystem,
     PackageAttachmentUnsupported,
-    PotentialUnboundLocal,
     SemanticAmbiguity,
     SyntaxObservation,
     UnknownClosureEnclosure,

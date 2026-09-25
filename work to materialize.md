@@ -79,6 +79,10 @@ User constraints:
 synthetic fixtures (root-only, Linked, transitive External, explicit External `Suggests`, private
 environments with Linked S3 registration), for the vendored real packages `praise` and `pkgconfig`
 in `tests/fixtures`, for `voucher` with `--external cli,fs`, and for `here` with rprojroot Linked.
+`tests/cran_packages.rs` downloads real CRAN packages, installs their dependencies privately,
+builds them with those dependencies Linked, removes the Linked packages from the runtime library,
+and runs each full testthat suite: `rebus.numbers`, `represtools`, `rslurm`, `qrcode`, `pkgcond`,
+and `doubt` pass.
 
 ```text
 SourcePackageSnapshot
@@ -155,12 +159,67 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
   original.
 - `eval(quote(x))`, `eval(bquote(x))`, and `evalq(x)` in the calling frame are analyzed as live
   code. A callee bound by a local non-closure (for example a parameter named `path`) also
-  retains the enclosing function of that name, matching R's function lookup. `..1` is never a
-  free name.
+  retains the enclosing function of that name, matching R's function lookup. `..N` and the S3
+  dispatch variables (`.Generic`, `.Class`, ...) are never free names.
+- A conditionally local name (for example assigned only inside a loop or one branch) and a name
+  inside a `with`/`within`/`subset`/`transform` data mask retain an enclosing binding when one
+  resolves and never block otherwise: with no enclosing binding the original fails identically.
+- Custom infix operators (`%op%`) are name references, and `f(x) <- value` references `f<-`.
+- The Root keeps every binding it defines, because its own tests and users reach internals; only
+  Root dependencies are tree-shaken.
+- The CLI runs on a 64 MiB stack thread (the Air parse pool uses the same size), so deeply nested
+  R code does not overflow the default Windows stack.
 - Materializer code validation uses the same Harp normalizer as analysis.
 - Blockers live on `LinkIr::blockers()` (sorted `Diagnostic`s); provenance holds only successful
   derivations. Preflight reports every blocker, then freezes inputs; a blocked build publishes
   nothing.
+
+### Milestone: slink testthat
+
+A Linked namespace is registered under its original name, and activation fails with
+`LinkedNamespaceCollision` when the real package is already loaded (4.11.2). That makes the
+natural end-to-end check impossible for most packages: build the package, remove its Linked
+dependencies from the runtime library, and run its testthat suite. `testthat` loads `pkgload`,
+which imports `rprojroot`, `desc`, `R6`, `cli`, and more, so the real copy of any overlapping
+Linked dependency is already loaded before the package under test. For example, `here` links
+`rprojroot`, and its suite cannot run next to testthat.
+
+The milestone is to slink `testthat` itself: build testthat with its whole dependency closure
+Linked, so the test runner loads no real copy of any package it shares with the package under
+test. Reaching it requires Linked native code (item 1 below: cli, rlang, glue, vctrs, processx,
+ps, fansi, utf8, ...), R6 support, and the analysis precision found by the real-package runs
+below. When a slinked testthat exists, the end-to-end helper runs every package's suite against
+it, and overlapping dependencies stop being a restriction.
+
+The end-to-end helper downloads a CRAN source package, installs its hard dependencies into a
+private library, builds it with those dependencies Linked, installs the output into a runtime
+library that contains only testthat's closure and the package's External and `Suggests`
+dependencies, asserts every Linked dependency is absent from that library, and runs the full
+testthat suite against the installed generated package.
+
+### Milestone: vendored realistic test package
+
+Vendor a purpose-built pair of packages under `tests/fixtures` (a root and one or two pure-R
+dependencies) that read like ordinary CRAN packages, not edge-case collections. They should use the
+patterns most real packages use, so slinker covers the common cases very well before it chases
+rare ones:
+
+- roxygen-style `NAMESPACE` with `export`, `importFrom`, `S3method`, and a re-export;
+- S3 classes with constructors, `print`/`format` methods, a package-owned generic with `.default`
+  and class methods, `NextMethod`, and an `Ops`/`[` method;
+- closures and factories (functions returning functions), private state in a package-level
+  environment (`.state <- new.env()`), and `local()`-built helpers;
+- `.onLoad` that sets options and fills the private environment, plus `.onAttach` messaging;
+- `system.file()` resources under `inst/` and a `data/` dataset;
+- `match.arg`, `stopifnot`, `on.exit`, `tryCatch` with custom condition classes, `do.call`,
+  `Reduce`/`Map`/`vapply`, `switch`, and `eval(bquote(...))` code generation;
+- `requireNamespace()`-guarded optional behavior on a `Suggests` package;
+- a testthat suite that exercises all of it and runs unchanged against the generated package with
+  the dependencies removed from the runtime library.
+
+The goal is Pareto coverage: when this package links and its suite passes, most ordinary pure-R
+packages should too. Unusual loader tricks, reflection, and object systems stay blocked until real
+packages demand them.
 
 ### Remaining work
 
@@ -195,7 +254,10 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
 9. **Source snapshot hardening** (phase 9): exclude a prior `target/slinker` tree from the frozen
    input; tests for source-tree non-mutation, staging isolation, and pre-bootstrap independence.
 10. **`ImagePhase`** is declared but image facts do not use the shared runtime vocabulary.
-11. **Linux embedded startup** prints `package 'methods' in options("defaultPackages") was not
+11. **Analysis precision found by real packages**: `globals` calls `getNamespace("utils")` and
+    needs a relocation in a payload binding (`hasCodetoolsBug16`). `futile.logger` imports from
+    `futile.options` through `lambda.r`-generated functions whose base names do not resolve.
+12. **Linux embedded startup** prints `package 'methods' in options("defaultPackages") was not
     found` in the worker unit test on Ubuntu; Ark also exports `R_SHARE_DIR`, `R_INCLUDE_DIR`, and
     `R_DOC_DIR` from the R frontend before starting R, which the worker does not.
 

@@ -35,6 +35,8 @@ pub use graph::{Edge, EdgeKind, Graph, Node, NodeId, NodeKind};
 pub use need::{GenericId, LifecycleId, NativeId, Need, ResourceId, S3Id};
 pub use policy::{DiscoveryPolicy, LinkPolicy};
 
+pub const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 /// Demand-driven analysis of one root package against a frozen target universe.
 pub struct Linker<P: PackageProvider>(AnalyzerState<P>);
 

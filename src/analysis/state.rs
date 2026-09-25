@@ -151,11 +151,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.encountered.insert(root);
         let root_image = self.image(root)?;
 
-        // Package activation and the public/runtime entry points form the root
-        // contract. Internal namespace bindings are reached only when retained
-        // code, lifecycle hooks, S3 registrations, or native obligations demand
-        // them. DESCRIPTION/NAMESPACE dependency metadata informs resolution;
-        // it does not make every declared package or every root binding live.
         self.require_root(Need::Activation { package: root });
         while !self.pending.is_empty() {
             self.process_frontier()?;
@@ -165,6 +160,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .index
             .exports
             .values()
+            .chain(&root_image.index.binding_names)
             .cloned()
             .collect::<Vec<_>>();
         entry_bindings.sort();
@@ -274,6 +270,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(self.jobs)
                 .thread_name(|index| format!("slinker-air-{index}"))
+                .stack_size(super::ANALYSIS_STACK_BYTES)
                 .build()
                 .map_err(|error| {
                     Error::Analysis(format!("failed to create Rayon pool: {error}"))
@@ -1143,32 +1140,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     &reference.name,
                 )?;
                 if (!enclosure_known
-                    || reference.kind == NameRefKind::ShadowedCallee
+                    || reference.kind != NameRefKind::External
                     || self.value_closures.contains(&node))
                     && matches!(
                         &resolved,
                         Resolution::OpenDynamic(OpenReason::Unresolved(_))
                     )
                 {
-                    continue;
-                }
-                if reference.kind == NameRefKind::ConditionalFallthrough
-                    && matches!(
-                        &resolved,
-                        Resolution::OpenDynamic(OpenReason::Unresolved(_))
-                    )
-                {
-                    self.diagnostic(
-                        node,
-                        package,
-                        Some(binding),
-                        RejectCode::PotentialUnboundLocal,
-                        format!(
-                            "conditionally local name `{}` can fall through without an enclosing binding",
-                            reference.name
-                        ),
-                        Some(reference.span.clone()),
-                    );
                     continue;
                 }
                 self.require_resolved(

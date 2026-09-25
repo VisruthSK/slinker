@@ -464,7 +464,6 @@ fn reject_code_name(code: RejectCode) -> &'static str {
         RejectCode::MissingResource => "missing_resource",
         RejectCode::ObjectSystem => "object_system",
         RejectCode::PackageAttachmentUnsupported => "package_attachment_unsupported",
-        RejectCode::PotentialUnboundLocal => "potential_unbound_local",
         RejectCode::SemanticAmbiguity => "semantic_ambiguity",
         RejectCode::SyntaxObservation => "syntax_observation",
         RejectCode::UnknownClosureEnclosure => "unknown_closure_enclosure",

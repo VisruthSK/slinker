@@ -424,6 +424,38 @@ fn evaluated_quotation_text(text: &str, root: &RRoot, context: &OakParseContext)
     Some(String::from_utf8(bytes).expect("ASCII identifiers are replaced by ASCII spaces"))
 }
 
+fn data_mask_ranges(root: &RRoot, context: &OakParseContext) -> Vec<std::ops::Range<usize>> {
+    root.syntax()
+        .descendants()
+        .filter_map(RCall::cast)
+        .filter(|call| {
+            base_callee(call, context).is_some_and(|(name, _)| {
+                matches!(name.as_str(), "with" | "within" | "subset" | "transform")
+            })
+        })
+        .filter_map(|call| call.arguments().ok())
+        .flat_map(|arguments| {
+            arguments
+                .items()
+                .iter()
+                .skip(1)
+                .filter_map(|argument| argument.ok()?.value())
+                .map(|value| {
+                    let range = value.syntax().text_trimmed_range();
+                    text_offset(range.start())..text_offset(range.end())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn is_frame_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        ".Generic" | ".Class" | ".Method" | ".GenericCallEnv" | ".GenericDefEnv" | ".Group"
+    ) || is_dots_element(name)
+}
+
 fn is_dots_element(name: &str) -> bool {
     name.strip_prefix("..")
         .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
@@ -475,7 +507,7 @@ fn translate_index(
         for (use_id, use_site) in index.uses(scope).iter() {
             let symbol = index.symbols(scope).symbol(use_site.symbol());
             let name = symbol.name().to_owned();
-            if is_dots_element(&name) {
+            if is_frame_intrinsic(&name) {
                 continue;
             }
             let range = use_site.range();
@@ -546,25 +578,39 @@ fn translate_index(
         }
     }
 
+    let data_masks = data_mask_ranges(root, context);
     let mut references = live_uses
         .iter()
         .filter_map(|live_use| {
             if is_r_language_constant(&live_use.name) {
                 return None;
             }
+            let masked = data_masks.iter().any(|mask| mask.contains(&live_use.start));
             let kind = match live_use.callee_kind {
                 CalleeKind::DefinitelyLexical
                     if text.as_bytes().get(skip_trivia(text, live_use.end)) == Some(&b'(')
                         && !reaches_only_closures(text, index, live_use) =>
                 {
-                    NameRefKind::ShadowedCallee
+                    NameRefKind::MaybeLocal
                 }
                 CalleeKind::DefinitelyLexical => return None,
+                CalleeKind::DefinitelyExternal | CalleeKind::ConditionalFallthrough if masked => {
+                    NameRefKind::MaybeLocal
+                }
                 CalleeKind::DefinitelyExternal => NameRefKind::External,
                 CalleeKind::ConditionalFallthrough => NameRefKind::ConditionalFallthrough,
             };
+            let replaced =
+                call_after_name(text, live_use.start, live_use.end).is_some_and(|call| {
+                    let rest = &text[skip_trivia(text, call.end)..];
+                    rest.starts_with("<-") || rest.starts_with("<<-")
+                });
             Some(NameRef {
-                name: live_use.name.clone(),
+                name: if replaced {
+                    format!("{}<-", live_use.name)
+                } else {
+                    live_use.name.clone()
+                },
                 kind,
                 phase: live_use.phase,
                 guards: Vec::new(),
@@ -658,10 +704,10 @@ fn translate_index(
         .descendants()
         .filter_map(RBinaryExpression::cast)
     {
-        let Ok(operator) = binary.operator() else {
+        let Ok(operator_token) = binary.operator() else {
             continue;
         };
-        let operator = operator.text_trimmed().to_owned();
+        let operator = operator_token.text_trimmed().to_owned();
         if matches!(operator.as_str(), "<-" | "=" | "<<-" | "->" | "->>") {
             continue;
         }
@@ -670,6 +716,20 @@ fn translate_index(
         };
         let span = ast_span(&source, &binary);
         let (scope, _) = index.scope_at(binary.range().start());
+        if operator.len() > 2 && operator.starts_with('%') && operator.ends_with('%') {
+            let range = operator_token.text_trimmed_range();
+            references.push(NameRef {
+                name: operator.clone(),
+                kind: NameRefKind::External,
+                phase: phase_for_scope(index, scope),
+                guards: Vec::new(),
+                span: Span::new(
+                    source.clone(),
+                    text_offset(range.start()),
+                    text_offset(range.end()),
+                ),
+            });
+        }
         let argument = |expression: &AnyRExpression| {
             let span = ast_span(&source, expression);
             (
@@ -2189,8 +2249,7 @@ fn condition_symbols_stable(
 
     // `rm()` / `remove()` can destroy a binding without creating an Oak
     // definition. Refuse the correlation proof if either appears between the
-    // two sites. This is deliberately conservative; false negatives here keep
-    // a PotentialUnboundLocal rather than hiding one.
+    // two sites.
     let segment = text.get(start..end).unwrap_or_default();
     !contains_call_named(segment, "rm") && !contains_call_named(segment, "remove")
 }
@@ -4350,7 +4409,7 @@ mod tests {
         };
         assert_eq!(
             kind("f <- function(path) path(path, 'x')"),
-            Some(NameRefKind::ShadowedCallee)
+            Some(NameRefKind::MaybeLocal)
         );
         assert_eq!(
             kind("f <- function() { path <- function() 1; path() }"),
@@ -4365,6 +4424,42 @@ mod tests {
         assert!(!names.contains(&"..1"));
         assert!(!names.contains(&"..12"));
         assert!(names.contains(&"..x"));
+    }
+
+    #[test]
+    fn replacement_call_references_the_replacement_function() {
+        let parsed = parse_source("f <- function(x) { substr2(x, 1, 2) <- 'a'; x }");
+        let names = reference_names(&parsed);
+        assert!(names.contains(&"substr2<-"));
+        assert!(!names.contains(&"substr2"));
+    }
+
+    #[test]
+    fn custom_infix_operator_is_a_name_reference() {
+        let parsed = parse_source("f <- function(a, b) a %R% (b %in% a)");
+        let names = reference_names(&parsed);
+        assert!(names.contains(&"%R%"));
+        assert!(names.contains(&"%in%"));
+    }
+
+    #[test]
+    fn data_masked_names_may_be_columns() {
+        let parsed = parse_source("f <- function(d) with(d, middle + helper(x))");
+        let kinds = parsed.expressions[0]
+            .references
+            .iter()
+            .map(|reference| (reference.name.as_str(), reference.kind))
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&("middle", NameRefKind::MaybeLocal)));
+        assert!(kinds.contains(&("helper", NameRefKind::MaybeLocal)));
+    }
+
+    #[test]
+    fn dispatch_frame_variables_are_never_free_names() {
+        let parsed = parse_source("Ops.poly <- function(e1, e2) switch(.Generic, `+` = .Class)");
+        let names = reference_names(&parsed);
+        assert!(!names.contains(&".Generic"));
+        assert!(!names.contains(&".Class"));
     }
 
     #[test]

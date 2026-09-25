@@ -56,7 +56,7 @@
     control = c("keepInteger", "keepNA", "niceNames")
   ), collapse = "\n")
   simple <- grepl("^[A-Za-z.][A-Za-z0-9._]*$", name) && !grepl("^\\.[0-9]", name)
-  lhs <- if (simple) name else paste0("`", gsub("`", "\\\\`", name, fixed = TRUE), "`")
+  lhs <- if (simple) name else paste0("`", gsub("([`\\\\])", "\\\\\\1", name), "`")
   paste0(lhs, " <- ", rhs)
 }
 

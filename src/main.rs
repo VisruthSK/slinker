@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 
 use clap::{Args, Parser, Subcommand};
-use slinker::analysis::{Edge, ExplanationDag, LinkIr, Linker, NodeId, NodeKind};
+use slinker::analysis::{
+    ANALYSIS_STACK_BYTES, Edge, ExplanationDag, LinkIr, Linker, NodeId, NodeKind,
+};
 use slinker::build::{BuildContext, PureRStatic, materialize};
 use slinker::package::PackageStore;
 use slinker::source::{SourcePackageSnapshot, stage_root};
@@ -105,7 +107,22 @@ struct QueryArgs {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse().command) {
+    match Cli::parse().command {
+        Command::RWorker { protocol } => {
+            report(slinker::r_worker::run(&protocol).map_err(Into::into))
+        }
+        command => std::thread::Builder::new()
+            .name("slinker".into())
+            .stack_size(ANALYSIS_STACK_BYTES)
+            .spawn(move || report(run(command)))
+            .expect("spawn the slinker command thread")
+            .join()
+            .unwrap_or(ExitCode::FAILURE),
+    }
+}
+
+fn report(result: Result<(), Box<dyn Error>>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("slinker: {error}");
@@ -125,7 +142,7 @@ fn run(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Analyze(args) => analyze(&args),
         Command::Why(args) => explain_why(&args),
         Command::Path(args) => explain_paths(&args),
-        Command::RWorker { protocol } => Ok(slinker::r_worker::run(&protocol)?),
+        Command::RWorker { .. } => unreachable!("the R worker runs on the main thread"),
     }
 }
 

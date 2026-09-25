@@ -1,6 +1,9 @@
+mod common;
+
+use common::{assert_success, discover_r_home, install_package, run_r, run_r_output};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::Path;
+use std::process::Command;
 
 #[test]
 fn build_defaults_to_current_package_and_emits_installable_source() {
@@ -369,75 +372,4 @@ fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &s
     .expect("DESCRIPTION");
     fs::write(root.join("NAMESPACE"), namespace).expect("NAMESPACE");
     fs::write(root.join("R/code.R"), code).expect("R code");
-}
-
-fn install_package(r_home: &Path, package: &Path, library: &Path) {
-    let output = Command::new(r_executable(r_home))
-        .args(["CMD", "INSTALL", "--no-test-load"])
-        .arg(format!("--library={}", library.display()))
-        .arg(package)
-        .output()
-        .expect("R CMD INSTALL");
-    assert_success(&output, "R CMD INSTALL");
-}
-
-fn run_r(r_home: &Path, library: &Path, expression: &str) {
-    let output = run_r_output(r_home, library, expression);
-    assert_success(&output, "target R expression");
-}
-
-fn run_r_output(r_home: &Path, library: &Path, expression: &str) -> Output {
-    let script = tempfile::Builder::new()
-        .suffix(".R")
-        .tempfile()
-        .expect("R script");
-    fs::write(script.path(), expression).expect("write R script");
-    Command::new(r_executable(r_home))
-        .args(["--slave", "--no-save", "--no-restore", "--vanilla", "-f"])
-        .arg(script.path())
-        .env("R_LIBS", library)
-        .env("R_LIBS_USER", library)
-        .env_remove("R_LIBS_SITE")
-        .output()
-        .expect("run target R")
-}
-
-fn discover_r_home() -> PathBuf {
-    let output = if cfg!(windows) {
-        Command::new("cmd").args(["/c", "R RHOME"]).output()
-    } else {
-        Command::new("R").arg("RHOME").output()
-    }
-    .expect("R RHOME");
-    assert_success(&output, "R RHOME");
-    let home = String::from_utf8(output.stdout).expect("R home UTF-8");
-    dunce::canonicalize(
-        home.lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .expect("R home line")
-            .trim(),
-    )
-    .expect("canonical R home")
-}
-
-fn r_executable(r_home: &Path) -> PathBuf {
-    [
-        r_home.join("bin/x64/R.exe"),
-        r_home.join("bin/R.exe"),
-        r_home.join("bin/R"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .expect("target R executable")
-}
-
-fn assert_success(output: &Output, operation: &str) {
-    assert!(
-        output.status.success(),
-        "{operation} failed ({})\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }

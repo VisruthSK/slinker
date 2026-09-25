@@ -580,13 +580,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         for (node, package, binding, span) in std::mem::take(&mut self.next_method_calls) {
-            if !self.closed_methods.contains(&(package, binding.clone())) {
+            let registered = self
+                .namespace_builders
+                .get(&package)
+                .is_some_and(|namespace| {
+                    namespace
+                        .registrations
+                        .iter()
+                        .any(|registration| registration.method == binding)
+                });
+            if !registered && !self.closed_methods.contains(&(package, binding.clone())) {
                 self.diagnostic(
                     node,
                     package,
                     Some(&binding),
                     RejectCode::ObjectSystem,
-                    "NextMethod is not inside a method of a closed S3 generic",
+                    "NextMethod is not inside a registered method or a method of a closed S3 generic",
                     Some(span),
                 );
             }
