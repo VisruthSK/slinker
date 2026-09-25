@@ -150,22 +150,29 @@ impl LinkedSuite<'_> {
                   found <- tools::package_dependencies(packages, db = db, which = fields, recursive = TRUE)
                   setdiff(unique(c(packages, unlist(found))), base)
                 }}
-                provide <- function(library, packages) {{
+                installed <- function(library) rownames(installed.packages(library, noCache = TRUE))
+                provide <- function(library, required, optional = character()) {{
                   dir.create(library, recursive = TRUE, showWarnings = FALSE)
-                  missing <- setdiff(packages, rownames(installed.packages(library, noCache = TRUE)))
                   .libPaths(c(library, .libPaths()))
-                  if (length(missing)) install.packages(missing, lib = library, dependencies = FALSE, quiet = TRUE)
-                  stopifnot(all(packages %in% rownames(installed.packages(library, noCache = TRUE))))
+                  missing <- setdiff(union(required, optional), installed(library))
+                  if (length(missing)) install.packages(missing, lib = library, dependencies = FALSE)
+                  absent <- setdiff(required, installed(library))
+                  if (length(absent)) stop("could not install: ", toString(absent))
                 }}
                 hard <- setdiff(closure(package), package)
                 stopifnot(all(linked %in% hard))
                 external <- setdiff(hard, linked)
-                suggests <- tools::package_dependencies(package, db = db, which = "Suggests")[[1]]
-                runtime <- closure(c(external, intersect(suggests, rownames(db)), "testthat"))
-                overlap <- intersect(runtime, linked)
+                required <- closure(c(external, "testthat"))
+                overlap <- intersect(required, linked)
                 if (length(overlap)) stop("the test runtime needs Linked packages: ", toString(overlap))
+                suggests <- intersect(tools::package_dependencies(package, db = db, which = "Suggests")[[1]], rownames(db))
+                usable <- suggests[!vapply(
+                  tools::package_dependencies(suggests, db = db, which = fields, recursive = TRUE),
+                  function(dependencies) any(linked %in% dependencies),
+                  logical(1)
+                )]
                 provide({dependencies}, hard)
-                provide({runtime_library}, runtime)
+                provide({runtime_library}, required, setdiff(closure(usable), c(required, linked)))
                 if (!dir.exists({source})) {{
                   tarball <- download.packages(package, tempdir(), type = "source")[1, 2]
                   untar(tarball, exdir = dirname({source}))
