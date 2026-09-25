@@ -48,17 +48,15 @@
   )
 }
 
-.slinker_deparse_binding <- function(name, value, embedded = FALSE) {
+.slinker_deparse_binding <- function(name, value) {
   rhs <- paste(deparse(
     value,
     width.cutoff = 500L,
     control = c("keepInteger", "keepNA", "niceNames")
   ), collapse = "\n")
-  if (embedded) paste0(".slinker_embedded <- ", rhs) else {
-    simple <- grepl("^[A-Za-z.][A-Za-z0-9._]*$", name) && !grepl("^\\.[0-9]", name)
-    lhs <- if (simple) name else paste0("`", gsub("`", "\\\\`", name, fixed = TRUE), "`")
-    paste0(lhs, " <- ", rhs)
-  }
+  simple <- grepl("^[A-Za-z.][A-Za-z0-9._]*$", name) && !grepl("^\\.[0-9]", name)
+  lhs <- if (simple) name else paste0("`", gsub("`", "\\\\`", name, fixed = TRUE), "`")
+  paste0(lhs, " <- ", rhs)
 }
 
 .slinker_normalize_source <- function(source) {

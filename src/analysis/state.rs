@@ -66,6 +66,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) objects: ObjectWorld,
     pub(super) diagnostics: Vec<Diagnostic>,
     pub(super) pending_relocations: Vec<PendingRelocation>,
+    pub(super) dynamic_resource_lookups: Vec<(NodeId, PackageId, Span)>,
     pub(super) sources: Sources,
     pub(super) source_ids: HashMap<(PackageId, String), SourceId>,
     pub(super) normalized_shapes: HashMap<(PackageId, String), Digest>,
@@ -114,6 +115,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             objects: ObjectWorld::default(),
             diagnostics: Vec::new(),
             pending_relocations: Vec::new(),
+            dynamic_resource_lookups: Vec::new(),
             sources: Sources::default(),
             source_ids: HashMap::new(),
             normalized_shapes: HashMap::new(),
@@ -219,7 +221,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         binding: &str,
     ) -> Result<Arc<PackageImage>> {
         let image = self.image(package)?;
-        if image.binding(binding).is_some() {
+        if image.binding(binding).is_some()
+            || !image.index.binding_names.iter().any(|name| name == binding)
+        {
             return Ok(image);
         }
         let partial = self.packages.binding_image(package, binding)?;
@@ -1818,16 +1822,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         resource: &crate::syntax::ResourceRef,
     ) -> Result<()> {
         let Some(package_name) = &resource.package else {
-            if resource.path.is_none() {
-                self.diagnostic(
-                    from,
-                    current,
-                    None,
-                    RejectCode::DynamicLookup,
-                    "dynamic system.file() resource path",
-                    Some(resource.span.clone()),
-                );
-            }
+            self.dynamic_resource_lookups
+                .push((from, current, resource.span.clone()));
             return Ok(());
         };
 

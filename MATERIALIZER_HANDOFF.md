@@ -119,7 +119,8 @@ SourcePackageSnapshot
 - `TargetUniverse::set_root` and `set_explicit_external` must run before any resolution.
 - Explicit `--external` on a `Suggests` package counts as selected optional behavior; the contract
   is promoted into generated `Imports`.
-- Root staging library must be first in the captured library order.
+- Root staging library must be first in the captured library order, followed by `--lib` paths or,
+  without `--lib`, the default `.libPaths()` (never drop the user library).
 - `R CMD INSTALL` takes one `--library=<path>` option plus the package path.
 - Linked imports never appear in generated NAMESPACE, or R loads the removed package first.
 - R processes `export()` after `.onLoad`, so Linked re-exports wired during bootstrap work.

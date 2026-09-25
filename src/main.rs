@@ -167,7 +167,14 @@ fn link(args: &AnalysisArgs) -> Result<(TargetEnvironment, LinkIr), Box<dyn Erro
 fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
     let r_home = discover_r_home()?;
     let source = SourcePackageSnapshot::capture(&args.path)?;
-    let libraries = absolute_libraries(&args.universe)?;
+    let libraries = match absolute_libraries(&args.universe)? {
+        explicit if explicit.is_empty() => {
+            TargetEnvironmentRequest::new(r_home.clone())
+                .capture()?
+                .libraries
+        }
+        explicit => explicit,
+    };
     let staged = stage_root(&source, &r_home, &libraries)?;
     let mut target_request = TargetEnvironmentRequest::new(r_home.clone());
     target_request.libraries = std::iter::once(staged.library().to_path_buf())
@@ -184,7 +191,8 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
         context
             .source()
             .original_root()
-            .join("target/slinker")
+            .join("target")
+            .join("slinker")
             .join(context.source().package())
     });
     let buildable = PureRStatic::check(&ir, &mut context)?;

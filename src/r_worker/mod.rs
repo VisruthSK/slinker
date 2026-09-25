@@ -576,10 +576,7 @@ impl ObjectScanner {
                 (BindingRepresentation::Value, object)
             }
         };
-        let mut facts = self.scan_value(object.sexp, "$", false, 0)?;
-        if let Some(closure) = &mut facts.closure {
-            closure.source = self.deparse(name, object.sexp, false)?.into();
-        }
+        let mut facts = self.scan_value(object.sexp, "$", Some(name), 0)?;
         Ok(BindingImage {
             name: name.into(),
             origin,
@@ -661,7 +658,7 @@ impl ObjectScanner {
                 (BindingRepresentation::Value, object)
             }
         };
-        let mut facts = self.scan_value(object.sexp, "$", false, 0)?;
+        let mut facts = self.scan_value(object.sexp, "$", Some(name), 0)?;
         Ok(PrivateBindingImage {
             name: name.into(),
             representation,
@@ -679,7 +676,7 @@ impl ObjectScanner {
         &mut self,
         value: libr::SEXP,
         path: &str,
-        embedded: bool,
+        binding: Option<&str>,
         depth: usize,
     ) -> std::result::Result<ObjectFacts, String> {
         if depth > 128 {
@@ -706,7 +703,7 @@ impl ObjectScanner {
             let mut facts = ObjectFacts::new(object_kind(value));
             if harp::utils::r_typeof(value) == libr::ENVSXP {
                 let environment = self.environment_ref(value)?;
-                if embedded && !environment.starts_with("unsupported:") {
+                if binding.is_none() && !environment.starts_with("unsupported:") {
                     facts.environments.push(EmbeddedEnvironmentRef {
                         path: path.into(),
                         environment: environment.clone(),
@@ -724,23 +721,25 @@ impl ObjectScanner {
                     .call()
                     .map_err(r_error)?;
                 let environment = self.environment_ref(closure_environment.sexp)?;
-                if embedded {
-                    facts.closures.push(EmbeddedClosureSource {
+                let source = self.deparse(binding, value)?.into();
+                match binding {
+                    Some(_) => {
+                        facts.closure = Some(ClosureSource {
+                            environment: environment.clone(),
+                            source,
+                        });
+                    }
+                    None => facts.closures.push(EmbeddedClosureSource {
                         path: path.into(),
                         environment: environment.clone(),
-                        source: self.deparse(".slinker_embedded", value, true)?.into(),
-                    });
-                } else {
-                    facts.closure = Some(ClosureSource {
-                        environment: environment.clone(),
-                        source: self.deparse("", value, false)?.into(),
-                    });
+                        source,
+                    }),
                 }
                 facts.environment = Some(environment);
             }
             libr::ENVSXP => {
                 let environment = self.environment_ref(value)?;
-                if embedded && !environment.starts_with("unsupported:") {
+                if binding.is_none() && !environment.starts_with("unsupported:") {
                     facts.environments.push(EmbeddedEnvironmentRef {
                         path: path.into(),
                         environment: environment.clone(),
@@ -765,7 +764,7 @@ impl ObjectScanner {
                     facts.merge(self.scan_value(
                         harp::object::list_get(value, index),
                         &format!("{path}{member}"),
-                        true,
+                        None,
                         depth + 1,
                     )?);
                 }
@@ -783,7 +782,7 @@ impl ObjectScanner {
                         facts.merge(self.scan_value(
                             item,
                             &format!("{path}{member}"),
-                            true,
+                            None,
                             depth + 1,
                         )?);
                     }
@@ -811,7 +810,7 @@ impl ObjectScanner {
                 facts.merge(self.scan_value(
                     unsafe { libr::CAR(attribute) },
                     &format!("{path}.attr[{name}]"),
-                    true,
+                    None,
                     depth + 1,
                 )?);
                 attribute = unsafe { libr::CDR(attribute) };
@@ -825,14 +824,12 @@ impl ObjectScanner {
 
     fn deparse(
         &self,
-        name: &str,
+        binding: Option<&str>,
         value: libr::SEXP,
-        embedded: bool,
     ) -> std::result::Result<String, String> {
         harp::RFunction::new("", ".slinker_deparse_binding")
-            .add(name)
+            .add(binding.unwrap_or(".slinker_embedded"))
             .add(value)
-            .add(embedded)
             .call()
             .and_then(String::try_from)
             .map_err(r_error)
@@ -1363,6 +1360,7 @@ mod tests {
                 2L
               }, assign.env = private)
               private$self <- private
+              private$handler <- function(expr) expr
               image$holder <- list(private = private, closure = function(x) x)
               class(image$holder) <- c("first_class", "second_class")
               image$counter <- 0L
@@ -1419,6 +1417,12 @@ mod tests {
         assert_eq!(
             private.bindings["self"].environment.as_deref(),
             Some(private.id.as_str())
+        );
+        assert!(
+            private.bindings["handler"]
+                .closure
+                .as_ref()
+                .is_some_and(|closure| closure.source.starts_with("handler <- function"))
         );
         let mut later_epoch = ObjectScanner::new(image.sexp, "fixture".into(), HashMap::new(), 1);
         let rescanned = harp::environment_iter::Binding::new(&image_environment, "holder".into())

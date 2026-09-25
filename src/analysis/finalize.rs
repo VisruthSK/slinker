@@ -44,6 +44,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 None,
             );
         }
+        if retained
+            .iter()
+            .any(|package| self.packages.role(*package) == LinkedPackageRole::Linked)
+        {
+            for (node, package, span) in std::mem::take(&mut self.dynamic_resource_lookups) {
+                self.diagnostic(
+                    node,
+                    package,
+                    None,
+                    RejectCode::DynamicLookup,
+                    "dynamic system.file() package can name a Linked package whose installation is removed",
+                    Some(span),
+                );
+            }
+        }
         let mut blockers = self.diagnostics;
         blockers.sort_by(|left, right| {
             (&left.package, left.code, &left.binding, &left.message).cmp(&(

@@ -2690,6 +2690,14 @@ fn collect_resources(
         if call.site.callee != "system.file" || !is_base_call(context, &call.site) {
             continue;
         }
+        if !call
+            .raw
+            .args
+            .iter()
+            .any(|argument| argument.name.as_deref() == Some("package"))
+        {
+            continue;
+        }
         let package = named_static_string(&call.raw.args, "package");
         let must_work = named_static_bool(&call.raw.args, "mustWork");
         let path_parts = call

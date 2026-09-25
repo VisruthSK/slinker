@@ -2323,6 +2323,48 @@ fn resource_reference_retains_only_required_path() {
 }
 
 #[test]
+fn dynamic_resource_package_blocks_only_when_an_installation_is_removed() {
+    let dynamic = "f <- function(package = 'root') system.file('data', package = package)";
+    let standalone = Linker::new(
+        FakeProvider::new(vec![package("root", &[("f", Some(dynamic))])]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+    assert!(standalone.blockers().is_empty());
+
+    let root = package(
+        "root",
+        &[
+            ("f", Some(dynamic)),
+            ("g", Some("g <- function() foo::h()")),
+        ],
+    );
+    let foo = package("foo", &[("h", Some("h <- function() 1"))]);
+    let linked = Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        .analyze("root")
+        .unwrap();
+    assert!(linked.blockers().iter().any(|diagnostic| {
+        diagnostic.binding.is_none()
+            && diagnostic.code == RejectCode::DynamicLookup
+            && diagnostic.message.contains("system.file")
+    }));
+}
+
+#[test]
+fn base_resource_lookup_is_not_a_package_resource() {
+    let root = package(
+        "root",
+        &[("f", Some("f <- function() system.file('DESCRIPTION')"))],
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+    assert!(plan.blockers().is_empty());
+    assert!(plan.program().resources().is_empty());
+}
+
+#[test]
 fn non_closure_binding_never_invokes_air() {
     let root = package("root", &[("constant", None)]);
     let plan = Linker::new(FakeProvider::new(vec![root]), 4)
