@@ -180,6 +180,12 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
 - A dynamic `asNamespace`/`getNamespace` does not block when its result is only the `envir` of
   `registerS3method` or is read for `.__NAMESPACE__.` metadata. ALTREP values from base (compact
   sequences, deferred strings, wrappers) serialize as ordinary vectors and do not block.
+- Review fixes: External `:::` access is kept as `ExternalBindingAccess::Internal` in the program
+  and the materializer honors it; `find.package()` of a Linked package blocks in analysis instead
+  of failing in materialization; Linked activation order includes every activation-time
+  dependency (from `.onLoad` and S3 registration subgraphs), not only NAMESPACE imports;
+  `getNamespaceInfo`/`getNamespaceImports` reads of `imports`, `path`, `dynlibs`, or `S3methods`
+  on a synthetic Linked namespace block.
 - Generated code never resolves base functions through the Root namespace: the bootstrap and its
   helpers live in `.slinker_runtime` (parent `baseenv()`), and rewritten call sites use `base::`.
 - Reflective lookups are analyzed: a static `get("x")`/`exists`/`match.fun`/`do.call("x")` name
@@ -301,11 +307,13 @@ packages demand them.
    bindings that tree-shaking removed; C callbacks are not analyzed yet. A Linked library whose
    registered routines cannot be read (its init fails in the worker) still leaves those routine
    names unresolved.
-2. **Narrower S3 retention** (section 9, static S3): closed generics keep every method. When the
-   receiver classes are proven, keeping only their methods, inherited chains, `.default`, and
-   `NextMethod` targets would shrink the output. This is an optimization, not a correctness gap.
-3. **Linked `.onLoad` libname** (4.10, 3.3): analyze whether a retained Linked `.onLoad` observes
-   `libname`; lower to resources or block with `UnsupportedLinkedLibname`. Today it receives `""`.
+2. **S3 registration demand** (section 9, static S3): declared receiver classes narrow the
+   lexical `g.*` sweep, but installed registrations are still retained wholesale. Separate
+   registration availability from registration demanded by dispatch once operators and group
+   generics use the same class domains; automatic class inference beyond declarations stays out.
+3. **Linked `.onLoad` libname, lowering** (4.10, 3.3): a retained Linked `.onLoad` that reads
+   `libname` (an Oak use of its first formal) now blocks with `UnsupportedLinkedLibname`; one
+   that never reads it receives `""` safely. Lowering real uses to resources remains.
 4. **Reflection and host-environment semantics** (3.6, 3.7): exact reflection over closed
    namespaces, blocking open reflection, `.GlobalEnv`/search-path/caller-environment behavior.
 5. **Typed blocker taxonomy** (phase 9): blockers are typed by `RejectCode`; the full list
@@ -315,21 +323,29 @@ packages demand them.
 6. **Provenance ownership** (phase 7): `ProvenanceIr` still stores the legacy `Node`/`Edge` graph
    and reconstructs a `Graph`; it should store typed derivations and build the explanation graph
    only for presentation.
-7. **CodeIr guarantees** (4.16, 5.6): relocated code is checked for parse stability, not against a
-   modeled expected shape; occurrence overlap validation and deterministic ordering tests remain.
-   `CodeIr` still contains the `name <- ` assignment, and the Root `.onLoad` rename is textual.
-8. **Payload identity across namespaces**: private environments shared between two packages'
-   bundles are serialized twice. `InstalledObjectLocator` path steps are not redeemed.
+7. **CodeIr guarantees** (4.16, 5.6): preflight now rejects relocation occurrences that are out of
+   bounds, overlap, repeat, or do not match the syntax their relocation expects (binding name,
+   package, operation, `system.file`), and replacements apply in start order. `CodeIr` models
+   where its assignment value starts, so the Root `.onLoad` rename is structural. A normalized
+   post-rewrite AST comparison is still not modeled.
+8. **Payload bundles are a bounded capability, not modeled environments**: `ProgramIr` names each
+   payload by package and root binding (`Value::Payload`); R serialization of one bundle per
+   namespace reconstructs everything beneath it. Serialization is trusted to preserve, within one
+   bundle: sharing and cycles, private environment identity and parent chains, closure
+   enclosures, and attributes. It does not preserve identity across two namespaces' bundles
+   (shared environments are duplicated), and `EnvironmentIr` does not describe those graphs.
+   Nested `InstalledObjectLocator` paths are rejected by preflight. Either model these graphs in
+   `EnvironmentIr` or keep this contract explicit.
 9. **Source snapshot hardening** (phase 9): exclude a prior `target/slinker` tree from the frozen
    input; tests for source-tree non-mutation, staging isolation, and pre-bootstrap independence.
 10. **`ImagePhase`** is declared but image facts do not use the shared runtime vocabulary.
 11. **Analysis precision found by real packages**: `globals` calls `getNamespace("utils")` and
     needs a relocation in a payload binding (`hasCodetoolsBug16`). `futile.logger` imports from
     `futile.options` through `lambda.r`-generated functions whose base names do not resolve.
-12. **cli as a Linked dependency**: remaining blockers are `get_call_scope` and
-    `format_trace_call_cli`, which reflect with `exists(name, envir = asNamespace(ns))` to print
-    `::` versus `:::` in traces, and `deferred_run`, which cli's vendored withr code references
-    but never defines (a real cli bug, reached only by a session-end finalizer).
+12. **cli as a Linked dependency**: links and runs with `--strict false` (voucher). Its strict
+    blockers are trace formatting that reflects with `exists(name, envir = asNamespace(ns))`,
+    dynamic `get`/`do.call`, and `deferred_run`, which cli's vendored withr code references but
+    never defines (a real cli bug, reached only by a session-end finalizer).
 13. **Linux embedded startup** prints `package 'methods' in options("defaultPackages") was not
     found` in the worker unit test on Ubuntu; Ark also exports `R_SHARE_DIR`, `R_INCLUDE_DIR`, and
     `R_DOC_DIR` from the R frontend before starting R, which the worker does not.

@@ -282,6 +282,7 @@ pub struct PayloadRef {
 #[derive(Clone, Debug)]
 pub struct CodeIr {
     source: Arc<str>,
+    value_start: Option<usize>,
     occurrences: Vec<CodeOccurrence>,
     normalized_shape: Digest,
 }
@@ -293,6 +294,7 @@ impl CodeIr {
         normalized_shape: Digest,
     ) -> Self {
         Self {
+            value_start: crate::syntax::assigned_value_start(&source),
             source,
             occurrences,
             normalized_shape,
@@ -301,6 +303,10 @@ impl CodeIr {
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    pub fn assigned_value_start(&self) -> Option<usize> {
+        self.value_start
     }
 
     pub fn occurrences(&self) -> &[CodeOccurrence] {
@@ -364,7 +370,6 @@ pub enum PackageOperationIr {
     GetNamespace,
     AsNamespace,
     PackageVersion { version: String },
-    FindPackage,
 }
 
 #[derive(Clone, Debug)]

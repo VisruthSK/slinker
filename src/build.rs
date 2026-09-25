@@ -24,7 +24,6 @@ pub enum PackageOperation {
     GetNamespace,
     AsNamespace,
     PackageVersion { version: String },
-    FindPackage,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +270,7 @@ impl PureRStatic {
                     .insert("nested payload reconstruction is not supported by PureRStatic".into());
             }
         }
+        blockers.extend(relocation_site_issues(ir.program()));
         let program = ir.program();
         for import in &program.root_namespace().imports {
             let target = program.binding(import.target);
@@ -450,7 +450,14 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     for closure in namespace_closures(program, root) {
         let source = relocated_source(program, program.closure(closure).code)?;
         if Some(closure) == root_on_load {
-            root_code.push_str(&rename_assignment(&source, ".slinker_original_on_load"));
+            let value_start = program
+                .code(program.closure(closure).code)
+                .assigned_value_start()
+                .ok_or_else(|| {
+                    MaterializeError::InvalidR("Root .onLoad code is not an assignment".into())
+                })?;
+            root_code.push_str(".slinker_original_on_load <- ");
+            root_code.push_str(&source[value_start..]);
         } else {
             root_code.push_str(&source);
         }
@@ -619,7 +626,13 @@ fn binding_reference(program: &ProgramIr, binding: crate::ir::BindingId) -> Stri
     let package = r_string(&program.package(namespace.package).identity().name);
     let name = r_string(&program.binding(binding).name);
     match namespace.state {
-        LinkNamespaceState::External { .. } => format!("base::getExportedValue({package}, {name})"),
+        LinkNamespaceState::External { .. } => match program.binding(binding).state {
+            LinkBindingState::External {
+                access: crate::ir::ExternalBindingAccess::Internal,
+                ..
+            } => namespace_get(&package, &name),
+            _ => format!("base::getExportedValue({package}, {name})"),
+        },
         LinkNamespaceState::Root(_) | LinkNamespaceState::Linked(_) => {
             namespace_get(&package, &name)
         }
@@ -733,6 +746,90 @@ fn render_namespace(program: &ProgramIr) -> String {
     out
 }
 
+fn relocation_site(relocation: &Relocation) -> &crate::ir::CodeSite {
+    match relocation {
+        Relocation::Binding { site, .. }
+        | Relocation::Namespace { site, .. }
+        | Relocation::Package { site, .. }
+        | Relocation::Resource { site, .. } => site,
+    }
+}
+
+fn relocation_matches(program: &ProgramIr, relocation: &Relocation, original: &str) -> bool {
+    let unqualified = original
+        .rsplit(':')
+        .next()
+        .unwrap_or(original)
+        .trim_matches('`');
+    let callee = original.trim_start_matches("base::");
+    match relocation {
+        Relocation::Binding { target, .. } => unqualified == program.binding(*target).name,
+        Relocation::Namespace { target, .. } => original.contains(
+            program
+                .package(program.namespace(*target).package)
+                .identity()
+                .name
+                .as_str(),
+        ),
+        Relocation::Package { operation, .. } => {
+            let names: &[&str] = match operation {
+                PackageOperationIr::RequireNamespace { .. } => &["requireNamespace("],
+                PackageOperationIr::LoadNamespace => &["loadNamespace("],
+                PackageOperationIr::GetNamespace => &["getNamespace("],
+                PackageOperationIr::AsNamespace => &["asNamespace("],
+                PackageOperationIr::PackageVersion { .. } => &["packageVersion("],
+            };
+            names.iter().any(|name| callee.starts_with(name))
+        }
+        Relocation::Resource { .. } => callee.starts_with("system.file("),
+    }
+}
+
+fn relocation_site_issues(program: &ProgramIr) -> Vec<String> {
+    let mut sites = BTreeMap::<crate::ir::CodeId, Vec<crate::ir::CodeOccurrenceId>>::new();
+    let mut issues = Vec::new();
+    for relocation in program.relocations() {
+        let site = relocation_site(relocation);
+        sites.entry(site.code).or_default().push(site.occurrence);
+        let code_ir = program.code(site.code);
+        let occurrence = code_ir.occurrence(site.occurrence);
+        let original = code_ir
+            .source()
+            .get(occurrence.start..occurrence.end)
+            .unwrap_or_default();
+        if !relocation_matches(program, relocation, original) {
+            issues.push(format!(
+                "relocation does not match the syntax it rewrites: `{original}`"
+            ));
+        }
+    }
+    for (code, mut occurrences) in sites {
+        let code_ir = program.code(code);
+        let source = code_ir.source();
+        occurrences.sort_by_key(|occurrence| code_ir.occurrence(*occurrence).start);
+        for pair in occurrences.windows(2) {
+            if pair[0] == pair[1] {
+                issues.push("two relocations rewrite the same code occurrence".to_owned());
+            } else if code_ir.occurrence(pair[0]).end > code_ir.occurrence(pair[1]).start {
+                issues.push("relocation occurrences overlap in one code unit".to_owned());
+            }
+        }
+        for occurrence in occurrences
+            .iter()
+            .map(|occurrence| code_ir.occurrence(*occurrence))
+        {
+            if occurrence.start > occurrence.end
+                || occurrence.end > source.len()
+                || !source.is_char_boundary(occurrence.start)
+                || !source.is_char_boundary(occurrence.end)
+            {
+                issues.push("relocation occurrence lies outside its code unit".to_owned());
+            }
+        }
+    }
+    issues
+}
+
 fn relocated_source(
     program: &ProgramIr,
     code: crate::ir::CodeId,
@@ -743,12 +840,7 @@ fn relocated_source(
         .relocations()
         .iter()
         .filter_map(|relocation| {
-            let site = match relocation {
-                Relocation::Binding { site, .. }
-                | Relocation::Namespace { site, .. }
-                | Relocation::Package { site, .. }
-                | Relocation::Resource { site, .. } => site,
-            };
+            let site = relocation_site(relocation);
             (site.code == code).then_some((site, relocation))
         })
         .collect::<Vec<_>>();
@@ -789,12 +881,6 @@ fn relocated_source(
                 }
                 PackageOperationIr::PackageVersion { version } => {
                     format!("base::package_version({})", r_string(version))
-                }
-                PackageOperationIr::FindPackage => {
-                    return Err(MaterializeError::InvalidR(
-                        "find.package for a Linked package has no source-package runtime path"
-                            .into(),
-                    ));
                 }
             },
             Relocation::Resource { target, .. } => {
@@ -907,13 +993,6 @@ fn copy_entry(source: &Path, target: &Path) -> Result<(), std::io::Error> {
         fs::copy(source, target)?;
     }
     Ok(())
-}
-
-fn rename_assignment(source: &str, replacement: &str) -> String {
-    source.find("<-").map_or_else(
-        || source.to_owned(),
-        |assignment| format!("{replacement} {}", &source[assignment..]),
-    )
 }
 
 fn r_string(value: &str) -> String {

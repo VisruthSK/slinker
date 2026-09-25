@@ -457,6 +457,7 @@ fn reject_code_name(code: RejectCode) -> &'static str {
         RejectCode::ArbitraryEvaluation => "arbitrary_evaluation",
         RejectCode::DynamicLookup => "dynamic_lookup",
         RejectCode::InvalidDeclaration => "invalid_declaration",
+        RejectCode::UnsupportedLinkedLibname => "unsupported_linked_libname",
         RejectCode::DynamicPackageDiscovery => "dynamic_package_discovery",
         RejectCode::DependsAttachmentUnsupported => "depends_attachment_unsupported",
         RejectCode::EnvironmentMutation => "environment_mutation",

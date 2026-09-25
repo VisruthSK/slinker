@@ -90,6 +90,8 @@ impl FakeProvider {
                     "do.call",
                     "reg.finalizer",
                     "declare",
+                    "getNamespaceInfo",
+                    "getNamespaceImports",
                     "registerS3method",
                     "is.function",
                     "length",
@@ -2423,6 +2425,169 @@ fn base_resource_lookup_is_not_a_package_resource() {
         .unwrap();
     assert!(plan.blockers().is_empty());
     assert!(plan.program().resources().is_empty());
+}
+
+#[test]
+fn synthetic_namespace_metadata_reads_block_for_linked_packages() {
+    let analyze = |source: &str| {
+        let root = package("root", &[("f", Some(source))]);
+        let dep = package("dep", &[("x", Some("x <- function() 1"))]);
+        Linker::new(FakeProvider::new(vec![root, dep]), 1)
+            .analyze("root")
+            .unwrap()
+    };
+    let blocked = |plan: &slinker::analysis::LinkIr| {
+        plan.blockers().iter().any(|diagnostic| {
+            diagnostic.code == RejectCode::UnsupportedRootTransformation
+                && diagnostic.message.contains("synthetic")
+        })
+    };
+
+    assert!(blocked(&analyze(
+        "f <- function() { dep::x(); getNamespaceInfo('dep', 'path') }"
+    )));
+    assert!(blocked(&analyze(
+        "f <- function() { dep::x(); getNamespaceImports('dep') }"
+    )));
+    assert!(!blocked(&analyze(
+        "f <- function() { dep::x(); getNamespaceInfo('dep', 'spec') }"
+    )));
+}
+
+#[test]
+fn linked_on_load_that_reads_libname_blocks() {
+    let analyze = |on_load: &str| {
+        let root = package("root", &[("f", Some("f <- function() dep::run()"))]);
+        let mut dep = package(
+            "dep",
+            &[
+                ("run", Some("run <- function() 1")),
+                (".onLoad", Some(on_load)),
+            ],
+        );
+        Arc::make_mut(&mut dep.index).lifecycle.on_load = true;
+        Linker::new(FakeProvider::new(vec![root, dep]), 1)
+            .analyze("root")
+            .unwrap()
+    };
+    let blocked = |plan: &slinker::analysis::LinkIr| {
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnsupportedLinkedLibname)
+    };
+
+    assert!(blocked(&analyze(
+        ".onLoad <- function(libname, pkgname) print(file.path(libname, pkgname))"
+    )));
+    assert!(!blocked(&analyze(
+        ".onLoad <- function(libname, pkgname) print(pkgname)"
+    )));
+}
+
+#[test]
+fn activation_order_follows_lifecycle_dependencies_not_only_imports() {
+    let root = package("root", &[("f", Some("f <- function() alpha::run()"))]);
+    let mut alpha = package(
+        "alpha",
+        &[
+            ("run", Some("run <- function() 1")),
+            (
+                ".onLoad",
+                Some(".onLoad <- function(libname, pkgname) beta::setup()"),
+            ),
+        ],
+    );
+    Arc::make_mut(&mut alpha.index).lifecycle.on_load = true;
+    let beta = package("beta", &[("setup", Some("setup <- function() 2"))]);
+    let plan = Linker::new(FakeProvider::new(vec![root, alpha, beta]), 1)
+        .analyze("root")
+        .unwrap();
+
+    let order = plan
+        .program()
+        .root_artifact()
+        .bootstrap_namespaces
+        .iter()
+        .map(|namespace| {
+            plan.program()
+                .package(plan.program().namespace(*namespace).package)
+                .identity()
+                .name
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(order, ["beta", "alpha"]);
+}
+
+#[test]
+fn external_internal_access_is_preserved_in_the_program() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some("f <- function() { foo:::hidden(); foo::shown() }"),
+        )],
+    );
+    let foo = package(
+        "foo",
+        &[
+            ("hidden", Some("hidden <- function() 1")),
+            ("shown", Some("shown <- function() 2")),
+        ],
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        .with_external_packages(["foo".into()])
+        .analyze("root")
+        .unwrap();
+
+    let access = |name: &str| {
+        plan.program()
+            .bindings()
+            .iter()
+            .find_map(|binding| match &binding.state {
+                slinker::ir::LinkBindingState::External { access, .. } if binding.name == name => {
+                    Some(*access)
+                }
+                _ => None,
+            })
+            .expect("External binding in the program")
+    };
+    assert_eq!(
+        access("hidden"),
+        slinker::ir::ExternalBindingAccess::Internal
+    );
+    assert_eq!(
+        access("shown"),
+        slinker::ir::ExternalBindingAccess::Exported
+    );
+}
+
+#[test]
+fn find_package_of_a_linked_package_blocks_before_materialization() {
+    let analyze = |source: &str| {
+        let root = package("root", &[("f", Some(source))]);
+        let foo = package("foo", &[("x", Some("x <- function() 1"))]);
+        Linker::new(FakeProvider::new(vec![root, foo]), 1)
+            .with_policy(LinkPolicy {
+                namespace_discovery: DiscoveryPolicy::Internalize,
+                ..LinkPolicy::default()
+            })
+            .analyze("root")
+            .unwrap()
+    };
+
+    let located = analyze("f <- function() { foo::x(); find.package('foo') }");
+    assert!(located.blockers().iter().any(|diagnostic| {
+        diagnostic.code == RejectCode::UnsupportedRootTransformation
+            && diagnostic.message.contains("find.package")
+    }));
+
+    let versioned = analyze("f <- function() { foo::x(); packageVersion('foo') }");
+    assert!(
+        versioned.blockers().is_empty(),
+        "{:?}",
+        versioned.blockers()
+    );
 }
 
 #[test]

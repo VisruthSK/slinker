@@ -97,6 +97,63 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
 }
 
 #[test]
+fn linked_code_keeps_internal_access_to_an_external_package() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+
+    let external_source = fixture.path().join("tinyvault");
+    write_package(
+        &external_source,
+        "tinyvault",
+        "",
+        "export(open_vault)\n",
+        "open_vault <- function() 'open'\nsecret <- function(x) paste0('S:', x)\n",
+    );
+    install_package(&r_home, &external_source, &build_library);
+
+    let linked_source = fixture.path().join("tinyagent");
+    write_package(
+        &linked_source,
+        "tinyagent",
+        "Imports: tinyvault (>= 1.0.0)\n",
+        "export(reveal)\n",
+        "reveal <- function(x) tinyvault:::secret(x)\n",
+    );
+    install_package(&r_home, &linked_source, &build_library);
+
+    let root_source = fixture.path().join("vaultroot");
+    write_package(
+        &root_source,
+        "vaultroot",
+        "Imports: tinyagent\n",
+        "importFrom(tinyagent, reveal)\nexport(run)\n",
+        "run <- function(x) reveal(x)\n",
+    );
+    let output = fixture.path().join("generated-vaultroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .args(["--external", "tinyvault", "--output"])
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run internal-access build");
+    assert_success(&result, "slinker build internal-access fixture");
+
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &external_source, &validation);
+    install_package(&r_home, &output, &validation);
+    run_r(
+        &r_home,
+        &validation,
+        "library(vaultroot); stopifnot(identical(run('x'), 'S:x')); stopifnot(length(find.package('tinyagent', quiet = TRUE)) == 0L)",
+    );
+}
+
+#[test]
 fn build_preserves_transitive_external_contract() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

@@ -80,6 +80,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) value_closures: HashSet<NodeId>,
     pub(super) unspecialized_calls: HashMap<(PackageId, String), AbstractValue>,
     pub(super) namespace_registration_targets: HashSet<Span>,
+    pub(super) internal_external_bindings: HashSet<(PackageId, String)>,
     pub(super) sources: Sources,
     pub(super) source_ids: HashMap<(PackageId, String), SourceId>,
     pub(super) normalized_shapes: HashMap<(PackageId, String), Digest>,
@@ -138,6 +139,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             value_closures: HashSet::new(),
             unspecialized_calls: HashMap::new(),
             namespace_registration_targets: HashSet::new(),
+            internal_external_bindings: HashSet::new(),
             sources: Sources::default(),
             source_ids: HashMap::new(),
             normalized_shapes: HashMap::new(),
@@ -795,6 +797,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
             if let Some(parsed) = self.parsed(id, &binding, &image, &binding_image)? {
+                if binding == ".onLoad"
+                    && self.packages.role(id) == crate::package::PackageRole::Linked
+                    && parsed.expressions.first().is_some_and(|expression| {
+                        expression
+                            .parameters
+                            .first()
+                            .is_some_and(|libname| expression.used_parameters.contains(libname))
+                    })
+                {
+                    self.diagnostic(
+                        node,
+                        id,
+                        Some(&binding),
+                        RejectCode::UnsupportedLinkedLibname,
+                        "Linked .onLoad reads libname, which has no installed library once linked",
+                        None,
+                    );
+                }
                 let image = self.prepare_construction_image(
                     id,
                     &image,
@@ -1815,6 +1835,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         if self.packages.is_external(foreign) {
             self.external.insert(foreign);
+            if reference.internal {
+                self.internal_external_bindings
+                    .insert((foreign, reference.symbol.clone()));
+            }
             let external = self.graph.add_node(
                 self.packages.name(foreign),
                 NodeKind::ExternalBinding {
@@ -2116,6 +2140,50 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
+    fn namespace_metadata_query(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+    ) {
+        if call.callee == "getNamespaceInfo"
+            && !matches!(
+                matched_static_arg(call, &["ns", "which"], "which"),
+                Some(StaticArg::String(field)) if matches!(field.as_str(), "imports" | "path" | "dynlibs" | "S3methods")
+            )
+        {
+            return;
+        }
+        match matched_static_arg(call, &["ns", "which"], "ns") {
+            Some(StaticArg::String(name)) => {
+                if self.known_package(name).is_some_and(|package| {
+                    self.packages.role(package) == crate::package::PackageRole::Linked
+                }) {
+                    self.diagnostic(
+                        from,
+                        current,
+                        Some(binding),
+                        RejectCode::UnsupportedRootTransformation,
+                        format!("{}() reads metadata that the synthetic `{name}` namespace does not reproduce", call.callee),
+                        Some(call.span.clone()),
+                    );
+                }
+            }
+            _ => self.assume(
+                from,
+                current,
+                Some(binding),
+                RejectCode::DynamicLookup,
+                format!(
+                    "{}() reads namespace metadata of a dynamic namespace",
+                    call.callee
+                ),
+                Some(call.span.clone()),
+            ),
+        }
+    }
+
     fn reflective_lookup(
         &mut self,
         from: NodeId,
@@ -2211,6 +2279,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 | "packageVersion"
                 | "find.package"
                 | "system.file"
+                | "getNamespaceImports"
+                | "getNamespaceInfo"
                 | ".Call"
                 | ".External"
                 | ".C"
@@ -2451,6 +2521,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     },
                 }
             }
+            "getNamespaceImports" | "getNamespaceInfo" => {
+                self.namespace_metadata_query(from, current, binding, call);
+            }
             "packageVersion" => self.identity_query(from, current, call, true)?,
             "find.package" => self.identity_query(from, current, call, false)?,
             "UseMethod" | "NextMethod" => {
@@ -2587,19 +2660,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Some(foreign) if self.packages.is_external(foreign) => {
                     self.external.insert(foreign);
                 }
+                Some(_) if !version => self.diagnostic(
+                    from,
+                    current,
+                    None,
+                    RejectCode::UnsupportedRootTransformation,
+                    format!(
+                        "find.package(\"{name}\") has no installed path once `{name}` is Linked"
+                    ),
+                    Some(call.span.clone()),
+                ),
                 Some(foreign) => {
-                    let operation = if version {
-                        PackageOperation::PackageVersion {
-                            version: self.packages.identity(foreign).version.to_string(),
-                        }
-                    } else {
-                        PackageOperation::FindPackage
-                    };
                     self.pending_relocations
                         .push(PendingRelocation::PackageOperation {
                             source: call.span.clone(),
                             package: Some(foreign),
-                            operation,
+                            operation: PackageOperation::PackageVersion {
+                                version: self.packages.identity(foreign).version.to_string(),
+                            },
                         });
                 }
                 None => self.record_missing_package(

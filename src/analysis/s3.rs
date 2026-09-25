@@ -278,10 +278,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .index
             .binding_names
             .iter()
-            .filter(|name| {
-                name.strip_prefix(&prefix)
-                    .is_some_and(&wanted)
-            })
+            .filter(|name| name.strip_prefix(&prefix).is_some_and(&wanted))
             .map(|name| (name.clone(), EdgeKind::Lexical))
             .chain(registered)
             .collect::<BTreeMap<_, _>>();
@@ -301,11 +298,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 }
 
-fn selector_domain(
-    invocation: &Invocation,
-    selector: &str,
-    generic: &S3Generic,
-) -> ClassDomain {
+fn selector_domain(invocation: &Invocation, selector: &str, generic: &S3Generic) -> ClassDomain {
     if let Some((_, domain)) = invocation
         .arguments
         .iter()

@@ -268,6 +268,8 @@ pub struct ParsedExpression {
     pub span: Span,
     #[serde(default)]
     pub parameters: Vec<String>,
+    #[serde(default)]
+    pub used_parameters: Vec<String>,
     pub definitions: Vec<BindingDef>,
     pub references: Vec<NameRef>,
     pub package_refs: Vec<PackageRef>,

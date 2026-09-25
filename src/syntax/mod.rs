@@ -9,6 +9,7 @@ pub use facts::{
     NameRef, NameRefKind, PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourceRef,
     SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
+pub use oak::assigned_value_start;
 pub(crate) use oak::{
     NamespaceImportResolution, NamespaceImports, closure_definitely_non_returning,
 };

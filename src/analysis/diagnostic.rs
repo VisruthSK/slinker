@@ -27,6 +27,7 @@ pub enum RejectCode {
     UnknownNativeLookup,
     UnresolvedBinding,
     UnsupportedObject,
+    UnsupportedLinkedLibname,
     UnsupportedRootTransformation,
     UnsupportedTopLevelEffect,
 }

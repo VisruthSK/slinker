@@ -450,6 +450,25 @@ fn data_mask_ranges(root: &RRoot, context: &OakParseContext) -> Vec<std::ops::Ra
         .collect()
 }
 
+fn used_parameters(index: &SemanticIndex) -> Vec<String> {
+    let mut used = BTreeSet::new();
+    for scope in index.scope_ids() {
+        for (_, use_site) in index.uses(scope).iter() {
+            let name = index.symbols(scope).symbol(use_site.symbol()).name();
+            if let Some((owner, _, definition)) = index.resolve(name, scope)
+                && matches!(definition.kind(), DefinitionKind::Parameter(_))
+                && index
+                    .scope(owner)
+                    .parent()
+                    .is_some_and(|file| index.scope(file).parent().is_none())
+            {
+                used.insert(name.to_owned());
+            }
+        }
+    }
+    used.into_iter().collect()
+}
+
 fn is_frame_intrinsic(name: &str) -> bool {
     matches!(
         name,
@@ -706,6 +725,25 @@ fn sole_positional_argument(call: &RCall) -> Option<AnyRExpression> {
         return None;
     }
     argument.value()
+}
+
+pub fn assigned_value_start(text: &str) -> Option<usize> {
+    let parsed = parse(text, RParserOptions::default());
+    let assignment = parsed
+        .tree()
+        .syntax()
+        .descendants()
+        .find_map(RBinaryExpression::cast)?;
+    let operator = assignment.operator().ok()?;
+    (operator.text_trimmed() == "<-").then_some(())?;
+    Some(text_offset(
+        assignment
+            .right()
+            .ok()?
+            .syntax()
+            .text_trimmed_range()
+            .start(),
+    ))
 }
 
 fn build_semantic_index(root: &RRoot, context: &OakParseContext) -> SemanticIndex {
@@ -1055,10 +1093,12 @@ fn translate_index(
     let mut issues = translate_diagnostics(source.clone(), index);
     issues.extend(declarations.issues);
 
+    let used_parameters = used_parameters(index);
     ParsedRFile {
         expressions: vec![ParsedExpression {
             span: Span::new(source, 0, text.len()),
             parameters,
+            used_parameters,
             definitions: Vec::new(),
             references,
             package_refs,
@@ -4695,6 +4735,14 @@ mod tests {
         let names = reference_names(&parsed);
         assert!(names.contains(&"substr2<-"));
         assert!(!names.contains(&"substr2"));
+    }
+
+    #[test]
+    fn assigned_value_start_is_the_outer_assignment_value() {
+        let source = "`.onLoad` <- function(libname, pkgname) { x <- 1 }";
+        let start = assigned_value_start(source).unwrap();
+        assert!(source[start..].starts_with("function(libname"));
+        assert_eq!(assigned_value_start("f(1)"), None);
     }
 
     #[test]

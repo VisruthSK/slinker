@@ -11,7 +11,7 @@ use crate::metadata::{Relation, RelationField, intersect_requirements, relations
 use crate::package::{ImportSpec, PackageAvailability, PackageId, PackageProvider};
 use crate::source::generated_description;
 use crate::syntax::{SourceOrigin, Sources, Span};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -148,7 +148,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if role == LinkedPackageRole::External {
                 let bindings = self.graph.nodes.iter().filter_map(|node| match &node.kind {
                     NodeKind::ExternalBinding { name } if node.package == package_name => {
-                        Some((name.clone(), ExternalBindingAccess::Exported))
+                        let access = if self
+                            .internal_external_bindings
+                            .contains(&(package, name.clone()))
+                        {
+                            ExternalBindingAccess::Internal
+                        } else {
+                            ExternalBindingAccess::Exported
+                        };
+                        Some((name.clone(), access))
                     }
                     _ => None,
                 });
@@ -323,6 +331,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .collect();
             builder.set_exports(namespace, exports);
         }
+        for (owner, dependency) in self.activation_time_dependencies(&namespace_ids) {
+            if owner != dependency {
+                namespace_dependencies
+                    .entry(owner)
+                    .or_default()
+                    .insert(dependency);
+            }
+        }
         for (namespace, dependencies) in &namespace_dependencies {
             builder.set_activation_dependencies(*namespace, dependencies.iter().copied().collect());
         }
@@ -431,7 +447,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                 version: version.clone(),
                             }
                         }
-                        PackageOperation::FindPackage => PackageOperationIr::FindPackage,
                     },
                 }),
             }
@@ -535,6 +550,44 @@ impl<P: PackageProvider> AnalyzerState<P> {
             platform,
             requirements,
         }
+    }
+
+    fn activation_time_dependencies(
+        &self,
+        namespace_ids: &HashMap<String, crate::ir::FinalizedNamespace>,
+    ) -> Vec<(crate::ir::NamespaceId, crate::ir::NamespaceId)> {
+        let mut successors =
+            HashMap::<crate::analysis::NodeId, Vec<crate::analysis::NodeId>>::new();
+        for edge in &self.graph.edges {
+            successors.entry(edge.from).or_default().push(edge.to);
+        }
+        let mut dependencies = Vec::new();
+        for start in self.graph.nodes.iter().filter(|node| {
+            matches!(
+                node.kind,
+                NodeKind::Lifecycle { .. } | NodeKind::S3Registration { .. }
+            )
+        }) {
+            let Some(owner) = namespace_ids.get(&start.package) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            let mut stack = vec![start.id];
+            while let Some(node) = stack.pop() {
+                if !seen.insert(node) {
+                    continue;
+                }
+                for &next in successors.get(&node).into_iter().flatten() {
+                    let target = &self.graph.nodes[next.0];
+                    if target.package == start.package {
+                        stack.push(next);
+                    } else if let Some(dependency) = namespace_ids.get(&target.package) {
+                        dependencies.push((owner.namespace, dependency.namespace));
+                    }
+                }
+            }
+        }
+        dependencies
     }
 
     fn finalize_s3_dispatch(&mut self, retained: &BTreeSet<PackageId>) {
@@ -680,10 +733,9 @@ fn reaches_removed_installation(relocation: &PendingRelocation) -> bool {
     match relocation {
         PendingRelocation::NamespaceAccess { .. } => false,
         PendingRelocation::ResourceAccess { .. } => true,
-        PendingRelocation::PackageOperation { operation, .. } => matches!(
-            operation,
-            PackageOperation::PackageVersion { .. } | PackageOperation::FindPackage
-        ),
+        PendingRelocation::PackageOperation { operation, .. } => {
+            matches!(operation, PackageOperation::PackageVersion { .. })
+        }
     }
 }
 
