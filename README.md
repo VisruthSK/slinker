@@ -14,6 +14,34 @@ slinker build path/to/rootpkg --lib C:/project/renv/library --external dplyr --o
 
 Third-party dependencies are Linked by default; base-priority packages and every `--external` package stay External. The generated `DESCRIPTION` drops Linked packages and declares the intersection of every retained requirement on each External package. A build that the profile cannot realize exactly fails with one report listing every blocker.
 
+The Root keeps every binding it defines. Linked namespaces keep their real names and their full original export table; a binding that tree-shaking removed becomes an active binding that stops with "`pkg::name` was removed by slinker because the build never reached it", so `exists()` and export reflection answer as the original does. If a namespace with a Linked package's name is already loaded, loading the generated package fails with `LinkedNamespaceCollision`.
+
+### Strict mode
+
+`--strict` defaults to `true`: anything slinker cannot prove blocks the build. With `--strict false`, a fixed set of heuristics is allowed instead and each use is recorded as an assumption, listed by `analyze` and printed by `build` as `slinker: assumed <code> in <pkg>::<binding>: <message>`:
+
+- unanalyzed native code (its C-to-R callbacks are not checked);
+- a free name bound nowhere (assumed to fail as in the original);
+- a dynamic `asNamespace`/`getNamespace`/`requireNamespace`/`loadNamespace` target;
+- `get`/`get0`/`exists`/`match.fun`/`do.call` with a computed name or environment;
+- `system.file(package = x)` with a computed `x` while a package is Linked;
+- `NextMethod()` outside a known method set.
+
+Everything else, including every real blocker, behaves the same in both modes.
+
+### Declarations
+
+A retained function can promise slinker what a value can be, with base R's `declare()`:
+
+```r
+f <- function(x) {
+  declare(slinker(x = one_of(s3("foo"), s3("bar", "parent"))))
+  pkg::generic(x)
+}
+```
+
+`s3("a", "b")` is one exact class vector; `one_of()` lists alternatives; classes are literal strings. The declaration applies to the binding throughout the function wherever it appears, and nested functions that capture the binding may narrow it but never widen it. When every call of an S3 generic passes a declared class, only the matching methods and `.default` are retained. Declarations are contracts, not heuristics: they apply in both strict modes, and a malformed one is an `InvalidDeclaration` blocker. Everything inside `declare()` is inert for analysis.
+
 ## Analyze
 
 ```text
@@ -77,13 +105,13 @@ The semantic stack is deliberately narrow: `harp`, `libr`, `air_r_parser`, `air_
 
 ## Native packages
 
-Native opacity widens the demanded native component, not the package's R namespace. A demanded DLL is retained whole, while unrelated R wrappers remain eligible for elimination. Unanalyzed dynamic native behavior is a blocker rather than an excuse to retain the entire R layer.
+Native opacity widens the demanded native component, not the package's R namespace. A Linked package's compiled library is copied into the generated package and loaded by its bootstrap, while unrelated R wrappers remain eligible for elimination. The worker loads each installed library to read its registered routines, so `useDynLib(pkg, .registration = TRUE)` names resolve. A Root keeps and compiles its own native code. Unanalyzed native code blocks in strict mode and is an assumption with `--strict false`.
 
 Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema `1` keys each JSON entry by package name, version, and slinker's installed-image fingerprint, so a summary cannot silently transfer to a different native build. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and continue to produce `UnknownNativeEffects`.
 
 ## Root, Linked, and External packages
 
-The root package keeps its real installed-package behavior, including package metadata, help/documentation databases, and normal root namespace identity. Linked dependency packages are synthetic and minimal: only semantically retained bindings, imports, resources, datasets, S3/native obligations, and lifecycle behavior belong in the link plan.
+The root package keeps its real installed-package behavior, including package metadata, help/documentation databases, and normal root namespace identity. Linked dependency packages are synthetic: only semantically retained bindings, imports, resources, datasets, S3/native obligations, and lifecycle behavior are materialized, and every other original binding name is a stub that errors when read.
 
 ## Environment
 
