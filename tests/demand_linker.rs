@@ -2385,6 +2385,32 @@ fn base_resource_lookup_is_not_a_package_resource() {
 }
 
 #[test]
+fn construction_interpreter_does_not_reevaluate_unspecialized_calls() {
+    let sources = (0..18)
+        .map(|level| {
+            let next = format!("f{}", level + 1);
+            (
+                format!("f{level}"),
+                format!("f{level} <- function() {{ {next}(); {next}(); {next}() }}"),
+            )
+        })
+        .chain(std::iter::once((
+            "f18".to_owned(),
+            "f18 <- function() 1".to_owned(),
+        )))
+        .collect::<Vec<_>>();
+    let bindings = sources
+        .iter()
+        .map(|(name, source)| (name.as_str(), Some(source.as_str())))
+        .collect::<Vec<_>>();
+    let plan = Linker::new(FakeProvider::new(vec![package("root", &bindings)]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(retained_binding(&plan, "root", "f18"));
+}
+
+#[test]
 fn non_closure_binding_never_invokes_air() {
     let root = package("root", &[("constant", None)]);
     let plan = Linker::new(FakeProvider::new(vec![root]), 4)

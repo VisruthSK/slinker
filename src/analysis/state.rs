@@ -1,5 +1,5 @@
 use super::arguments::{native_selector_span, static_package_arg, static_string_arg};
-use super::execute::ExecutionContext;
+use super::execute::{AbstractValue, ExecutionContext};
 use super::namespace::NamespaceBuilder;
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
@@ -71,6 +71,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) closed_methods: HashSet<(PackageId, String)>,
     pub(super) next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
     pub(super) value_closures: HashSet<NodeId>,
+    pub(super) unspecialized_calls: HashMap<(PackageId, String), AbstractValue>,
     pub(super) sources: Sources,
     pub(super) source_ids: HashMap<(PackageId, String), SourceId>,
     pub(super) normalized_shapes: HashMap<(PackageId, String), Digest>,
@@ -124,6 +125,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             closed_methods: HashSet::new(),
             next_method_calls: Vec::new(),
             value_closures: HashSet::new(),
+            unspecialized_calls: HashMap::new(),
             sources: Sources::default(),
             source_ids: HashMap::new(),
             normalized_shapes: HashMap::new(),

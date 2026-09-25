@@ -167,6 +167,8 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
 - Custom infix operators (`%op%`) are name references, and `f(x) <- value` references `f<-`.
 - The Root keeps every binding it defines, because its own tests and users reach internals; only
   Root dependencies are tree-shaken.
+- The construction interpreter memoizes calls whose arguments are all unknown, so dense internal
+  call graphs (rlang) stay linear instead of exponential; recursion sees `Unknown`.
 - The CLI runs on a 64 MiB stack thread (the Air parse pool uses the same size), so deeply nested
   R code does not overflow the default Windows stack.
 - Materializer code validation uses the same Harp normalizer as analysis.

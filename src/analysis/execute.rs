@@ -504,6 +504,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 (closure, binding.to_owned())
             }
         };
+        let specialized = arguments
+            .iter()
+            .any(|value| !matches!(value, AbstractValue::Unknown));
+        let memo = (context.package, owner.clone());
+        if !specialized {
+            if let Some(value) = self.unspecialized_calls.get(&memo) {
+                return Ok(ExecutionOutcome::value(value.clone()));
+            }
+            self.unspecialized_calls
+                .insert(memo.clone(), AbstractValue::Unknown);
+        }
         let parse_context =
             self.oak_parse_context(context.package, context.image, &closure.environment)?;
         let Some(parsed) = self.parsed_source(
@@ -527,19 +538,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let nested_context = ExecutionContext {
             lexical_environment: &closure.environment,
             depth: context.depth + 1,
-            specialized: arguments
-                .iter()
-                .any(|value| !matches!(value, AbstractValue::Unknown)),
+            specialized,
             ..context
         };
-        let mut outcome = ExecutionOutcome::value(AbstractValue::Null);
+        let mut value = AbstractValue::Null;
         for construction in &expression.construction {
-            outcome = self.evaluate_construction(nested_context, &mut nested, construction)?;
+            let outcome = self.evaluate_construction(nested_context, &mut nested, construction)?;
+            value = outcome.value;
             if outcome.returned {
                 break;
             }
         }
-        Ok(outcome)
+        if !specialized {
+            self.unspecialized_calls.insert(memo, value.clone());
+        }
+        Ok(ExecutionOutcome::value(value))
     }
 
     pub(super) fn evaluate_base_construction_call(
