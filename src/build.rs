@@ -78,7 +78,7 @@ pub struct BuildContext {
     source: SourcePackageSnapshot,
     _staged_root: StagedRoot,
     target_runtime: TargetRuntimeHandle,
-    frozen: FrozenInputs,
+    frozen: Option<FrozenInputs>,
 }
 
 /// Exact installed bytes redeemed from the selected images before preflight.
@@ -90,6 +90,20 @@ struct FrozenInputs {
 }
 
 impl BuildContext {
+    pub fn new(
+        source: SourcePackageSnapshot,
+        staged_root: StagedRoot,
+        r_home: PathBuf,
+        target: TargetEnvironment,
+    ) -> Self {
+        Self {
+            source,
+            _staged_root: staged_root,
+            target_runtime: TargetRuntimeHandle::new(r_home, target),
+            frozen: None,
+        }
+    }
+
     /// Redeem every physical input `ProgramIr` needs, then prove that no selected image changed
     /// since analysis fingerprinted it.
     ///
@@ -97,13 +111,7 @@ impl BuildContext {
     ///
     /// Fails when payload serialization or resource copying fails, or with
     /// [`BuildContextError::TargetUniverseChanged`] when a selected image no longer matches.
-    pub fn new(
-        source: SourcePackageSnapshot,
-        staged_root: StagedRoot,
-        r_home: PathBuf,
-        target: TargetEnvironment,
-        ir: &LinkIr,
-    ) -> Result<Self, BuildContextError> {
+    fn freeze(&mut self, ir: &LinkIr) -> Result<(), BuildContextError> {
         let program = ir.program();
         let sources = ir.package_sources();
         let location = |package| {
@@ -125,7 +133,7 @@ impl BuildContext {
         }
         let mut bundles = BTreeMap::new();
         if !payloads.is_empty() {
-            let mut worker = WorkerClient::spawn(r_home.clone(), &target)?;
+            let mut worker = self.target_runtime.worker()?;
             for (package, names) in payloads {
                 let identity = program.package(package).identity();
                 let spec = PackageSpec {
@@ -156,16 +164,12 @@ impl BuildContext {
                 changed.name.clone(),
             ));
         }
-        Ok(Self {
-            source,
-            _staged_root: staged_root,
-            target_runtime: TargetRuntimeHandle::new(r_home, target),
-            frozen: FrozenInputs {
-                bundles,
-                resources,
-                _directory: directory,
-            },
-        })
+        self.frozen = Some(FrozenInputs {
+            bundles,
+            resources,
+            _directory: directory,
+        });
+        Ok(())
     }
 
     pub fn source(&self) -> &SourcePackageSnapshot {
@@ -176,7 +180,10 @@ impl BuildContext {
         MaterializationContext {
             source_files: self.source.files(),
             target_runtime: &self.target_runtime,
-            frozen: &self.frozen,
+            frozen: self
+                .frozen
+                .as_ref()
+                .expect("preflight freezes inputs before materialization"),
         }
     }
 }
@@ -228,16 +235,29 @@ pub struct BuildableProgram<'a, Profile> {
 }
 
 impl PureRStatic {
+    /// Check every analysis blocker and profile capability, then freeze the physical inputs of an
+    /// eligible program.
+    ///
+    /// # Errors
+    ///
+    /// Returns one deterministic report of every blocker, or the failure to freeze inputs.
     pub fn check<'a>(
         ir: &'a LinkIr,
-        context: &'a BuildContext,
-    ) -> Result<BuildableProgram<'a, PureRStatic>, BuildReport> {
+        context: &'a mut BuildContext,
+    ) -> Result<BuildableProgram<'a, PureRStatic>, PreflightError> {
         let mut blockers = ir
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
-            .filter(|diagnostic| diagnostic.reachable)
-            .map(|diagnostic| format!("{:?}: {}", diagnostic.code, diagnostic.message))
+            .map(|blocker| match &blocker.binding {
+                Some(binding) => format!(
+                    "{:?} in {}::{binding}: {}",
+                    blocker.code, blocker.package, blocker.message
+                ),
+                None => format!(
+                    "{:?} in {}: {}",
+                    blocker.code, blocker.package, blocker.message
+                ),
+            })
             .collect::<BTreeSet<_>>();
         if !ir.program().residuals().is_empty() {
             blockers.insert("residual runtime capability is outside PureRStatic".into());
@@ -267,16 +287,25 @@ impl PureRStatic {
                 ));
             }
         }
-        if blockers.is_empty() {
-            Ok(BuildableProgram {
-                program: ir.program(),
-                materialization: context.materialization(),
-                _profile: PhantomData,
-            })
-        } else {
-            Err(BuildReport::new(blockers.into_iter().collect()))
+        if !blockers.is_empty() {
+            return Err(BuildReport::new(blockers.into_iter().collect()).into());
         }
+        context.freeze(ir)?;
+        let context: &'a BuildContext = context;
+        Ok(BuildableProgram {
+            program: ir.program(),
+            materialization: context.materialization(),
+            _profile: PhantomData,
+        })
     }
+}
+
+#[derive(Debug, Error)]
+pub enum PreflightError {
+    #[error(transparent)]
+    Blocked(#[from] BuildReport),
+    #[error(transparent)]
+    Freeze(#[from] BuildContextError),
 }
 
 /// Deterministic complete build-preflight failure report.

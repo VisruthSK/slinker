@@ -503,7 +503,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
 
     assert!(retained_binding(&plan, "root", "first_dependency"));
     assert!(retained_binding(&plan, "root", "second_dependency"));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("self")
     }));
 }
@@ -522,11 +522,11 @@ fn unknown_closure_enclosure_reports_root_cause_without_lexical_cascade() {
         .analyze("root")
         .unwrap();
 
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnknownClosureEnclosure
             && diagnostic.binding.as_deref() == Some("f")
     }));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && (diagnostic.message.contains("self") || diagnostic.message.contains("classname"))
     }));
@@ -758,8 +758,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
         .unwrap();
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnsupportedObject)
     );
@@ -790,7 +789,7 @@ fn onload_can_create_a_missing_exported_active_binding() {
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.binding.as_deref() == Some("pb")
     }));
@@ -832,7 +831,7 @@ fn dependency_onload_can_create_a_missing_exported_active_binding() {
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.package == "foo"
             && diagnostic.binding.as_deref() == Some("pb")
@@ -858,7 +857,7 @@ fn runtime_make_active_binding_does_not_satisfy_missing_export() {
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.binding.as_deref() == Some("pb")
     }));
@@ -934,8 +933,7 @@ fn root_reexported_import_is_demanded_without_local_binding() {
     assert!(!retained_binding(&plan, "utils", "unused"));
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnresolvedBinding)
     );
@@ -1187,8 +1185,7 @@ fn require_namespace_default_policy_does_not_ingest_optional_package() {
     let counts = provider.count_handle();
     let plan = Linker::new(provider, 1).analyze("root").unwrap();
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
     );
@@ -1207,8 +1204,7 @@ fn namespace_discovery_matches_named_and_mixed_positional_arguments() {
             .unwrap();
         assert!(
             !plan
-                .provenance()
-                .diagnostics()
+                .blockers()
                 .iter()
                 .any(|diagnostic| { diagnostic.code == RejectCode::DynamicPackageDiscovery }),
             "static package argument was lost for {source}"
@@ -1245,12 +1241,11 @@ fn constant_argument_specializes_private_namespace_helper() {
 
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery),
         "{:?}",
-        plan.provenance().diagnostics()
+        plan.blockers()
     );
     assert!(
         plan.program()
@@ -1274,8 +1269,7 @@ fn unknown_argument_keeps_public_namespace_helper_dynamic() {
         .unwrap();
 
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
     );
@@ -1312,8 +1306,7 @@ fn bounded_string_operations_specialize_namespace_helper() {
 
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
     );
@@ -1347,8 +1340,7 @@ fn unknown_string_index_keeps_namespace_discovery_dynamic() {
         .unwrap();
 
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
     );
@@ -1387,8 +1379,7 @@ fn resolved_null_coalescing_helper_propagates_constant() {
 
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
     );
@@ -1425,8 +1416,7 @@ fn bounded_switch_propagates_selected_package() {
 
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
     );
@@ -1465,8 +1455,7 @@ fn library_and_attaching_require_reject() {
             .analyze("root")
             .unwrap();
         assert!(
-            plan.provenance()
-                .diagnostics()
+            plan.blockers()
                 .iter()
                 .any(|diagnostic| diagnostic.code == RejectCode::PackageAttachmentUnsupported)
         );
@@ -1487,8 +1476,7 @@ fn locally_shadowed_library_is_not_attachment_semantics() {
         .unwrap();
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::PackageAttachmentUnsupported)
     );
@@ -1507,16 +1495,10 @@ fn function_parameter_shadowing_prevents_special_call_semantics() {
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
-    assert!(
-        !plan
-            .provenance()
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| matches!(
-                diagnostic.code,
-                RejectCode::PackageAttachmentUnsupported | RejectCode::SyntaxObservation
-            ))
-    );
+    assert!(!plan.blockers().iter().any(|diagnostic| matches!(
+        diagnostic.code,
+        RejectCode::PackageAttachmentUnsupported | RejectCode::SyntaxObservation
+    )));
 }
 
 #[test]
@@ -1579,7 +1561,7 @@ fn registered_native_symbol_is_not_an_unresolved_r_binding() {
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("croot_f")
     }));
     assert!(plan.provenance().nodes().iter().any(|node| {
@@ -1621,12 +1603,11 @@ fn opaque_registered_selector_is_consumed_by_native_call() {
             && matches!(&node.kind, NodeKind::NativeComponent { name } if name == "root")
     }));
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnknownNativeLookup
             || (diagnostic.code == RejectCode::UnresolvedBinding
                 && diagnostic.message.contains("croot_f"))
@@ -1653,8 +1634,7 @@ fn opaque_native_selector_consumption_is_occurrence_specific() {
         .unwrap();
 
     assert_eq!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .filter(|diagnostic| {
                 diagnostic.code == RejectCode::UnresolvedBinding
@@ -1665,8 +1645,7 @@ fn opaque_native_selector_consumption_is_occurrence_specific() {
     );
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
@@ -1690,8 +1669,7 @@ fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
 
     assert!(retained_binding(&plan, "root", "foo"));
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
@@ -1725,7 +1703,7 @@ fn shadowed_native_primitive_does_not_consume_selector() {
                 NodeKind::NativeComponent { .. }
             )
     }));
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("croot_f")
     }));
 }
@@ -1752,7 +1730,7 @@ fn named_opaque_native_selector_is_matched_by_formal_name() {
             .iter()
             .any(|node| matches!(node.kind, NodeKind::NativeComponent { .. }))
     );
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnknownNativeLookup
             || (diagnostic.code == RejectCode::UnresolvedBinding
                 && diagnostic.message.contains("croot_f"))
@@ -1800,8 +1778,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
 
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
@@ -1833,8 +1810,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
         .analyze("root")
         .unwrap();
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
@@ -1876,14 +1852,13 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.message.contains("croot_tick")
     }));
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::EnvironmentMutation)
     );
@@ -1919,20 +1894,18 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.message.contains("croot_tick")
     }));
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
@@ -2009,8 +1982,7 @@ fn known_native_callback_adds_binding_edge() {
     );
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
@@ -2066,7 +2038,7 @@ fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
     assert!(plan.provenance().edges().iter().any(|edge| {
         edge.from == native && edge.to == callback && edge.kind == EdgeKind::Callback
     }));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         matches!(
             diagnostic.code,
             RejectCode::UnknownNativeLookup | RejectCode::UnknownNativeEffects
@@ -2109,8 +2081,7 @@ fn native_summary_accepts_oak_proven_local_closure_callback() {
 
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
@@ -2166,7 +2137,7 @@ fn native_callback_positions_ignore_named_package_and_match_named_selector() {
         .analyze("root")
         .unwrap();
     assert!(retained_binding(&plan, "root", "callback"));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         matches!(
             diagnostic.code,
             RejectCode::UnknownNativeLookup | RejectCode::UnknownNativeEffects
@@ -2236,15 +2207,13 @@ fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
         .analyze("root")
         .unwrap();
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
@@ -2276,15 +2245,13 @@ fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
         .unwrap();
     assert!(!retained_binding(&plan, "foo", "callback"));
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
@@ -2396,7 +2363,7 @@ fn air_frontend_failure_is_localized_not_package_fatal() {
         .unwrap();
 
     assert!(retained_binding(&plan, "root", "good"));
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("awkward")
             && diagnostic.code == RejectCode::AirUnsupportedSyntax
     }));
@@ -2409,11 +2376,11 @@ fn air_accepted_unknown_name_is_a_semantic_error_not_a_frontend_error() {
         .analyze("root")
         .unwrap();
 
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::UnresolvedBinding
     }));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::AirUnsupportedSyntax
     }));
@@ -2426,11 +2393,11 @@ fn air_and_target_rejection_is_invalid_installed_representation() {
         .validation(SyntaxValidation::Rejected("unexpected end of input".into()));
     let plan = Linker::new(provider, 1).analyze("root").unwrap();
 
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("awkward")
             && diagnostic.code == RejectCode::InvalidInstalledRepresentation
     }));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("awkward")
             && diagnostic.code == RejectCode::AirUnsupportedSyntax
     }));
@@ -2481,8 +2448,7 @@ fn missing_packages_are_collated_instead_of_failing_fast() {
     missing.sort();
     assert_eq!(missing, vec!["bar", "foo"]);
     assert_eq!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .filter(|d| d.code == RejectCode::MissingDependency)
             .count(),
@@ -2609,8 +2575,7 @@ fn absent_optional_resource_is_not_a_blocker() {
         .unwrap();
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::MissingResource)
     );
@@ -2639,8 +2604,7 @@ fn absent_must_work_resource_is_a_precise_blocker() {
         .analyze("root")
         .unwrap();
     assert!(
-        plan.provenance()
-            .diagnostics()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::MissingResource)
     );
@@ -3166,8 +3130,7 @@ fn unselected_suggested_attachment_call_is_ignored() {
     );
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::PackageAttachmentUnsupported)
     );
@@ -3203,7 +3166,7 @@ fn root_s3_registration_is_available_without_rooting_unknown_dispatch_method() {
     assert!(program_has_s3_registration(
         &plan, "root", None, "foo", "bar", "foo.bar"
     ));
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::ObjectSystem && diagnostic.message.contains("UseMethod")
     }));
 }
@@ -3244,7 +3207,7 @@ fn reachable_operator_dispatch_blocks_while_registration_stays_namespace_state()
         .unwrap();
 
     assert!(!retained_binding(&plan, "root", "|.root_criterion"));
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::ObjectSystem
             && diagnostic.message.contains("outside PureRStatic")
     }));
@@ -3544,8 +3507,7 @@ fn optional_onload_hook_does_not_activate_suggested_namespace() {
     );
     assert!(
         !plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::MissingDependency)
     );
@@ -3666,7 +3628,7 @@ fn quoted_iscam_style_symbols_do_not_create_graph_edges() {
         "x5",
     ] {
         assert!(
-            !plan.provenance().diagnostics().iter().any(|diagnostic| {
+            !plan.blockers().iter().any(|diagnostic| {
                 diagnostic.binding.as_deref() == Some("f")
                     && diagnostic.code == RejectCode::UnresolvedBinding
                     && diagnostic.message.contains(name)
@@ -3674,7 +3636,7 @@ fn quoted_iscam_style_symbols_do_not_create_graph_edges() {
             "quoted symbol {name} leaked into lexical dependency diagnostics"
         );
     }
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         matches!(
             diagnostic.code,
             RejectCode::MissingDependency | RejectCode::MissingResource
@@ -3707,7 +3669,7 @@ fn conditional_special_callee_blocks_path_dependent_specialization() {
         .analyze("root")
         .unwrap();
 
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::SemanticAmbiguity
             && diagnostic.message.contains("system.file")
@@ -3736,7 +3698,7 @@ fn repeated_predicate_refines_conditional_local_fallthrough() {
         .analyze("root")
         .unwrap();
 
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::PotentialUnboundLocal
             && diagnostic.message.contains("tvalue")
@@ -3776,7 +3738,7 @@ fn non_returning_package_helper_refines_exhaustive_dispatch() {
         .unwrap();
 
     assert!(retained_binding(&plan, "root", ".stop_invalid_direction"));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::PotentialUnboundLocal
             && diagnostic.message.contains("showprob")
@@ -3805,7 +3767,7 @@ fn non_returning_summary_does_not_hide_real_invalid_input_fallthrough() {
         .analyze("root")
         .unwrap();
 
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::PotentialUnboundLocal
             && diagnostic.message.contains("pvalue")
@@ -3822,12 +3784,12 @@ fn conditional_local_fallthrough_is_not_reported_as_missing_dependency() {
         .analyze("root")
         .unwrap();
 
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::PotentialUnboundLocal
             && diagnostic.message.contains("x")
     }));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && matches!(
                 diagnostic.code,
@@ -3844,7 +3806,7 @@ fn later_formal_default_does_not_escape_to_package_resolution() {
         .analyze("root")
         .unwrap();
 
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f") && diagnostic.message.contains("`y`")
     }));
 }
@@ -3859,7 +3821,7 @@ fn for_induction_variable_is_bound_inside_loop_body() {
         .analyze("root")
         .unwrap();
 
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f") && diagnostic.message.contains("`x`")
     }));
 }
@@ -3877,7 +3839,7 @@ fn for_induction_variable_after_loop_keeps_zero_iteration_fallthrough() {
         .analyze("root")
         .unwrap();
 
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::PotentialUnboundLocal
             && diagnostic.message.contains("`x`")
@@ -3897,7 +3859,7 @@ fn captured_activation_superassignment_does_not_require_package_binding() {
         .analyze("root")
         .unwrap();
 
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("outer")
             && diagnostic.code == RejectCode::EnvironmentMutation
             && diagnostic.message.contains("`x`")
@@ -3914,7 +3876,7 @@ fn uncaptured_superassignment_remains_environment_mutation_blocker() {
         .analyze("root")
         .unwrap();
 
-    assert!(plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("outer")
             && diagnostic.code == RejectCode::EnvironmentMutation
             && diagnostic.message.contains("`x`")
@@ -3966,7 +3928,7 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
         .unwrap();
 
     assert!(retained_private_binding(&plan, "root", "private:1", ".die"));
-    assert!(!plan.provenance().diagnostics().iter().any(|diagnostic| {
+    assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("public")
             && diagnostic.code == RejectCode::PotentialUnboundLocal
             && diagnostic.message.contains("value")
@@ -4038,7 +4000,7 @@ fn graph_export_survives_blocked_analysis() {
     let provider = FakeProvider::new(vec![root])
         .validation(SyntaxValidation::Rejected("unexpected end of input".into()));
     let plan = Linker::new(provider, 1).analyze("root").unwrap();
-    assert!(!plan.provenance().diagnostics().is_empty());
+    assert!(!plan.blockers().is_empty());
 
     let target = TargetEnvironment {
         r_home: PathBuf::from("/opt/R"),

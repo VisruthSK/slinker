@@ -246,8 +246,7 @@ impl GraphExport {
         root_reasons.sort();
 
         let mut blockers = plan
-            .provenance()
-            .diagnostics()
+            .blockers()
             .iter()
             .filter(|diagnostic| diagnostic.code != RejectCode::MissingDependency)
             .map(|diagnostic| {

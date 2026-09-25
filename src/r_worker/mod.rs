@@ -1299,13 +1299,9 @@ mod tests {
 
     #[test]
     fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
-        let Some(r_home) = test_r_home() else {
-            return;
-        };
-        let Some((fixture_root, fixture_library, marker, fixture_temp)) = install_fixture(&r_home)
-        else {
-            return;
-        };
+        let r_home = test_r_home().expect("selected R installation");
+        let (fixture_root, fixture_library, fixture_temp) =
+            install_fixture(&r_home).expect("install worker fixture package");
         let target = TargetSpec {
             r_home,
             arch: match std::env::consts::ARCH {
@@ -1320,11 +1316,6 @@ mod tests {
             dunce::canonicalize(&initial_target.libraries[0]).expect("canonical first library"),
             dunce::canonicalize(&fixture_library).expect("canonical fixture library")
         );
-        // Safety: this test owns the only embedded R runtime and performs all R access on this
-        // thread, so no concurrent environment access can occur.
-        unsafe {
-            std::env::set_var("SLINKER_HARP_ONLOAD_MARKER", &marker);
-        }
         let package = PackageSpec {
             name: "harpfixture".into(),
             version: "1.0.0".into(),
@@ -1341,12 +1332,17 @@ mod tests {
                 && registration.generic.package.as_deref() == Some("utils")
                 && registration.method == "head.harpfixture"
         }));
-        assert!(!marker.exists(), "indexing executed .onLoad");
+        let on_load_ran = || {
+            harp::parse_eval_base("isTRUE(getOption(\"harpfixture.onload\"))")
+                .and_then(bool::try_from)
+                .expect("query fixture load hook option")
+        };
+        assert!(!on_load_ran(), "indexing executed .onLoad");
         let good = runtime
             .binding(&package, "good")
             .expect("inspect demanded binding");
         assert!(good.binding.closure.is_some());
-        assert!(!marker.exists(), "binding inspection executed .onLoad");
+        assert!(!on_load_ran(), "binding inspection executed .onLoad");
         assert_eq!(
             runtime.target().expect("target after inspection").libraries,
             initial_target.libraries,
@@ -1508,12 +1504,7 @@ mod tests {
 
     fn install_fixture(
         r_home: &std::path::Path,
-    ) -> Option<(
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-    )> {
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let temp = std::env::temp_dir().join(format!(
             "slinker-harp-fixture-{}-{}",
@@ -1540,10 +1531,7 @@ mod tests {
 good <- function() 1L
 head.harpfixture <- function(x, ...) x
 unrelated <- function() stop("unrelated binding executed")
-.onLoad <- function(...) {
-  marker <- Sys.getenv("SLINKER_HARP_ONLOAD_MARKER", unset = "")
-  if (nzchar(marker)) file.create(marker)
-}
+.onLoad <- function(...) options(harpfixture.onload = TRUE)
 "#,
         )
         .ok()?;
@@ -1565,11 +1553,6 @@ unrelated <- function() stop("unrelated binding executed")
         if !status.success() {
             return None;
         }
-        Some((
-            library.join("harpfixture"),
-            library,
-            temp.join("onload-marker"),
-            temp,
-        ))
+        Some((library.join("harpfixture"), library, temp))
     }
 }

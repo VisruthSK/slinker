@@ -5,7 +5,14 @@
     stop(sprintf("installed package metadata missing under %s", root), call. = FALSE)
   }
 
+  version <- unname(readRDS(file.path(root, "Meta", "package.rds"))$DESCRIPTION[["Version"]])
   image_env <- new.env(hash = TRUE, parent = .BaseNamespaceEnv)
+  info <- new.env(hash = TRUE, parent = baseenv())
+  info$spec <- c(name = package, version = version)
+  assign(".__NAMESPACE__.", info, envir = image_env)
+  if (is.null(.Internal(getRegisteredNamespace(package)))) {
+    .Internal(registerNamespace(package, image_env))
+  }
   code_db <- file.path(root, "R", package)
   if (!file.exists(paste0(code_db, ".rdx")) || !file.exists(paste0(code_db, ".rdb"))) {
     stop(sprintf("installed R lazy-load database missing for %s", package), call. = FALSE)
@@ -29,7 +36,7 @@
 
   list(
     package = package,
-    version = unname(readRDS(file.path(root, "Meta", "package.rds"))$DESCRIPTION[["Version"]]),
+    version = version,
     ns_info = readRDS(file.path(root, "Meta", "nsInfo.rds")),
     image_env = image_env,
     binding_names = sort(setdiff(

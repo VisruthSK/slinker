@@ -234,6 +234,42 @@ fn explicit_external_promotes_declared_suggests_contract() {
 }
 
 #[test]
+fn blocked_preflight_reports_every_blocker_and_publishes_nothing() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let source = fixture.path().join("blockedroot");
+    write_package(
+        &source,
+        "blockedroot",
+        "",
+        "export(discover, dispatch)\n",
+        "discover <- function(package) requireNamespace(package)\ndispatch <- function(x) UseMethod('dispatch')\n",
+    );
+    let output = fixture.path().join("generated-blockedroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--output"])
+        .arg(&output)
+        .arg(&source)
+        .env("R_HOME", &r_home)
+        .output()
+        .expect("run blocked build");
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("DynamicPackageDiscovery"), "{stderr}");
+    assert!(stderr.contains("ObjectSystem"), "{stderr}");
+    assert!(!output.exists());
+    assert_eq!(
+        fs::read_dir(fixture.path())
+            .expect("fixture directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".slinker"))
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn private_environments_and_registrations_survive_linking() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

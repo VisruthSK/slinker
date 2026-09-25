@@ -19,7 +19,7 @@ pub struct LinkIr {
     packages: crate::package::PackageSources,
     program: ProgramIr,
     provenance: crate::ir::ProvenanceIr,
-    blockers: crate::ir::AnalysisBlockerSet,
+    blockers: Vec<Diagnostic>,
     sources: Sources,
 }
 
@@ -44,17 +44,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 None,
             );
         }
-        let mut blockers = crate::ir::AnalysisBlockerSet::default();
-        for diagnostic in &self.diagnostics {
-            blockers.push(diagnostic_blocker(diagnostic));
-        }
+        let mut blockers = self.diagnostics;
+        blockers.sort_by(|left, right| {
+            (&left.package, left.code, &left.binding, &left.message).cmp(&(
+                &right.package,
+                right.code,
+                &right.binding,
+                &right.message,
+            ))
+        });
         LinkIr {
             program,
-            provenance: crate::ir::ProvenanceIr::from_analysis(
-                self.graph,
-                self.roots,
-                self.diagnostics,
-            ),
+            provenance: crate::ir::ProvenanceIr::from_analysis(self.graph, self.roots),
             blockers,
             sources: self.sources,
             packages: self.packages.sources(retained),
@@ -557,8 +558,8 @@ impl LinkIr {
         &self.provenance
     }
 
-    /// Complete accumulated semantic blockers.
-    pub fn blockers(&self) -> &crate::ir::AnalysisBlockerSet {
+    /// Every independent semantic blocker, sorted deterministically.
+    pub fn blockers(&self) -> &[Diagnostic] {
         &self.blockers
     }
 
@@ -570,37 +571,6 @@ impl LinkIr {
     /// Diagnostic source map retained for provenance rendering only.
     pub fn sources(&self) -> &Sources {
         &self.sources
-    }
-}
-
-pub(super) fn diagnostic_blocker(diagnostic: &Diagnostic) -> crate::ir::AnalysisBlocker {
-    use crate::ir::AnalysisBlocker;
-    match diagnostic.code {
-        RejectCode::ActiveBinding => AnalysisBlocker::UnsupportedActiveBinding {
-            binding: diagnostic.binding.clone().unwrap_or_default(),
-        },
-        RejectCode::ObjectSystem => AnalysisBlocker::UnsupportedObjectSystem {
-            site: diagnostic.span.clone(),
-        },
-        RejectCode::UnknownNativeEffects | RejectCode::UnknownNativeLookup => {
-            AnalysisBlocker::UnsupportedNative {
-                component: diagnostic.message.clone(),
-            }
-        }
-        RejectCode::UnknownClosureEnclosure => AnalysisBlocker::MutableClosureEnclosure {
-            site: diagnostic.span.clone(),
-        },
-        RejectCode::EnvironmentMutation => AnalysisBlocker::OpenEnvironmentShape {
-            site: diagnostic.span.clone(),
-        },
-        RejectCode::DynamicLookup | RejectCode::DynamicPackageDiscovery => {
-            AnalysisBlocker::OpenCallable {
-                site: diagnostic.span.clone(),
-            }
-        }
-        _ => AnalysisBlocker::UnsupportedRootTransformation {
-            detail: format!("{:?}: {}", diagnostic.code, diagnostic.message),
-        },
     }
 }
 

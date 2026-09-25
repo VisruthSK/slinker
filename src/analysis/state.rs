@@ -2571,7 +2571,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             message,
             span,
             node: Some(node),
-            reachable: true,
         });
     }
 

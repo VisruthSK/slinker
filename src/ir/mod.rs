@@ -1,6 +1,6 @@
 //! Immutable linked-program representation consumed by build preflight and materialization.
 
-use crate::analysis::{Diagnostic, Edge, Graph, Node, NodeId};
+use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{PackageId, PackageIdentity, PackageRole};
 
 use crate::package::Digest;
@@ -1055,59 +1055,17 @@ impl ProgramBuilder {
     }
 }
 
-/// Typed analysis blocker retained outside construction authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AnalysisBlocker {
-    OpenNamespaceShape { site: Option<Span> },
-    OpenEnvironmentShape { site: Option<Span> },
-    MutableEnvironmentParent { site: Option<Span> },
-    MutableClosureEnclosure { site: Option<Span> },
-    OpenCallable { site: Option<Span> },
-    OpenReflection { site: Option<Span> },
-    RuntimeRepresentationIntrospection { site: Option<Span> },
-    UnsupportedActiveBinding { binding: String },
-    UnsupportedAltrep { binding: String },
-    UnsupportedNestedPromise { binding: String },
-    UnsupportedObjectSystem { site: Option<Span> },
-    UnsupportedNative { component: String },
-    UnsupportedLinkedLibname { package: String },
-    UnsupportedCodeRepresentation { binding: String },
-    UnsupportedRootTransformation { detail: String },
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AnalysisBlockerSet {
-    blockers: Vec<AnalysisBlocker>,
-}
-
-impl AnalysisBlockerSet {
-    pub fn as_slice(&self) -> &[AnalysisBlocker] {
-        &self.blockers
-    }
-
-    pub fn push(&mut self, blocker: AnalysisBlocker) {
-        if !self.blockers.contains(&blocker) {
-            self.blockers.push(blocker);
-        }
-    }
-}
-
 /// Successful semantic provenance sidecar; never consumed by materialization.
 #[derive(Debug, Default)]
 pub struct ProvenanceIr {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     roots: Vec<NodeId>,
-    diagnostics: Vec<Diagnostic>,
     records: Vec<ProvenanceRecord>,
 }
 
 impl ProvenanceIr {
-    pub(crate) fn from_analysis(
-        graph: Graph,
-        roots: Vec<NodeId>,
-        diagnostics: Vec<Diagnostic>,
-    ) -> Self {
+    pub(crate) fn from_analysis(graph: Graph, roots: Vec<NodeId>) -> Self {
         let records = graph
             .edges
             .iter()
@@ -1122,7 +1080,6 @@ impl ProvenanceIr {
             nodes: graph.nodes,
             edges: graph.edges,
             roots,
-            diagnostics,
             records,
         }
     }
@@ -1141,10 +1098,6 @@ impl ProvenanceIr {
 
     pub fn roots(&self) -> &[NodeId] {
         &self.roots
-    }
-
-    pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
     }
 
     pub(crate) fn graph(&self) -> Graph {

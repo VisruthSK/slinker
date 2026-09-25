@@ -21,8 +21,11 @@ fn worker_library_selection_matches_target_r_semantics() {
     let explicit =
         WorkerProbe::start(&r_home, vec![first.clone(), second.clone()]).expect("explicit worker");
     assert_eq!(
-        explicit.target_libraries[..2],
-        [normalized(&first), normalized(&second)]
+        explicit.target_libraries[..2]
+            .iter()
+            .map(|library| canonical(library))
+            .collect::<Vec<_>>(),
+        [canonical(&first), canonical(&second)]
     );
     assert!(
         explicit
@@ -172,8 +175,8 @@ fn target_r_libraries(r_home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn normalized(path: &Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().replace('\\', "/"))
+fn canonical(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).expect("canonical library path")
 }
 
 fn unique_temp(label: &str) -> PathBuf {

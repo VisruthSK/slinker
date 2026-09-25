@@ -2,7 +2,7 @@ use crate::analysis::graph::NodeId;
 use crate::syntax::source::Span;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectCode {
     AirUnsupportedSyntax,
@@ -39,23 +39,4 @@ pub struct Diagnostic {
     pub message: String,
     pub span: Option<Span>,
     pub node: Option<NodeId>,
-    pub reachable: bool,
-}
-
-impl Diagnostic {
-    pub fn reject(
-        package: impl Into<String>,
-        code: RejectCode,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            package: package.into(),
-            binding: None,
-            code,
-            message: message.into(),
-            span: None,
-            node: None,
-            reachable: true,
-        }
-    }
 }

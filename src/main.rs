@@ -179,7 +179,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
         .with_external_packages(args.universe.external.iter().cloned())
         .with_root_source(source.description_source())
         .analyze(source.package())?;
-    let context = BuildContext::new(source, staged, r_home, target, &ir)?;
+    let mut context = BuildContext::new(source, staged, r_home, target);
     let output = args.output.clone().unwrap_or_else(|| {
         context
             .source()
@@ -187,7 +187,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
             .join("target/slinker")
             .join(context.source().package())
     });
-    let buildable = PureRStatic::check(&ir, &context)?;
+    let buildable = PureRStatic::check(&ir, &mut context)?;
     let generated = materialize(buildable, &output)?;
     println!("{}", generated.path().display());
     Ok(())
@@ -457,10 +457,10 @@ fn print_analysis(target: &TargetEnvironment, plan: &LinkIr) {
     println!("  roots: {}", plan.provenance().roots().len());
     println!();
     println!("blockers");
-    if plan.provenance().diagnostics().is_empty() {
+    if plan.blockers().is_empty() {
         println!("  none");
     } else {
-        for diagnostic in plan.provenance().diagnostics() {
+        for diagnostic in plan.blockers() {
             println!("  - {:?}: {}", diagnostic.code, diagnostic.message);
         }
     }
