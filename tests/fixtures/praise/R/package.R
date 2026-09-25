@@ -1,10 +1,9 @@
-
 #' @title Praise Users
 #' @name praise
 #' @description Build friendly R packages that
 #' praise their users if they have done something
 #' good, or they just need it to feel better.
-#' 
+#'
 #' @docType package
 #' @aliases praise praise-package
 
@@ -25,7 +24,7 @@ NULL
 #'   \item{exclamation}{Positive exclamations.}
 #'   \item{rpackage}{Synonyms for the term \sQuote{R package}.}
 #' }
-#' 
+#'
 #' @include adjective.R adverb.R exclamation.R rpackage.R verb.R
 #' @export
 

@@ -1,4 +1,3 @@
-
 #' Persistent configuration for R packages
 #'
 #' This package is meant to be used in other packages, and provides
