@@ -72,6 +72,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
     pub(super) value_closures: HashSet<NodeId>,
     pub(super) unspecialized_calls: HashMap<(PackageId, String), AbstractValue>,
+    pub(super) namespace_registration_targets: HashSet<Span>,
     pub(super) sources: Sources,
     pub(super) source_ids: HashMap<(PackageId, String), SourceId>,
     pub(super) normalized_shapes: HashMap<(PackageId, String), Digest>,
@@ -126,6 +127,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             next_method_calls: Vec::new(),
             value_closures: HashSet::new(),
             unspecialized_calls: HashMap::new(),
+            namespace_registration_targets: HashSet::new(),
             sources: Sources::default(),
             source_ids: HashMap::new(),
             normalized_shapes: HashMap::new(),
@@ -1171,6 +1173,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 self.resource_access(node, package, resource)?;
             }
+            self.namespace_registration_targets = expression
+                .calls
+                .iter()
+                .filter(|call| call.callee == "registerS3method")
+                .flat_map(|call| call.arg_names.iter().zip(&call.arg_spans))
+                .filter(|(name, _)| name.as_deref() == Some("envir"))
+                .filter_map(|(_, span)| span.clone())
+                .collect();
             for call in &expression.calls {
                 if !self.guards_active(package, image, &call.guards)? {
                     continue;
@@ -1225,6 +1235,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         Ok(())
+    }
+
+    fn namespace_used_without_reflection(&self, call: &CallSite) -> bool {
+        matches!(call.callee.as_str(), "asNamespace" | "getNamespace")
+            && (self.namespace_registration_targets.contains(&call.span)
+                || self.sources.get(&call.span.source).is_some_and(|source| {
+                    source.text[call.span.end..].starts_with("$.__NAMESPACE__.")
+                }))
     }
 
     pub(super) fn s3_dispatch(
@@ -2240,12 +2258,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         .map(Cow::Owned)
                 });
                 let Some(name) = name else {
+                    if self.namespace_used_without_reflection(call) {
+                        return Ok(());
+                    }
                     self.diagnostic(
                         from,
                         current,
-                        None,
+                        Some(binding),
                         RejectCode::DynamicPackageDiscovery,
-                        "dynamic namespace discovery",
+                        format!("{}() with a dynamic namespace name", call.callee),
                         Some(call.span.clone()),
                     );
                     return Ok(());

@@ -373,9 +373,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .get(owner_binding)
                 .and_then(|binding| builder.binding_code(*binding))
             else {
-                issues.push(format!(
-                    "`{owner_package}::{owner_binding}` needs a code relocation but is not emitted as relocatable source"
-                ));
+                if reaches_removed_installation(relocation) {
+                    issues.push(format!(
+                        "`{owner_package}::{owner_binding}` needs a code relocation but is not emitted as relocatable source"
+                    ));
+                }
                 continue;
             };
             let site = builder.add_code_occurrence(code, source.start, source.end);
@@ -663,6 +665,17 @@ impl LinkIr {
     /// Diagnostic source map retained for provenance rendering only.
     pub fn sources(&self) -> &Sources {
         &self.sources
+    }
+}
+
+fn reaches_removed_installation(relocation: &PendingRelocation) -> bool {
+    match relocation {
+        PendingRelocation::NamespaceAccess { .. } => false,
+        PendingRelocation::ResourceAccess { .. } => true,
+        PendingRelocation::PackageOperation { operation, .. } => matches!(
+            operation,
+            PackageOperation::PackageVersion { .. } | PackageOperation::FindPackage
+        ),
     }
 }
 

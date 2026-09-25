@@ -573,11 +573,7 @@ impl ObjectScanner {
                     environment: None,
                     embedded_closures: Vec::new(),
                     embedded_environments: Vec::new(),
-                    issues: vec![ObjectIssue {
-                        path: "$".into(),
-                        kind: "altrep".into(),
-                        detail: class,
-                    }],
+                    issues: altrep_issues("$", class),
                 });
             }
             harp::environment_iter::BindingValue::Standard { object } => {
@@ -655,11 +651,7 @@ impl ObjectScanner {
                     environment: None,
                     embedded_closures: Vec::new(),
                     embedded_environments: Vec::new(),
-                    issues: vec![ObjectIssue {
-                        path: "$".into(),
-                        kind: "altrep".into(),
-                        detail: class,
-                    }],
+                    issues: altrep_issues("$", class),
                 });
             }
             harp::environment_iter::BindingValue::Standard { object } => {
@@ -696,12 +688,9 @@ impl ObjectScanner {
             ));
         }
         if harp::utils::r_is_altrep(value) {
-            return Ok(ObjectFacts::issue(
-                ObjectKind::Altrep,
-                path,
-                "altrep",
-                &harp::utils::r_altrep_class(value),
-            ));
+            let mut facts = ObjectFacts::new(ObjectKind::Altrep);
+            facts.issues = altrep_issues(path, harp::utils::r_altrep_class(value));
+            return Ok(facts);
         }
         let recursive = matches!(
             harp::utils::r_typeof(value),
@@ -982,6 +971,17 @@ fn object_kind(value: libr::SEXP) -> ObjectKind {
 fn names(value: libr::SEXP) -> Vec<String> {
     let names = unsafe { libr::Rf_getAttrib(value, libr::R_NamesSymbol) };
     Vec::<String>::try_from(harp::object::RObject::from(names)).unwrap_or_default()
+}
+
+fn altrep_issues(path: &str, class: String) -> Vec<ObjectIssue> {
+    if class.starts_with("base::") {
+        return Vec::new();
+    }
+    vec![ObjectIssue {
+        path: path.into(),
+        kind: "altrep".into(),
+        detail: class,
+    }]
 }
 
 fn classes(value: libr::SEXP) -> Vec<String> {
@@ -1462,6 +1462,10 @@ mod tests {
             altrep.representation,
             BindingRepresentation::Altrep { .. }
         ));
+        assert!(
+            altrep.issues.is_empty(),
+            "base ALTREP serializes as a plain vector"
+        );
 
         harp::parse_eval_global("cat('worker console noise')")
             .expect("write through the embedded R console");

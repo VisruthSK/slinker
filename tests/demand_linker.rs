@@ -2415,6 +2415,31 @@ fn base_resource_lookup_is_not_a_package_resource() {
 }
 
 #[test]
+fn dynamic_namespace_is_allowed_only_without_reflection() {
+    let blocked = |source: &str| {
+        let plan = Linker::new(
+            FakeProvider::new(vec![package("root", &[("f", Some(source))])]),
+            1,
+        )
+        .analyze("root")
+        .unwrap();
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+    };
+
+    assert!(!blocked(
+        "f <- function(pkg, fun) registerS3method('g', 'c', fun, envir = asNamespace(pkg))"
+    ));
+    assert!(!blocked(
+        "f <- function(ns) asNamespace(ns)$.__NAMESPACE__.$exports"
+    ));
+    assert!(blocked(
+        "f <- function(ns, name) exists(name, envir = asNamespace(ns), inherits = FALSE)"
+    ));
+}
+
+#[test]
 fn construction_interpreter_does_not_reevaluate_unspecialized_calls() {
     let sources = (0..18)
         .map(|level| {

@@ -174,6 +174,12 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
   into the output, and the bootstrap `dyn.load`s it and assigns every routine object before the
   namespace is populated. A Root keeps its own compiled code and gets its `useDynLib` directive
   rendered into the generated NAMESPACE.
+- Code shipped as a payload (not relocatable source) only blocks on relocations that point into a
+  removed installation (`system.file`, `packageVersion`, `find.package`). Namespace access and
+  `requireNamespace`/`loadNamespace`/`asNamespace` already reach the registered Linked namespace.
+- A dynamic `asNamespace`/`getNamespace` does not block when its result is only the `envir` of
+  `registerS3method` or is read for `.__NAMESPACE__.` metadata. ALTREP values from base (compact
+  sequences, deferred strings, wrappers) serialize as ordinary vectors and do not block.
 - Generated code never resolves base functions through the Root namespace: the bootstrap and its
   helpers live in `.slinker_runtime` (parent `baseenv()`), and rewritten call sites use `base::`.
 - The construction interpreter memoizes calls whose arguments are all unknown, so dense internal
@@ -264,7 +270,11 @@ packages demand them.
 11. **Analysis precision found by real packages**: `globals` calls `getNamespace("utils")` and
     needs a relocation in a payload binding (`hasCodetoolsBug16`). `futile.logger` imports from
     `futile.options` through `lambda.r`-generated functions whose base names do not resolve.
-12. **Linux embedded startup** prints `package 'methods' in options("defaultPackages") was not
+12. **cli as a Linked dependency**: remaining blockers are `get_call_scope` and
+    `format_trace_call_cli`, which reflect with `exists(name, envir = asNamespace(ns))` to print
+    `::` versus `:::` in traces, and `deferred_run`, which cli's vendored withr code references
+    but never defines (a real cli bug, reached only by a session-end finalizer).
+13. **Linux embedded startup** prints `package 'methods' in options("defaultPackages") was not
     found` in the worker unit test on Ubuntu; Ark also exports `R_SHARE_DIR`, `R_INCLUDE_DIR`, and
     `R_DOC_DIR` from the R frontend before starting R, which the worker does not.
 
