@@ -1,16 +1,18 @@
 use crate::TargetEnvironment;
-use crate::analysis::engine::LinkPlan;
+use crate::analysis::Graph;
+use crate::analysis::engine::LinkIr;
 use crate::analysis::export::{
     GraphBlockerExport, GraphEdgeReasonExport, GraphExport, GraphNodeKindExport, GraphSourceExport,
     PackageIdentityExport, TargetIdentityExport, edge_reason, node_kind, root_reason,
     semantic_node_id, stable_source,
 };
+use crate::ir::PackageRole;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-pub const EXPLANATION_SCHEMA_VERSION: u32 = 1;
+pub const EXPLANATION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplanationDag {
@@ -35,9 +37,6 @@ pub struct ExplanationComponent {
     pub visibility: PresentationVisibility,
     pub package: Option<PackageIdentityExport>,
     pub root_causes: Vec<String>,
-    pub immediate_dominator: Option<String>,
-    pub exclusive_downstream_components: usize,
-    pub exclusive_downstream_packages: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub internal_evidence: Vec<ExplanationEvidence>,
 }
@@ -123,12 +122,22 @@ pub struct ExplanationRoot {
 pub struct ExplanationPackage {
     pub name: String,
     pub version: Option<String>,
-    pub target_provided: bool,
+    pub image_fingerprint: Option<String>,
+    pub external: bool,
     pub retained_components: usize,
     pub retained_bindings: usize,
     pub root_causes: Vec<String>,
     pub entry_bindings: Vec<String>,
     pub boundary_edges: Vec<String>,
+    pub boundary_occurrences: Vec<ExplanationBoundaryOccurrence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExplanationBoundaryOccurrence {
+    pub edge_id: String,
+    pub from_member: String,
+    pub to_member: String,
+    pub reason: GraphEdgeReasonExport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,25 +162,21 @@ impl std::error::Error for ExplanationError {}
 
 impl ExplanationDag {
     pub fn from_plan(
-        plan: &LinkPlan,
+        plan: &LinkIr,
         target: &TargetEnvironment,
         root_name: &str,
     ) -> Result<Self, ExplanationError> {
         let raw = GraphExport::from_plan(plan, target, root_name)
             .map_err(|error| ExplanationError(error.to_string()))?;
-        let node_ids = plan
-            .graph
-            .nodes
-            .iter()
-            .map(semantic_node_id)
-            .collect::<Vec<_>>();
-        let adjacency = adjacency(plan);
+        let graph = plan.provenance().graph();
+        let node_ids = graph.nodes.iter().map(semantic_node_id).collect::<Vec<_>>();
+        let adjacency = adjacency(&graph);
         let (component_of, component_members) = strongly_connected_components(&adjacency);
         let component_ids = component_members
             .iter()
             .map(|members| component_id(members, &node_ids))
             .collect::<Vec<_>>();
-        let versions = package_versions(plan);
+        let identities = package_identities(plan)?;
 
         let mut components = component_members
             .iter()
@@ -181,8 +186,8 @@ impl ExplanationDag {
                     .iter()
                     .map(|&member| ExplanationMember {
                         id: node_ids[member].clone(),
-                        kind: node_kind(&plan.graph.nodes[member].kind),
-                        package: plan.graph.nodes[member].package.clone(),
+                        kind: node_kind(&graph.nodes[member].kind),
+                        package: graph.nodes[member].package.clone(),
                     })
                     .collect::<Vec<_>>();
                 exported_members.sort();
@@ -191,19 +196,12 @@ impl ExplanationDag {
                     .map(|member| member.package.clone())
                     .collect::<BTreeSet<_>>();
                 let package = match packages.iter().collect::<Vec<_>>().as_slice() {
-                    [name] => versions
-                        .get(*name)
-                        .cloned()
-                        .map(|version| PackageIdentityExport {
-                            name: (*name).clone(),
-                            version,
-                        }),
+                    [name] => identities.get(*name).cloned(),
                     _ => None,
                 };
                 let (class, visibility) = presentation(&exported_members);
                 let cyclic = members.len() > 1
-                    || plan
-                        .graph
+                    || graph
                         .edges
                         .iter()
                         .any(|edge| edge.from.0 == members[0] && edge.to.0 == members[0]);
@@ -215,16 +213,13 @@ impl ExplanationDag {
                     visibility,
                     package,
                     root_causes: Vec::new(),
-                    immediate_dominator: None,
-                    exclusive_downstream_components: 0,
-                    exclusive_downstream_packages: Vec::new(),
                     internal_evidence: Vec::new(),
                 }
             })
             .collect::<Vec<_>>();
 
         let mut grouped = BTreeMap::<(usize, usize), Vec<ExplanationEvidence>>::new();
-        for edge in &plan.graph.edges {
+        for edge in &graph.edges {
             let from_component = component_of[edge.from.0];
             let to_component = component_of[edge.to.0];
             let evidence = ExplanationEvidence {
@@ -232,11 +227,11 @@ impl ExplanationDag {
                 to_member: node_ids[edge.to.0].clone(),
                 reason: edge_reason(
                     edge,
-                    &plan.graph.nodes[edge.from.0].kind,
-                    &plan.graph.nodes[edge.to.0].kind,
+                    &graph.nodes[edge.from.0].kind,
+                    &graph.nodes[edge.to.0].kind,
                 ),
                 detail: edge.reason.clone(),
-                source: stable_source(&plan.sources, edge.span.as_ref()),
+                source: stable_source(plan.sources(), edge.span.as_ref()),
             };
             if from_component == to_component {
                 components[from_component].internal_evidence.push(evidence);
@@ -286,32 +281,25 @@ impl ExplanationDag {
         mark_redundant_edges(&mut edges, &component_adjacency, &component_ids);
         let projected_edges =
             project_transparent_paths(&components, &edges, &component_adjacency, &component_ids);
-        let roots = explanation_roots(plan, &component_of, &component_ids, &node_ids)?;
+        let roots = explanation_roots(
+            &graph,
+            plan.provenance().roots(),
+            &component_of,
+            &component_ids,
+            &node_ids,
+        )?;
         attribute_roots(
             &mut components,
             &component_adjacency,
             &roots,
             &component_ids,
         );
-        apply_dominators(
-            &mut components,
-            &component_adjacency,
-            &roots,
-            &component_ids,
-        );
-        let packages = package_summaries(
-            plan,
-            root_name,
-            &components,
-            &edges,
-            &component_ids,
-            &versions,
-        );
+        let packages = package_summaries(plan, root_name, &components, &edges, &identities);
 
         components.sort_by(|left, right| left.id.cmp(&right.id));
         let stats = ExplanationStats {
-            raw_nodes: plan.graph.nodes.len(),
-            raw_edges: plan.graph.edges.len(),
+            raw_nodes: graph.nodes.len(),
+            raw_edges: graph.edges.len(),
             components: components.len(),
             explanation_edges: edges.len(),
             nontrivial_sccs: components
@@ -334,9 +322,9 @@ impl ExplanationDag {
     }
 }
 
-fn adjacency(plan: &LinkPlan) -> Vec<Vec<usize>> {
-    let mut adjacency = vec![Vec::new(); plan.graph.nodes.len()];
-    for edge in &plan.graph.edges {
+fn adjacency(graph: &Graph) -> Vec<Vec<usize>> {
+    let mut adjacency = vec![Vec::new(); graph.nodes.len()];
+    for edge in &graph.edges {
         adjacency[edge.from.0].push(edge.to.0);
     }
     for targets in &mut adjacency {
@@ -491,12 +479,28 @@ fn presentation_rank(kind: GraphNodeKindExport) -> u8 {
     }
 }
 
-fn package_versions(plan: &LinkPlan) -> BTreeMap<String, String> {
-    plan.packages
-        .iter()
-        .chain(plan.target_provided.iter())
-        .map(|package| (package.name.clone(), package.version.to_string()))
-        .collect()
+fn package_identities(
+    plan: &LinkIr,
+) -> Result<BTreeMap<String, PackageIdentityExport>, ExplanationError> {
+    let mut identities = BTreeMap::new();
+    for package in plan.program().packages() {
+        let package = package.identity();
+        let identity = PackageIdentityExport {
+            name: package.name.clone(),
+            version: package.version.to_string(),
+            image_fingerprint: package.image_fingerprint.0.clone(),
+        };
+        if let Some(existing) = identities.get(&package.name)
+            && existing != &identity
+        {
+            return Err(ExplanationError(format!(
+                "conflicting installed identities for package `{}`",
+                package.name
+            )));
+        }
+        identities.insert(package.name.clone(), identity);
+    }
+    Ok(identities)
 }
 
 fn component_packages(component: &ExplanationComponent) -> Vec<String> {
@@ -527,15 +531,15 @@ fn component_adjacency(count: usize, edges: &[ExplanationEdge], ids: &[String]) 
 }
 
 fn explanation_roots(
-    plan: &LinkPlan,
+    graph: &Graph,
+    root_nodes: &[crate::analysis::NodeId],
     component_of: &[usize],
     component_ids: &[String],
     node_ids: &[String],
 ) -> Result<Vec<ExplanationRoot>, ExplanationError> {
     let mut roots = Vec::new();
-    for root in &plan.roots {
-        let node = plan
-            .graph
+    for root in root_nodes {
+        let node = graph
             .nodes
             .get(root.0)
             .ok_or_else(|| ExplanationError(format!("missing root node {}", root.0)))?;
@@ -579,82 +583,6 @@ fn attribute_roots(
     for component in components {
         component.root_causes.sort();
         component.root_causes.dedup();
-    }
-}
-
-fn apply_dominators(
-    components: &mut [ExplanationComponent],
-    adjacency: &[Vec<usize>],
-    roots: &[ExplanationRoot],
-    ids: &[String],
-) {
-    let count = components.len();
-    let super_root = count;
-    let by_id = ids
-        .iter()
-        .enumerate()
-        .map(|(index, id)| (id.as_str(), index))
-        .collect::<BTreeMap<_, _>>();
-    let root_components = roots
-        .iter()
-        .map(|root| by_id[root.component.as_str()])
-        .collect::<BTreeSet<_>>();
-    let mut predecessors = vec![Vec::new(); count];
-    for (from, targets) in adjacency.iter().enumerate() {
-        for &to in targets {
-            predecessors[to].push(from);
-        }
-    }
-    for &root in &root_components {
-        predecessors[root].push(super_root);
-    }
-    let universe = (0..=count).collect::<BTreeSet<_>>();
-    let mut dominators = vec![universe; count + 1];
-    dominators[super_root] = BTreeSet::from([super_root]);
-    loop {
-        let mut changed = false;
-        for component in 0..count {
-            let mut next = predecessors[component]
-                .iter()
-                .map(|&predecessor| dominators[predecessor].clone())
-                .reduce(|left, right| left.intersection(&right).copied().collect())
-                .unwrap_or_default();
-            next.insert(component);
-            if next != dominators[component] {
-                dominators[component] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let mut children = vec![Vec::new(); count];
-    for component in 0..count {
-        let immediate = dominators[component]
-            .iter()
-            .copied()
-            .filter(|dominator| *dominator != component && *dominator != super_root)
-            .max_by_key(|dominator| dominators[*dominator].len());
-        if let Some(dominator) = immediate {
-            components[component].immediate_dominator = Some(ids[dominator].clone());
-            children[dominator].push(component);
-        }
-    }
-    for component in 0..count {
-        let mut descendants = Vec::new();
-        let mut queue = VecDeque::from(children[component].clone());
-        while let Some(child) = queue.pop_front() {
-            descendants.push(child);
-            queue.extend(children[child].iter().copied());
-        }
-        components[component].exclusive_downstream_components = descendants.len();
-        components[component].exclusive_downstream_packages = descendants
-            .into_iter()
-            .flat_map(|descendant| component_packages(&components[descendant]))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
     }
 }
 
@@ -762,22 +690,23 @@ fn reaches(start: usize, target: usize, adjacency: &[Vec<usize>]) -> bool {
 }
 
 fn package_summaries(
-    plan: &LinkPlan,
+    plan: &LinkIr,
     root_name: &str,
     components: &[ExplanationComponent],
     edges: &[ExplanationEdge],
-    component_ids: &[String],
-    versions: &BTreeMap<String, String>,
+    identities: &BTreeMap<String, PackageIdentityExport>,
 ) -> Vec<ExplanationPackage> {
-    let component_by_id = component_ids
+    let members = components
         .iter()
-        .enumerate()
-        .map(|(index, id)| (id.as_str(), index))
+        .flat_map(|component| component.members.iter())
+        .map(|member| (member.id.as_str(), member))
         .collect::<BTreeMap<_, _>>();
     let target_names = plan
-        .target_provided
+        .program()
+        .packages()
         .iter()
-        .map(|package| package.name.as_str())
+        .filter(|package| package.role() == PackageRole::External)
+        .map(|package| package.identity().name.as_str())
         .collect::<BTreeSet<_>>();
     let names = components
         .iter()
@@ -799,26 +728,37 @@ fn package_summaries(
                 .collect::<BTreeSet<_>>();
             let mut boundary_edges = Vec::new();
             let mut entry_bindings = BTreeSet::new();
+            let mut boundary_occurrences = Vec::new();
             for edge in edges {
-                let target = component_by_id[edge.to.as_str()];
-                if !component_indexes.contains(&target)
-                    || edge.source_packages.contains(&name)
-                    || !edge.target_packages.contains(&name)
-                {
-                    continue;
+                for evidence in &edge.evidence {
+                    let Some(from) = members.get(evidence.from_member.as_str()) else {
+                        continue;
+                    };
+                    let Some(to) = members.get(evidence.to_member.as_str()) else {
+                        continue;
+                    };
+                    if from.package == name || to.package != name {
+                        continue;
+                    }
+                    boundary_edges.push(edge.id.clone());
+                    if matches!(
+                        to.kind,
+                        GraphNodeKindExport::RBinding | GraphNodeKindExport::TargetBinding
+                    ) {
+                        entry_bindings.insert(to.id.clone());
+                    }
+                    boundary_occurrences.push(ExplanationBoundaryOccurrence {
+                        edge_id: edge.id.clone(),
+                        from_member: evidence.from_member.clone(),
+                        to_member: evidence.to_member.clone(),
+                        reason: evidence.reason,
+                    });
                 }
-                boundary_edges.push(edge.id.clone());
-                entry_bindings.extend(
-                    components[target]
-                        .members
-                        .iter()
-                        .filter(|&member| {
-                            member.package == name && member.kind == GraphNodeKindExport::RBinding
-                        })
-                        .map(|member| member.id.clone()),
-                );
             }
             boundary_edges.sort();
+            boundary_edges.dedup();
+            boundary_occurrences.sort();
+            boundary_occurrences.dedup();
             let root_causes = component_indexes
                 .iter()
                 .flat_map(|&index| components[index].root_causes.iter().cloned())
@@ -826,17 +766,28 @@ fn package_summaries(
                 .into_iter()
                 .collect();
             ExplanationPackage {
-                version: versions.get(&name).cloned(),
-                target_provided: target_names.contains(name.as_str()),
+                version: identities
+                    .get(&name)
+                    .map(|identity| identity.version.clone()),
+                image_fingerprint: identities
+                    .get(&name)
+                    .map(|identity| identity.image_fingerprint.clone()),
+                external: target_names.contains(name.as_str()),
                 retained_components: component_indexes.len(),
                 retained_bindings: component_indexes
                     .iter()
                     .flat_map(|&index| &components[index].members)
-                    .filter(|member| member.kind == GraphNodeKindExport::RBinding)
+                    .filter(|member| {
+                        matches!(
+                            member.kind,
+                            GraphNodeKindExport::RBinding | GraphNodeKindExport::TargetBinding
+                        )
+                    })
                     .count(),
                 root_causes,
                 entry_bindings: entry_bindings.into_iter().collect(),
                 boundary_edges,
+                boundary_occurrences,
                 name,
             }
         })

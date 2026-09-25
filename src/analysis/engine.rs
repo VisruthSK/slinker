@@ -1,18 +1,26 @@
 use crate::analysis::policy::{DiscoveryPolicy, LinkPolicy};
-use crate::analysis::{Diagnostic, EdgeKind, Graph, Need, NodeId, NodeKind, RejectCode, S3Id};
-use crate::build::{PackageOperation, Rewrite};
+use crate::analysis::{
+    Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode, S3Id,
+};
+use crate::build::{PackageOperation, PendingRelocation};
+use crate::ir::{
+    ExternalBindingAccess, ExternalPackageContract, InstalledObjectLocator, MaterializedSlot,
+    MaterializedSlotSource, PackageIdentity as LinkedPackageIdentity, PackageIr,
+    PackageOperationIr, PackageRole as LinkedPackageRole, ProgramIr, RootArtifactIr,
+    TargetContract,
+};
 use crate::metadata::{RelationField, relations};
 use crate::package::{
-    BindingImage, BindingRepresentation, ClosureId, ClosureObject, ClosureSource, EnvironmentId,
-    ImportSpec, InstalledObject, InstalledPackage, NativeRoutineSummary, NativeSafety, ObjectId,
-    ObjectKind, PackageId, PackageImage, PackageIndex, PackageObjectGraph, PackageProvider,
-    PrivateBindingImage, SyntaxValidation,
+    BindingImage, BindingRepresentation, ClosureId, ClosureObject, ClosureSource, Digest,
+    EnvironmentId, ImportSpec, InstalledObject, InstalledPackage, NativeRoutineSummary,
+    NativeSafety, ObjectId, ObjectKind, PackageId, PackageImage, PackageIndex, PackageObjectGraph,
+    PackageProvider, PrivateBindingImage, SyntaxValidation, TargetUniverse,
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, ConstructionArgument, ConstructionCall,
     ConstructionExpr, ConstructionExprKind, ConstructionTarget, NameRefKind,
     NamespaceImportResolution, NamespaceImports, OakParseContext, OakParser, PackageGuard,
-    ParsedRFile, ResolvedName, SemanticIssueKind, SourceId, Sources, Span, StaticArg,
+    ParsedRFile, ResolvedName, SemanticIssueKind, SourceId, SourceOrigin, Sources, Span, StaticArg,
     StaticEnvironment, SyntaxEffect, SyntaxEffectKind, closure_definitely_non_returning,
 };
 use crate::{Error, Result};
@@ -22,23 +30,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[derive(Debug)]
-pub struct LinkPlan {
-    pub graph: Graph,
-    pub roots: Vec<NodeId>,
-    pub diagnostics: Vec<Diagnostic>,
-    pub rewrites: Vec<Rewrite>,
-    pub sources: Sources,
-    pub retained: HashSet<Need>,
-    pub packages: HashSet<PackageId>,
-    pub target_provided: HashSet<PackageId>,
-    pub parsed_bindings: usize,
-    pub parsed_top_level_closures: usize,
-    pub parsed_private_closures: usize,
-    pub parsed_nested_closures: usize,
-    pub parsed_derived_closures: usize,
-    pub inspected_packages: usize,
-    pub images: HashMap<PackageId, Arc<PackageImage>>,
-    pub object_graphs: HashMap<PackageId, PackageObjectGraph>,
+pub struct LinkIr {
+    program: ProgramIr,
+    provenance: crate::ir::ProvenanceIr,
+    blockers: crate::ir::AnalysisBlockerSet,
+    sources: Sources,
 }
 
 #[derive(Clone, Debug)]
@@ -73,9 +69,10 @@ struct NativeCallbackContext<'a> {
 }
 
 pub struct Linker<P: PackageProvider> {
-    packages: P,
+    packages: TargetUniverse<P>,
     policy: LinkPolicy,
     extra_packages: HashSet<String>,
+    explicit_external_packages: HashSet<String>,
     jobs: usize,
     parse_pool: Option<Arc<rayon::ThreadPool>>,
     graph: Graph,
@@ -84,23 +81,30 @@ pub struct Linker<P: PackageProvider> {
     queued: HashSet<Need>,
     processed: HashSet<Need>,
     encountered: HashSet<PackageId>,
-    target_provided: HashSet<PackageId>,
+    external: HashSet<PackageId>,
     parsed_bindings: HashMap<(PackageId, String), ParseState>,
     parse_kinds: HashMap<(PackageId, String), ParseKind>,
     images: HashMap<PackageId, Arc<PackageImage>>,
     object_graphs: HashMap<PackageId, PackageObjectGraph>,
     diagnostics: Vec<Diagnostic>,
-    rewrites: Vec<Rewrite>,
+    pending_relocations: Vec<PendingRelocation>,
     sources: Sources,
     source_ids: HashMap<(PackageId, String), SourceId>,
+    normalized_shapes: HashMap<(PackageId, String), Digest>,
     root: Option<PackageId>,
     suggested_only: HashMap<PackageId, HashSet<String>>,
     namespace_imports: HashMap<PackageId, NamespaceImports>,
     non_returning_bindings: HashMap<PackageId, BTreeSet<String>>,
-    activation_bindings: HashSet<(PackageId, String)>,
+    namespace_builders: HashMap<PackageId, NamespaceBuilder>,
     observations: Vec<SyntaxObservation>,
     diagnostic_keys: HashSet<(NodeId, RejectCode, String)>,
     contextual_namespace_calls: HashMap<Span, Option<String>>,
+    root_source: Option<RootSourceArtifact>,
+}
+
+#[derive(Clone)]
+struct RootSourceArtifact {
+    description: Arc<str>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +118,35 @@ struct SyntaxObservation {
 struct NativeCallTarget {
     component: String,
     consumes_selector: bool,
+}
+
+#[derive(Clone, Debug)]
+struct NamespaceBuilder {
+    bindings: BTreeSet<String>,
+    registrations: Vec<S3Id>,
+}
+
+impl NamespaceBuilder {
+    fn new(index: &PackageIndex) -> Self {
+        let mut bindings = index.binding_names.iter().cloned().collect::<BTreeSet<_>>();
+        bindings.extend([
+            ".__NAMESPACE__.".into(),
+            ".__S3MethodsTable__.".into(),
+            ".packageName".into(),
+        ]);
+        Self {
+            bindings,
+            registrations: Vec::new(),
+        }
+    }
+
+    fn add_binding(&mut self, name: String) -> bool {
+        self.bindings.insert(name)
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.bindings.contains(name)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -165,9 +198,10 @@ impl ExecutionOutcome {
 impl<P: PackageProvider> Linker<P> {
     pub fn new(packages: P, jobs: usize) -> Self {
         Self {
-            packages,
+            packages: TargetUniverse::new(packages),
             policy: LinkPolicy::default(),
             extra_packages: HashSet::new(),
+            explicit_external_packages: HashSet::new(),
             jobs: jobs.max(1),
             parse_pool: None,
             graph: Graph::default(),
@@ -176,23 +210,25 @@ impl<P: PackageProvider> Linker<P> {
             queued: HashSet::new(),
             processed: HashSet::new(),
             encountered: HashSet::new(),
-            target_provided: HashSet::new(),
+            external: HashSet::new(),
             parsed_bindings: HashMap::new(),
             parse_kinds: HashMap::new(),
             images: HashMap::new(),
             object_graphs: HashMap::new(),
             diagnostics: Vec::new(),
-            rewrites: Vec::new(),
+            pending_relocations: Vec::new(),
             sources: Sources::default(),
             source_ids: HashMap::new(),
+            normalized_shapes: HashMap::new(),
             root: None,
             suggested_only: HashMap::new(),
             namespace_imports: HashMap::new(),
             non_returning_bindings: HashMap::new(),
-            activation_bindings: HashSet::new(),
+            namespace_builders: HashMap::new(),
             observations: Vec::new(),
             diagnostic_keys: HashSet::new(),
             contextual_namespace_calls: HashMap::new(),
+            root_source: None,
         }
     }
 
@@ -206,11 +242,29 @@ impl<P: PackageProvider> Linker<P> {
         self
     }
 
-    pub fn analyze(mut self, root_name: &str) -> Result<LinkPlan> {
+    /// Record explicit source-policy External choices for DESCRIPTION contract finalization.
+    pub fn with_external_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
+        let packages = packages.into_iter().collect::<Vec<_>>();
+        self.packages
+            .set_explicit_external(packages.iter().cloned());
+        self.explicit_external_packages.extend(packages);
+        self
+    }
+
+    /// Supply frozen source metadata used to finalize the generated Root artifact plan.
+    pub fn with_root_source(mut self, description: impl Into<Arc<str>>) -> Self {
+        self.root_source = Some(RootSourceArtifact {
+            description: description.into(),
+        });
+        self
+    }
+
+    pub fn analyze(mut self, root_name: &str) -> Result<LinkIr> {
+        self.packages.set_root(root_name.to_owned());
         let root = self.packages.locate(root_name)?;
-        if self.packages.is_target_provided(&root) {
+        if self.packages.is_external(&root) {
             return Err(Error::Analysis(format!(
-                "root package `{root_name}` cannot be target-provided"
+                "root package `{root_name}` cannot be External"
             )));
         }
         self.root = Some(root.id.clone());
@@ -249,50 +303,499 @@ impl<P: PackageProvider> Linker<P> {
         }
 
         self.finalize_syntax_observations();
-        let inspected_packages = self.images.len();
-        let parsed_bindings = self
-            .parsed_bindings
-            .values()
-            .filter(|state| matches!(state, ParseState::Parsed(_)))
-            .count();
-        let parsed_top_level_closures = self
-            .parse_kinds
-            .values()
-            .filter(|kind| matches!(kind, ParseKind::Namespace))
-            .count();
-        let parsed_private_closures = self
-            .parse_kinds
-            .values()
-            .filter(|kind| matches!(kind, ParseKind::Private))
-            .count();
-        let parsed_nested_closures = self
-            .parse_kinds
-            .values()
-            .filter(|kind| matches!(kind, ParseKind::Nested))
-            .count();
-        let parsed_derived_closures = self
-            .parse_kinds
-            .values()
-            .filter(|kind| matches!(kind, ParseKind::Derived))
-            .count();
-        Ok(LinkPlan {
-            graph: self.graph,
-            roots: self.roots,
-            diagnostics: self.diagnostics,
-            rewrites: self.rewrites,
+        let root_package = self
+            .root
+            .clone()
+            .expect("root package established before analysis");
+        let mut packages = self
+            .encountered
+            .iter()
+            .cloned()
+            .map(|package| {
+                let role = if package == root_package {
+                    LinkedPackageRole::Root
+                } else {
+                    LinkedPackageRole::Linked
+                };
+                (package, role)
+            })
+            .collect::<HashMap<_, _>>();
+        for package in &self.external {
+            packages.insert(package.clone(), LinkedPackageRole::External);
+        }
+        let program = self.finalize_program(&root_package, &packages);
+        let provenance = crate::ir::ProvenanceIr::from_analysis(
+            self.graph.clone(),
+            self.roots.clone(),
+            self.diagnostics.clone(),
+        );
+        let mut blockers = crate::ir::AnalysisBlockerSet::default();
+        for diagnostic in &self.diagnostics {
+            blockers.push(diagnostic_blocker(diagnostic));
+        }
+        Ok(LinkIr {
+            program,
+            provenance,
+            blockers,
             sources: self.sources,
-            retained: self.processed,
-            packages: self.encountered,
-            target_provided: self.target_provided,
-            parsed_bindings,
-            parsed_top_level_closures,
-            parsed_private_closures,
-            parsed_nested_closures,
-            parsed_derived_closures,
-            inspected_packages,
-            images: self.images,
-            object_graphs: self.object_graphs,
         })
+    }
+
+    fn finalize_program(
+        &self,
+        root: &PackageId,
+        roles: &HashMap<PackageId, LinkedPackageRole>,
+    ) -> ProgramIr {
+        let target = self.packages.target_environment();
+        let mut builder = ProgramIr::builder(TargetContract {
+            r_version: target
+                .map(|target| target.target.r_version.clone())
+                .unwrap_or_else(|| "test".into()),
+            platform: target
+                .map(|target| target.target.os.clone())
+                .unwrap_or_else(|| std::env::consts::OS.into()),
+            arch: target
+                .map(|target| target.target.arch.clone())
+                .unwrap_or_else(|| std::env::consts::ARCH.into()),
+        });
+        let mut ordered = roles.iter().collect::<Vec<_>>();
+        ordered.sort_by(|(left, _), (right, _)| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.version.cmp(&right.version))
+                .then_with(|| left.image_fingerprint.0.cmp(&right.image_fingerprint.0))
+        });
+        // Root receives ID zero deterministically, independent of package discovery order.
+        ordered.sort_by_key(|(package, _)| (*package != root, package.name.clone()));
+        let external_names = roles
+            .iter()
+            .filter(|(_, role)| **role == LinkedPackageRole::External)
+            .map(|(package, _)| package.name.as_str())
+            .collect::<HashSet<_>>();
+        let mut external_requirements = BTreeMap::<String, BTreeSet<String>>::new();
+        for (package, role) in &ordered {
+            if !matches!(role, LinkedPackageRole::Root | LinkedPackageRole::Linked) {
+                continue;
+            }
+            let Some(image) = self.images.get(*package) else {
+                continue;
+            };
+            if let Ok(imports) = relations(&image.index.description, RelationField::Imports) {
+                for relation in imports {
+                    if external_names.contains(relation.package()) {
+                        external_requirements
+                            .entry(relation.package().to_owned())
+                            .or_default()
+                            .insert(relation.to_string());
+                    }
+                }
+            }
+            if let Ok(suggests) = relations(&image.index.description, RelationField::Suggests) {
+                for relation in suggests {
+                    if external_names.contains(relation.package())
+                        && self.explicit_external_packages.contains(relation.package())
+                    {
+                        external_requirements
+                            .entry(relation.package().to_owned())
+                            .or_default()
+                            .insert(relation.to_string());
+                    }
+                }
+            }
+        }
+        let mut package_ids = HashMap::new();
+        for (package, role) in &ordered {
+            let identity = LinkedPackageIdentity {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                image_fingerprint: package.image_fingerprint.clone(),
+            };
+            let package_ir = match role {
+                LinkedPackageRole::Root => PackageIr::Root {
+                    build_identity: identity,
+                },
+                LinkedPackageRole::Linked => PackageIr::Linked {
+                    build_identity: identity,
+                },
+                LinkedPackageRole::External => PackageIr::External {
+                    analyzed_identity: identity,
+                    contract: ExternalPackageContract {
+                        package: package.name.clone(),
+                        requirements: external_requirements
+                            .get(&package.name)
+                            .map(|requirements| requirements.iter().cloned().collect())
+                            .unwrap_or_default(),
+                    },
+                },
+            };
+            package_ids.insert((*package).clone(), builder.add_package(package_ir));
+        }
+
+        let mut linked_namespaces = Vec::new();
+        let mut namespace_ids = HashMap::new();
+        for (package, role) in ordered {
+            let linked_package = package_ids[package];
+            if *role == LinkedPackageRole::External {
+                let bindings = self.graph.nodes.iter().filter_map(|node| match &node.kind {
+                    NodeKind::ExternalBinding { name } if node.package == package.name => {
+                        Some((name.clone(), ExternalBindingAccess::Exported))
+                    }
+                    _ => None,
+                });
+                let namespace = builder.finish_external_namespace(linked_package, bindings);
+                namespace_ids.insert(package.name.clone(), namespace);
+                continue;
+            }
+            let image = self
+                .images
+                .get(package)
+                .expect("Root/Linked package has an initialized image");
+            let namespace_builder = self
+                .namespace_builders
+                .get(package)
+                .expect("Root/Linked namespace builder");
+            let names = namespace_builder.bindings.clone();
+            let slots = names.iter().map(|name| {
+                let source =
+                    image
+                        .binding(name)
+                        .map_or(MaterializedSlotSource::Unbound, |binding| {
+                            let locator = InstalledObjectLocator {
+                                root: name.clone(),
+                                path: Vec::new(),
+                            };
+                            binding.closure.as_ref().map_or(
+                                MaterializedSlotSource::Payload {
+                                    locator: locator.clone(),
+                                },
+                                |closure| MaterializedSlotSource::Closure {
+                                    source: Arc::clone(&closure.source),
+                                    normalized_shape: self
+                                        .normalized_shapes
+                                        .get(&(package.clone(), name.clone()))
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            Digest(format!(
+                                                "{:x}",
+                                                <sha2::Sha256 as sha2::Digest>::digest(
+                                                    closure.source.as_bytes(),
+                                                )
+                                            ))
+                                        }),
+                                    locator,
+                                },
+                            )
+                        });
+                MaterializedSlot {
+                    name: name.clone(),
+                    source,
+                }
+            });
+            let exports = image
+                .index
+                .exports
+                .values()
+                .filter(|name| names.contains(*name))
+                .cloned();
+            let namespace = builder.finish_materialized_namespace(
+                linked_package,
+                match role {
+                    LinkedPackageRole::Root => LinkedPackageRole::Root,
+                    LinkedPackageRole::Linked => LinkedPackageRole::Linked,
+                    LinkedPackageRole::External => unreachable!(),
+                },
+                slots,
+                exports,
+                image.index.lifecycle.on_load.then(|| ".onLoad".into()),
+            );
+            for registration in &namespace_builder.registrations {
+                let Some(&method) = namespace.bindings.get(&registration.method) else {
+                    continue;
+                };
+                builder.attach_s3_registration(
+                    namespace.namespace,
+                    crate::ir::GenericId {
+                        package: registration
+                            .generic
+                            .package
+                            .as_ref()
+                            .and_then(|package| package_ids.get(package).copied()),
+                        name: registration.generic.name.clone(),
+                    },
+                    registration.class.clone(),
+                    method,
+                );
+            }
+            for native in &image.index.dynlibs {
+                builder.attach_native_component(namespace.namespace, native.name.clone());
+            }
+            if *role == LinkedPackageRole::Linked {
+                linked_namespaces.push(namespace.namespace);
+            }
+            namespace_ids.insert(package.name.clone(), namespace);
+        }
+        let mut namespace_dependencies =
+            HashMap::<crate::ir::NamespaceId, BTreeSet<crate::ir::NamespaceId>>::new();
+        for (package, role) in roles {
+            if *role == LinkedPackageRole::External {
+                continue;
+            }
+            let Some(image) = self.images.get(package) else {
+                continue;
+            };
+            let owner = namespace_ids[&package.name].namespace;
+            for import in &image.index.imports {
+                let (target_name, pairs) = match import {
+                    ImportSpec::From {
+                        package: target,
+                        bindings,
+                    } => (
+                        target,
+                        bindings
+                            .iter()
+                            .map(|binding| (binding.local.clone(), binding.remote.clone()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    ImportSpec::All {
+                        package: target,
+                        except,
+                    } => {
+                        let exported = roles
+                            .keys()
+                            .find(|package| package.name == *target)
+                            .and_then(|package| self.images.get(package))
+                            .map(|image| image.index.exports.values().cloned().collect::<Vec<_>>())
+                            .unwrap_or_else(|| {
+                                self.graph
+                                    .nodes
+                                    .iter()
+                                    .filter_map(|node| match &node.kind {
+                                        NodeKind::ExternalBinding { name }
+                                            if node.package == *target =>
+                                        {
+                                            Some(name.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect()
+                            });
+                        (
+                            target,
+                            exported
+                                .into_iter()
+                                .filter(|name| !except.contains(name))
+                                .map(|name| (name.clone(), name))
+                                .collect(),
+                        )
+                    }
+                };
+                let Some(target) = namespace_ids.get(target_name) else {
+                    continue;
+                };
+                for (local, remote) in pairs {
+                    if let Some(&binding) = target.bindings.get(&remote) {
+                        builder.attach_import(owner, local, binding);
+                        namespace_dependencies
+                            .entry(owner)
+                            .or_default()
+                            .insert(builder.binding_namespace(binding));
+                    }
+                }
+            }
+        }
+        for (namespace, dependencies) in &namespace_dependencies {
+            builder.set_activation_dependencies(*namespace, dependencies.iter().copied().collect());
+        }
+        let linked_set = linked_namespaces.iter().copied().collect::<BTreeSet<_>>();
+        let mut remaining = linked_set.clone();
+        let mut ordered_linked = Vec::new();
+        while !remaining.is_empty() {
+            let next = remaining
+                .iter()
+                .copied()
+                .find(|namespace| {
+                    namespace_dependencies
+                        .get(namespace)
+                        .is_none_or(|dependencies| {
+                            dependencies.iter().all(|dependency| {
+                                !linked_set.contains(dependency) || !remaining.contains(dependency)
+                            })
+                        })
+                })
+                .unwrap_or_else(|| *remaining.iter().next().expect("remaining namespace"));
+            remaining.remove(&next);
+            ordered_linked.push(next);
+        }
+        let root_image = self.images.get(root).expect("Root image finalized");
+        let root_namespace = &namespace_ids[&root.name];
+        let mut namespace_source = String::new();
+        for binding in root_image.index.exports.values() {
+            if root_namespace.bindings.contains_key(binding) {
+                namespace_source
+                    .push_str(&format!("export({})\n", namespace_directive_name(binding)));
+            }
+        }
+        let mut external_namespace_imports = Vec::new();
+        let mut linked_imports = Vec::new();
+        for import in &root_image.index.imports {
+            let (name, imported) = match import {
+                ImportSpec::All { package, except } => {
+                    if except.is_empty() {
+                        (package, Vec::new())
+                    } else {
+                        continue;
+                    }
+                }
+                ImportSpec::From { package, bindings } => (
+                    package,
+                    bindings
+                        .iter()
+                        .filter_map(|binding| {
+                            namespace_ids
+                                .get(package)
+                                .and_then(|namespace| namespace.bindings.get(&binding.remote))
+                                .copied()
+                        })
+                        .collect(),
+                ),
+            };
+            let Some(namespace) = namespace_ids.get(name) else {
+                continue;
+            };
+            match roles
+                .iter()
+                .find(|(package, _)| package.name == *name)
+                .map(|(_, role)| *role)
+            {
+                Some(LinkedPackageRole::External) => {
+                    match import {
+                        ImportSpec::All { .. } => namespace_source
+                            .push_str(&format!("import({})\n", namespace_directive_name(name))),
+                        ImportSpec::From { bindings, .. } => {
+                            for binding in bindings {
+                                namespace_source.push_str(&format!(
+                                    "importFrom({}, {})\n",
+                                    namespace_directive_name(name),
+                                    namespace_directive_name(&binding.remote)
+                                ));
+                            }
+                        }
+                    }
+                    external_namespace_imports.push(crate::ir::ExternalImportIr {
+                        namespace: namespace.namespace,
+                        bindings: imported,
+                    });
+                }
+                Some(LinkedPackageRole::Linked) => linked_imports.push(crate::ir::LinkedImportIr {
+                    namespace: namespace.namespace,
+                    bindings: imported,
+                }),
+                Some(LinkedPackageRole::Root) | None => {}
+            }
+        }
+        let contracts = external_requirements
+            .into_iter()
+            .map(|(package, requirements)| ExternalPackageContract {
+                package,
+                requirements: requirements.into_iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        let mut retained_resources = Vec::new();
+        for relocation in &self.pending_relocations {
+            let source = pending_relocation_span(relocation);
+            let Some(entry) = self.sources.get(&source.source) else {
+                continue;
+            };
+            let SourceOrigin::InstalledBinding {
+                package: owner_package,
+                binding: owner_binding,
+            } = &entry.origin
+            else {
+                continue;
+            };
+            let Some(owner_namespace) = namespace_ids.get(owner_package) else {
+                continue;
+            };
+            let Some(&owner_binding) = owner_namespace.bindings.get(owner_binding) else {
+                continue;
+            };
+            let Some(code) = builder.binding_code(owner_binding) else {
+                continue;
+            };
+            let site = builder.add_code_occurrence(code, source.start, source.end);
+            match relocation {
+                PendingRelocation::NamespaceAccess {
+                    package,
+                    binding,
+                    internal,
+                    ..
+                } => {
+                    let Some(target_namespace) = namespace_ids.get(&package.name) else {
+                        continue;
+                    };
+                    let Some(&target) = target_namespace.bindings.get(binding) else {
+                        continue;
+                    };
+                    builder.add_relocation(crate::ir::Relocation::Binding {
+                        site,
+                        target,
+                        access: if *internal {
+                            ExternalBindingAccess::Internal
+                        } else {
+                            ExternalBindingAccess::Exported
+                        },
+                    });
+                }
+                PendingRelocation::ResourceAccess {
+                    package, resource, ..
+                } => {
+                    let resource_id = builder.add_resource(crate::ir::ResourceIr {
+                        package: package_ids[package],
+                        path: resource.clone(),
+                    });
+                    retained_resources.push(resource_id);
+                    builder.add_relocation(crate::ir::Relocation::Resource {
+                        site,
+                        target: resource_id,
+                    });
+                }
+                PendingRelocation::PackageOperation {
+                    package, operation, ..
+                } => builder.add_relocation(crate::ir::Relocation::Package {
+                    site,
+                    target: package.as_ref().map(|package| package_ids[package]),
+                    operation: match operation {
+                        PackageOperation::RequireNamespace { result } => {
+                            PackageOperationIr::RequireNamespace { result: *result }
+                        }
+                        PackageOperation::LoadNamespace => PackageOperationIr::LoadNamespace,
+                        PackageOperation::GetNamespace => PackageOperationIr::GetNamespace,
+                        PackageOperation::AsNamespace => PackageOperationIr::AsNamespace,
+                        PackageOperation::PackageVersion { version } => {
+                            PackageOperationIr::PackageVersion {
+                                version: version.clone(),
+                            }
+                        }
+                        PackageOperation::FindPackage => PackageOperationIr::FindPackage,
+                    },
+                }),
+            }
+        }
+        let description = self.root_source.as_ref().map_or_else(
+            || Arc::<str>::from(""),
+            |source| Arc::from(rewrite_description_imports(&source.description, &contracts)),
+        );
+        builder.set_root_artifact(RootArtifactIr {
+            description,
+            namespace: namespace_source.into(),
+            external_description_requirements: contracts,
+            external_namespace_imports,
+            linked_imports,
+            bootstrap_namespaces: ordered_linked,
+            original_on_load: None,
+            retained_resources,
+        });
+        builder.finish()
     }
 
     fn process_frontier(&mut self) -> Result<()> {
@@ -330,6 +833,8 @@ impl<P: PackageProvider> Linker<P> {
             bindings: HashMap::new(),
             private_environments: HashMap::new(),
         });
+        self.namespace_builders
+            .insert(package.id.clone(), NamespaceBuilder::new(&index));
         self.object_graphs
             .insert(package.id.clone(), image.object_graph());
         self.images.insert(package.id.clone(), Arc::clone(&image));
@@ -410,7 +915,7 @@ impl<P: PackageProvider> Linker<P> {
             }
         }
         let mut packages = self.packages.locate_many(&names, self.jobs)?;
-        packages.retain(|package| !self.packages.is_target_provided(package));
+        packages.retain(|package| !self.packages.is_external(package));
         if !packages.is_empty() {
             self.packages.prefetch_indexes(&packages, self.jobs)?;
         }
@@ -446,7 +951,7 @@ impl<P: PackageProvider> Linker<P> {
                     binding,
                 } => {
                     let package = self.packages.locate(&id.name)?;
-                    if self.packages.is_target_provided(&package) {
+                    if self.packages.is_external(&package) {
                         continue;
                     }
                     let image = self.binding_image(&package, &binding)?;
@@ -476,7 +981,7 @@ impl<P: PackageProvider> Linker<P> {
                     binding,
                 } => {
                     let package = self.packages.locate(&id.name)?;
-                    if self.packages.is_target_provided(&package) {
+                    if self.packages.is_external(&package) {
                         continue;
                     }
                     let image = self.image(&package)?;
@@ -509,7 +1014,7 @@ impl<P: PackageProvider> Linker<P> {
                     closure,
                 } => {
                     let package = self.packages.locate(&id.name)?;
-                    if self.packages.is_target_provided(&package) {
+                    if self.packages.is_external(&package) {
                         continue;
                     }
                     let image = self.image(&package)?;
@@ -553,6 +1058,29 @@ impl<P: PackageProvider> Linker<P> {
                 Arc::clone(&closure.source),
             );
             self.source_ids.insert(key.clone(), source.clone());
+            let normalized = self.packages.normalize_syntax(closure.source.as_ref())?;
+            let normalized_again = self.packages.normalize_syntax(&normalized)?;
+            if normalized != normalized_again {
+                self.diagnostic(
+                    owner_node,
+                    &id,
+                    Some(&owner_binding),
+                    RejectCode::InvalidInstalledRepresentation,
+                    format!(
+                        "target-R canonical source for {source_key} is not stable across parse/deparse"
+                    ),
+                    Some(Span::new(source.clone(), 0, closure.source.len())),
+                );
+                self.parsed_bindings.insert(key, ParseState::Blocked);
+                continue;
+            }
+            self.normalized_shapes.insert(
+                key.clone(),
+                Digest(format!(
+                    "{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(normalized.as_bytes())
+                )),
+            );
             work.push(Work {
                 key,
                 owner_binding,
@@ -656,8 +1184,8 @@ impl<P: PackageProvider> Linker<P> {
             closure,
         };
         let node = self.need_node(&need);
-        if self.packages.is_target_provided(&package) {
-            self.target_provided.insert(package.id.clone());
+        if self.packages.is_external(&package) {
+            self.external.insert(package.id.clone());
             return Ok(());
         }
         let image = self.image(&package)?;
@@ -722,8 +1250,8 @@ impl<P: PackageProvider> Linker<P> {
             package: id.clone(),
             binding: binding.clone(),
         });
-        if self.packages.is_target_provided(&package) {
-            self.target_provided.insert(package.id.clone());
+        if self.packages.is_external(&package) {
+            self.external.insert(package.id.clone());
             return Ok(());
         }
         let image = self.binding_image(&package, &binding)?;
@@ -732,8 +1260,10 @@ impl<P: PackageProvider> Linker<P> {
                 self.ensure_on_load_analyzed(&id)?;
             }
             if self
-                .activation_bindings
-                .contains(&(id.clone(), binding.clone()))
+                .namespace_builders
+                .get(&id)
+                .is_some_and(|namespace| namespace.contains(&binding))
+                && !image.index.binding_names.contains(&binding)
             {
                 let lifecycle = self.need_node(&Need::Lifecycle {
                     package: id.clone(),
@@ -776,7 +1306,7 @@ impl<P: PackageProvider> Linker<P> {
                         );
                         return Ok(());
                     }
-                    ResolvedName::TargetProvided {
+                    ResolvedName::External {
                         package,
                         binding: foreign_binding,
                     } => {
@@ -791,7 +1321,7 @@ impl<P: PackageProvider> Linker<P> {
                             node,
                             external,
                             EdgeKind::Export,
-                            format!("root re-export `{binding}` resolves to target-provided `{foreign_binding}`"),
+                            format!("root re-export `{binding}` resolves to External `{foreign_binding}`"),
                         );
                         return Ok(());
                     }
@@ -856,38 +1386,6 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         };
-
-        if !self.is_root(&id) {
-            for registration in image
-                .index
-                .s3
-                .iter()
-                .filter(|registration| registration.method == binding)
-            {
-                if let Some((package_name, _generic)) = registration.generic.split_once("::")
-                    && self.package_is_suggested_only(&image.index, package_name)?
-                    && !self.optional_package_selected(package_name)
-                {
-                    continue;
-                }
-                self.require(
-                    node,
-                    Need::S3Registration {
-                        package: id.clone(),
-                        registration: S3Id {
-                            generic: registration.generic.clone(),
-                            class: registration.class.clone(),
-                            method: registration.method.clone(),
-                        },
-                    },
-                    EdgeKind::S3Registration,
-                    format!(
-                        "retained method `{binding}` requires its {}/{} registration",
-                        registration.generic, registration.class
-                    ),
-                );
-            }
-        }
 
         let object_issues = binding_image
             .issues
@@ -987,8 +1485,8 @@ impl<P: PackageProvider> Linker<P> {
             environment: environment.clone(),
             binding: binding.clone(),
         });
-        if self.packages.is_target_provided(&package) {
-            self.target_provided.insert(package.id.clone());
+        if self.packages.is_external(&package) {
+            self.external.insert(package.id.clone());
             return Ok(());
         }
         let image = self.image(&package)?;
@@ -1168,8 +1666,8 @@ impl<P: PackageProvider> Linker<P> {
                         continue;
                     }
                     match self.packages.locate_optional(package)? {
-                        Some(candidate) if self.packages.is_target_provided(&candidate) => {
-                            self.target_provided.insert(candidate.id);
+                        Some(candidate) if self.packages.is_external(&candidate) => {
+                            self.external.insert(candidate.id);
                         }
                         _ => return Ok(false),
                     }
@@ -2138,8 +2636,10 @@ impl<P: PackageProvider> Linker<P> {
                     lexical_environment,
                     active,
                 )? && self
-                    .activation_bindings
-                    .insert((package.id.clone(), active.name.clone()))
+                    .namespace_builders
+                    .get_mut(&package.id)
+                    .expect("namespace builder initialized")
+                    .add_binding(active.name.clone())
                 {
                     self.non_returning_bindings.remove(&package.id);
                 }
@@ -2227,6 +2727,32 @@ impl<P: PackageProvider> Linker<P> {
                 if !self.guards_active(image, &call.guards)? {
                     continue;
                 }
+                self.block_s3_dispatch(node, package, image, binding, lexical_environment, call)?;
+                if matches!(call.callee.as_str(), "UseMethod" | "NextMethod")
+                    && call.qualified_package.is_none()
+                    && matches!(
+                        self.resolve_lexical_name(
+                            package,
+                            image,
+                            lexical_environment,
+                            &call.callee,
+                        )?,
+                        ResolvedName::Base(_)
+                    )
+                {
+                    self.diagnostic(
+                        node,
+                        &package.id,
+                        Some(binding),
+                        RejectCode::ObjectSystem,
+                        format!(
+                            "{} has no complete statically proven receiver class and dispatch chain",
+                            call.callee
+                        ),
+                        Some(call.span.clone()),
+                    );
+                    continue;
+                }
                 self.semantic_call(node, package, image, binding, lexical_environment, call)?;
             }
             for effect in &expression.effects {
@@ -2259,6 +2785,64 @@ impl<P: PackageProvider> Linker<P> {
                         );
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn block_s3_dispatch(
+        &mut self,
+        from: NodeId,
+        current: &InstalledPackage,
+        image: &PackageImage,
+        owner_binding: &str,
+        lexical_environment: &str,
+        call: &CallSite,
+    ) -> Result<()> {
+        let Some(Some(StaticArg::Symbol(receiver))) = call.args.first() else {
+            return Ok(());
+        };
+        let ResolvedName::PackageBinding { package, binding } =
+            self.resolve_lexical_name(current, image, lexical_environment, receiver)?
+        else {
+            return Ok(());
+        };
+        let receiver_package = self.packages.locate(&package.name)?;
+        let receiver_image = self.binding_image(&receiver_package, &binding)?;
+        let Some(receiver) = receiver_image.binding(&binding) else {
+            return Ok(());
+        };
+        if receiver.classes.is_empty() {
+            return Ok(());
+        }
+        let registrations = self
+            .namespace_builders
+            .iter()
+            .flat_map(|(package, namespace)| {
+                namespace
+                    .registrations
+                    .iter()
+                    .filter(|registration| registration.generic.name == call.callee)
+                    .map(|registration| (package.clone(), registration.clone()))
+            })
+            .collect::<Vec<_>>();
+        for class in &receiver.classes {
+            if let Some((_package, registration)) = registrations
+                .iter()
+                .find(|(_, registration)| &registration.class == class)
+            {
+                self.diagnostic(
+                    from,
+                    &current.id,
+                    Some(owner_binding),
+                    RejectCode::ObjectSystem,
+                    format!(
+                        "reachable S3 dispatch {}/{} -> {} is outside PureRStatic",
+                        registration.generic, class, registration.method
+                    ),
+                    Some(call.span.clone()),
+                );
+                return Ok(());
             }
         }
         Ok(())
@@ -2321,6 +2905,29 @@ impl<P: PackageProvider> Linker<P> {
             Arc::clone(&source_text),
         );
         self.source_ids.insert(key.clone(), source.clone());
+        let normalized = self.packages.normalize_syntax(source_text.as_ref())?;
+        let normalized_again = self.packages.normalize_syntax(&normalized)?;
+        if normalized != normalized_again {
+            self.diagnostic(
+                owner_node,
+                id,
+                Some(owner_binding),
+                RejectCode::InvalidInstalledRepresentation,
+                format!(
+                    "target-R canonical source for {source_key} is not stable across parse/deparse"
+                ),
+                Some(Span::new(source.clone(), 0, source_text.len())),
+            );
+            self.parsed_bindings.insert(key, ParseState::Blocked);
+            return Ok(None);
+        }
+        self.normalized_shapes.insert(
+            key.clone(),
+            Digest(format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(normalized.as_bytes())
+            )),
+        );
         match OakParser.parse_binding_with_context(source, source_text.as_ref(), &context) {
             Ok(parsed) => {
                 let parsed = Arc::new(parsed);
@@ -2390,10 +2997,11 @@ impl<P: PackageProvider> Linker<P> {
 
     fn ensure_on_load_analyzed(&mut self, id: &PackageId) -> Result<()> {
         let package = self.packages.locate(&id.name)?;
-        if self.packages.is_target_provided(&package) {
+        if self.packages.is_external(&package) {
             return Ok(());
         }
-        let index = self.packages.index(&package)?;
+        let image = self.image(&package)?;
+        let index = Arc::new(image.index.clone());
         if !index.lifecycle.on_load {
             return Ok(());
         }
@@ -2453,11 +3061,12 @@ impl<P: PackageProvider> Linker<P> {
 
     fn process_activation(&mut self, id: PackageId) -> Result<()> {
         let package = self.packages.locate(&id.name)?;
-        if self.packages.is_target_provided(&package) {
-            self.target_provided.insert(package.id.clone());
+        if self.packages.is_external(&package) {
+            self.external.insert(package.id.clone());
             return Ok(());
         }
-        let index = self.packages.index(&package)?;
+        let image = self.image(&package)?;
+        let index = Arc::new(image.index.clone());
         let node = self.need_node(&Need::Activation {
             package: id.clone(),
         });
@@ -2465,31 +3074,61 @@ impl<P: PackageProvider> Linker<P> {
         // Dependency declarations are lookup metadata, not reachability roots.
         // A retained binding that resolves through an import will demand the
         // exact foreign activation/binding. Unused Imports/Depends stay cold.
-        if self.is_root(&id) {
-            for registration in &index.s3 {
-                if let Some((package_name, _generic)) = registration.generic.split_once("::")
-                    && self.package_is_suggested_only(&index, package_name)?
-                    && !self.optional_package_selected(package_name)
-                {
-                    continue;
-                }
-                self.require(
-                    node,
-                    Need::S3Registration {
-                        package: id.clone(),
-                        registration: S3Id {
-                            generic: registration.generic.clone(),
-                            class: registration.class.clone(),
-                            method: registration.method.clone(),
-                        },
-                    },
-                    EdgeKind::S3Registration,
-                    format!(
-                        "root activation registers {}/{}",
-                        registration.generic, registration.class
-                    ),
-                );
+        for registration in &index.s3 {
+            if let Some(package_name) = registration.generic.package.as_deref()
+                && self.package_is_suggested_only(&index, package_name)?
+                && !self.optional_package_selected(package_name)
+            {
+                continue;
             }
+            let generic_package = match registration.generic.package.as_deref() {
+                Some(name) => match self.packages.locate_optional(name)? {
+                    Some(package) => Some(package.id),
+                    None => {
+                        self.record_missing_package(
+                            node,
+                            &id,
+                            name,
+                            EdgeKind::S3Registration,
+                            format!(
+                                "S3 registration requires generic `{}`",
+                                registration.generic
+                            ),
+                            None,
+                        );
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            // Registration availability is namespace state. Fetch the exact method payload so
+            // finalization can materialize the slot without treating it as executable reachability.
+            let _ = self.binding_image(&package, &registration.method)?;
+            let registration_id = S3Id {
+                generic: GenericId {
+                    package: generic_package,
+                    name: registration.generic.name.clone(),
+                },
+                class: registration.class.clone(),
+                method: registration.method.clone(),
+            };
+            self.namespace_builders
+                .get_mut(&id)
+                .expect("namespace builder initialized")
+                .registrations
+                .push(registration_id.clone());
+            self.require(
+                node,
+                Need::S3Registration {
+                    package: id.clone(),
+                    registration: registration_id,
+                },
+                EdgeKind::S3Registration,
+                format!(
+                    "namespace activation registers {}/{}",
+                    registration.generic, registration.class
+                ),
+            );
         }
 
         for native in &index.dynlibs {
@@ -2519,10 +3158,11 @@ impl<P: PackageProvider> Linker<P> {
 
     fn process_resource(&mut self, id: PackageId, resource: String) -> Result<()> {
         let package = self.packages.locate(&id.name)?;
-        if self.packages.is_target_provided(&package) {
-            self.target_provided.insert(package.id.clone());
+        if self.packages.is_external(&package) {
+            self.external.insert(package.id.clone());
             return Ok(());
         }
+        let _ = self.image(&package)?;
         let _present = self.packages.resource_exists(&package, &resource)?;
         // An absent system.file() path is a valid result when mustWork is false
         // (the default). The reference is retained only when the installed
@@ -2532,8 +3172,8 @@ impl<P: PackageProvider> Linker<P> {
 
     fn process_dataset(&mut self, id: PackageId, dataset: String) -> Result<()> {
         let package = self.packages.locate(&id.name)?;
-        if self.packages.is_target_provided(&package) {
-            self.target_provided.insert(package.id.clone());
+        if self.packages.is_external(&package) {
+            self.external.insert(package.id.clone());
             return Ok(());
         }
         let image = self.image(&package)?;
@@ -2559,51 +3199,26 @@ impl<P: PackageProvider> Linker<P> {
             package: id.clone(),
             registration: registration.clone(),
         });
-        self.require(
-            node,
-            Need::Binding {
-                package: id.clone(),
-                binding: registration.method.clone(),
-            },
-            EdgeKind::S3Registration,
-            format!(
-                "S3 registration {}/{} requires method {}",
-                registration.generic, registration.class, registration.method
-            ),
-        );
-        if let Some((package_name, _generic)) = registration.generic.split_once("::") {
-            match self.packages.locate_optional(package_name)? {
-                Some(generic_package) => self.require(
-                    node,
-                    Need::Activation {
-                        package: generic_package.id,
-                    },
-                    EdgeKind::S3Registration,
-                    format!(
-                        "S3 generic `{}` requires its namespace",
-                        registration.generic
-                    ),
+        if let Some(generic_package) = &registration.generic.package {
+            self.require(
+                node,
+                Need::Activation {
+                    package: generic_package.clone(),
+                },
+                EdgeKind::S3Registration,
+                format!(
+                    "S3 generic `{}` requires its namespace",
+                    registration.generic
                 ),
-                None => self.record_missing_package(
-                    node,
-                    &id,
-                    package_name,
-                    EdgeKind::S3Registration,
-                    format!(
-                        "S3 registration requires generic `{}`",
-                        registration.generic
-                    ),
-                    None,
-                ),
-            }
+            );
         }
         Ok(())
     }
 
     fn process_native(&mut self, id: PackageId, component: String) -> Result<()> {
         let package = self.packages.locate(&id.name)?;
-        if self.packages.is_target_provided(&package) {
-            self.target_provided.insert(package.id.clone());
+        if self.packages.is_external(&package) {
+            self.external.insert(package.id.clone());
             return Ok(());
         }
         let index = self.packages.index(&package)?;
@@ -2734,8 +3349,8 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         }
-        if self.packages.is_target_provided(&foreign) {
-            self.target_provided.insert(foreign.id.clone());
+        if self.packages.is_external(&foreign) {
+            self.external.insert(foreign.id.clone());
             let external = self.graph.add_node(
                 &foreign.id.name,
                 NodeKind::ExternalBinding {
@@ -2748,7 +3363,7 @@ impl<P: PackageProvider> Linker<P> {
                 external,
                 EdgeKind::PackageQualified,
                 format!(
-                    "{} access to target-provided binding",
+                    "{} access to External binding",
                     if reference.internal { ":::" } else { "::" }
                 ),
                 Some(reference.span.clone()),
@@ -2789,12 +3404,13 @@ impl<P: PackageProvider> Linker<P> {
             ),
             Some(reference.span.clone()),
         );
-        self.rewrites.push(Rewrite::NamespaceAccess {
-            source: reference.span.clone(),
-            package: foreign.id,
-            binding,
-            internal: reference.internal,
-        });
+        self.pending_relocations
+            .push(PendingRelocation::NamespaceAccess {
+                source: reference.span.clone(),
+                package: foreign.id,
+                binding,
+                internal: reference.internal,
+            });
         Ok(())
     }
 
@@ -2843,8 +3459,8 @@ impl<P: PackageProvider> Linker<P> {
             );
             return Ok(());
         };
-        if self.packages.is_target_provided(&foreign) {
-            self.target_provided.insert(foreign.id.clone());
+        if self.packages.is_external(&foreign) {
+            self.external.insert(foreign.id.clone());
             return Ok(());
         }
         let Some(path) = &resource.path else {
@@ -2895,16 +3511,17 @@ impl<P: PackageProvider> Linker<P> {
             format!("system.file requires {package_name}/{path}"),
             Some(resource.span.clone()),
         );
-        self.rewrites.push(Rewrite::ResourceAccess {
-            source: resource.span.clone(),
-            package: foreign.id,
-            resource: path.clone(),
-        });
+        self.pending_relocations
+            .push(PendingRelocation::ResourceAccess {
+                source: resource.span.clone(),
+                package: foreign.id,
+                resource: path.clone(),
+            });
         Ok(())
     }
 
     fn optional_package_selected(&self, name: &str) -> bool {
-        self.extra_packages.contains(name)
+        self.extra_packages.contains(name) || self.explicit_external_packages.contains(name)
     }
 
     fn package_is_suggested_only(&mut self, index: &PackageIndex, name: &str) -> Result<bool> {
@@ -3088,7 +3705,7 @@ impl<P: PackageProvider> Linker<P> {
                         Some(call.span.clone()),
                     );
                 }
-                ResolvedName::TargetProvided { package, binding: callback } => {
+                ResolvedName::External { package, binding: callback } => {
                     let target = self.graph.add_node(
                         package.name,
                         NodeKind::ExternalBinding { name: callback.clone() },
@@ -3098,7 +3715,7 @@ impl<P: PackageProvider> Linker<P> {
                         native_node,
                         target,
                         EdgeKind::Callback,
-                        format!("native routine `{selector}` invokes target-provided callback argument #{position} `{callback}`"),
+                        format!("native routine `{selector}` invokes External callback argument #{position} `{callback}`"),
                         Some(call.span.clone()),
                     );
                 }
@@ -3187,7 +3804,7 @@ impl<P: PackageProvider> Linker<P> {
             | ResolvedName::PackageBinding { .. }
             | ResolvedName::PrivateBinding { .. }
             | ResolvedName::Imported { .. }
-            | ResolvedName::TargetProvided { .. }
+            | ResolvedName::External { .. }
             | ResolvedName::PackageMetadata { .. }
             | ResolvedName::MissingPackage { .. }
             | ResolvedName::Base(_) => return Ok(None),
@@ -3312,7 +3929,7 @@ impl<P: PackageProvider> Linker<P> {
             ResolvedName::NativeSymbol { .. }
             | ResolvedName::ClosureObject { .. }
             | ResolvedName::Imported { .. }
-            | ResolvedName::TargetProvided { .. }
+            | ResolvedName::External { .. }
             | ResolvedName::PackageMetadata { .. }
             | ResolvedName::MissingPackage { .. }
             | ResolvedName::Base(_)
@@ -3354,6 +3971,8 @@ impl<P: PackageProvider> Linker<P> {
                 | "packageEvent"
                 | "makeActiveBinding"
                 | "environment"
+                | "UseMethod"
+                | "NextMethod"
         )
     }
 
@@ -3459,7 +4078,7 @@ impl<P: PackageProvider> Linker<P> {
                     );
                     return Ok(());
                 };
-                if self.is_root(&current.id) && name == current.id.name {
+                if name == current.id.name {
                     return Ok(());
                 }
                 let operation = match call.callee.as_str() {
@@ -3473,11 +4092,12 @@ impl<P: PackageProvider> Linker<P> {
                 let discovery_policy = if self.optional_package_selected(&name) {
                     DiscoveryPolicy::Internalize
                 } else if suggested && call.callee == "requireNamespace" {
-                    self.rewrites.push(Rewrite::PackageOperation {
-                        source: call.span.clone(),
-                        package: None,
-                        operation: PackageOperation::RequireNamespace { result: false },
-                    });
+                    self.pending_relocations
+                        .push(PendingRelocation::PackageOperation {
+                            source: call.span.clone(),
+                            package: None,
+                            operation: PackageOperation::RequireNamespace { result: false },
+                        });
                     return Ok(());
                 } else if suggested {
                     return Ok(());
@@ -3490,27 +4110,31 @@ impl<P: PackageProvider> Linker<P> {
                         &current.id,
                         None,
                         RejectCode::DynamicPackageDiscovery,
-                        format!("reachable {} for `{name}` is not specialized by policy", call.callee),
+                        format!(
+                            "reachable {} for `{name}` is not specialized by policy",
+                            call.callee
+                        ),
                         Some(call.span.clone()),
                     ),
-                    DiscoveryPolicy::TargetProvidedOnly => match self.packages.locate_optional(&name)? {
-                        Some(foreign) if self.packages.is_target_provided(&foreign) => {
-                            self.target_provided.insert(foreign.id);
+                    DiscoveryPolicy::ExternalOnly => match self.packages.locate_optional(&name)? {
+                        Some(foreign) if self.packages.is_external(&foreign) => {
+                            self.external.insert(foreign.id);
                         }
                         Some(_) => self.diagnostic(
                             from,
                             &current.id,
                             None,
                             RejectCode::DynamicPackageDiscovery,
-                            format!("`{name}` is installed but is not an exact target-provided namespace"),
+                            format!("`{name}` is installed but is not configured External"),
                             Some(call.span.clone()),
                         ),
                         None if call.callee == "requireNamespace" => {
-                            self.rewrites.push(Rewrite::PackageOperation {
-                                source: call.span.clone(),
-                                package: None,
-                                operation: PackageOperation::RequireNamespace { result: false },
-                            });
+                            self.pending_relocations
+                                .push(PendingRelocation::PackageOperation {
+                                    source: call.span.clone(),
+                                    package: None,
+                                    operation: PackageOperation::RequireNamespace { result: false },
+                                });
                         }
                         None => self.record_missing_package(
                             from,
@@ -3522,29 +4146,35 @@ impl<P: PackageProvider> Linker<P> {
                         ),
                     },
                     DiscoveryPolicy::Internalize => match self.packages.locate_optional(&name)? {
-                        Some(foreign) if self.packages.is_target_provided(&foreign) => {
-                            self.target_provided.insert(foreign.id);
+                        Some(foreign) if self.packages.is_external(&foreign) => {
+                            self.external.insert(foreign.id);
                         }
                         Some(foreign) => {
                             self.require_at(
                                 from,
-                                Need::Activation { package: foreign.id.clone() },
+                                Need::Activation {
+                                    package: foreign.id.clone(),
+                                },
                                 EdgeKind::Discovery,
                                 format!("specialized {} requires `{name}`", call.callee),
                                 Some(call.span.clone()),
                             );
-                            self.rewrites.push(Rewrite::PackageOperation {
-                                source: call.span.clone(),
-                                package: Some(foreign.id),
-                                operation,
-                            });
+                            self.pending_relocations
+                                .push(PendingRelocation::PackageOperation {
+                                    source: call.span.clone(),
+                                    package: Some(foreign.id),
+                                    operation,
+                                });
                         }
-                        None if call.callee == "requireNamespace" && !self.optional_package_selected(&name) => {
-                            self.rewrites.push(Rewrite::PackageOperation {
-                                source: call.span.clone(),
-                                package: None,
-                                operation: PackageOperation::RequireNamespace { result: false },
-                            });
+                        None if call.callee == "requireNamespace"
+                            && !self.optional_package_selected(&name) =>
+                        {
+                            self.pending_relocations
+                                .push(PendingRelocation::PackageOperation {
+                                    source: call.span.clone(),
+                                    package: None,
+                                    operation: PackageOperation::RequireNamespace { result: false },
+                                });
                         }
                         None => self.record_missing_package(
                             from,
@@ -3559,6 +4189,17 @@ impl<P: PackageProvider> Linker<P> {
             }
             "packageVersion" => self.identity_query(from, current, image, call, true)?,
             "find.package" => self.identity_query(from, current, image, call, false)?,
+            "UseMethod" | "NextMethod" => self.diagnostic(
+                from,
+                &current.id,
+                Some(binding),
+                RejectCode::ObjectSystem,
+                format!(
+                    "{} has no complete statically proven receiver class and dispatch chain",
+                    call.callee
+                ),
+                Some(call.span.clone()),
+            ),
             ".Call" | ".External" | ".C" | ".Fortran" => {
                 if let Some(target) =
                     self.native_component_for_call(current, image, lexical_environment, call)?
@@ -3668,16 +4309,16 @@ impl<P: PackageProvider> Linker<P> {
                 ),
                 Some(call.span.clone()),
             ),
-            DiscoveryPolicy::TargetProvidedOnly => match self.packages.locate_optional(name)? {
-                Some(foreign) if self.packages.is_target_provided(&foreign) => {
-                    self.target_provided.insert(foreign.id);
+            DiscoveryPolicy::ExternalOnly => match self.packages.locate_optional(name)? {
+                Some(foreign) if self.packages.is_external(&foreign) => {
+                    self.external.insert(foreign.id);
                 }
                 Some(_) => self.diagnostic(
                     from,
                     &current.id,
                     None,
                     RejectCode::DynamicPackageDiscovery,
-                    format!("package identity query for `{name}` is not target-provided"),
+                    format!("package identity query for `{name}` is not External"),
                     Some(call.span.clone()),
                 ),
                 None => self.record_missing_package(
@@ -3690,8 +4331,8 @@ impl<P: PackageProvider> Linker<P> {
                 ),
             },
             DiscoveryPolicy::Internalize => match self.packages.locate_optional(name)? {
-                Some(foreign) if self.packages.is_target_provided(&foreign) => {
-                    self.target_provided.insert(foreign.id);
+                Some(foreign) if self.packages.is_external(&foreign) => {
+                    self.external.insert(foreign.id);
                 }
                 Some(foreign) => {
                     let operation = if version {
@@ -3701,11 +4342,12 @@ impl<P: PackageProvider> Linker<P> {
                     } else {
                         PackageOperation::FindPackage
                     };
-                    self.rewrites.push(Rewrite::PackageOperation {
-                        source: call.span.clone(),
-                        package: Some(foreign.id),
-                        operation,
-                    });
+                    self.pending_relocations
+                        .push(PendingRelocation::PackageOperation {
+                            source: call.span.clone(),
+                            package: Some(foreign.id),
+                            operation,
+                        });
                 }
                 None => self.record_missing_package(
                     from,
@@ -3766,10 +4408,10 @@ impl<P: PackageProvider> Linker<P> {
         let mut namespace_shadowed = BTreeSet::new();
         namespace_shadowed.extend(image.bindings.keys().cloned());
         namespace_shadowed.extend(
-            self.activation_bindings
+            self.namespace_builders[&image.index.package.id]
+                .bindings
                 .iter()
-                .filter(|(package, _)| package == &image.index.package.id)
-                .map(|(_, binding)| binding.clone()),
+                .cloned(),
         );
         for component in &image.index.dynlibs {
             namespace_shadowed.extend(
@@ -3821,10 +4463,10 @@ impl<P: PackageProvider> Linker<P> {
         let mut shadowed = BTreeSet::new();
         shadowed.extend(image.index.binding_names.iter().cloned());
         shadowed.extend(
-            self.activation_bindings
+            self.namespace_builders[&image.index.package.id]
+                .bindings
                 .iter()
-                .filter(|(package, _)| package == &image.index.package.id)
-                .map(|(_, binding)| binding.clone()),
+                .cloned(),
         );
         for component in &image.index.dynlibs {
             shadowed.extend(
@@ -4021,9 +4663,9 @@ impl<P: PackageProvider> Linker<P> {
                         binding: Some(name.to_owned()),
                     });
                 };
-                if self.packages.is_target_provided(&foreign) {
-                    self.target_provided.insert(foreign.id.clone());
-                    return Ok(ResolvedName::TargetProvided {
+                if self.packages.is_external(&foreign) {
+                    self.external.insert(foreign.id.clone());
+                    return Ok(ResolvedName::External {
                         package: foreign.id,
                         binding: name.to_owned(),
                     });
@@ -4066,8 +4708,9 @@ impl<P: PackageProvider> Linker<P> {
             .iter()
             .any(|binding| binding == name)
             || self
-                .activation_bindings
-                .contains(&(current.id.clone(), name.to_owned()))
+                .namespace_builders
+                .get(&current.id)
+                .is_some_and(|namespace| namespace.contains(name))
         {
             return Ok(ResolvedName::PackageBinding {
                 package: current.id.clone(),
@@ -4095,9 +4738,9 @@ impl<P: PackageProvider> Linker<P> {
                         binding: Some(binding),
                     });
                 };
-                return Ok(if self.packages.is_target_provided(&foreign) {
-                    self.target_provided.insert(foreign.id.clone());
-                    ResolvedName::TargetProvided {
+                return Ok(if self.packages.is_external(&foreign) {
+                    self.external.insert(foreign.id.clone());
+                    ResolvedName::External {
                         package: foreign.id,
                         binding,
                     }
@@ -4200,7 +4843,7 @@ impl<P: PackageProvider> Linker<P> {
                     Some(span.clone()),
                 );
             }
-            ResolvedName::TargetProvided { package, binding } => {
+            ResolvedName::External { package, binding } => {
                 let node = self.graph.add_node(
                     package.name.clone(),
                     NodeKind::ExternalBinding {
@@ -4212,7 +4855,7 @@ impl<P: PackageProvider> Linker<P> {
                     from,
                     node,
                     EdgeKind::Import,
-                    format!("target-provided imported binding `{binding}`"),
+                    format!("External imported binding `{binding}`"),
                     Some(span),
                 );
             }
@@ -4337,7 +4980,7 @@ impl<P: PackageProvider> Linker<P> {
                 name: dataset.clone(),
             },
             Need::S3Registration { registration, .. } => NodeKind::S3Registration {
-                generic: registration.generic.clone(),
+                generic: registration.generic.to_string(),
                 class: registration.class.clone(),
             },
             Need::Native { component, .. } => NodeKind::NativeComponent {
@@ -4402,17 +5045,17 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     fn finalize_syntax_observations(&mut self) {
-        if self.observations.is_empty() || self.rewrites.is_empty() {
+        if self.observations.is_empty() || self.pending_relocations.is_empty() {
             return;
         }
-        let rewrites = self
-            .rewrites
+        let pending_relocations = self
+            .pending_relocations
             .iter()
-            .map(rewrite_span)
+            .map(pending_relocation_span)
             .cloned()
             .collect::<Vec<_>>();
         for observation in self.observations.clone() {
-            if rewrites
+            if pending_relocations
                 .iter()
                 .any(|rewrite| spans_overlap(&observation.span, rewrite))
             {
@@ -4432,6 +5075,59 @@ impl<P: PackageProvider> Linker<P> {
     }
 }
 
+impl LinkIr {
+    /// Immutable semantic construction authority produced by finalization.
+    pub fn program(&self) -> &ProgramIr {
+        &self.program
+    }
+
+    /// Successful typed derivations used only by explanation/query consumers.
+    pub fn provenance(&self) -> &crate::ir::ProvenanceIr {
+        &self.provenance
+    }
+
+    /// Complete accumulated semantic blockers.
+    pub fn blockers(&self) -> &crate::ir::AnalysisBlockerSet {
+        &self.blockers
+    }
+
+    /// Diagnostic source map retained for provenance rendering only.
+    pub fn sources(&self) -> &Sources {
+        &self.sources
+    }
+}
+
+fn diagnostic_blocker(diagnostic: &Diagnostic) -> crate::ir::AnalysisBlocker {
+    use crate::ir::AnalysisBlocker;
+    match diagnostic.code {
+        RejectCode::ActiveBinding => AnalysisBlocker::UnsupportedActiveBinding {
+            binding: diagnostic.binding.clone().unwrap_or_default(),
+        },
+        RejectCode::ObjectSystem => AnalysisBlocker::UnsupportedObjectSystem {
+            site: diagnostic.span.clone(),
+        },
+        RejectCode::UnknownNativeEffects | RejectCode::UnknownNativeLookup => {
+            AnalysisBlocker::UnsupportedNative {
+                component: diagnostic.message.clone(),
+            }
+        }
+        RejectCode::UnknownClosureEnclosure => AnalysisBlocker::MutableClosureEnclosure {
+            site: diagnostic.span.clone(),
+        },
+        RejectCode::EnvironmentMutation => AnalysisBlocker::OpenEnvironmentShape {
+            site: diagnostic.span.clone(),
+        },
+        RejectCode::DynamicLookup | RejectCode::DynamicPackageDiscovery => {
+            AnalysisBlocker::OpenCallable {
+                site: diagnostic.span.clone(),
+            }
+        }
+        _ => AnalysisBlocker::UnsupportedRootTransformation {
+            detail: format!("{:?}: {}", diagnostic.code, diagnostic.message),
+        },
+    }
+}
+
 fn is_r_constant(name: &str) -> bool {
     matches!(
         name,
@@ -4448,12 +5144,59 @@ fn is_r_constant(name: &str) -> bool {
     )
 }
 
-fn rewrite_span(rewrite: &Rewrite) -> &Span {
+fn pending_relocation_span(rewrite: &PendingRelocation) -> &Span {
     match rewrite {
-        Rewrite::NamespaceAccess { source, .. }
-        | Rewrite::ResourceAccess { source, .. }
-        | Rewrite::PackageOperation { source, .. } => source,
+        PendingRelocation::NamespaceAccess { source, .. }
+        | PendingRelocation::ResourceAccess { source, .. }
+        | PendingRelocation::PackageOperation { source, .. } => source,
     }
+}
+
+fn namespace_directive_name(name: &str) -> String {
+    if name.bytes().enumerate().all(|(index, byte)| {
+        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.' && index > 0
+    }) {
+        name.to_owned()
+    } else {
+        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+fn rewrite_description_imports(source: &str, contracts: &[ExternalPackageContract]) -> String {
+    let imports = contracts
+        .iter()
+        .flat_map(|contract| contract.requirements.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut index = 0;
+    let mut inserted = false;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.starts_with("Imports:") {
+            if !imports.is_empty() {
+                output.push(format!("Imports: {imports}"));
+            }
+            inserted = true;
+            index += 1;
+            while index < lines.len()
+                && lines[index].chars().next().is_some_and(char::is_whitespace)
+            {
+                index += 1;
+            }
+            continue;
+        }
+        output.push(line.to_owned());
+        index += 1;
+    }
+    if !inserted && !imports.is_empty() {
+        output.push(format!("Imports: {imports}"));
+    }
+    let mut result = output.join("\n");
+    result.push('\n');
+    result
 }
 
 fn spans_overlap(left: &Span, right: &Span) -> bool {

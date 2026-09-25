@@ -1,15 +1,15 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
-use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 
-use slinker::analysis::{Edge, ExplanationDag, LinkPlan, Linker, Need, NodeId, NodeKind};
-use slinker::build::Rewrite;
+use slinker::analysis::{Edge, ExplanationDag, LinkIr, Linker, NodeId, NodeKind};
+use slinker::build::{BuildContext, PureRStatic, materialize};
 use slinker::package::PackageStore;
+use slinker::source::{SourcePackageSnapshot, stage_root};
 use slinker::{TargetEnvironment, TargetEnvironmentRequest};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -47,6 +47,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Analyze(args) => analyze(&args),
+        Command::Build(args) => build(&args),
         Command::Why(args) => explain_why(&args),
         Command::Path(args) => explain_paths(&args),
     }
@@ -54,6 +55,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
+    Build(BuildArgs),
     Analyze(AnalyzeArgs),
     Why(QueryArgs),
     Path(QueryArgs),
@@ -62,15 +64,22 @@ enum Command {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+struct BuildArgs {
+    input: PathBuf,
+    output: Option<PathBuf>,
+    libraries: Vec<PathBuf>,
+    external: BTreeSet<String>,
+    jobs: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 struct AnalyzeArgs {
     root: String,
     libraries: Vec<PathBuf>,
-    target_provided: BTreeSet<String>,
+    external: BTreeSet<String>,
     extra_pkgs: BTreeSet<String>,
     jobs: usize,
     graph: bool,
-    dump_graph: Option<PathBuf>,
-    dump_objects: Option<PathBuf>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -78,7 +87,7 @@ struct QueryArgs {
     root: String,
     target: String,
     libraries: Vec<PathBuf>,
-    target_provided: BTreeSet<String>,
+    external: BTreeSet<String>,
     extra_pkgs: BTreeSet<String>,
     jobs: usize,
 }
@@ -98,10 +107,91 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Comm
             Ok(Command::Version)
         }
         Some("analyze") => parse_analyze_args(args).map(Command::Analyze),
+        Some("build") => parse_build_args(args).map(Command::Build),
         Some("why") => parse_query_args(args).map(Command::Why),
         Some("path") => parse_query_args(args).map(Command::Path),
-        _ => Err(CliError::Usage("expected `analyze`, `why`, or `path`")),
+        _ => Err(CliError::Usage(
+            "expected `build`, `analyze`, `why`, or `path`",
+        )),
     }
+}
+
+fn parse_build_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<BuildArgs, CliError> {
+    let mut args = args.peekable();
+    let mut input = None;
+    let mut output = None;
+    let mut libraries = Vec::new();
+    let mut external = BTreeSet::new();
+    let mut jobs = default_jobs();
+    while let Some(argument) = args.next() {
+        let text = argument.to_string_lossy();
+        if text == "--lib" {
+            libraries.push(PathBuf::from(
+                args.next()
+                    .ok_or(CliError::Usage("`--lib` requires a library path"))?,
+            ));
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--lib=") {
+            if value.is_empty() {
+                return Err(CliError::Usage("`--lib` requires a library path"));
+            }
+            libraries.push(value.into());
+            continue;
+        }
+        if text == "--external" {
+            let value = args
+                .next()
+                .ok_or(CliError::Usage("`--external` requires a package list"))?;
+            insert_package_list(&mut external, &value)?;
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--external=") {
+            insert_package_list_str(&mut external, value)?;
+            continue;
+        }
+        if text == "--output" {
+            output = Some(PathBuf::from(
+                args.next()
+                    .ok_or(CliError::Usage("`--output` requires a path"))?,
+            ));
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--output=") {
+            if value.is_empty() {
+                return Err(CliError::Usage("`--output` requires a path"));
+            }
+            output = Some(value.into());
+            continue;
+        }
+        if text == "--jobs" {
+            jobs = parse_jobs(
+                &args
+                    .next()
+                    .ok_or(CliError::Usage("`--jobs` requires a positive integer"))?,
+            )?;
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--jobs=") {
+            jobs = parse_jobs_str(value)?;
+            continue;
+        }
+        if text.starts_with('-') {
+            return Err(CliError::Usage("unknown build option"));
+        }
+        if input.replace(PathBuf::from(argument)).is_some() {
+            return Err(CliError::Usage(
+                "build accepts at most one source package path",
+            ));
+        }
+    }
+    Ok(BuildArgs {
+        input: input.unwrap_or_else(|| PathBuf::from(".")),
+        output,
+        libraries,
+        external,
+        jobs,
+    })
 }
 
 fn parse_analyze_args(
@@ -110,12 +200,10 @@ fn parse_analyze_args(
     let mut args = args.peekable();
     let mut root = None;
     let mut libraries = Vec::new();
-    let mut target_provided = BTreeSet::new();
+    let mut external = BTreeSet::new();
     let mut extra_pkgs = BTreeSet::new();
     let mut jobs = default_jobs();
     let mut graph = false;
-    let mut dump_graph = None;
-    let mut dump_objects = None;
     while let Some(argument) = args.next() {
         let text = argument.to_string_lossy();
         if text == "--lib" {
@@ -132,15 +220,15 @@ fn parse_analyze_args(
             libraries.push(PathBuf::from(value));
             continue;
         }
-        if text == "--target-provided" {
-            let value = args.next().ok_or(CliError::Usage(
-                "`--target-provided` requires a package list",
-            ))?;
-            insert_package_list(&mut target_provided, &value)?;
+        if text == "--external" {
+            let value = args
+                .next()
+                .ok_or(CliError::Usage("`--external` requires a package list"))?;
+            insert_package_list(&mut external, &value)?;
             continue;
         }
-        if let Some(value) = text.strip_prefix("--target-provided=") {
-            insert_package_list_str(&mut target_provided, value)?;
+        if let Some(value) = text.strip_prefix("--external=") {
+            insert_package_list_str(&mut external, value)?;
             continue;
         }
         if text == "--extra-pkgs" {
@@ -166,34 +254,6 @@ fn parse_analyze_args(
             graph = true;
             continue;
         }
-        if text == "--dump-graph" {
-            let value = args
-                .next()
-                .ok_or(CliError::Usage("`--dump-graph` requires an output path"))?;
-            dump_graph = Some(PathBuf::from(value));
-            continue;
-        }
-        if let Some(value) = text.strip_prefix("--dump-graph=") {
-            if value.is_empty() {
-                return Err(CliError::Usage("`--dump-graph` requires an output path"));
-            }
-            dump_graph = Some(PathBuf::from(value));
-            continue;
-        }
-        if text == "--dump-objects" {
-            let value = args
-                .next()
-                .ok_or(CliError::Usage("`--dump-objects` requires an output path"))?;
-            dump_objects = Some(PathBuf::from(value));
-            continue;
-        }
-        if let Some(value) = text.strip_prefix("--dump-objects=") {
-            if value.is_empty() {
-                return Err(CliError::Usage("`--dump-objects` requires an output path"));
-            }
-            dump_objects = Some(PathBuf::from(value));
-            continue;
-        }
         if text.starts_with('-') {
             return Err(CliError::Usage("unknown analyze option"));
         }
@@ -216,12 +276,10 @@ fn parse_analyze_args(
             "analyze requires an installed package name",
         ))?,
         libraries,
-        target_provided,
+        external,
         extra_pkgs,
         jobs,
         graph,
-        dump_graph,
-        dump_objects,
     })
 }
 
@@ -229,7 +287,7 @@ fn parse_query_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Qu
     let mut args = args.peekable();
     let mut positional = Vec::new();
     let mut libraries = Vec::new();
-    let mut target_provided = BTreeSet::new();
+    let mut external = BTreeSet::new();
     let mut extra_pkgs = BTreeSet::new();
     let mut jobs = default_jobs();
     while let Some(argument) = args.next() {
@@ -248,15 +306,15 @@ fn parse_query_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Qu
             libraries.push(PathBuf::from(value));
             continue;
         }
-        if text == "--target-provided" {
-            let value = args.next().ok_or(CliError::Usage(
-                "`--target-provided` requires a package list",
-            ))?;
-            insert_package_list(&mut target_provided, &value)?;
+        if text == "--external" {
+            let value = args
+                .next()
+                .ok_or(CliError::Usage("`--external` requires a package list"))?;
+            insert_package_list(&mut external, &value)?;
             continue;
         }
-        if let Some(value) = text.strip_prefix("--target-provided=") {
-            insert_package_list_str(&mut target_provided, value)?;
+        if let Some(value) = text.strip_prefix("--external=") {
+            insert_package_list_str(&mut external, value)?;
             continue;
         }
         if text == "--extra-pkgs" {
@@ -298,13 +356,13 @@ fn parse_query_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Qu
         root,
         target: positional.remove(0),
         libraries,
-        target_provided,
+        external,
         extra_pkgs,
         jobs,
     })
 }
 
-fn link(args: &AnalyzeArgs) -> Result<(TargetEnvironment, LinkPlan), Box<dyn Error>> {
+fn link(args: &AnalyzeArgs) -> Result<(TargetEnvironment, LinkIr), Box<dyn Error>> {
     let r_home = discover_r_home()?;
     let mut target_request = TargetEnvironmentRequest::new(r_home.clone());
     target_request.libraries = args
@@ -314,21 +372,49 @@ fn link(args: &AnalyzeArgs) -> Result<(TargetEnvironment, LinkPlan), Box<dyn Err
         .collect::<io::Result<Vec<_>>>()?;
     let target = target_request.capture()?;
 
-    let store = PackageStore::new(r_home, target.clone(), args.target_provided.iter().cloned())?;
+    let store = PackageStore::new(r_home, target.clone())?;
     let plan = Linker::new(store, args.jobs)
+        .with_external_packages(args.external.iter().cloned())
         .with_extra_packages(args.extra_pkgs.iter().cloned())
         .analyze(&args.root)?;
     Ok((target, plan))
 }
 
+fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
+    let r_home = discover_r_home()?;
+    let source = SourcePackageSnapshot::capture(&args.input)?;
+    let libraries = args
+        .libraries
+        .iter()
+        .map(|library| absolute_path(library))
+        .collect::<io::Result<Vec<_>>>()?;
+    let staged = stage_root(&source, &r_home, &libraries)?;
+    let mut target_request = TargetEnvironmentRequest::new(r_home.clone());
+    target_request.libraries = std::iter::once(staged.library().to_path_buf())
+        .chain(libraries)
+        .collect();
+    let target = target_request.capture()?;
+    let store = PackageStore::new(r_home.clone(), target.clone())?;
+    let ir = Linker::new(store, args.jobs)
+        .with_external_packages(args.external.iter().cloned())
+        .with_root_source(source.description_source())
+        .analyze(source.package())?;
+    let context = BuildContext::new(source, staged, r_home, target, ir.program())?;
+    let output = args.output.clone().unwrap_or_else(|| {
+        context
+            .source()
+            .original_root()
+            .join("target/slinker")
+            .join(context.source().package())
+    });
+    let buildable = PureRStatic::check(&ir, &context)?;
+    let generated = materialize(buildable, &output)?;
+    println!("{}", generated.path().display());
+    Ok(())
+}
+
 fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
     let (target, plan) = link(args)?;
-    if let Some(path) = &args.dump_graph {
-        fs::write(path, plan.graph.dump())?;
-    }
-    if let Some(path) = &args.dump_objects {
-        fs::write(path, dump_object_graphs(&plan))?;
-    }
     if args.graph {
         let graph = ExplanationDag::from_plan(&plan, &target, &args.root)?;
         let stdout = io::stdout();
@@ -341,31 +427,14 @@ fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn dump_object_graphs(plan: &LinkPlan) -> String {
-    let mut packages = plan.object_graphs.iter().collect::<Vec<_>>();
-    packages.sort_by(|(left, _), (right, _)| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.version.to_string().cmp(&right.version.to_string()))
-    });
-    let mut out = String::new();
-    for (id, graph) in packages {
-        out.push_str(&format!("package {} {}\n", id.name, id.version));
-        out.push_str(&graph.dump());
-    }
-    out
-}
-
 fn query_link_args(args: &QueryArgs) -> AnalyzeArgs {
     AnalyzeArgs {
         root: args.root.clone(),
         libraries: args.libraries.clone(),
-        target_provided: args.target_provided.clone(),
+        external: args.external.clone(),
         extra_pkgs: args.extra_pkgs.clone(),
         jobs: args.jobs,
         graph: false,
-        dump_graph: None,
-        dump_objects: None,
     }
 }
 
@@ -383,8 +452,8 @@ fn explain_why(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
     let best = targets
         .iter()
         .filter_map(|target| {
-            plan.graph
-                .shortest_path(&plan.roots, *target)
+            plan.provenance()
+                .shortest_path(plan.provenance().roots(), *target)
                 .map(|path| (*target, path))
         })
         .min_by_key(|(_, path)| path.len());
@@ -440,7 +509,10 @@ fn explain_paths(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
     for (ordinal, entry) in entries.iter().enumerate() {
         println!();
         println!("path {}:", ordinal + 1);
-        if let Some(mut prefix) = plan.graph.shortest_path(&plan.roots, entry.from) {
+        if let Some(mut prefix) = plan
+            .provenance()
+            .shortest_path(plan.provenance().roots(), entry.from)
+        {
             prefix.push(entry);
             print_edge_path(&plan, &prefix);
         } else {
@@ -457,7 +529,7 @@ fn explain_paths(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn matching_nodes(plan: &LinkPlan, target: &str) -> Vec<NodeId> {
+fn matching_nodes(plan: &LinkIr, target: &str) -> Vec<NodeId> {
     let (package, binding) = if let Some((package, binding)) = target.split_once(":::") {
         (package, Some(binding))
     } else if let Some((package, binding)) = target.split_once("::") {
@@ -465,20 +537,26 @@ fn matching_nodes(plan: &LinkPlan, target: &str) -> Vec<NodeId> {
     } else {
         (target, None)
     };
-    plan.graph
-        .nodes_for_package(package)
-        .filter(|id| match (binding, &plan.graph.nodes[id.0].kind) {
-            (None, _) => true,
-            (
-                Some(name),
-                NodeKind::Binding { name: binding } | NodeKind::ExternalBinding { name: binding },
-            ) => binding == name,
-            _ => false,
-        })
+    plan.provenance()
+        .nodes()
+        .iter()
+        .filter(|node| node.package == package)
+        .map(|node| node.id)
+        .filter(
+            |id| match (binding, &plan.provenance().nodes()[id.0].kind) {
+                (None, _) => true,
+                (
+                    Some(name),
+                    NodeKind::Binding { name: binding }
+                    | NodeKind::ExternalBinding { name: binding },
+                ) => binding == name,
+                _ => false,
+            },
+        )
         .collect()
 }
 
-fn package_entry_edges<'a>(plan: &'a LinkPlan, target: &str) -> Vec<&'a Edge> {
+fn package_entry_edges<'a>(plan: &'a LinkIr, target: &str) -> Vec<&'a Edge> {
     let package = target
         .split_once(":::")
         .map(|x| x.0)
@@ -489,12 +567,12 @@ fn package_entry_edges<'a>(plan: &'a LinkPlan, target: &str) -> Vec<&'a Edge> {
         .map(|x| x.1)
         .or_else(|| target.split_once("::").map(|x| x.1));
     let mut edges = plan
-        .graph
-        .edges
+        .provenance()
+        .edges()
         .iter()
         .filter(|edge| {
-            let to = &plan.graph.nodes[edge.to.0];
-            let from = &plan.graph.nodes[edge.from.0];
+            let to = &plan.provenance().nodes()[edge.to.0];
+            let from = &plan.provenance().nodes()[edge.from.0];
             if to.package != package || from.package == package {
                 return false;
             }
@@ -512,7 +590,7 @@ fn package_entry_edges<'a>(plan: &'a LinkPlan, target: &str) -> Vec<&'a Edge> {
     edges
 }
 
-fn print_edge_path(plan: &LinkPlan, path: &[&Edge]) {
+fn print_edge_path(plan: &LinkIr, path: &[&Edge]) {
     if path.is_empty() {
         println!("  explicit root");
         return;
@@ -529,19 +607,19 @@ fn print_edge_path(plan: &LinkPlan, path: &[&Edge]) {
     }
 }
 
-fn edge_location(plan: &LinkPlan, edge: &Edge) -> String {
+fn edge_location(plan: &LinkIr, edge: &Edge) -> String {
     let Some(span) = &edge.span else {
         return String::new();
     };
     let source = plan
-        .sources
+        .sources()
         .display(&span.source)
         .unwrap_or_else(|| format!("source#{}", span.source.0));
     format!(" @ {source}:{}..{}", span.start, span.end)
 }
 
-fn node_label(plan: &LinkPlan, id: NodeId) -> String {
-    let node = &plan.graph.nodes[id.0];
+fn node_label(plan: &LinkIr, id: NodeId) -> String {
+    let node = &plan.provenance().nodes()[id.0];
     match &node.kind {
         NodeKind::Binding { name } | NodeKind::ExternalBinding { name } => {
             format!("{}::{name}", node.package)
@@ -577,256 +655,48 @@ fn node_label(plan: &LinkPlan, id: NodeId) -> String {
 
 fn print_analysis(
     target: &TargetEnvironment,
-    root_name: &str,
-    plan: &LinkPlan,
+    _root_name: &str,
+    plan: &LinkIr,
 ) -> Result<(), Box<dyn Error>> {
-    let root = plan
-        .images
-        .iter()
-        .find(|(id, _)| id.name == root_name)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "root image missing from link plan",
-            )
-        })?;
-    let root_id = root.0;
-    let root_image = root.1;
-
-    println!("package: {} {}", root_id.name, root_id.version);
-    println!("image: {}", root_id.root.display());
-    println!("origin: installed image from {}", root_id.library.display());
+    let program = plan.program();
+    let root = program.package(program.root_package()).identity();
+    println!("package: {} {}", root.name, root.version);
     println!(
         "target: R {} | {} | {}",
         target.target.r_version, target.target.os, target.target.arch
     );
     println!();
-
-    println!("library universe");
-    for (index, library) in target.libraries.iter().enumerate() {
-        println!("  [{index}] {}", library.display());
-    }
-    println!();
-
-    println!("root image");
-    println!("  bindings: {}", root_image.index.binding_names.len());
-    println!("  exports: {}", root_image.index.exports.len());
-    println!("  runtime resources: resolved on demand");
-    println!("  S3 registrations: {}", root_image.index.s3.len());
-    println!("  dynamic libraries: {}", root_image.index.dynlibs.len());
-    println!(
-        "  .onLoad present: {}",
-        if root_image.index.lifecycle.on_load {
-            "yes"
-        } else {
-            "no"
-        }
-    );
-    println!("  inspection: one structured installed lazy-load image; Air parsing is binding-lazy");
-    println!();
-
-    println!("semantic package closure");
-    let mut packages = plan
-        .packages
-        .iter()
-        .filter(|id| id.name != root_name && !plan.target_provided.contains(*id))
-        .collect::<Vec<_>>();
-    packages.sort_by(|left, right| left.name.cmp(&right.name));
-    if packages.is_empty() {
-        println!("  none internalized");
-    } else {
-        for package in &packages {
-            let state = if plan.images.contains_key(*package) {
-                "demanded installed image"
-            } else {
-                "activation/index only"
-            };
-            println!("  {} {}: {state}", package.name, package.version);
-            println!("    {}", package.root.display());
-        }
-    }
-    let mut externals = plan.target_provided.iter().collect::<Vec<_>>();
-    externals.sort_by(|left, right| left.name.cmp(&right.name));
-    for package in externals {
+    println!("package roles");
+    for package in program.packages() {
         println!(
-            "  {} {}: exact target-provided namespace",
-            package.name, package.version
+            "  {} {}: {:?}",
+            package.identity().name,
+            package.identity().version,
+            package.role()
         );
     }
     println!();
-
-    println!("graph");
-    println!("  nodes: {}", plan.graph.nodes.len());
-    println!("  edges: {}", plan.graph.edges.len());
-    println!("  roots: {}", plan.roots.len());
-    println!("  processed semantic needs: {}", plan.retained.len());
-    println!("  installed images inspected: {}", plan.inspected_packages);
-    let namespace_bindings_inspected = plan
-        .images
-        .values()
-        .map(|image| image.bindings.len())
-        .sum::<usize>();
-    let environments_inspected = plan
-        .images
-        .values()
-        .map(|image| 1 + image.private_environments.len())
-        .sum::<usize>();
-    println!("  namespace bindings inspected: {namespace_bindings_inspected}");
-    println!(
-        "  top-level closures Air-parsed: {}",
-        plan.parsed_top_level_closures
-    );
-    println!(
-        "  private closures Air-parsed: {}",
-        plan.parsed_private_closures
-    );
-    println!(
-        "  nested closures Air-parsed: {}",
-        plan.parsed_nested_closures
-    );
-    println!(
-        "  derived closures Air-parsed: {}",
-        plan.parsed_derived_closures
-    );
-    println!(
-        "  total closure bodies Air-parsed: {}",
-        plan.parsed_bindings
-    );
-    println!("  environments inspected: {environments_inspected}");
+    println!("linked program");
+    println!("  namespaces: {}", program.namespaces().len());
+    println!("  bindings: {}", program.bindings().len());
+    println!("  closures: {}", program.closures().len());
+    println!("  environments: {}", program.environments().len());
+    println!("  relocations: {}", program.relocations().len());
+    println!("  residual capabilities: {}", program.residuals().len());
     println!();
-
-    println!("retention");
-    for package in &packages {
-        let mut kept = plan
-            .retained
-            .iter()
-            .filter_map(|need| match need {
-                Need::Binding {
-                    package: owner,
-                    binding,
-                } if owner == *package => Some(binding.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        kept.sort();
-        if let Some(image) = plan.images.get(*package) {
-            let dropped = image.index.binding_names.len().saturating_sub(kept.len());
-            println!(
-                "  {}: {}/{} bindings retained; {} discarded",
-                package.name,
-                kept.len(),
-                image.index.binding_names.len(),
-                dropped
-            );
-        } else {
-            println!(
-                "  {}: activation/index only; no R binding image forced",
-                package.name
-            );
-        }
-        if !kept.is_empty() {
-            println!("    keep: {}", kept.join(", "));
-        }
-    }
-    if packages.is_empty() {
-        println!("  no third-party runtime bindings internalized");
-    }
+    println!("provenance");
+    println!("  entities: {}", plan.provenance().nodes().len());
+    println!("  derivations: {}", plan.provenance().edges().len());
+    println!("  roots: {}", plan.provenance().roots().len());
     println!();
-
-    println!("missing dependencies");
-    let mut missing = plan.graph.missing_packages().collect::<Vec<_>>();
-    missing.sort_by(|left, right| {
-        plan.graph.nodes[left.0]
-            .package
-            .cmp(&plan.graph.nodes[right.0].package)
-    });
-    if missing.is_empty() {
-        println!("  none");
-    } else {
-        for node in missing {
-            let package = &plan.graph.nodes[node.0].package;
-            println!("  {package}");
-            let mut incoming = plan.graph.incoming(node).collect::<Vec<_>>();
-            incoming.sort_by_key(|edge| edge.from.0);
-            for edge in incoming {
-                println!(
-                    "    {} -- {:?}{}: {}",
-                    node_label(plan, edge.from),
-                    edge.kind,
-                    edge_location(plan, edge),
-                    edge.reason
-                );
-            }
-        }
-    }
-    println!();
-
     println!("blockers");
-    let blockers = plan
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            !matches!(
-                diagnostic.code,
-                slinker::analysis::RejectCode::MissingDependency
-            )
-        })
-        .collect::<Vec<_>>();
-    if blockers.is_empty() {
+    if plan.provenance().diagnostics().is_empty() {
         println!("  none");
     } else {
-        for diagnostic in blockers {
-            let owner = diagnostic
-                .binding
-                .as_ref()
-                .map(|binding| format!("{}::{binding}", diagnostic.package))
-                .unwrap_or_else(|| diagnostic.package.clone());
-            let location = diagnostic
-                .span
-                .as_ref()
-                .and_then(|span| plan.sources.display(&span.source))
-                .unwrap_or(owner);
-            println!(
-                "  - {:?} [{}]: {}",
-                diagnostic.code, location, diagnostic.message
-            );
+        for diagnostic in plan.provenance().diagnostics() {
+            println!("  - {:?}: {}", diagnostic.code, diagnostic.message);
         }
     }
-    println!();
-
-    let namespace_rewrites = plan
-        .rewrites
-        .iter()
-        .filter(|rewrite| matches!(rewrite, Rewrite::NamespaceAccess { .. }))
-        .count();
-    let resource_rewrites = plan
-        .rewrites
-        .iter()
-        .filter(|rewrite| matches!(rewrite, Rewrite::ResourceAccess { .. }))
-        .count();
-    let discovery_rewrites = plan
-        .rewrites
-        .iter()
-        .filter(|rewrite| matches!(rewrite, Rewrite::PackageOperation { .. }))
-        .count();
-    println!("link plan");
-    println!("  root package: {} {}", root_id.name, root_id.version);
-    println!("  internalized packages: {}", packages.len());
-    println!("  package-qualified rewrites: {namespace_rewrites}");
-    println!("  resource rewrites: {resource_rewrites}");
-    println!("  specialized discovery rewrites: {discovery_rewrites}");
-    println!("  analysis model: binding-level demand-driven installed-image linker");
-    println!("  package discovery rounds: none");
-    println!("  per-binding temporary R files: none");
-    println!(
-        "  analysis status: {}",
-        if plan.diagnostics.is_empty() {
-            "link plan complete"
-        } else {
-            "blocked"
-        }
-    );
-    println!("  build status: analysis/rewrite plan only");
     Ok(())
 }
 
@@ -857,7 +727,7 @@ fn insert_package_list(
     value: &std::ffi::OsString,
 ) -> Result<(), CliError> {
     let value = value.to_str().ok_or(CliError::Usage(
-        "target-provided package names must be valid UTF-8",
+        "External package names must be valid UTF-8",
     ))?;
     insert_package_list_str(packages, value)
 }
@@ -866,7 +736,7 @@ fn insert_package_list_str(packages: &mut BTreeSet<String>, value: &str) -> Resu
     for package in value.split(',').map(str::trim) {
         if package.is_empty() {
             return Err(CliError::Usage(
-                "target-provided package list contains an empty name",
+                "External package list contains an empty name",
             ));
         }
         packages.insert(package.to_owned());
@@ -917,17 +787,16 @@ fn reject_extra(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<()
 fn print_help() {
     println!(
         "slinker {VERSION}\n\n\
-         Usage:\n  slinker analyze PACKAGE [--lib PATH]... [--target-provided PKG[,PKG...]] [--extra-pkgs PKG...] [--jobs N] [--graph] [--dump-graph PATH] [--dump-objects PATH]\n  slinker why ROOT TARGET [same options]\n  slinker path ROOT DOWNSTREAM [same options]\n\n\
-         Link an installed R package image by following reachable semantic bindings.\n  `why` prints a shortest provenance chain; `path` prints every cross-package use site.\n\
-         slinker never installs, rebuilds, or downloads packages, and never recursively resolves DESCRIPTION dependencies.\n\n\
+         Usage:\n  slinker build [PATH] [--lib PATH]... [--external PKG[,PKG...]] [--output PATH] [--jobs N]\n  slinker analyze PACKAGE [--lib PATH]... [--external PKG[,PKG...]] [--extra-pkgs PKG...] [--jobs N] [--graph]\n  slinker why ROOT TARGET [same options]\n  slinker path ROOT DOWNSTREAM [same options]\n\n\
+         Build a generated linked R source package. PATH defaults to the current directory.\n  `analyze` inspects an installed image; `why` and `path` query provenance.\n\n\
          Options:\n\
            --lib PATH                     select an installed R library (repeatable, ordered)\n\
-           --target-provided PKG[,PKG...] leave these exact third-party namespaces external\n\
+           --external PKG[,PKG...] preserve declared packages as runtime dependencies\n\
+           --output PATH                   generated source-package directory\n\
            --extra-pkgs PKG...             enable named optional packages when reachable\n\
            --jobs N                       analysis workers (default: min(CPUs, 8))\n\
            --graph                        emit deterministic explanation-DAG JSON\n\
-           --dump-graph PATH              write deterministic semantic graph dump\n\
-           --dump-objects PATH            write deterministic installed object/environment dump\n\n\
+\n\
          Environment:\n\
             R_HOME             fallback R installation when `R RHOME` is unavailable\n\
            SLINKER_CACHE_DIR  persistent installed-image analysis cache"
@@ -983,7 +852,7 @@ impl Error for CliError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalyzeArgs, Command, default_jobs, parse_args, parse_r_home};
+    use super::{AnalyzeArgs, BuildArgs, Command, default_jobs, parse_args, parse_r_home};
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -1004,12 +873,10 @@ mod tests {
             Command::Analyze(AnalyzeArgs {
                 root: "voucher".into(),
                 libraries: vec![PathBuf::from("one"), PathBuf::from("two")],
-                target_provided: BTreeSet::new(),
+                external: BTreeSet::new(),
                 extra_pkgs: BTreeSet::new(),
                 jobs: default_jobs(),
                 graph: false,
-                dump_graph: None,
-                dump_objects: None,
             })
         );
     }
@@ -1033,12 +900,10 @@ mod tests {
             Command::Analyze(AnalyzeArgs {
                 root: "voucher".into(),
                 libraries: Vec::new(),
-                target_provided: BTreeSet::new(),
+                external: BTreeSet::new(),
                 extra_pkgs,
                 jobs: 3,
                 graph: false,
-                dump_graph: None,
-                dump_objects: None,
             })
         );
         assert!(parse_args(os(&["analyze", "voucher", "--extra-pkgs", "--jobs", "3"])).is_err());
@@ -1052,37 +917,31 @@ mod tests {
             Command::Analyze(AnalyzeArgs {
                 root: "voucher".into(),
                 libraries: Vec::new(),
-                target_provided: BTreeSet::new(),
+                external: BTreeSet::new(),
                 extra_pkgs: BTreeSet::new(),
                 jobs: 6,
                 graph: false,
-                dump_graph: None,
-                dump_objects: None,
             })
         );
         assert!(parse_args(os(&["analyze", "voucher", "--jobs=0"])).is_err());
     }
 
     #[test]
-    fn accepts_deterministic_dump_paths() {
+    fn removed_debug_dump_options_are_rejected() {
+        assert!(parse_args(os(&["analyze", "voucher", "--dump-objects=objects.txt"])).is_err());
+        assert!(parse_args(os(&["analyze", "voucher", "--dump-graph", "graph.txt"])).is_err());
+    }
+
+    #[test]
+    fn build_defaults_to_current_directory() {
         assert_eq!(
-            parse_args(os(&[
-                "analyze",
-                "voucher",
-                "--dump-graph",
-                "graph.txt",
-                "--dump-objects=objects.txt"
-            ]))
-            .unwrap(),
-            Command::Analyze(AnalyzeArgs {
-                root: "voucher".into(),
+            parse_args(os(&["build"])).unwrap(),
+            Command::Build(BuildArgs {
+                input: PathBuf::from("."),
+                output: None,
                 libraries: Vec::new(),
-                target_provided: BTreeSet::new(),
-                extra_pkgs: BTreeSet::new(),
+                external: BTreeSet::new(),
                 jobs: default_jobs(),
-                graph: false,
-                dump_graph: Some(PathBuf::from("graph.txt")),
-                dump_objects: Some(PathBuf::from("objects.txt")),
             })
         );
     }

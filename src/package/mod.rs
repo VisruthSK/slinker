@@ -2,6 +2,7 @@ mod image;
 mod index;
 mod locator;
 mod store;
+mod universe;
 
 pub use image::{
     BindingImage, BindingOrigin, BindingRepresentation, ClosureId, ClosureObject, ClosureSource,
@@ -10,12 +11,13 @@ pub use image::{
     PackageObjectGraph, PrivateBindingImage, PrivateEnvironmentImage,
 };
 pub use index::{
-    ExportMap, ImportBinding, ImportSpec, LifecycleMetadata, NativeComponent, NativeFacts,
-    NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding, PackageIndex,
-    S3Registration,
+    ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NativeComponent,
+    NativeFacts, NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding,
+    PackageIndex, S3Registration,
 };
-pub use locator::{Digest, InstalledPackage, PackageId, PackageLocator};
+pub use locator::{Digest, InstalledPackage, PackageId, PackageLocation, PackageLocator};
 pub use store::{PackageProvider, PackageStore, SyntaxValidation};
+pub use universe::{PackageAvailability, TargetUniverse};
 
 pub type BindingName = String;
 pub type BindingKey = (PackageId, BindingName);

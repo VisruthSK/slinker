@@ -73,7 +73,16 @@ pub enum WorkerRequest {
         package: PackageSpec,
         name: String,
     },
+    SerializeBinding {
+        request_id: u64,
+        package: PackageSpec,
+        name: String,
+    },
     ValidateSyntax {
+        request_id: u64,
+        source: String,
+    },
+    NormalizeSyntax {
         request_id: u64,
         source: String,
     },
@@ -96,27 +105,54 @@ pub enum WorkerResponse {
         request_id: u64,
         binding: WorkerBinding,
     },
+    Payload {
+        request_id: u64,
+        bytes: Vec<u8>,
+    },
     SyntaxValidation {
         request_id: u64,
         accepted: bool,
         message: Option<String>,
     },
+    NormalizedSyntax {
+        request_id: u64,
+        source: String,
+    },
     Error {
-        request_id: Option<u64>,
-        code: WorkerErrorCode,
-        message: String,
+        error: WorkerFailure,
     },
     Shutdown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerFailure {
+    pub request_id: Option<u64>,
+    pub package: Option<WorkerPackageIdentity>,
+    pub binding: Option<String>,
+    pub code: WorkerErrorCode,
+    pub message: String,
+    pub captured_output: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkerPackageIdentity {
+    pub name: String,
+    pub version: String,
+    pub image_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerErrorCode {
     Protocol,
-    Startup,
+    SharedLibraryLoad,
+    RuntimeStartup,
+    ArchitectureMismatch,
+    TargetIdentityMismatch,
     PackageMetadata,
+    LazyLoadDatabase,
     MissingBinding,
-    BindingInspection,
-    SyntaxValidation,
-    Unsupported,
+    BindingForce,
+    WorkerCrash,
+    TargetSyntaxRejection,
 }

@@ -1,5 +1,22 @@
+use crate::TargetEnvironment;
+use crate::analysis::LinkIr;
+use crate::ir::{
+    LinkBindingState, LinkNamespaceState, PackageId as LinkedPackageId, PackageOperationIr,
+    PackageRole, PayloadRef, ProgramIr, Relocation, Value,
+};
+use crate::package::PackageLocator;
 use crate::package::{BindingName, PackageId};
+use crate::r_worker::client::WorkerClient;
+use crate::r_worker::protocol::PackageSpec;
+use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
 use crate::syntax::Span;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::fs;
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PackageOperation {
@@ -12,7 +29,7 @@ pub enum PackageOperation {
 }
 
 #[derive(Clone, Debug)]
-pub enum Rewrite {
+pub(crate) enum PendingRelocation {
     NamespaceAccess {
         source: Span,
         package: PackageId,
@@ -30,3 +47,834 @@ pub enum Rewrite {
         operation: PackageOperation,
     },
 }
+
+/// Selected target-R physical handle available to staging and materialization.
+#[derive(Debug)]
+pub struct TargetRuntimeHandle {
+    r_home: PathBuf,
+    target: TargetEnvironment,
+}
+
+impl TargetRuntimeHandle {
+    pub fn new(r_home: PathBuf, target: TargetEnvironment) -> Self {
+        Self { r_home, target }
+    }
+
+    pub fn r_home(&self) -> &Path {
+        &self.r_home
+    }
+
+    pub fn target(&self) -> &TargetEnvironment {
+        &self.target
+    }
+}
+
+/// Frozen physical inputs used to orchestrate preflight, never passed wholesale to materialization.
+#[derive(Debug)]
+pub struct BuildContext {
+    source: SourcePackageSnapshot,
+    staged_root: StagedRoot,
+    target_runtime: TargetRuntimeHandle,
+    package_sources: BTreeMap<LinkedPackageId, PathBuf>,
+    payload_store: PayloadStore,
+}
+
+impl BuildContext {
+    pub fn new(
+        source: SourcePackageSnapshot,
+        staged_root: StagedRoot,
+        r_home: PathBuf,
+        target: TargetEnvironment,
+        program: &ProgramIr,
+    ) -> Result<Self, BuildContextError> {
+        let locator = PackageLocator::new(target.clone());
+        let mut package_sources = BTreeMap::new();
+        for package in program.package_ids() {
+            let package_ir = program.package(package);
+            let identity = package_ir.identity();
+            let root = if package_ir.role() == PackageRole::Root {
+                staged_root.package_root().to_path_buf()
+            } else {
+                let installed = locator
+                    .locate(&identity.name)
+                    .map_err(|error| BuildContextError::Package(error.to_string()))?;
+                if installed.id.version != identity.version
+                    || installed.id.image_fingerprint != identity.image_fingerprint
+                {
+                    return Err(BuildContextError::TargetUniverseChanged(
+                        identity.name.clone(),
+                    ));
+                }
+                installed.location.root
+            };
+            package_sources.insert(package, root);
+        }
+        let mut payload_store = PayloadStore::default();
+        let payloads = program
+            .values()
+            .iter()
+            .filter_map(|value| match value {
+                Value::Payload(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if !payloads.is_empty() {
+            let mut worker = WorkerClient::spawn(r_home.clone(), &target)
+                .map_err(|error| BuildContextError::Package(error.to_string()))?;
+            for payload in payloads {
+                let identity = program.package(payload.package).identity();
+                let bytes = worker
+                    .serialize_binding(
+                        PackageSpec {
+                            name: identity.name.clone(),
+                            version: identity.version.to_string(),
+                            image_fingerprint: identity.image_fingerprint.0.clone(),
+                            root: package_sources[&payload.package].clone(),
+                        },
+                        &payload.locator.root,
+                    )
+                    .map_err(|error| BuildContextError::Package(error.to_string()))?;
+                payload_store.payloads.insert(payload, bytes);
+            }
+        }
+        Ok(Self {
+            source,
+            staged_root,
+            target_runtime: TargetRuntimeHandle::new(r_home, target),
+            package_sources,
+            payload_store,
+        })
+    }
+
+    pub fn source(&self) -> &SourcePackageSnapshot {
+        &self.source
+    }
+
+    pub fn staged_root(&self) -> &StagedRoot {
+        &self.staged_root
+    }
+
+    fn materialization(&self) -> MaterializationContext<'_> {
+        MaterializationContext {
+            source_files: self.source.files(),
+            target_runtime: &self.target_runtime,
+            package_sources: &self.package_sources,
+            payload_store: &self.payload_store,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PayloadStore {
+    payloads: BTreeMap<PayloadRef, Vec<u8>>,
+}
+
+#[derive(Debug, Error)]
+pub enum BuildContextError {
+    #[error("failed to freeze package source: {0}")]
+    Package(String),
+    #[error("selected package image changed during the invocation: {0}")]
+    TargetUniverseChanged(String),
+}
+
+/// Narrow physical view available only after successful preflight.
+#[derive(Clone, Copy)]
+pub struct MaterializationContext<'a> {
+    source_files: &'a FrozenSourceFiles,
+    target_runtime: &'a TargetRuntimeHandle,
+    package_sources: &'a BTreeMap<LinkedPackageId, PathBuf>,
+    payload_store: &'a PayloadStore,
+}
+
+impl MaterializationContext<'_> {
+    fn source_files(&self) -> &FrozenSourceFiles {
+        self.source_files
+    }
+
+    fn target_runtime(&self) -> &TargetRuntimeHandle {
+        self.target_runtime
+    }
+
+    fn package_root(&self, package: LinkedPackageId) -> &Path {
+        &self.package_sources[&package]
+    }
+
+    fn payload(&self, payload: &PayloadRef) -> &[u8] {
+        &self.payload_store.payloads[payload]
+    }
+}
+
+/// First exact source-package materialization profile.
+pub enum PureRStatic {}
+
+/// Opaque capability proving full preflight succeeded for one profile.
+pub struct BuildableProgram<'a, Profile> {
+    program: &'a ProgramIr,
+    materialization: MaterializationContext<'a>,
+    _profile: PhantomData<Profile>,
+}
+
+impl PureRStatic {
+    pub fn check<'a>(
+        ir: &'a LinkIr,
+        context: &'a BuildContext,
+    ) -> Result<BuildableProgram<'a, PureRStatic>, BuildReport> {
+        let mut blockers = ir
+            .provenance()
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.reachable)
+            .map(|diagnostic| format!("{:?}: {}", diagnostic.code, diagnostic.message))
+            .collect::<BTreeSet<_>>();
+        if !ir.program().residuals().is_empty() {
+            blockers.insert("residual runtime capability is outside PureRStatic".into());
+        }
+        if ir.program().root_artifact().description.is_empty() {
+            blockers.insert("Root source-package DESCRIPTION plan is missing".into());
+        }
+        for package in ir.program().packages() {
+            if let crate::ir::PackageIr::External { contract, .. } = package
+                && contract.requirements.is_empty()
+            {
+                blockers.insert(format!(
+                    "External package `{}` has no declared runtime requirement",
+                    contract.package
+                ));
+            }
+        }
+        for value in ir.program().values() {
+            if matches!(value, Value::Payload(payload) if !payload.locator.path.is_empty()) {
+                blockers
+                    .insert("nested payload reconstruction is not supported by PureRStatic".into());
+            }
+        }
+        if blockers.is_empty() {
+            Ok(BuildableProgram {
+                program: ir.program(),
+                materialization: context.materialization(),
+                _profile: PhantomData,
+            })
+        } else {
+            Err(BuildReport::new(blockers.into_iter().collect()))
+        }
+    }
+}
+
+/// Deterministic complete build-preflight failure report.
+#[derive(Clone, Debug, Error)]
+#[error("build preflight failed:\n{rendered}")]
+pub struct BuildReport {
+    blockers: Vec<String>,
+    rendered: String,
+}
+
+impl BuildReport {
+    fn new(blockers: Vec<String>) -> Self {
+        let rendered = blockers
+            .iter()
+            .map(|blocker| format!("  - {blocker}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self { blockers, rendered }
+    }
+
+    pub fn blockers(&self) -> &[String] {
+        &self.blockers
+    }
+}
+
+/// Completed generated source-package artifact.
+#[derive(Debug)]
+pub struct GeneratedPackage {
+    path: PathBuf,
+}
+
+impl GeneratedPackage {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Materialize a preflight-approved ProgramIr into a generated R source package.
+pub fn materialize(
+    buildable: BuildableProgram<'_, PureRStatic>,
+    output: &Path,
+) -> Result<GeneratedPackage, MaterializeError> {
+    if output.exists() {
+        return Err(MaterializeError::OutputExists(output.into()));
+    }
+    let parent = output
+        .parent()
+        .ok_or_else(|| MaterializeError::InvalidOutput(output.into()))?;
+    fs::create_dir_all(parent)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".slinker-materialize-")
+        .tempdir_in(parent)?;
+    let package_name = &buildable
+        .program
+        .package(buildable.program.root_package())
+        .identity()
+        .name;
+    let package_root = temporary.path().join(package_name);
+    fs::create_dir_all(package_root.join("R"))?;
+    fs::create_dir_all(package_root.join("inst/slinker"))?;
+    fs::write(
+        package_root.join("DESCRIPTION"),
+        buildable.program.root_artifact().description.as_bytes(),
+    )?;
+    fs::write(
+        package_root.join("NAMESPACE"),
+        buildable.program.root_artifact().namespace.as_bytes(),
+    )?;
+    copy_root_resources(
+        buildable.materialization.source_files().root(),
+        &package_root,
+    )?;
+    let payload_directory = package_root.join("inst/slinker/payload");
+    fs::create_dir_all(&payload_directory)?;
+    for value in buildable.program.values() {
+        if let Value::Payload(payload) = value {
+            fs::write(
+                payload_directory.join(format!("{}.rds", payload_key(buildable.program, payload))),
+                buildable.materialization.payload(payload),
+            )?;
+        }
+    }
+    let generated = generate_r_source(buildable.program)?;
+    validate_program_code(
+        buildable.program,
+        buildable.materialization.target_runtime(),
+    )?;
+    validate_r_source(buildable.materialization.target_runtime(), &generated)?;
+    fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
+    copy_linked_resources(buildable.program, buildable.materialization, &package_root)?;
+    fs::rename(&package_root, output)?;
+    Ok(GeneratedPackage {
+        path: output.to_path_buf(),
+    })
+}
+
+#[derive(Debug, Error)]
+pub enum MaterializeError {
+    #[error("generated output already exists: {0}")]
+    OutputExists(PathBuf),
+    #[error("invalid generated output path: {0}")]
+    InvalidOutput(PathBuf),
+    #[error("generated R source failed target-R validation: {0}")]
+    InvalidR(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
+    let mut out = String::new();
+    out.push_str(GENERATED_RUNTIME);
+    out.push('\n');
+    writeln!(
+        out,
+        ".slinker_target <- c(version = {}, platform = {}, arch = {})",
+        r_string(&program.target().r_version),
+        r_string(&program.target().platform),
+        r_string(&program.target().arch)
+    )
+    .expect("String writes cannot fail");
+    writeln!(
+        out,
+        ".slinker_root_package <- {}",
+        r_string(&program.package(program.root_package()).identity().name)
+    )
+    .expect("String writes cannot fail");
+    let root_namespace = program
+        .namespaces()
+        .iter()
+        .position(|namespace| matches!(namespace.state, LinkNamespaceState::Root(_)))
+        .map(|index| &program.namespaces()[index])
+        .expect("ProgramIr Root namespace");
+
+    for (name, binding) in &root_namespace.bindings {
+        let LinkBindingState::Materialized { initial, .. } = &program.binding(*binding).state
+        else {
+            continue;
+        };
+        let crate::ir::InitialBindingState::Value(value) = initial else {
+            continue;
+        };
+        match program.value(*value) {
+            Value::Closure(closure) => {
+                let source = relocated_source(program, program.closure(*closure).code)?;
+                if name == ".onLoad" {
+                    out.push_str(&rename_assignment(&source, ".slinker_original_on_load"));
+                } else {
+                    out.push_str(&source);
+                }
+            }
+            Value::Payload(payload) => {
+                writeln!(
+                    out,
+                    "{} <- .slinker_payload({})",
+                    r_binding_name(name),
+                    r_string(&payload_key(program, payload))
+                )
+                .expect("String writes cannot fail");
+            }
+            _ => continue,
+        }
+        out.push('\n');
+    }
+
+    for namespace_id in &program.root_artifact().bootstrap_namespaces {
+        let namespace = program.namespace(*namespace_id);
+        let package = program.package(namespace.package).identity();
+        writeln!(
+            out,
+            ".slinker_spec_{} <- function() {{",
+            safe_identifier(&package.name)
+        )
+        .expect("String writes cannot fail");
+        writeln!(
+            out,
+            "  ns <- .slinker_new_namespace({}, {})",
+            r_string(&package.name),
+            r_string(package.version.as_ref())
+        )
+        .expect("String writes cannot fail");
+        out.push_str("  imports <- parent.env(ns)\n");
+        for import in &namespace.imports {
+            let target = program.binding(import.target);
+            let target_namespace = program.binding_namespace(import.target);
+            let target_state = &program.namespace(target_namespace).state;
+            let target_package = program
+                .package(program.namespace(target_namespace).package)
+                .identity();
+            let value = match target_state {
+                LinkNamespaceState::External { .. } => format!(
+                    "getExportedValue({}, {})",
+                    r_string(&target_package.name),
+                    r_string(&target.name)
+                ),
+                LinkNamespaceState::Root(_) | LinkNamespaceState::Linked(_) => format!(
+                    ".slinker_binding({}, {})",
+                    r_string(&target_package.name),
+                    r_string(&target.name)
+                ),
+            };
+            writeln!(
+                out,
+                "  assign({}, {}, envir = imports)",
+                r_string(&import.local),
+                value
+            )
+            .expect("String writes cannot fail");
+        }
+        for binding in namespace.bindings.values() {
+            let LinkBindingState::Materialized { initial, .. } = &program.binding(*binding).state
+            else {
+                continue;
+            };
+            let crate::ir::InitialBindingState::Value(value) = initial else {
+                continue;
+            };
+            match program.value(*value) {
+                Value::Closure(closure) => {
+                    let source = relocated_source(program, program.closure(*closure).code)?;
+                    writeln!(
+                        out,
+                        "  eval(parse(text = {}), envir = ns)",
+                        r_string(&source)
+                    )
+                    .expect("String writes cannot fail");
+                }
+                Value::Payload(payload) => {
+                    writeln!(
+                        out,
+                        "  assign({}, .slinker_payload({}), envir = ns)",
+                        r_string(&program.binding(*binding).name),
+                        r_string(&payload_key(program, payload))
+                    )
+                    .expect("String writes cannot fail");
+                }
+                _ => {}
+            }
+        }
+        let exports = match &namespace.state {
+            LinkNamespaceState::Linked(state) => state.exports.bindings(),
+            _ => &[],
+        };
+        let export_names = exports
+            .iter()
+            .map(|binding| r_string(&program.binding(*binding).name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "  .slinker_finish_namespace(ns, c({export_names}))")
+            .expect("String writes cannot fail");
+        out.push_str("}\n");
+    }
+
+    out.push_str(".onLoad <- function(libname, pkgname) {\n  .slinker_check_target()\n");
+    for namespace in &program.root_artifact().bootstrap_namespaces {
+        let package = program
+            .package(program.namespace(*namespace).package)
+            .identity();
+        writeln!(out, "  .slinker_spec_{}()", safe_identifier(&package.name))
+            .expect("String writes cannot fail");
+    }
+    for import in &root_namespace.imports {
+        let target = program.binding(import.target);
+        let target_namespace = program.binding_namespace(import.target);
+        if matches!(
+            program.namespace(target_namespace).state,
+            LinkNamespaceState::Linked(_)
+        ) {
+            let target_package = program
+                .package(program.namespace(target_namespace).package)
+                .identity();
+            writeln!(
+                out,
+                "  assign({}, .slinker_binding({}, {}), envir = parent.env(environment(.onLoad)))",
+                r_string(&import.local),
+                r_string(&target_package.name),
+                r_string(&target.name)
+            )
+            .expect("String writes cannot fail");
+        }
+    }
+    out.push_str(
+        "  root_ns <- environment(.onLoad)\n  if (exists('.slinker_original_on_load', envir = root_ns, inherits = FALSE)) get('.slinker_original_on_load', envir = root_ns, inherits = FALSE)(libname, pkgname)\n}\n",
+    );
+    Ok(out)
+}
+
+fn relocated_source(
+    program: &ProgramIr,
+    code: crate::ir::CodeId,
+) -> Result<String, MaterializeError> {
+    let code_ir = program.code(code);
+    let mut source = code_ir.source().to_owned();
+    let mut relocations = program
+        .relocations()
+        .iter()
+        .filter_map(|relocation| {
+            let site = match relocation {
+                Relocation::Binding { site, .. }
+                | Relocation::Namespace { site, .. }
+                | Relocation::Package { site, .. }
+                | Relocation::Resource { site, .. } => site,
+            };
+            (site.code == code).then_some((site, relocation))
+        })
+        .collect::<Vec<_>>();
+    relocations
+        .sort_by_key(|(site, _)| std::cmp::Reverse(code_ir.occurrence(site.occurrence).start));
+    for (site, relocation) in relocations {
+        let occurrence = code_ir.occurrence(site.occurrence);
+        let replacement = match relocation {
+            Relocation::Binding { target, access, .. } => {
+                let binding = program.binding(*target);
+                let namespace = program.namespace(program.binding_namespace(*target));
+                let package = program.package(namespace.package).identity();
+                match namespace.state {
+                    LinkNamespaceState::Linked(_) => format!(
+                        ".slinker_binding({}, {})",
+                        r_string(&package.name),
+                        r_string(&binding.name)
+                    ),
+                    LinkNamespaceState::Root(_) | LinkNamespaceState::External { .. } => {
+                        match access {
+                            crate::ir::ExternalBindingAccess::Exported => format!(
+                                "getExportedValue({}, {})",
+                                r_string(&package.name),
+                                r_string(&binding.name)
+                            ),
+                            crate::ir::ExternalBindingAccess::Internal => format!(
+                                "get({}, envir = asNamespace({}), inherits = FALSE)",
+                                r_string(&binding.name),
+                                r_string(&package.name)
+                            ),
+                        }
+                    }
+                }
+            }
+            Relocation::Namespace { target, .. } => {
+                let package = program
+                    .package(program.namespace(*target).package)
+                    .identity();
+                format!("asNamespace({})", r_string(&package.name))
+            }
+            Relocation::Package {
+                target, operation, ..
+            } => match operation {
+                PackageOperationIr::RequireNamespace { result } => {
+                    if *result { "TRUE" } else { "FALSE" }.into()
+                }
+                PackageOperationIr::LoadNamespace
+                | PackageOperationIr::GetNamespace
+                | PackageOperationIr::AsNamespace => {
+                    let package = program
+                        .package(target.expect("resolved package operation"))
+                        .identity();
+                    format!("asNamespace({})", r_string(&package.name))
+                }
+                PackageOperationIr::PackageVersion { version } => {
+                    format!("package_version({})", r_string(version))
+                }
+                PackageOperationIr::FindPackage => {
+                    return Err(MaterializeError::InvalidR(
+                        "find.package for a Linked package has no source-package runtime path"
+                            .into(),
+                    ));
+                }
+            },
+            Relocation::Resource { target, .. } => {
+                let resource = program.resource(*target);
+                let package = program.package(resource.package).identity();
+                format!(
+                    ".slinker_resource({}, {})",
+                    r_string(&package.name),
+                    r_string(&resource.path)
+                )
+            }
+        };
+        source.replace_range(occurrence.start..occurrence.end, &replacement);
+    }
+    Ok(source)
+}
+
+fn validate_r_source(runtime: &TargetRuntimeHandle, source: &str) -> Result<(), MaterializeError> {
+    let normalized = normalize_r_source(runtime, source)?;
+    let normalized_again = normalize_r_source(runtime, &normalized)?;
+    if normalized == normalized_again {
+        Ok(())
+    } else {
+        Err(MaterializeError::InvalidR(
+            "target-R parse/deparse normalization is not stable".into(),
+        ))
+    }
+}
+
+fn validate_program_code(
+    program: &ProgramIr,
+    runtime: &TargetRuntimeHandle,
+) -> Result<(), MaterializeError> {
+    use sha2::Digest as _;
+    for (code_id, code) in program.indexed_codes() {
+        let emitted = relocated_source(program, code_id)?;
+        let normalized = normalize_r_source(runtime, &emitted)?;
+        let normalized_again = normalize_r_source(runtime, &normalized)?;
+        if normalized != normalized_again {
+            return Err(MaterializeError::InvalidR(format!(
+                "CodeIr {code_id:?} is not stable across target-R emission round trip"
+            )));
+        }
+        let relocated = program
+            .relocations()
+            .iter()
+            .any(|relocation| match relocation {
+                Relocation::Binding { site, .. }
+                | Relocation::Namespace { site, .. }
+                | Relocation::Package { site, .. }
+                | Relocation::Resource { site, .. } => site.code == code_id,
+            });
+        if !relocated {
+            let digest = crate::package::Digest(format!(
+                "{:x}",
+                sha2::Sha256::digest(normalized.as_bytes())
+            ));
+            if &digest != code.normalized_shape() {
+                return Err(MaterializeError::InvalidR(format!(
+                    "CodeIr {code_id:?} changed normalized shape before emission: expected {}, got {}; normalized source {normalized:?}",
+                    code.normalized_shape().0,
+                    digest.0
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_r_source(
+    runtime: &TargetRuntimeHandle,
+    source: &str,
+) -> Result<String, MaterializeError> {
+    let temporary = tempfile::Builder::new().prefix("slinker-code-").tempdir()?;
+    let source_path = temporary.path().join("generated.R");
+    fs::write(&source_path, source)?;
+    let executable = r_executable(runtime.r_home())
+        .ok_or_else(|| MaterializeError::InvalidR("selected R executable is missing".into()))?;
+    let output = Command::new(executable)
+        .args(["--slave", "--no-save", "--no-restore", "--vanilla", "-e"])
+        .arg(format!("expressions <- parse(file={}, keep.source = FALSE); cat(paste(vapply(expressions, function(expression) paste(deparse(expression, width.cutoff=500L, control=c('keepInteger','keepNA','niceNames')), collapse='\\n'), character(1L), USE.NAMES=FALSE), collapse='\\n'))", r_string(&source_path.to_string_lossy().replace('\\', "/"))))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(MaterializeError::InvalidR(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+}
+
+fn copy_root_resources(source: &Path, output: &Path) -> Result<(), std::io::Error> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some("DESCRIPTION" | "NAMESPACE" | "R" | "target" | ".git")
+        ) {
+            continue;
+        }
+        copy_entry(&entry.path(), &output.join(name))?;
+    }
+    Ok(())
+}
+
+fn copy_linked_resources(
+    program: &ProgramIr,
+    context: MaterializationContext<'_>,
+    output: &Path,
+) -> Result<(), std::io::Error> {
+    for resource in program.resources() {
+        let package = program.package(resource.package).identity();
+        let source = context.package_root(resource.package).join(&resource.path);
+        let target = output
+            .join("inst/slinker/resources")
+            .join(&package.name)
+            .join(&resource.path);
+        copy_entry(&source, &target)?;
+    }
+    Ok(())
+}
+
+fn copy_entry(source: &Path, target: &Path) -> Result<(), std::io::Error> {
+    if source.is_dir() {
+        fs::create_dir_all(target)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_entry(&entry.path(), &target.join(entry.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, target)?;
+    }
+    Ok(())
+}
+
+fn rename_assignment(source: &str, replacement: &str) -> String {
+    source.find("<-").map_or_else(
+        || source.to_owned(),
+        |assignment| format!("{replacement} {}", &source[assignment..]),
+    )
+}
+
+fn safe_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn r_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    )
+}
+
+fn r_binding_name(value: &str) -> String {
+    let simple = !value.is_empty()
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphabetic() || byte == b'.'
+            } else {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_')
+            }
+        })
+        && !(value.starts_with('.') && value.as_bytes().get(1).is_some_and(u8::is_ascii_digit));
+    if simple {
+        value.into()
+    } else {
+        format!("`{}`", value.replace('`', "\\`"))
+    }
+}
+
+fn payload_key(program: &ProgramIr, payload: &PayloadRef) -> String {
+    use sha2::Digest as _;
+    let identity = program.package(payload.package).identity();
+    let mut hash = sha2::Sha256::new();
+    hash.update(identity.name.as_bytes());
+    hash.update([0]);
+    hash.update(identity.image_fingerprint.0.as_bytes());
+    hash.update([0]);
+    hash.update(payload.locator.root.as_bytes());
+    for step in &payload.locator.path {
+        hash.update(format!("{step:?}").as_bytes());
+        hash.update([0]);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn r_executable(r_home: &Path) -> Option<PathBuf> {
+    [
+        r_home.join("bin/x64/R.exe"),
+        r_home.join("bin/R.exe"),
+        r_home.join("bin/R"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+const GENERATED_RUNTIME: &str = r#"
+.slinker_check_target <- function() {
+  actual <- c(
+    version = paste0(R.version$major, ".", R.version$minor),
+    platform = R.version$os,
+    arch = R.version$arch
+  )
+  if (!identical(unname(actual), unname(.slinker_target))) {
+    stop(sprintf("slinker target mismatch: expected %s, got %s", paste(.slinker_target, collapse = "/"), paste(actual, collapse = "/")), call. = FALSE)
+  }
+}
+.slinker_new_namespace <- function(name, version) {
+  if (isNamespaceLoaded(name)) stop(sprintf("LinkedNamespaceCollision(%s)", name), call. = FALSE)
+  imports <- new.env(parent = .BaseNamespaceEnv, hash = TRUE)
+  attr(imports, "name") <- paste0("imports:", name)
+  namespace <- new.env(parent = imports, hash = TRUE)
+  info <- new.env(hash = TRUE, parent = baseenv())
+  namespace$.__NAMESPACE__. <- info
+  info$spec <- c(name = name, version = version)
+  setNamespaceInfo(namespace, "exports", new.env(hash = TRUE, parent = baseenv()))
+  setNamespaceInfo(namespace, "imports", list(base = TRUE))
+  setNamespaceInfo(namespace, "path", "")
+  setNamespaceInfo(namespace, "dynlibs", NULL)
+  setNamespaceInfo(namespace, "S3methods", matrix(NA_character_, 0L, 4L))
+  namespace$.__S3MethodsTable__. <- new.env(hash = TRUE, parent = baseenv())
+  .Internal(registerNamespace(name, namespace))
+  namespace
+}
+.slinker_binding <- function(package, name) get(name, envir = asNamespace(package), inherits = FALSE)
+.slinker_payload <- function(key) readRDS(system.file("slinker", "payload", paste0(key, ".rds"), package = .slinker_root_package))
+.slinker_finish_namespace <- function(namespace, exports) {
+  if (length(exports)) namespaceExport(namespace, exports)
+  if (exists(".onLoad", envir = namespace, inherits = FALSE)) {
+    get(".onLoad", envir = namespace, inherits = FALSE)("", unname(getNamespaceName(namespace)))
+  }
+  lockEnvironment(namespace, TRUE)
+  lockEnvironment(parent.env(namespace), TRUE)
+  invisible(namespace)
+}
+.slinker_resource <- function(package, path) system.file("slinker", "resources", package, path, package = environmentName(topenv(parent.frame())))
+"#;

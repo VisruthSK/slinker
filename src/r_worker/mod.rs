@@ -15,7 +15,8 @@ use crate::package::{
 use crate::{Error, Result};
 use harp::{RFunctionExt, RObjectExt};
 use protocol::{
-    PROTOCOL_VERSION, WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse,
+    PROTOCOL_VERSION, WorkerErrorCode, WorkerFailure, WorkerPackageIdentity, WorkerPackageIndex,
+    WorkerRequest, WorkerResponse,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -97,6 +98,14 @@ impl WorkerRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn normalize_syntax(&self, source: &str) -> std::result::Result<String, String> {
+        harp::RFunction::new("", ".slinker_normalize_source")
+            .add(source)
+            .call()
+            .and_then(String::try_from)
+            .map_err(|error| error.to_string())
+    }
+
     fn target(&self) -> std::result::Result<protocol::WorkerTarget, String> {
         let string = |code| {
             harp::parse_eval_base(code)
@@ -158,11 +167,7 @@ impl WorkerRuntime {
             .expect("package image context inserted")
             .image
             .clone();
-        let metadata = harp::RFunction::new("", ".slinker_package_metadata")
-            .add(context)
-            .call()
-            .map_err(|error| format!("failed to inspect {}: {error}", package.name))?;
-        let mut index = worker_package_index(&metadata)?;
+        let mut index = worker_package_index(&context)?;
         index.image_fingerprint = package.image_fingerprint.clone();
         Ok(index)
     }
@@ -171,8 +176,42 @@ impl WorkerRuntime {
         &mut self,
         package: &protocol::PackageSpec,
         name: &str,
+    ) -> std::result::Result<protocol::WorkerBinding, WorkerOperationError> {
+        let index = self
+            .package_index(package)
+            .map_err(|message| WorkerOperationError {
+                code: WorkerErrorCode::PackageMetadata,
+                message,
+            })?;
+        let key = package.root.to_string_lossy();
+        let context = self
+            ._contexts
+            .get(key.as_ref())
+            .expect("package context created by index request");
+        let image_environment =
+            field(&context.image, "image_env").map_err(|message| WorkerOperationError {
+                code: WorkerErrorCode::PackageMetadata,
+                message,
+            })?;
+        if !harp::environment::Environment::new(image_environment).exists(name) {
+            return Err(WorkerOperationError {
+                code: WorkerErrorCode::MissingBinding,
+                message: format!("installed image has no binding {name}"),
+            });
+        }
+        self.binding_value(package, name, index)
+            .map_err(|message| WorkerOperationError {
+                code: WorkerErrorCode::BindingForce,
+                message,
+            })
+    }
+
+    fn binding_value(
+        &mut self,
+        package: &protocol::PackageSpec,
+        name: &str,
+        index: WorkerPackageIndex,
     ) -> std::result::Result<protocol::WorkerBinding, String> {
-        let index = self.package_index(package)?;
         let key = package.root.to_string_lossy();
         let context = self
             ._contexts
@@ -214,6 +253,78 @@ impl WorkerRuntime {
             private_environments: scanner.private_environments,
         })
     }
+
+    fn serialize_binding(
+        &mut self,
+        package: &protocol::PackageSpec,
+        name: &str,
+    ) -> std::result::Result<Vec<u8>, WorkerOperationError> {
+        self.package_index(package)
+            .map_err(|message| WorkerOperationError {
+                code: WorkerErrorCode::PackageMetadata,
+                message,
+            })?;
+        let context = self
+            ._contexts
+            .get(package.root.to_string_lossy().as_ref())
+            .expect("package context created by index request");
+        let image_environment =
+            field(&context.image, "image_env").map_err(|message| WorkerOperationError {
+                code: WorkerErrorCode::PackageMetadata,
+                message,
+            })?;
+        let environment = harp::environment::Environment::new(image_environment);
+        if !environment.exists(name) {
+            return Err(WorkerOperationError {
+                code: WorkerErrorCode::MissingBinding,
+                message: format!("installed image has no binding {name}"),
+            });
+        }
+        let binding =
+            harp::environment_iter::Binding::new(&environment, name.into()).map_err(|error| {
+                WorkerOperationError {
+                    code: WorkerErrorCode::BindingForce,
+                    message: error.to_string(),
+                }
+            })?;
+        let object = match binding.value {
+            harp::environment_iter::BindingValue::Active { .. } => {
+                return Err(WorkerOperationError {
+                    code: WorkerErrorCode::BindingForce,
+                    message: "active binding cannot be serialized without execution".into(),
+                });
+            }
+            harp::environment_iter::BindingValue::Promise { promise } => {
+                harp::utils::r_promise_force_with_rollback(promise.sexp).map_err(|error| {
+                    WorkerOperationError {
+                        code: WorkerErrorCode::BindingForce,
+                        message: error.to_string(),
+                    }
+                })?
+            }
+            harp::environment_iter::BindingValue::Altrep { object, .. }
+            | harp::environment_iter::BindingValue::Standard { object } => object,
+        };
+        let serialized = harp::RFunction::new("base", "serialize")
+            .add(object)
+            .add(unsafe { libr::R_NilValue })
+            .param("version", 3)
+            .call()
+            .map_err(|error| WorkerOperationError {
+                code: WorkerErrorCode::BindingForce,
+                message: format!("failed to serialize {name}: {error}"),
+            })?;
+        Vec::<u8>::try_from(&serialized).map_err(|error| WorkerOperationError {
+            code: WorkerErrorCode::BindingForce,
+            message: format!("failed to copy serialized {name}: {error}"),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct WorkerOperationError {
+    code: WorkerErrorCode,
+    message: String,
 }
 
 fn r_error(error: impl std::fmt::Display) -> String {
@@ -245,77 +356,145 @@ fn list_field(
     Vec::<harp::object::RObject>::try_from(field(object, name)?).map_err(r_error)
 }
 
-fn bool_field(object: &harp::object::RObject, name: &str) -> std::result::Result<bool, String> {
-    bool::try_from(field(object, name)?).map_err(r_error)
-}
-
 fn worker_package_index(
-    metadata: &harp::object::RObject,
+    context: &harp::object::RObject,
 ) -> std::result::Result<WorkerPackageIndex, String> {
-    let export_names = strings_field(metadata, "export_names")?;
-    let export_bindings = strings_field(metadata, "export_bindings")?;
+    let namespace = field(context, "ns_info")?;
+    let image_environment = field(context, "image_env")?;
+    let installed_exports = field(&namespace, "exports")?;
+    let export_bindings = Vec::<String>::try_from(&installed_exports).map_err(r_error)?;
+    let mut export_names = names(installed_exports.sexp);
     if export_names.len() != export_bindings.len() {
-        return Err("installed export names and bindings have different lengths".into());
+        export_names = export_bindings.clone();
     }
-    let exports = export_names
+    let mut exports = export_names
         .into_iter()
         .zip(export_bindings)
         .collect::<ExportMap>();
-    let imports = list_field(metadata, "imports")?
+    for pattern in strings_field(&namespace, "exportPatterns")? {
+        let matches = harp::RFunction::new("base", "ls")
+            .add(image_environment.clone())
+            .param("pattern", pattern)
+            .param("all.names", true)
+            .call()
+            .and_then(Vec::<String>::try_from)
+            .map_err(r_error)?;
+        exports.extend(matches.into_iter().map(|name| (name.clone(), name)));
+    }
+
+    let imports = list_field(&namespace, "imports")?
         .into_iter()
         .map(|item| {
-            let package = string_field(&item, "package")?;
-            match string_field(&item, "kind")?.as_str() {
-                "all" => Ok(ImportSpec::All {
+            if harp::utils::r_typeof(item.sexp) == libr::STRSXP {
+                return Ok(ImportSpec::All {
+                    package: String::try_from(item).map_err(r_error)?,
+                    except: Vec::new(),
+                });
+            }
+            let values = Vec::<harp::object::RObject>::try_from(&item).map_err(r_error)?;
+            let package = values
+                .first()
+                .ok_or_else(|| "installed import has no package".to_owned())
+                .and_then(|value| String::try_from(value).map_err(r_error))?;
+            if names(item.sexp).iter().any(|name| name == "except") {
+                return Ok(ImportSpec::All {
                     package,
                     except: strings_field(&item, "except")?,
-                }),
-                "from" => {
-                    let remote = strings_field(&item, "remote")?;
-                    let local = strings_field(&item, "local")?;
-                    if remote.len() != local.len() {
-                        return Err("installed import names have different lengths".into());
-                    }
-                    Ok(ImportSpec::From {
-                        package,
-                        bindings: local
-                            .into_iter()
-                            .zip(remote)
-                            .map(|(local, remote)| ImportBinding { local, remote })
-                            .collect(),
-                    })
-                }
-                kind => Err(format!("unsupported installed import kind {kind:?}")),
+                });
             }
-        })
-        .collect::<std::result::Result<Vec<_>, String>>()?;
-    let s3 = list_field(metadata, "s3")?
-        .into_iter()
-        .map(|item| {
-            Ok(S3Registration {
-                generic: string_field(&item, "generic")?,
-                generic_package: Vec::<String>::try_from(field(&item, "generic_package")?)
-                    .map_err(r_error)?
+            let remote_object = values
+                .get(1)
+                .ok_or_else(|| "installed importFrom has no bindings".to_owned())?;
+            let remote = Vec::<String>::try_from(remote_object).map_err(r_error)?;
+            let mut local = names(remote_object.sexp);
+            if local.len() != remote.len() {
+                local = remote.clone();
+            } else {
+                for (local, remote) in local.iter_mut().zip(&remote) {
+                    if local.is_empty() {
+                        local.clone_from(remote);
+                    }
+                }
+            }
+            Ok(ImportSpec::From {
+                package,
+                bindings: local
                     .into_iter()
-                    .next(),
-                class: string_field(&item, "class")?,
-                method: string_field(&item, "method")?,
+                    .zip(remote)
+                    .map(|(local, remote)| ImportBinding { local, remote })
+                    .collect(),
             })
         })
         .collect::<std::result::Result<Vec<_>, String>>()?;
-    let dynlibs = list_field(metadata, "dynlibs")?
+
+    let s3_object = field(&namespace, "S3methods")?;
+    let s3_values = Vec::<Option<String>>::try_from(s3_object.clone()).map_err(r_error)?;
+    let dimensions = Vec::<i32>::try_from(harp::object::RObject::from(harp::object::r_dim(
+        s3_object.sexp,
+    )))
+    .map_err(r_error)?;
+    let rows = dimensions.first().copied().unwrap_or_default().max(0) as usize;
+    let columns = dimensions.get(1).copied().unwrap_or_default().max(0) as usize;
+    let mut s3 = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let generic = s3_values
+            .get(row)
+            .and_then(Clone::clone)
+            .ok_or_else(|| "installed S3 registration has no generic".to_owned())?;
+        let class = s3_values
+            .get(rows + row)
+            .and_then(Clone::clone)
+            .ok_or_else(|| "installed S3 registration has no class".to_owned())?;
+        let method = s3_values
+            .get(2 * rows + row)
+            .and_then(Clone::clone)
+            .unwrap_or_else(|| format!("{generic}.{class}"));
+        let package = (columns >= 4)
+            .then(|| s3_values.get(3 * rows + row).and_then(Clone::clone))
+            .flatten();
+        s3.push(S3Registration {
+            generic: crate::package::GenericSpec {
+                package,
+                name: generic,
+            },
+            class,
+            method,
+        });
+    }
+
+    let native_routines = field(&namespace, "nativeRoutines")?;
+    let dynlibs = strings_field(&namespace, "dynlibs")?
         .into_iter()
-        .map(|item| {
-            let bindings = strings_field(&item, "bindings")?;
-            let symbols = strings_field(&item, "symbols")?;
+        .map(|name| {
+            let native = native_routines.elt(name.as_str()).ok();
+            let registered = native
+                .as_ref()
+                .and_then(|native| field(native, "useRegistration").ok())
+                .and_then(|value| bool::try_from(value).ok())
+                .unwrap_or(false);
+            let fixes = native
+                .as_ref()
+                .and_then(|native| strings_field(native, "registrationFixes").ok())
+                .unwrap_or_default();
+            let symbols_object = native
+                .as_ref()
+                .and_then(|native| field(native, "symbolNames").ok());
+            let symbols = symbols_object
+                .as_ref()
+                .and_then(|symbols| Vec::<String>::try_from(symbols).ok())
+                .unwrap_or_default();
+            let mut bindings = symbols_object
+                .as_ref()
+                .map(|symbols| names(symbols.sexp))
+                .unwrap_or_default();
             if bindings.len() != symbols.len() {
-                return Err("installed native binding names have different lengths".into());
+                bindings.clone_from(&symbols);
             }
             Ok(NativeComponent {
-                name: string_field(&item, "name")?,
-                registration: bool_field(&item, "registered")?.then(|| NativeRegistration {
-                    prefix: string_field(&item, "prefix").expect("metadata prefix"),
-                    suffix: string_field(&item, "suffix").expect("metadata suffix"),
+                name,
+                registration: registered.then(|| NativeRegistration {
+                    prefix: fixes.first().cloned().unwrap_or_default(),
+                    suffix: fixes.get(1).cloned().unwrap_or_default(),
                 }),
                 symbols: bindings
                     .into_iter()
@@ -327,17 +506,19 @@ fn worker_package_index(
         })
         .collect::<std::result::Result<Vec<_>, String>>()?;
     Ok(WorkerPackageIndex {
-        name: string_field(metadata, "name")?,
-        version: string_field(metadata, "version")?,
+        name: string_field(context, "package")?,
+        version: string_field(context, "version")?,
         image_fingerprint: String::new(),
         exports,
         imports,
         s3,
         dynlibs,
-        on_load: bool_field(metadata, "on_load")?,
-        binding_names: strings_field(metadata, "binding_names")?,
-        datasets: strings_field(metadata, "datasets")?,
-        has_sysdata: bool_field(metadata, "has_sysdata")?,
+        on_load: strings_field(context, "binding_names")?
+            .iter()
+            .any(|name| name == ".onLoad"),
+        binding_names: strings_field(context, "binding_names")?,
+        datasets: strings_field(context, "dataset_names")?,
+        has_sysdata: !strings_field(context, "sysdata_names")?.is_empty(),
     })
 }
 
@@ -545,7 +726,18 @@ impl ObjectScanner {
             libr::CLOSXP | libr::ENVSXP | libr::VECSXP | libr::LISTSXP
         );
         if recursive && !self.walking.insert(value) {
-            return Ok(ObjectFacts::new(object_kind(value)));
+            let mut facts = ObjectFacts::new(object_kind(value));
+            if harp::utils::r_typeof(value) == libr::ENVSXP {
+                let environment = self.environment_ref(value)?;
+                if embedded && !environment.starts_with("unsupported:") {
+                    facts.environments.push(EmbeddedEnvironmentRef {
+                        path: path.into(),
+                        environment: environment.clone(),
+                    });
+                }
+                facts.environment = Some(environment);
+            }
+            return Ok(facts);
         }
         let mut facts = ObjectFacts::new(object_kind(value));
         match harp::utils::r_typeof(value) {
@@ -884,11 +1076,13 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
             Err(error) => {
                 write_response(
                     &mut output,
-                    &WorkerResponse::Error {
-                        request_id: None,
-                        code: WorkerErrorCode::Protocol,
-                        message: format!("invalid worker request: {error}"),
-                    },
+                    &worker_failure(
+                        None,
+                        WorkerErrorCode::Protocol,
+                        format!("invalid worker request: {error}"),
+                        None,
+                        None,
+                    ),
                 )?;
                 continue;
             }
@@ -897,13 +1091,15 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
         let response = match request {
             WorkerRequest::Hello { protocol, target } => {
                 if protocol != PROTOCOL_VERSION {
-                    WorkerResponse::Error {
-                        request_id: None,
-                        code: WorkerErrorCode::Protocol,
-                        message: format!(
+                    worker_failure(
+                        None,
+                        WorkerErrorCode::Protocol,
+                        format!(
                             "unsupported worker protocol {protocol}; expected {PROTOCOL_VERSION}"
                         ),
-                    }
+                        None,
+                        None,
+                    )
                 } else {
                     match WorkerRuntime::start(&target) {
                         Ok(started) => match started.target() {
@@ -915,17 +1111,21 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                                     target,
                                 }
                             }
-                            Err(message) => WorkerResponse::Error {
-                                request_id: None,
-                                code: WorkerErrorCode::Startup,
+                            Err(message) => worker_failure(
+                                None,
+                                WorkerErrorCode::RuntimeStartup,
                                 message,
-                            },
+                                None,
+                                None,
+                            ),
                         },
-                        Err(message) => WorkerResponse::Error {
-                            request_id: None,
-                            code: WorkerErrorCode::Startup,
+                        Err(message) => worker_failure(
+                            None,
+                            WorkerErrorCode::RuntimeStartup,
                             message,
-                        },
+                            None,
+                            None,
+                        ),
                     }
                 }
             }
@@ -946,11 +1146,32 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                         message: Some(message),
                     },
                 },
-                None => WorkerResponse::Error {
-                    request_id: Some(request_id),
-                    code: WorkerErrorCode::Startup,
-                    message: "Harp worker must receive hello before semantic requests".into(),
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    None,
+                    None,
+                ),
+            },
+            WorkerRequest::NormalizeSyntax { request_id, source } => match runtime.as_ref() {
+                Some(runtime) => match runtime.normalize_syntax(&source) {
+                    Ok(source) => WorkerResponse::NormalizedSyntax { request_id, source },
+                    Err(message) => worker_failure(
+                        Some(request_id),
+                        WorkerErrorCode::TargetSyntaxRejection,
+                        message,
+                        None,
+                        None,
+                    ),
                 },
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    None,
+                    None,
+                ),
             },
             WorkerRequest::PackageIndex {
                 request_id,
@@ -958,17 +1179,21 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
             } => match runtime.as_mut() {
                 Some(runtime) => match runtime.package_index(&package) {
                     Ok(index) => WorkerResponse::PackageIndex { request_id, index },
-                    Err(message) => WorkerResponse::Error {
-                        request_id: Some(request_id),
-                        code: WorkerErrorCode::PackageMetadata,
+                    Err(message) => worker_failure(
+                        Some(request_id),
+                        WorkerErrorCode::PackageMetadata,
                         message,
-                    },
+                        Some(&package),
+                        None,
+                    ),
                 },
-                None => WorkerResponse::Error {
-                    request_id: Some(request_id),
-                    code: WorkerErrorCode::Startup,
-                    message: "Harp worker must receive hello before semantic requests".into(),
-                },
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    Some(&package),
+                    None,
+                ),
             },
             WorkerRequest::Binding {
                 request_id,
@@ -980,17 +1205,44 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                         request_id,
                         binding,
                     },
-                    Err(message) => WorkerResponse::Error {
-                        request_id: Some(request_id),
-                        code: WorkerErrorCode::BindingInspection,
-                        message,
-                    },
+                    Err(error) => worker_failure(
+                        Some(request_id),
+                        error.code,
+                        error.message,
+                        Some(&package),
+                        Some(name),
+                    ),
                 },
-                None => WorkerResponse::Error {
-                    request_id: Some(request_id),
-                    code: WorkerErrorCode::Startup,
-                    message: "Harp worker must receive hello before semantic requests".into(),
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    Some(&package),
+                    Some(name),
+                ),
+            },
+            WorkerRequest::SerializeBinding {
+                request_id,
+                package,
+                name,
+            } => match runtime.as_mut() {
+                Some(runtime) => match runtime.serialize_binding(&package, &name) {
+                    Ok(bytes) => WorkerResponse::Payload { request_id, bytes },
+                    Err(error) => worker_failure(
+                        Some(request_id),
+                        error.code,
+                        error.message,
+                        Some(&package),
+                        Some(name),
+                    ),
                 },
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    Some(&package),
+                    Some(name),
+                ),
             },
         };
 
@@ -998,6 +1250,29 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn worker_failure(
+    request_id: Option<u64>,
+    code: WorkerErrorCode,
+    message: impl Into<String>,
+    package: Option<&protocol::PackageSpec>,
+    binding: Option<String>,
+) -> WorkerResponse {
+    WorkerResponse::Error {
+        error: WorkerFailure {
+            request_id,
+            package: package.map(|package| WorkerPackageIdentity {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                image_fingerprint: package.image_fingerprint.clone(),
+            }),
+            binding,
+            code,
+            message: message.into(),
+            captured_output: Vec::new(),
+        },
+    }
 }
 
 fn write_response(writer: &mut impl Write, response: &WorkerResponse) -> Result<()> {
@@ -1017,6 +1292,8 @@ fn write_response(writer: &mut impl Write, response: &WorkerResponse) -> Result<
 #[cfg(test)]
 mod tests {
     use super::protocol::*;
+    use super::*;
+    use crate::package::BindingRepresentation;
 
     #[test]
     fn protocol_round_trips_binding_request() {
@@ -1041,5 +1318,268 @@ mod tests {
             }
             _ => panic!("wrong request variant"),
         }
+    }
+
+    #[test]
+    fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
+        let Some(r_home) = test_r_home() else {
+            return;
+        };
+        let Some((fixture_root, fixture_library, marker, fixture_temp)) = install_fixture(&r_home)
+        else {
+            return;
+        };
+        let target = TargetSpec {
+            r_home,
+            arch: match std::env::consts::ARCH {
+                "x86" => "i386".into(),
+                arch => arch.into(),
+            },
+            libraries: vec![fixture_library.clone()],
+        };
+        let mut runtime = WorkerRuntime::start(&target).expect("start selected target R");
+        let initial_target = runtime.target().expect("capture initialized target");
+        assert_eq!(
+            dunce::canonicalize(&initial_target.libraries[0]).expect("canonical first library"),
+            dunce::canonicalize(&fixture_library).expect("canonical fixture library")
+        );
+        // Safety: this test owns the only embedded R runtime and performs all R access on this
+        // thread, so no concurrent environment access can occur.
+        unsafe {
+            std::env::set_var("SLINKER_HARP_ONLOAD_MARKER", &marker);
+        }
+        let package = PackageSpec {
+            name: "harpfixture".into(),
+            version: "1.0.0".into(),
+            image_fingerprint: "fixture-image".into(),
+            root: fixture_root,
+        };
+        let index = runtime
+            .package_index(&package)
+            .expect("index exact fixture root");
+        assert!(index.on_load);
+        assert!(index.binding_names.iter().any(|name| name == "good"));
+        assert!(index.s3.iter().any(|registration| {
+            registration.generic.name == "head"
+                && registration.generic.package.as_deref() == Some("utils")
+                && registration.method == "head.harpfixture"
+        }));
+        assert!(!marker.exists(), "indexing executed .onLoad");
+        let good = runtime
+            .binding(&package, "good")
+            .expect("inspect demanded binding");
+        assert!(good.binding.closure.is_some());
+        assert!(!marker.exists(), "binding inspection executed .onLoad");
+        assert_eq!(
+            runtime.target().expect("target after inspection").libraries,
+            initial_target.libraries,
+            "package inspection mutated .libPaths()"
+        );
+        let fixture = harp::parse_eval_global(
+            r#"
+            local({
+              image <- new.env(parent = baseenv())
+              private <- new.env(parent = baseenv())
+              private$counter <- 0L
+              makeActiveBinding("active", function() {
+                private$counter <- private$counter + 1L
+                1L
+              }, private)
+              delayedAssign("promise", {
+                private$counter <- private$counter + 1L
+                2L
+              }, assign.env = private)
+              private$self <- private
+              image$holder <- list(private = private, closure = function(x) x)
+              class(image$holder) <- c("first_class", "second_class")
+              image$counter <- 0L
+              delayedAssign("unrelated", {
+                image$counter <- image$counter + 1L
+                99L
+              }, assign.env = image)
+              delayedAssign("lazy", function() 1L, assign.env = image)
+              image$altrep <- 1:1000000
+              list(image = image, private = private)
+            })
+            "#,
+        )
+        .expect("create worker fixture");
+        let image = field(&fixture, "image").expect("image environment");
+        let image_environment = harp::environment::Environment::new(image.clone());
+
+        let lazy = harp::environment_iter::Binding::new(&image_environment, "lazy".into())
+            .expect("lazy binding");
+        let mut scanner = ObjectScanner::new(image.sexp, "fixture".into(), HashMap::new());
+        let lazy = scanner
+            .top_binding("lazy", BindingOrigin::Code, lazy.value)
+            .expect("inspect demanded promise");
+        assert_eq!(lazy.representation, BindingRepresentation::LazyLoadPromise);
+        assert!(lazy.closure.is_some());
+        assert_eq!(
+            i32::try_from(image_environment.get("counter").expect("image counter"))
+                .expect("integer"),
+            0,
+            "demanding lazy forced unrelated"
+        );
+
+        let holder = harp::environment_iter::Binding::new(&image_environment, "holder".into())
+            .expect("holder binding");
+        let holder = scanner
+            .top_binding("holder", BindingOrigin::Code, holder.value)
+            .expect("inspect retained private environment");
+        assert_eq!(holder.embedded_closures.len(), 1);
+        assert!(holder.embedded_closures[0].source.contains("function"));
+        assert_eq!(holder.classes, ["first_class", "second_class"]);
+        let private = scanner
+            .private_environments
+            .values()
+            .find(|environment| environment.bindings.contains_key("active"))
+            .expect("private environment");
+        assert_eq!(
+            private.bindings["active"].representation,
+            BindingRepresentation::ActiveBinding
+        );
+        assert_eq!(
+            private.bindings["promise"].representation,
+            BindingRepresentation::Promise { forced: false }
+        );
+        assert_eq!(
+            private.bindings["self"].environment.as_deref(),
+            Some(private.id.as_str())
+        );
+        let private_environment = harp::environment::Environment::new(
+            field(&fixture, "private").expect("private fixture environment"),
+        );
+        assert_eq!(
+            i32::try_from(private_environment.get("counter").expect("counter")).expect("integer"),
+            0
+        );
+
+        let altrep = harp::environment_iter::Binding::new(&image_environment, "altrep".into())
+            .expect("ALTREP binding");
+        let altrep = scanner
+            .top_binding("altrep", BindingOrigin::Code, altrep.value)
+            .expect("classify ALTREP");
+        assert!(matches!(
+            altrep.representation,
+            BindingRepresentation::Altrep { .. }
+        ));
+
+        harp::parse_eval_global("cat('worker console noise')")
+            .expect("write through the embedded R console");
+        let response = WorkerResponse::SyntaxValidation {
+            request_id: 19,
+            accepted: true,
+            message: None,
+        };
+        let mut protocol = Vec::new();
+        write_response(&mut protocol, &response).expect("write isolated protocol response");
+        assert!(matches!(
+            serde_json::from_slice::<WorkerResponse>(&protocol).expect("decode protocol response"),
+            WorkerResponse::SyntaxValidation {
+                request_id: 19,
+                accepted: true,
+                ..
+            }
+        ));
+        assert!(runtime.validate_syntax("function(").is_err());
+        assert_eq!(
+            runtime
+                .target()
+                .expect("recapture initialized target")
+                .libraries,
+            initial_target.libraries
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(fixture_temp).expect("remove installed fixture");
+    }
+
+    fn test_r_home() -> Option<std::path::PathBuf> {
+        if let Some(home) = std::env::var_os("R_HOME") {
+            return dunce::canonicalize(home).ok();
+        }
+        let output = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/c", "R RHOME"])
+                .output()
+                .ok()?
+        } else {
+            std::process::Command::new("R").arg("RHOME").output().ok()?
+        };
+        let home = String::from_utf8(output.stdout).ok()?;
+        dunce::canonicalize(
+            home.lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())?
+                .trim(),
+        )
+        .ok()
+    }
+
+    fn install_fixture(
+        r_home: &std::path::Path,
+    ) -> Option<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = std::env::temp_dir().join(format!(
+            "slinker-harp-fixture-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let source = temp.join("source");
+        let library = temp.join("library");
+        std::fs::create_dir_all(source.join("R")).ok()?;
+        std::fs::create_dir_all(&library).ok()?;
+        std::fs::write(
+            source.join("DESCRIPTION"),
+            "Package: harpfixture\nVersion: 1.0.0\nTitle: Harp fixture\nDescription: Harp worker fixture.\nAuthors@R: person('A', 'B', email='a@example.com', role=c('aut','cre'))\nLicense: MIT\nEncoding: UTF-8\n",
+        )
+        .ok()?;
+        std::fs::write(
+            source.join("NAMESPACE"),
+            "export(good)\nS3method(utils::head, harpfixture)\n",
+        )
+        .ok()?;
+        std::fs::write(
+            source.join("R").join("fixture.R"),
+            r#"
+good <- function() 1L
+head.harpfixture <- function(x, ...) x
+unrelated <- function() stop("unrelated binding executed")
+.onLoad <- function(...) {
+  marker <- Sys.getenv("SLINKER_HARP_ONLOAD_MARKER", unset = "")
+  if (nzchar(marker)) file.create(marker)
+}
+"#,
+        )
+        .ok()?;
+        let executable = [
+            r_home.join("bin").join("x64").join("R.exe"),
+            r_home.join("bin").join("R.exe"),
+            r_home.join("bin").join("R"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())?;
+        let status = std::process::Command::new(executable)
+            .args(["CMD", "INSTALL", "--no-test-load"])
+            .arg(format!("--library={}", library.display()))
+            .arg(&source)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        Some((
+            library.join("harpfixture"),
+            library,
+            temp.join("onload-marker"),
+            temp,
+        ))
     }
 }

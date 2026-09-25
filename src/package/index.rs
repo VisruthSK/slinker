@@ -25,10 +25,25 @@ pub enum ImportSpec {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct S3Registration {
-    pub generic: String,
-    pub generic_package: Option<String>,
+    pub generic: GenericSpec,
     pub class: String,
     pub method: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct GenericSpec {
+    pub package: Option<String>,
+    pub name: String,
+}
+
+impl std::fmt::Display for GenericSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(package) = &self.package {
+            write!(formatter, "{package}::{}", self.name)
+        } else {
+            formatter.write_str(&self.name)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]

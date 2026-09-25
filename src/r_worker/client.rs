@@ -152,6 +152,25 @@ impl WorkerClient {
         }
     }
 
+    pub(crate) fn serialize_binding(
+        &mut self,
+        package: PackageSpec,
+        name: &str,
+    ) -> Result<Vec<u8>> {
+        let request_id = self.request_id();
+        match self.exchange(&WorkerRequest::SerializeBinding {
+            request_id,
+            package,
+            name: name.to_owned(),
+        })? {
+            WorkerResponse::Payload {
+                request_id: response_id,
+                bytes,
+            } if response_id == request_id => Ok(bytes),
+            response => Err(worker_error("payload serialization", response)),
+        }
+    }
+
     pub(crate) fn validate_syntax(
         &mut self,
         source: &str,
@@ -179,6 +198,20 @@ impl WorkerClient {
         }
     }
 
+    pub(crate) fn normalize_syntax(&mut self, source: &str) -> Result<String> {
+        let request_id = self.request_id();
+        match self.exchange(&WorkerRequest::NormalizeSyntax {
+            request_id,
+            source: source.to_owned(),
+        })? {
+            WorkerResponse::NormalizedSyntax {
+                request_id: response_id,
+                source,
+            } if response_id == request_id => Ok(source),
+            response => Err(worker_error("syntax normalization", response)),
+        }
+    }
+
     fn request_id(&mut self) -> u64 {
         let request = self.next_request;
         self.next_request = self.next_request.wrapping_add(1);
@@ -186,6 +219,7 @@ impl WorkerClient {
     }
 
     fn exchange(&mut self, request: &WorkerRequest) -> Result<WorkerResponse> {
+        let context = request_context(request);
         serde_json::to_writer(&mut self.input, request).map_err(|error| {
             Error::Analysis(format!("failed to serialize Harp worker request: {error}"))
         })?;
@@ -211,7 +245,7 @@ impl WorkerClient {
             }
             if let Some(status) = self.child.try_wait().ok().flatten() {
                 return Err(Error::Analysis(format!(
-                    "Harp worker terminated before responding; status {status}"
+                    "Harp worker terminated while processing {context}; status {status}"
                 )));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -221,6 +255,42 @@ impl WorkerClient {
                 "invalid Harp worker response: {error}; payload {line:?}"
             ))
         })
+    }
+}
+
+fn request_context(request: &WorkerRequest) -> String {
+    match request {
+        WorkerRequest::Hello { .. } => "target startup".into(),
+        WorkerRequest::PackageIndex {
+            request_id,
+            package,
+        } => format!(
+            "request {request_id} package index {} {} {}",
+            package.name, package.version, package.image_fingerprint
+        ),
+        WorkerRequest::Binding {
+            request_id,
+            package,
+            name,
+        } => format!(
+            "request {request_id} binding {}::{name} {} {}",
+            package.name, package.version, package.image_fingerprint
+        ),
+        WorkerRequest::SerializeBinding {
+            request_id,
+            package,
+            name,
+        } => format!(
+            "request {request_id} payload {}::{name} {} {}",
+            package.name, package.version, package.image_fingerprint
+        ),
+        WorkerRequest::ValidateSyntax { request_id, .. } => {
+            format!("request {request_id} target syntax validation")
+        }
+        WorkerRequest::NormalizeSyntax { request_id, .. } => {
+            format!("request {request_id} target syntax normalization")
+        }
+        WorkerRequest::Shutdown => "worker shutdown".into(),
     }
 }
 
@@ -255,17 +325,59 @@ fn package_spec(package: &InstalledPackage) -> PackageSpec {
         name: package.id.name.clone(),
         version: package.id.version.to_string(),
         image_fingerprint: package.id.image_fingerprint.0.clone(),
-        root: package.id.root.clone(),
+        root: package.location.root.clone(),
     }
 }
 
 fn worker_error(operation: &str, response: WorkerResponse) -> Error {
     match response {
-        WorkerResponse::Error { code, message, .. } => Error::Analysis(format!(
-            "Harp worker {operation} failed ({code:?}): {message}"
+        WorkerResponse::Error { error } => Error::Analysis(format!(
+            "Harp worker {operation} failed ({:?}) for {}{}: {}{}",
+            error.code,
+            error.package.as_ref().map_or_else(
+                || "target".into(),
+                |package| format!(
+                    "{} {} {}",
+                    package.name, package.version, package.image_fingerprint
+                )
+            ),
+            error
+                .binding
+                .as_ref()
+                .map_or_else(String::new, |binding| format!("::{binding}")),
+            error.message,
+            if error.captured_output.is_empty() {
+                String::new()
+            } else {
+                format!("; R output: {}", error.captured_output.join(" | "))
+            }
         )),
         response => Error::Analysis(format!(
             "Harp worker returned unexpected {operation} response: {response:?}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_crash_context_identifies_exact_binding_request() {
+        let request = WorkerRequest::Binding {
+            request_id: 41,
+            package: PackageSpec {
+                name: "fixture".into(),
+                version: "1.0.0".into(),
+                image_fingerprint: "abc123".into(),
+                root: "fixture".into(),
+            },
+            name: "bad".into(),
+        };
+
+        assert_eq!(
+            request_context(&request),
+            "request 41 binding fixture::bad 1.0.0 abc123"
+        );
     }
 }

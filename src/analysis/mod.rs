@@ -7,7 +7,7 @@ pub mod need;
 pub mod policy;
 
 pub use diagnostic::{Diagnostic, RejectCode};
-pub use engine::{LinkPlan, Linker};
+pub use engine::{LinkIr, Linker};
 pub use explain::{
     EXPLANATION_SCHEMA_VERSION, ExplanationComponent, ExplanationDag, ExplanationEdge,
     ExplanationError, ExplanationEvidence, ExplanationMember, ExplanationPackage, ExplanationRoot,
@@ -20,5 +20,5 @@ pub use export::{
     GraphSourceExport, GraphStatsExport, PackageIdentityExport, TargetIdentityExport,
 };
 pub use graph::{Edge, EdgeKind, Graph, Node, NodeId, NodeKind};
-pub use need::{LifecycleId, NativeId, Need, ResourceId, S3Id};
+pub use need::{GenericId, LifecycleId, NativeId, Need, ResourceId, S3Id};
 pub use policy::{DiscoveryPolicy, LinkPolicy};

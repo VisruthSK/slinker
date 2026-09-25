@@ -41,81 +41,6 @@
   )
 }
 
-.slinker_package_metadata <- function(context) {
-  ns <- context$ns_info
-  exports <- as.character(ns$exports)
-  export_names <- names(ns$exports)
-  if (is.null(export_names)) export_names <- exports
-  export_names[!nzchar(export_names)] <- exports[!nzchar(export_names)]
-  for (pattern in ns$exportPatterns) {
-    matches <- setdiff(
-      ls(context$image_env, pattern = pattern, all.names = TRUE),
-      c(".__NAMESPACE__.", ".__S3MethodsTable__.", ".packageName")
-    )
-    exports <- c(exports, matches)
-    export_names <- c(export_names, matches)
-  }
-  unique_exports <- !duplicated(paste0(export_names, "\r", exports))
-
-  imports <- lapply(ns$imports, function(entry) {
-    if (is.character(entry)) {
-      return(list(kind = "all", package = entry, except = character()))
-    }
-    if (!is.null(entry$except)) {
-      return(list(kind = "all", package = as.character(entry[[1L]]), except = as.character(entry$except)))
-    }
-    remote <- as.character(entry[[2L]])
-    local <- names(entry[[2L]])
-    if (is.null(local)) local <- remote
-    local[!nzchar(local)] <- remote[!nzchar(local)]
-    list(kind = "from", package = as.character(entry[[1L]]), remote = remote, local = local)
-  })
-
-  s3 <- ns$S3methods
-  s3 <- if (length(s3)) {
-    s3 <- as.matrix(s3)
-    lapply(seq_len(nrow(s3)), function(i) list(
-      generic = s3[i, 1L],
-      generic_package = if (ncol(s3) >= 4L && !is.na(s3[i, 4L])) s3[i, 4L] else character(),
-      class = s3[i, 2L],
-      method = if (ncol(s3) >= 3L && !is.na(s3[i, 3L])) s3[i, 3L] else paste(s3[i, 1L], s3[i, 2L], sep = ".")
-    ))
-  } else list()
-
-  dynlibs <- lapply(as.character(ns$dynlibs), function(dll) {
-    native <- ns$nativeRoutines[[dll]]
-    registered <- !is.null(native) && isTRUE(native$useRegistration)
-    fixes <- if (registered && length(native$registrationFixes) >= 2L) {
-      as.character(native$registrationFixes[1:2])
-    } else c("", "")
-    symbols <- if (is.null(native)) character() else native$symbolNames
-    bindings <- names(symbols)
-    if (is.null(bindings)) bindings <- as.character(symbols)
-    list(
-      name = dll,
-      registered = registered,
-      prefix = fixes[[1L]],
-      suffix = fixes[[2L]],
-      bindings = bindings,
-      symbols = as.character(symbols)
-    )
-  })
-
-  list(
-    name = context$package,
-    version = context$version,
-    export_names = export_names[unique_exports],
-    export_bindings = exports[unique_exports],
-    imports = imports,
-    s3 = s3,
-    dynlibs = dynlibs,
-    on_load = ".onLoad" %in% context$binding_names,
-    binding_names = context$binding_names,
-    datasets = context$dataset_names,
-    has_sysdata = length(context$sysdata_names) > 0L
-  )
-}
-
 .slinker_deparse_binding <- function(name, value, embedded = FALSE) {
   rhs <- paste(deparse(
     value,
@@ -127,4 +52,15 @@
     lhs <- if (simple) name else paste0("`", gsub("`", "\\\\`", name, fixed = TRUE), "`")
     paste0(lhs, " <- ", rhs)
   }
+}
+
+.slinker_normalize_source <- function(source) {
+  expressions <- parse(text = source, keep.source = FALSE)
+  paste(vapply(expressions, function(expression) {
+    paste(deparse(
+      expression,
+      width.cutoff = 500L,
+      control = c("keepInteger", "keepNA", "niceNames")
+    ), collapse = "\n")
+  }, character(1L), USE.NAMES = FALSE), collapse = "\n")
 }

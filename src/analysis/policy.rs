@@ -2,7 +2,7 @@
 pub enum DiscoveryPolicy {
     Reject,
     Internalize,
-    TargetProvidedOnly,
+    ExternalOnly,
 }
 
 #[derive(Clone, Copy, Debug)]

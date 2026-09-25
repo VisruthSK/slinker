@@ -19,7 +19,7 @@ use crate::syntax::facts::{
 use crate::syntax::source::{SourceId, Span};
 use crate::{Error, Result};
 use air_r_parser::{RParserOptions, parse};
-use air_r_syntax::{AnyRExpression, RRoot};
+use air_r_syntax::{AnyRExpression, RBinaryExpression, RRoot};
 use biome_rowan::{AstNode, AstNodeList, AstSeparatedList};
 use oak_semantic::semantic_index::{
     DefinitionKind, NamespaceAccessKind, ScopeId, ScopeKind, SemanticDiagnostic, SemanticIndex,
@@ -551,6 +551,53 @@ fn translate_index(
                 raw,
             });
         }
+    }
+
+    for binary in root
+        .syntax()
+        .descendants()
+        .filter_map(RBinaryExpression::cast)
+    {
+        let Ok(operator) = binary.operator() else {
+            continue;
+        };
+        let operator = operator.text_trimmed().to_owned();
+        if matches!(operator.as_str(), "<-" | "=" | "<<-" | "->" | "->>") {
+            continue;
+        }
+        let (Ok(left), Ok(right)) = (binary.left(), binary.right()) else {
+            continue;
+        };
+        let span = ast_span(&source, &binary);
+        let (scope, _) = index.scope_at(binary.range().start());
+        let argument = |expression: &AnyRExpression| {
+            let span = ast_span(&source, expression);
+            (
+                static_arg(text.get(span.start..span.end).unwrap_or_default().trim()),
+                Some(span),
+            )
+        };
+        let (left_arg, left_span) = argument(&left);
+        let (right_arg, right_span) = argument(&right);
+        live_calls.push(LiveCall {
+            site: CallSite {
+                callee: operator.clone(),
+                callee_kind: CalleeKind::DefinitelyExternal,
+                qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
+                args: vec![left_arg, right_arg],
+                arg_names: vec![None, None],
+                arg_spans: vec![left_span, right_span],
+                local_closure_args: vec![false, false],
+                phase: phase_for_scope(index, scope),
+                guards: Vec::new(),
+                span: span.clone(),
+            },
+            raw: RawCall {
+                start: span.start,
+                end: span.end,
+                args: Vec::new(),
+            },
+        });
     }
 
     deduplicate_calls(&mut live_calls);

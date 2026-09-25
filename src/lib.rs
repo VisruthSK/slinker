@@ -57,7 +57,11 @@ pub mod analysis;
 pub mod build;
 pub mod cache;
 #[cfg(feature = "air")]
+pub mod ir;
+#[cfg(feature = "air")]
 pub mod package;
+#[cfg(feature = "air")]
+pub mod source;
 #[cfg(feature = "air")]
 pub mod syntax;
 

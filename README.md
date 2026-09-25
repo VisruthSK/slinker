@@ -7,7 +7,7 @@
 ```text
 slinker analyze voucher
 slinker analyze voucher --lib C:/project/renv/library --lib C:/Users/me/AppData/Local/R/win-library/4.6
-slinker analyze voucher --target-provided cli
+slinker analyze voucher --external cli
 slinker analyze voucher --extra-pkgs posterior distributional
 slinker analyze voucher --graph
 slinker analyze voucher --graph
@@ -17,15 +17,15 @@ slinker analyze voucher --graph
 
 `Suggests` is not a dependency graph. A package appearing only in `Suggests` contributes no edge and is not inspected merely because it is installed.
 
-`--extra-pkgs PKG...` explicitly enables optional packages for reachable optional-package code paths. Values are space-separated, for example `--extra-pkgs foo bar baz`. The flag does not make those packages roots, does not retain their full APIs, and does not recursively follow their `Suggests`. If retained code never reaches an enabled package, that package still stays out of the graph. A standard guarded branch such as `if (requireNamespace("foo")) foo::bar()` is excluded unless `foo` is selected, target-provided, or otherwise required by the package's effective imports.
+`--extra-pkgs PKG...` explicitly enables optional packages for reachable optional-package code paths. Values are space-separated, for example `--extra-pkgs foo bar baz`. The flag does not make those packages roots, does not retain their full APIs, and does not recursively follow their `Suggests`. If retained code never reaches an enabled package, that package still stays out of the graph. A standard guarded branch such as `if (requireNamespace("foo")) foo::bar()` is excluded unless `foo` is selected, External, or otherwise required by the package's effective imports.
 
-`--target-provided` leaves named third-party namespaces external after resolving their exact installed identity. Base packages remain part of the target R platform.
+`--external` leaves named third-party namespaces external after resolving their exact installed identity. Base packages remain part of the target R platform.
 
 Slinker runs `R RHOME` once as a location-only preflight and falls back to `R_HOME` when `R` is unavailable. It then loads that installation's shared runtime through Harp/libr. No R executable participates in target probing or package analysis.
 
 ### Graph inspection
 
-`--graph` writes only deterministic explanation-DAG JSON to stdout, so output can be redirected and compared without cleanup. Progress messages remain on stderr. The versioned export coalesces parallel evidence, condenses strongly connected components into a DAG, and includes root attribution, package boundaries and entry points, dominators, presentation metadata, and transparent closure paths. The authoritative raw linker graph remains available through `--dump-graph` for exact debugging.
+`--graph` writes only deterministic explanation-DAG JSON to stdout, so output can be redirected and compared without cleanup. Progress messages remain on stderr. The versioned export coalesces parallel evidence, condenses strongly connected components into a DAG, and includes root attribution, package boundaries and entry points, presentation metadata, and transparent closure paths.
 
 Graph inspection is observational. Enabling it does not request additional bindings, discover packages, change retention, or alter blocker generation. Blocked analyses still have a graph export because blockers are a primary use case for graph inspection.
 
@@ -70,9 +70,9 @@ Native opacity widens the demanded native component, not the package's R namespa
 
 Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema `1` keys each JSON entry by package name, version, and slinker's installed-image fingerprint, so a summary cannot silently transfer to a different native build. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and continue to produce `UnknownNativeEffects`.
 
-## Root versus internalized packages
+## Root, Linked, and External packages
 
-The root package keeps its real installed-package behavior, including package metadata, help/documentation databases, and normal root namespace identity. Internalized dependency packages are synthetic and minimal: only semantically retained bindings, imports, resources, datasets, S3/native obligations, and lifecycle behavior belong in the link plan.
+The root package keeps its real installed-package behavior, including package metadata, help/documentation databases, and normal root namespace identity. Linked dependency packages are synthetic and minimal: only semantically retained bindings, imports, resources, datasets, S3/native obligations, and lifecycle behavior belong in the link plan.
 
 ## Environment
 

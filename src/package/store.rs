@@ -193,6 +193,9 @@ pub enum SyntaxValidation {
 }
 
 pub trait PackageProvider {
+    fn target_environment(&self) -> Option<&TargetEnvironment> {
+        None
+    }
     fn locate(&mut self, name: &str) -> Result<InstalledPackage>;
     fn locate_optional(&mut self, name: &str) -> Result<Option<InstalledPackage>>;
     fn locate_many(&mut self, names: &[String], _jobs: usize) -> Result<Vec<InstalledPackage>> {
@@ -207,8 +210,6 @@ pub trait PackageProvider {
     fn prefetch_indexes(&mut self, _packages: &[InstalledPackage], _jobs: usize) -> Result<()> {
         Ok(())
     }
-    fn is_target_provided(&self, package: &InstalledPackage) -> bool;
-    fn is_base_binding(&self, name: &str) -> bool;
     fn resource_exists(&mut self, package: &InstalledPackage, path: &str) -> Result<bool> {
         Ok(self
             .index(package)?
@@ -222,11 +223,11 @@ pub trait PackageProvider {
         binding: &str,
         source: &str,
     ) -> Result<SyntaxValidation>;
+    fn normalize_syntax(&mut self, source: &str) -> Result<String>;
 }
 
 pub struct PackageStore {
     locator: PackageLocator,
-    explicit_target: HashSet<PackageId>,
     locations: HashMap<String, InstalledPackage>,
     indexes: HashMap<PackageId, Arc<PackageIndex>>,
     bindings: HashMap<(PackageId, String), Arc<PackageImage>>,
@@ -239,11 +240,7 @@ pub struct PackageStore {
 }
 
 impl PackageStore {
-    pub fn new(
-        r_home: PathBuf,
-        target: TargetEnvironment,
-        explicit_target: impl IntoIterator<Item = String>,
-    ) -> Result<Self> {
+    pub fn new(r_home: PathBuf, target: TargetEnvironment) -> Result<Self> {
         let target_fingerprint = fingerprint_strings(
             std::iter::once(target.r_home.to_string_lossy().into_owned())
                 .chain(std::iter::once(format!(
@@ -259,19 +256,11 @@ impl PackageStore {
         )
         .0;
         let locator = PackageLocator::new(target);
-        let mut explicit_target_ids = HashSet::new();
-        let mut locations = HashMap::new();
-        for name in explicit_target {
-            let package = locator.locate(&name)?;
-            explicit_target_ids.insert(package.id.clone());
-            locations.insert(name, package);
-        }
         let cache = Cache::new(ANALYSIS_SCHEMA)?;
         let native_summaries = NativeSummaryManifest::load()?;
         Ok(Self {
             locator,
-            explicit_target: explicit_target_ids,
-            locations,
+            locations: HashMap::new(),
             indexes: HashMap::new(),
             bindings: HashMap::new(),
             cache,
@@ -347,14 +336,12 @@ impl PackageStore {
     }
 
     fn cache_key(&self, package: &InstalledPackage) -> String {
-        let library = package.id.library.to_string_lossy().into_owned();
         let key = fingerprint_strings([
             self.target_fingerprint.as_str(),
             AIR_VERSION,
             ANALYSIS_SCHEMA,
             package.id.name.as_str(),
             package.id.version.as_ref(),
-            library.as_str(),
             package.id.image_fingerprint.0.as_str(),
         ]);
         key.0
@@ -442,6 +429,9 @@ impl PackageStore {
 }
 
 impl PackageProvider for PackageStore {
+    fn target_environment(&self) -> Option<&TargetEnvironment> {
+        Some(self.locator.target())
+    }
     fn locate(&mut self, name: &str) -> Result<InstalledPackage> {
         if let Some(package) = self.locations.get(name) {
             return Ok(package.clone());
@@ -585,7 +575,7 @@ impl PackageProvider for PackageStore {
     fn resource_exists(&mut self, package: &InstalledPackage, path: &str) -> Result<bool> {
         use std::path::Component;
         if path.is_empty() {
-            return Ok(package.id.root.is_dir());
+            return Ok(package.location.root.is_dir());
         }
         let relative = Path::new(path);
         if relative.is_absolute()
@@ -595,19 +585,7 @@ impl PackageProvider for PackageStore {
         {
             return Ok(false);
         }
-        Ok(package.id.root.join(relative).exists())
-    }
-
-    fn is_target_provided(&self, package: &InstalledPackage) -> bool {
-        self.explicit_target.contains(&package.id)
-            || matches!(
-                package.description.priority_parsed(),
-                Some(Ok(crate::metadata::Priority::Base))
-            )
-    }
-
-    fn is_base_binding(&self, name: &str) -> bool {
-        self.locator.target().base_bindings.contains(name)
+        Ok(package.location.root.join(relative).exists())
     }
 
     fn validate_syntax(
@@ -618,13 +596,17 @@ impl PackageProvider for PackageStore {
     ) -> Result<SyntaxValidation> {
         self.worker()?.validate_syntax(source)
     }
+
+    fn normalize_syntax(&mut self, source: &str) -> Result<String> {
+        self.worker()?.normalize_syntax(source)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Description;
-    use crate::package::{Digest, LifecycleMetadata, NativeComponent};
+    use crate::package::{Digest, LifecycleMetadata, NativeComponent, PackageLocation};
 
     fn package_index() -> PackageIndex {
         let description = Description::parse("Package: fixture\nVersion: 1.0.0\n");
@@ -633,9 +615,11 @@ mod tests {
                 id: PackageId {
                     name: "fixture".into(),
                     version: "1.0.0".parse().expect("version"),
+                    image_fingerprint: Digest("exact-image".into()),
+                },
+                location: PackageLocation {
                     library: PathBuf::from("/library"),
                     root: PathBuf::from("/library/fixture"),
-                    image_fingerprint: Digest("exact-image".into()),
                 },
                 description: description.clone(),
             },

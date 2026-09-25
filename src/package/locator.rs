@@ -11,14 +11,19 @@ pub struct Digest(pub String);
 pub struct PackageId {
     pub name: String,
     pub version: Version,
+    pub image_fingerprint: Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackageLocation {
     pub library: PathBuf,
     pub root: PathBuf,
-    pub image_fingerprint: Digest,
 }
 
 #[derive(Clone, Debug)]
 pub struct InstalledPackage {
     pub id: PackageId,
+    pub location: PackageLocation,
     pub description: Description,
 }
 
@@ -88,10 +93,9 @@ impl PackageLocator {
                 id: PackageId {
                     name: name.to_owned(),
                     version,
-                    library,
-                    root,
                     image_fingerprint: fingerprint,
                 },
+                location: PackageLocation { library, root },
                 description,
             }));
         }

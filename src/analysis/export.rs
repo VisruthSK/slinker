@@ -1,13 +1,13 @@
 use crate::TargetEnvironment;
 use crate::analysis::diagnostic::RejectCode;
-use crate::analysis::engine::LinkPlan;
+use crate::analysis::engine::LinkIr;
 use crate::analysis::graph::{Edge, EdgeKind, Node, NodeKind};
 use crate::syntax::{SourceOrigin, Sources, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-pub const GRAPH_SCHEMA_VERSION: u32 = 1;
+pub const GRAPH_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GraphExport {
@@ -27,6 +27,7 @@ pub struct GraphExport {
 pub struct PackageIdentityExport {
     pub name: String,
     pub version: String,
+    pub image_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,39 +141,26 @@ impl std::error::Error for GraphExportError {}
 
 impl GraphExport {
     pub fn from_plan(
-        plan: &LinkPlan,
+        plan: &LinkIr,
         target: &TargetEnvironment,
         root_name: &str,
     ) -> Result<Self, GraphExportError> {
-        let mut root_packages = plan
-            .images
-            .keys()
-            .filter(|id| id.name == root_name)
-            .collect::<Vec<_>>();
-        root_packages.sort_by(|left, right| {
-            left.version
-                .to_string()
-                .cmp(&right.version.to_string())
-                .then_with(|| left.image_fingerprint.0.cmp(&right.image_fingerprint.0))
-        });
-        let root_package = match root_packages.as_slice() {
-            [root] => *root,
-            [] => {
-                return Err(GraphExportError::new(format!(
-                    "root package `{root_name}` is missing from the analyzed images"
-                )));
-            }
-            _ => {
-                return Err(GraphExportError::new(format!(
-                    "multiple analyzed images claim root package `{root_name}`"
-                )));
-            }
-        };
+        let graph = plan.provenance().graph();
+        let root_package = plan
+            .program()
+            .package(plan.program().root_package())
+            .identity();
+        if root_package.name != root_name {
+            return Err(GraphExportError::new(format!(
+                "requested root `{root_name}` disagrees with ProgramIr root `{}`",
+                root_package.name
+            )));
+        }
 
-        let mut node_ids = Vec::with_capacity(plan.graph.nodes.len());
+        let mut node_ids = Vec::with_capacity(graph.nodes.len());
         let mut seen_ids = BTreeMap::<String, usize>::new();
-        let mut nodes = Vec::with_capacity(plan.graph.nodes.len());
-        for (index, node) in plan.graph.nodes.iter().enumerate() {
+        let mut nodes = Vec::with_capacity(graph.nodes.len());
+        for (index, node) in graph.nodes.iter().enumerate() {
             if node.id.0 != index {
                 return Err(GraphExportError::new(format!(
                     "graph node index {index} carries inconsistent internal id {}",
@@ -200,21 +188,21 @@ impl GraphExport {
         // Preserve one exported edge for every internal edge. The internal graph
         // deliberately distinguishes provenance by detail/span, so coalescing
         // source/target pairs here would make diagnostic edge counts drift.
-        let mut edges = Vec::with_capacity(plan.graph.edges.len());
-        for edge in &plan.graph.edges {
+        let mut edges = Vec::with_capacity(graph.edges.len());
+        for edge in &graph.edges {
             let from = node_ids.get(edge.from.0).cloned().ok_or_else(|| {
                 GraphExportError::new(format!(
                     "edge references missing source node {}",
                     edge.from.0
                 ))
             })?;
-            let from_node = plan.graph.nodes.get(edge.from.0).ok_or_else(|| {
+            let from_node = graph.nodes.get(edge.from.0).ok_or_else(|| {
                 GraphExportError::new(format!(
                     "edge references missing source node {}",
                     edge.from.0
                 ))
             })?;
-            let to_node = plan.graph.nodes.get(edge.to.0).ok_or_else(|| {
+            let to_node = graph.nodes.get(edge.to.0).ok_or_else(|| {
                 GraphExportError::new(format!("edge references missing target node {}", edge.to.0))
             })?;
             let to = node_ids[edge.to.0].clone();
@@ -223,7 +211,7 @@ impl GraphExport {
                 to,
                 reasons: vec![edge_reason(edge, &from_node.kind, &to_node.kind)],
                 detail: (!edge.reason.is_empty()).then(|| edge.reason.clone()),
-                source: stable_source(&plan.sources, edge.span.as_ref()),
+                source: stable_source(plan.sources(), edge.span.as_ref()),
             });
         }
         edges.sort();
@@ -232,13 +220,13 @@ impl GraphExport {
         // `edges` so inspection cannot change graph counts; root_reasons makes
         // their semantic cause explicit without synthesizing graph structure.
         let mut root_indices = BTreeSet::new();
-        let mut roots = Vec::with_capacity(plan.roots.len());
-        let mut root_reasons = Vec::with_capacity(plan.roots.len());
-        for root in &plan.roots {
+        let mut roots = Vec::with_capacity(plan.provenance().roots().len());
+        let mut root_reasons = Vec::with_capacity(plan.provenance().roots().len());
+        for root in plan.provenance().roots() {
             if !root_indices.insert(root.0) {
                 continue;
             }
-            let node = plan.graph.nodes.get(root.0).ok_or_else(|| {
+            let node = graph.nodes.get(root.0).ok_or_else(|| {
                 GraphExportError::new(format!("root references missing node {}", root.0))
             })?;
             let id = node_ids[root.0].clone();
@@ -258,7 +246,8 @@ impl GraphExport {
         root_reasons.sort();
 
         let mut blockers = plan
-            .diagnostics
+            .provenance()
+            .diagnostics()
             .iter()
             .filter(|diagnostic| diagnostic.code != RejectCode::MissingDependency)
             .map(|diagnostic| {
@@ -292,6 +281,7 @@ impl GraphExport {
             package: PackageIdentityExport {
                 name: root_package.name.clone(),
                 version: root_package.version.to_string(),
+                image_fingerprint: root_package.image_fingerprint.0.clone(),
             },
             target: TargetIdentityExport {
                 r_version: target.target.r_version.clone(),
@@ -305,78 +295,6 @@ impl GraphExport {
             blockers,
             stats,
         })
-    }
-
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str("graph nodes\n\n");
-        for node in &self.nodes {
-            out.push_str(&node.id);
-            out.push('\n');
-            out.push_str("  kind: ");
-            out.push_str(node.kind.as_str());
-            out.push_str("\n\n");
-        }
-
-        out.push_str("graph edges\n\n");
-        for edge in &self.edges {
-            out.push_str(&edge.from);
-            out.push('\n');
-            out.push_str("  -> ");
-            out.push_str(&edge.to);
-            out.push('\n');
-            if edge.reasons.len() == 1 {
-                out.push_str("  reason: ");
-                out.push_str(edge.reasons[0].as_str());
-                out.push('\n');
-            } else {
-                out.push_str("  reasons: ");
-                for (index, reason) in edge.reasons.iter().enumerate() {
-                    if index > 0 {
-                        out.push_str(", ");
-                    }
-                    out.push_str(reason.as_str());
-                }
-                out.push('\n');
-            }
-            if let Some(detail) = &edge.detail {
-                out.push_str("  detail: ");
-                out.push_str(&escape_text_field(detail));
-                out.push('\n');
-            }
-            if let Some(source) = &edge.source {
-                out.push_str("  source: ");
-                out.push_str(&source.owner);
-                out.push(':');
-                out.push_str(&source.start.to_string());
-                out.push_str("..");
-                out.push_str(&source.end.to_string());
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-
-        out.push_str("graph roots\n\n");
-        for root in &self.root_reasons {
-            out.push_str(&root.id);
-            out.push('\n');
-            if root.reasons.len() == 1 {
-                out.push_str("  reason: ");
-                out.push_str(root.reasons[0].as_str());
-                out.push('\n');
-            } else {
-                out.push_str("  reasons: ");
-                for (index, reason) in root.reasons.iter().enumerate() {
-                    if index > 0 {
-                        out.push_str(", ");
-                    }
-                    out.push_str(reason.as_str());
-                }
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        out
     }
 }
 
@@ -557,11 +475,4 @@ fn reject_code_name(code: RejectCode) -> &'static str {
         RejectCode::UnsupportedObject => "unsupported_object",
         RejectCode::UnsupportedTopLevelEffect => "unsupported_top_level_effect",
     }
-}
-
-fn escape_text_field(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
 }

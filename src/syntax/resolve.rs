@@ -25,7 +25,7 @@ pub enum ResolvedName {
         package: PackageId,
         binding: BindingName,
     },
-    TargetProvided {
+    External {
         package: PackageId,
         binding: BindingName,
     },
