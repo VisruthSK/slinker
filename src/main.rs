@@ -30,7 +30,7 @@ struct Cli {
 enum Command {
     #[command(about = "Build a generated linked R source package")]
     Build(BuildArgs),
-    #[command(about = "Analyze an installed package image")]
+    #[command(about = "Analyze an installed package image", alias = "analyse")]
     Analyze(AnalyzeArgs),
     #[command(about = "Explain why TARGET is retained by ROOT")]
     Why(QueryArgs),
