@@ -1,4 +1,6 @@
-use super::arguments::{matched_arg_index, namespace_formals, namespace_target};
+use super::arguments::{
+    matched_arg_index, namespace_formals, namespace_target, reflective_name_formals,
+};
 use super::object_world::{ClosureId, EnvironmentId, InstalledObject, ObjectId};
 use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParseRequest};
@@ -31,6 +33,45 @@ pub(super) enum AbstractValue {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ExecutionState {
     pub(super) locals: HashMap<String, AbstractValue>,
+}
+
+impl AbstractValue {
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Logical(left), Self::Logical(right)) => left == right,
+            (Self::Integer(left), Self::Integer(right)) => left == right,
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::Object(left), Self::Object(right)) => left == right,
+            (Self::Vector(left), Self::Vector(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| left.same_as(right))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ExecutionState {
+    fn join(&mut self, other: &Self) {
+        for (name, value) in &mut self.locals {
+            if !other
+                .locals
+                .get(name)
+                .is_some_and(|candidate| candidate.same_as(value))
+            {
+                *value = AbstractValue::Unknown;
+            }
+        }
+        for name in other.locals.keys() {
+            self.locals
+                .entry(name.clone())
+                .or_insert(AbstractValue::Unknown);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -182,7 +223,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         || Ok(ExecutionOutcome::value(AbstractValue::Null)),
                         |alternative| self.evaluate_construction(context, state, alternative),
                     ),
-                    _ => Ok(ExecutionOutcome::value(AbstractValue::Unknown)),
+                    _ => {
+                        let mut alternative_state = state.clone();
+                        self.evaluate_construction(context, state, consequence)?;
+                        if let Some(alternative) = alternative {
+                            self.evaluate_construction(
+                                context,
+                                &mut alternative_state,
+                                alternative,
+                            )?;
+                        }
+                        state.join(&alternative_state);
+                        Ok(ExecutionOutcome::value(AbstractValue::Unknown))
+                    }
                 }
             }
             ConstructionExprKind::Function { parameters, body } => {
@@ -241,7 +294,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn construction_member(
-        &self,
+        &mut self,
         context: ExecutionContext<'_>,
         object: AbstractValue,
         name: Option<&str>,
@@ -249,6 +302,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let (AbstractValue::Object(object), Some(name)) = (object, name) else {
             return AbstractValue::Unknown;
         };
+        self.retain_namespace_member(context, object, name);
         let graph = self.objects.graph(context.package);
         let member = match graph.object(object) {
             InstalledObject::Environment(environment) => {
@@ -262,8 +316,51 @@ impl<P: PackageProvider> AnalyzerState<P> {
         member.map_or(AbstractValue::Unknown, AbstractValue::Object)
     }
 
+    fn retain_namespace_member(
+        &mut self,
+        context: ExecutionContext<'_>,
+        object: ObjectId,
+        name: &str,
+    ) {
+        let graph = self.objects.graph(context.package);
+        let namespace = graph.environment_id(&format!(
+            "namespace:{}",
+            self.packages.name(context.package)
+        ));
+        if namespace.is_none() || graph.environment_of(object) != namespace {
+            return;
+        }
+        if context
+            .image
+            .index
+            .binding_names
+            .iter()
+            .any(|binding| binding == name)
+        {
+            self.require(
+                context.node,
+                Need::Binding {
+                    package: context.package,
+                    binding: name.to_owned(),
+                },
+                EdgeKind::Lexical,
+                format!("namespace member access `${name}`"),
+            );
+        }
+    }
+
+    fn own_namespace_object(&mut self, context: ExecutionContext<'_>) -> AbstractValue {
+        let label = format!("namespace:{}", self.packages.name(context.package));
+        let graph = self.objects.graph_mut(context.package);
+        graph
+            .environment_id(&label)
+            .map_or(AbstractValue::Unknown, |environment| {
+                AbstractValue::Object(graph.environment_object(environment))
+            })
+    }
+
     pub(super) fn construction_index(
-        &self,
+        &mut self,
         context: ExecutionContext<'_>,
         object: AbstractValue,
         index: AbstractValue,
@@ -736,9 +833,60 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 {
                     self.record_contextual_namespace_call(span, package);
                 }
+                match construction_argument(
+                    call,
+                    arguments,
+                    namespace_formals(name),
+                    namespace_target(name),
+                ) {
+                    Some(AbstractValue::String(package))
+                        if matches!(name, "getNamespace" | "asNamespace")
+                            && package == self.packages.name(context.package) =>
+                    {
+                        self.own_namespace_object(context)
+                    }
+                    _ => AbstractValue::Unknown,
+                }
+            }
+            "reg.finalizer" => {
+                if let [
+                    object,
+                    AbstractValue::Function {
+                        parameters,
+                        body,
+                        captures,
+                    },
+                    ..,
+                ] = arguments
+                {
+                    self.evaluate_inline_function(
+                        context,
+                        call,
+                        std::slice::from_ref(object),
+                        parameters.clone(),
+                        body.clone(),
+                        captures.clone(),
+                    )?;
+                }
+                AbstractValue::Null
+            }
+            callee => {
+                if let Some((formals, target)) = reflective_name_formals(callee)
+                    && let Some(AbstractValue::String(name)) =
+                        construction_argument(call, arguments, formals, target)
+                {
+                    let name = name.clone();
+                    self.retain_reflective_name(
+                        context.node,
+                        context.package,
+                        context.image,
+                        context.lexical_environment,
+                        &name,
+                        span,
+                    )?;
+                }
                 AbstractValue::Unknown
             }
-            _ => AbstractValue::Unknown,
         };
         Ok(ExecutionOutcome::value(value))
     }

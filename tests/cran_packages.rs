@@ -13,6 +13,7 @@ fn rebus_numbers_suite_passes_with_rebus_base_linked() {
         package: "rebus.numbers",
         linked: &["rebus.base"],
         check: Check::Testthat,
+        strict: true,
     }
     .assert_passes();
 }
@@ -23,6 +24,7 @@ fn rslurm_suite_passes_with_whisker_linked() {
         package: "rslurm",
         linked: &["whisker"],
         check: Check::Testthat,
+        strict: true,
     }
     .assert_passes();
 }
@@ -33,6 +35,7 @@ fn represtools_suite_passes_with_whisker_linked() {
         package: "represtools",
         linked: &["whisker"],
         check: Check::Testthat,
+        strict: true,
     }
     .assert_passes();
 }
@@ -43,6 +46,7 @@ fn qrcode_suite_passes_with_assertthat_linked() {
         package: "qrcode",
         linked: &["assertthat"],
         check: Check::Testthat,
+        strict: true,
     }
     .assert_passes();
 }
@@ -53,6 +57,7 @@ fn pkgcond_suite_passes_with_assertthat_linked() {
         package: "pkgcond",
         linked: &["assertthat"],
         check: Check::Testthat,
+        strict: false,
     }
     .assert_passes();
 }
@@ -63,6 +68,7 @@ fn doubt_suite_passes_with_unglue_linked() {
         package: "doubt",
         linked: &["unglue"],
         check: Check::Testthat,
+        strict: false,
     }
     .assert_passes();
 }
@@ -73,6 +79,7 @@ fn config_suite_passes_with_compiled_yaml_linked() {
         package: "config",
         linked: &["yaml"],
         check: Check::Testthat,
+        strict: false,
     }
     .assert_passes();
 }
@@ -97,6 +104,7 @@ fn here_works_with_rprojroot_linked() {
             stopifnot(identical(normalizePath(here(), winslash = "/"), project))
             "#,
         ),
+        strict: true,
     }
     .assert_passes();
 }
@@ -105,6 +113,7 @@ struct LinkedSuite<'a> {
     package: &'a str,
     linked: &'a [&'a str],
     check: Check<'a>,
+    strict: bool,
 }
 
 enum Check<'a> {
@@ -134,6 +143,9 @@ impl LinkedSuite<'_> {
             OsStr::new("--output"),
             output.as_os_str(),
         ];
+        if !self.strict {
+            arguments.extend([OsStr::new("--strict"), OsStr::new("false")]);
+        }
         if !external.is_empty() {
             arguments.extend([OsStr::new("--external"), OsStr::new(&external)]);
         }

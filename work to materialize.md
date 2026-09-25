@@ -182,6 +182,12 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
   sequences, deferred strings, wrappers) serialize as ordinary vectors and do not block.
 - Generated code never resolves base functions through the Root namespace: the bootstrap and its
   helpers live in `.slinker_runtime` (parent `baseenv()`), and rewritten call sites use `base::`.
+- Reflective lookups are analyzed: a static `get("x")`/`exists`/`match.fun`/`do.call("x")` name
+  resolves lexically and is retained, and the construction interpreter retains names it computes
+  from constant arguments (for example `get(paste0(generic, ".", class))`). Unknown `if` conditions
+  explore both branches and join locals. `reg.finalizer(object, f)` evaluates `f(object)`,
+  `asNamespace("<self>")` is the namespace object, and `ns$name` on it retains `name`. A Linked
+  S3 registration also retains its package-local generic, which `registerS3methods` looks up.
 - The construction interpreter memoizes calls whose arguments are all unknown, so dense internal
   call graphs (rlang) stay linear instead of exponential; recursion sees `Unknown`.
 - The CLI runs on a 64 MiB stack thread (the Air parse pool uses the same size), so deeply nested
@@ -190,6 +196,25 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
 - Blockers live on `LinkIr::blockers()` (sorted `Diagnostic`s); provenance holds only successful
   derivations. Preflight reports every blocker, then freezes inputs; a blocked build publishes
   nothing.
+
+### Strict mode and assumptions
+
+`--strict` defaults to `true`. Every heuristic slinker can apply goes through one call site
+(`AnalyzerState::assume`): in strict mode it is a blocker; with `--strict false` it is recorded
+as an assumption on `LinkIr::assumptions()`, printed by `analyze` and emitted as a warning by
+`build`. Nothing is guessed silently. Current heuristics:
+
+- unanalyzed native components (C-to-R callbacks unchecked);
+- unresolved free names bound nowhere (assumed to fail as in the original);
+- dynamic `asNamespace`/`getNamespace`/`requireNamespace`/`loadNamespace` (assumed not to observe
+  tree-shaken bindings);
+- `get`/`get0`/`exists`/`match.fun`/`do.call` with a non-static name or computed environment;
+- dynamic `system.file(package = x)` while a Linked package exists;
+- `NextMethod` outside a known method set.
+
+Sound rules stay unconditional: `registerS3method(..., envir = asNamespace(pkg))`, base ALTREP,
+payload relocations into registered namespaces, Root bindings. Source declarations
+(`declare(slinker(...))`) are programmer contracts, not heuristics, and apply in both modes.
 
 ### Milestone: slink testthat
 

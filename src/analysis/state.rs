@@ -1,4 +1,7 @@
-use super::arguments::{native_selector_span, static_package_arg, static_string_arg};
+use super::arguments::{
+    matched_call_arg_index, matched_static_arg, native_selector_span, reflective_name_formals,
+    static_package_arg, static_string_arg,
+};
 use super::execute::{AbstractValue, ExecutionContext};
 use super::namespace::NamespaceBuilder;
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
@@ -16,7 +19,7 @@ use crate::package::{
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, OakParseContext,
-    OakParser, PackageGuard, ParsedRFile, SemanticIssueKind, SourceId, Sources, Span,
+    OakParser, PackageGuard, ParsedRFile, SemanticIssueKind, SourceId, Sources, Span, StaticArg,
     StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::{Error, Result};
@@ -65,6 +68,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) images: HashMap<PackageId, Arc<PackageImage>>,
     pub(super) objects: ObjectWorld,
     pub(super) diagnostics: Vec<Diagnostic>,
+    pub(super) assumptions: Vec<Diagnostic>,
     pub(super) pending_relocations: Vec<PendingRelocation>,
     pub(super) dynamic_resource_lookups: Vec<(NodeId, PackageId, Span)>,
     pub(super) closed_generics: HashMap<String, Vec<(NodeId, PackageId, Span)>>,
@@ -120,6 +124,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             images: HashMap::new(),
             objects: ObjectWorld::default(),
             diagnostics: Vec::new(),
+            assumptions: Vec::new(),
             pending_relocations: Vec::new(),
             dynamic_resource_lookups: Vec::new(),
             closed_generics: HashMap::new(),
@@ -1237,14 +1242,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    fn namespace_used_without_reflection(&self, call: &CallSite) -> bool {
-        matches!(call.callee.as_str(), "asNamespace" | "getNamespace")
-            && (self.namespace_registration_targets.contains(&call.span)
-                || self.sources.get(&call.span.source).is_some_and(|source| {
-                    source.text[call.span.end..].starts_with("$.__NAMESPACE__.")
-                }))
-    }
-
     pub(super) fn s3_dispatch(
         &mut self,
         from: NodeId,
@@ -1678,6 +1675,26 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 registration.method
             ),
         );
+        if registration.generic.package.is_none()
+            && self
+                .image(id)?
+                .index
+                .binding_names
+                .contains(&registration.generic.name)
+        {
+            self.require(
+                node,
+                Need::Binding {
+                    package: id,
+                    binding: registration.generic.name.clone(),
+                },
+                EdgeKind::S3Registration,
+                format!(
+                    "registering `{}` looks up its generic in the namespace",
+                    registration.method
+                ),
+            );
+        }
         Ok(())
     }
 
@@ -1714,7 +1731,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
             match &native.safety {
-                NativeSafety::Unanalyzed => {}
+                NativeSafety::Unanalyzed => self.assume(
+                    node,
+                    id,
+                    None,
+                    RejectCode::UnknownNativeEffects,
+                    format!("native component `{component}` has unanalyzed C-to-R callbacks"),
+                    None,
+                ),
                 NativeSafety::Safe(facts) => {
                     for callback in &facts.callbacks {
                         self.require(
@@ -2136,6 +2160,89 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
+    fn reflective_lookup(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        image: &PackageImage,
+        binding: &str,
+        lexical_environment: &str,
+        call: &CallSite,
+    ) -> Result<()> {
+        let (formals, target) = reflective_name_formals(&call.callee)
+            .expect("reflective lookup is dispatched only for reflective callees");
+        let computed_environment = call
+            .arg_names
+            .iter()
+            .flatten()
+            .any(|name| matches!(name.as_str(), "envir" | "pos" | "where" | "frame"))
+            || call.arg_names.iter().filter(|name| name.is_none()).count() > 1
+                && call.callee != "do.call";
+        match matched_static_arg(call, formals, target) {
+            Some(StaticArg::String(name)) if !computed_environment => {
+                let name = name.clone();
+                self.retain_reflective_name(
+                    from,
+                    current,
+                    image,
+                    lexical_environment,
+                    &name,
+                    &call.span,
+                )
+            }
+            Some(StaticArg::Symbol(_)) | None
+                if matches!(call.callee.as_str(), "match.fun" | "do.call")
+                    && !self.builds_function_name(call, formals, target) =>
+            {
+                Ok(())
+            }
+            _ => {
+                self.assume(
+                    from,
+                    current,
+                    Some(binding),
+                    RejectCode::DynamicLookup,
+                    format!(
+                        "{}() looks up a name that is not a static string in the calling scope",
+                        call.callee
+                    ),
+                    Some(call.span.clone()),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn builds_function_name(&self, call: &CallSite, formals: &[&str], target: &str) -> bool {
+        matched_call_arg_index(call, formals, target)
+            .and_then(|index| call.arg_spans.get(index)?.as_ref())
+            .and_then(|span| {
+                let text = &self.sources.get(&span.source)?.text[span.start..span.end];
+                Some(
+                    ["paste0(", "paste(", "sprintf(", "as.character("]
+                        .iter()
+                        .any(|builder| text.starts_with(builder)),
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    pub(super) fn retain_reflective_name(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        image: &PackageImage,
+        lexical_environment: &str,
+        name: &str,
+        span: &Span,
+    ) -> Result<()> {
+        let resolved = self.resolve_lexical_name(current, image, lexical_environment, name)?;
+        if matches!(resolved, Resolution::OpenDynamic(OpenReason::Unresolved(_))) {
+            return Ok(());
+        }
+        self.require_resolved(from, current, None, resolved, span.clone())
+    }
+
     pub(super) fn is_slinker_semantic_callee(name: &str) -> bool {
         matches!(
             name,
@@ -2226,6 +2333,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
         }
+        if reflective_name_formals(&call.callee).is_some() {
+            return self.reflective_lookup(
+                from,
+                current,
+                image,
+                binding,
+                lexical_environment,
+                call,
+            );
+        }
         match call.callee.as_str() {
             "library" | "require" => {
                 let package = static_package_arg(call);
@@ -2258,10 +2375,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         .map(Cow::Owned)
                 });
                 let Some(name) = name else {
-                    if self.namespace_used_without_reflection(call) {
+                    if self.namespace_registration_targets.contains(&call.span) {
                         return Ok(());
                     }
-                    self.diagnostic(
+                    self.assume(
                         from,
                         current,
                         Some(binding),
@@ -2630,18 +2747,57 @@ impl<P: PackageProvider> AnalyzerState<P> {
         message: impl Into<String>,
         span: Option<Span>,
     ) {
-        let message = message.into();
-        if !self.diagnostic_keys.insert((node, code, message.clone())) {
-            return;
-        }
-        self.diagnostics.push(Diagnostic {
+        let diagnostic = self.new_diagnostic(node, package, binding, code, message.into(), span);
+        self.record(true, diagnostic);
+    }
+
+    pub(super) fn assume(
+        &mut self,
+        node: NodeId,
+        package: PackageId,
+        binding: Option<&str>,
+        code: RejectCode,
+        message: impl Into<String>,
+        span: Option<Span>,
+    ) {
+        let diagnostic = self.new_diagnostic(node, package, binding, code, message.into(), span);
+        self.record(self.policy.strict, diagnostic);
+    }
+
+    fn new_diagnostic(
+        &self,
+        node: NodeId,
+        package: PackageId,
+        binding: Option<&str>,
+        code: RejectCode,
+        message: String,
+        span: Option<Span>,
+    ) -> Diagnostic {
+        Diagnostic {
             package: self.packages.name(package).to_owned(),
             binding: binding.map(str::to_owned),
             code,
             message,
             span,
             node: Some(node),
-        });
+        }
+    }
+
+    fn record(&mut self, blocking: bool, diagnostic: Diagnostic) {
+        let node = diagnostic
+            .node
+            .expect("analysis diagnostics carry their node");
+        if !self
+            .diagnostic_keys
+            .insert((node, diagnostic.code, diagnostic.message.clone()))
+        {
+            return;
+        }
+        if blocking {
+            self.diagnostics.push(diagnostic);
+        } else {
+            self.assumptions.push(diagnostic);
+        }
     }
 
     pub(super) fn generic_label(&self, generic: &GenericId) -> String {

@@ -8,7 +8,8 @@ use std::process::{Command as ProcessCommand, ExitCode};
 
 use clap::{Args, Parser, Subcommand};
 use slinker::analysis::{
-    ANALYSIS_STACK_BYTES, Edge, ExplanationDag, LinkIr, Linker, NodeId, NodeKind,
+    ANALYSIS_STACK_BYTES, Diagnostic, Edge, ExplanationDag, LinkIr, LinkPolicy, Linker, NodeId,
+    NodeKind,
 };
 use slinker::build::{BuildContext, PureRStatic, materialize};
 use slinker::package::PackageStore;
@@ -58,6 +59,14 @@ struct UniverseArgs {
     external: Vec<String>,
     #[arg(long, value_name = "N", default_value_t = default_jobs(), help = "Analysis workers")]
     jobs: NonZeroUsize,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Block on every unproven assumption; false records recorded heuristics instead"
+    )]
+    strict: bool,
 }
 
 #[derive(Debug, Args)]
@@ -159,6 +168,15 @@ fn default_jobs() -> NonZeroUsize {
         .min(NonZeroUsize::new(8).expect("8 is nonzero"))
 }
 
+impl UniverseArgs {
+    fn policy(&self) -> LinkPolicy {
+        LinkPolicy {
+            strict: self.strict,
+            ..LinkPolicy::default()
+        }
+    }
+}
+
 fn absolute_libraries(universe: &UniverseArgs) -> io::Result<Vec<PathBuf>> {
     universe
         .libraries
@@ -176,6 +194,7 @@ fn link(args: &AnalysisArgs) -> Result<(TargetEnvironment, LinkIr), Box<dyn Erro
     let store = PackageStore::new(r_home, target.clone())?;
     let plan = Linker::new(store, args.universe.jobs.get())
         .with_external_packages(args.universe.external.iter().cloned())
+        .with_policy(args.universe.policy())
         .with_extra_packages(args.extra_pkgs.iter().cloned())
         .analyze(&args.root)?;
     Ok((target, plan))
@@ -201,6 +220,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
     let store = PackageStore::new(r_home.clone(), target.clone())?;
     let ir = Linker::new(store, args.universe.jobs.get())
         .with_external_packages(args.universe.external.iter().cloned())
+        .with_policy(args.universe.policy())
         .with_root_source(source.description_source())
         .analyze(source.package())?;
     let mut context = BuildContext::new(source, staged, r_home, target);
@@ -214,6 +234,16 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
     });
     let buildable = PureRStatic::check(&ir, &mut context)?;
     let generated = materialize(buildable, &output)?;
+    for assumption in ir.assumptions() {
+        let owner = assumption.binding.as_ref().map_or_else(
+            || assumption.package.clone(),
+            |binding| format!("{}::{binding}", assumption.package),
+        );
+        eprintln!(
+            "slinker: assumed {:?} in {owner}: {}",
+            assumption.code, assumption.message
+        );
+    }
     println!("{}", generated.path().display());
     Ok(())
 }
@@ -481,13 +511,20 @@ fn print_analysis(target: &TargetEnvironment, plan: &LinkIr) {
     println!("  derivations: {}", plan.provenance().edges().len());
     println!("  roots: {}", plan.provenance().roots().len());
     println!();
-    println!("blockers");
-    if plan.blockers().is_empty() {
+    print_diagnostics("blockers", plan.blockers());
+    if !plan.assumptions().is_empty() {
+        println!();
+        print_diagnostics("assumptions", plan.assumptions());
+    }
+}
+
+fn print_diagnostics(title: &str, diagnostics: &[Diagnostic]) {
+    println!("{title}");
+    if diagnostics.is_empty() {
         println!("  none");
-    } else {
-        for diagnostic in plan.blockers() {
-            println!("  - {:?}: {}", diagnostic.code, diagnostic.message);
-        }
+    }
+    for diagnostic in diagnostics {
+        println!("  - {:?}: {}", diagnostic.code, diagnostic.message);
     }
 }
 

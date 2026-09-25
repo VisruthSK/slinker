@@ -179,3 +179,16 @@ pub(super) fn native_call_argument_index(call: &CallSite, position: usize) -> Op
     }
     None
 }
+
+pub(super) fn reflective_name_formals(
+    callee: &str,
+) -> Option<(&'static [&'static str], &'static str)> {
+    match callee {
+        "get" => Some((&["x", "pos", "envir", "mode", "inherits"], "x")),
+        "get0" => Some((&["x", "envir", "mode", "inherits", "ifnotfound"], "x")),
+        "exists" => Some((&["x", "where", "envir", "frame", "mode", "inherits"], "x")),
+        "match.fun" => Some((&["FUN", "descend"], "FUN")),
+        "do.call" => Some((&["what", "args", "quote", "envir"], "what")),
+        _ => None,
+    }
+}

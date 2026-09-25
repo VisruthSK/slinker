@@ -20,6 +20,7 @@ pub struct LinkIr {
     program: ProgramIr,
     provenance: crate::ir::ProvenanceIr,
     blockers: Vec<Diagnostic>,
+    assumptions: Vec<Diagnostic>,
     sources: Sources,
 }
 
@@ -49,7 +50,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .any(|package| self.packages.role(*package) == LinkedPackageRole::Linked)
         {
             for (node, package, span) in std::mem::take(&mut self.dynamic_resource_lookups) {
-                self.diagnostic(
+                self.assume(
                     node,
                     package,
                     None,
@@ -61,18 +62,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         self.finalize_s3_dispatch(&retained);
         let mut blockers = self.diagnostics;
-        blockers.sort_by(|left, right| {
-            (&left.package, left.code, &left.binding, &left.message).cmp(&(
-                &right.package,
-                right.code,
-                &right.binding,
-                &right.message,
-            ))
-        });
+        blockers.sort_by(diagnostic_order);
+        let mut assumptions = self.assumptions;
+        assumptions.sort_by(diagnostic_order);
         LinkIr {
             program,
             provenance: crate::ir::ProvenanceIr::from_analysis(self.graph, self.roots),
             blockers,
+            assumptions,
             sources: self.sources,
             packages: self.packages.sources(retained),
         }
@@ -598,7 +595,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         .any(|registration| registration.method == binding)
                 });
             if !registered && !self.closed_methods.contains(&(package, binding.clone())) {
-                self.diagnostic(
+                self.assume(
                     node,
                     package,
                     Some(&binding),
@@ -657,6 +654,10 @@ impl LinkIr {
         &self.blockers
     }
 
+    pub fn assumptions(&self) -> &[Diagnostic] {
+        &self.assumptions
+    }
+
     /// Exact selected installed image and build-time location of every finalized package.
     pub fn package_sources(&self) -> &crate::package::PackageSources {
         &self.packages
@@ -689,4 +690,13 @@ pub(super) fn pending_relocation_span(rewrite: &PendingRelocation) -> &Span {
 
 pub(super) fn spans_overlap(left: &Span, right: &Span) -> bool {
     left.source == right.source && left.start < right.end && right.start < left.end
+}
+
+fn diagnostic_order(left: &Diagnostic, right: &Diagnostic) -> std::cmp::Ordering {
+    (&left.package, left.code, &left.binding, &left.message).cmp(&(
+        &right.package,
+        right.code,
+        &right.binding,
+        &right.message,
+    ))
 }

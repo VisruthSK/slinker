@@ -83,6 +83,13 @@ impl FakeProvider {
                     "new.env",
                     "list2env",
                     "lapply",
+                    "get",
+                    "get0",
+                    "exists",
+                    "match.fun",
+                    "do.call",
+                    "reg.finalizer",
+                    "registerS3method",
                     "is.function",
                     "length",
                     "==",
@@ -1261,6 +1268,7 @@ fn constant_argument_specializes_private_namespace_helper() {
         .with_external_packages(["foo".into()])
         .with_policy(LinkPolicy {
             namespace_discovery: DiscoveryPolicy::ExternalOnly,
+            ..LinkPolicy::default()
         })
         .analyze("root")
         .unwrap();
@@ -1326,6 +1334,7 @@ fn bounded_string_operations_specialize_namespace_helper() {
         .with_external_packages(["foo".into()])
         .with_policy(LinkPolicy {
             namespace_discovery: DiscoveryPolicy::ExternalOnly,
+            ..LinkPolicy::default()
         })
         .analyze("root")
         .unwrap();
@@ -1399,6 +1408,7 @@ fn resolved_null_coalescing_helper_propagates_constant() {
         .with_external_packages(["foo".into()])
         .with_policy(LinkPolicy {
             namespace_discovery: DiscoveryPolicy::ExternalOnly,
+            ..LinkPolicy::default()
         })
         .analyze("root")
         .unwrap();
@@ -1436,6 +1446,7 @@ fn bounded_switch_propagates_selected_package() {
         .with_external_packages(["foo".into()])
         .with_policy(LinkPolicy {
             namespace_discovery: DiscoveryPolicy::ExternalOnly,
+            ..LinkPolicy::default()
         })
         .analyze("root")
         .unwrap();
@@ -1457,6 +1468,7 @@ fn explicit_discovery_policy_can_internalize() {
     let foo = package("foo", &[("x", Some("x <- function() 1"))]);
     let policy = LinkPolicy {
         namespace_discovery: DiscoveryPolicy::Internalize,
+        ..LinkPolicy::default()
     };
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_policy(policy)
@@ -1633,8 +1645,7 @@ fn opaque_registered_selector_is_consumed_by_native_call() {
             && matches!(&node.kind, NodeKind::NativeComponent { name } if name == "root")
     }));
     assert!(
-        !plan
-            .blockers()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
@@ -1932,8 +1943,7 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
             && diagnostic.message.contains("croot_tick")
     }));
     assert!(
-        !plan
-            .blockers()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
@@ -2415,6 +2425,81 @@ fn base_resource_lookup_is_not_a_package_resource() {
 }
 
 #[test]
+fn loose_mode_records_assumptions_that_strict_mode_blocks() {
+    let analyze = |strict| {
+        Linker::new(
+            FakeProvider::new(vec![package(
+                "root",
+                &[("f", Some("f <- function() missing_everywhere()"))],
+            )]),
+            1,
+        )
+        .with_policy(LinkPolicy {
+            strict,
+            ..LinkPolicy::default()
+        })
+        .analyze("root")
+        .unwrap()
+    };
+
+    let strict = analyze(true);
+    assert!(
+        strict
+            .blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnresolvedBinding)
+    );
+    assert!(strict.assumptions().is_empty());
+
+    let loose = analyze(false);
+    assert!(loose.blockers().is_empty(), "{:?}", loose.blockers());
+    assert!(
+        loose
+            .assumptions()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnresolvedBinding)
+    );
+}
+
+#[test]
+fn reflective_lookups_retain_static_names_and_block_dynamic_ones() {
+    let analyze = |source: &str| {
+        Linker::new(
+            FakeProvider::new(vec![root_calling("dep", "f"), package("dep", &[
+                ("f", Some(source)),
+                ("helper", Some("helper <- function() 1")),
+                ("helper_method.cls", Some("helper_method.cls <- function() 1")),
+                ("register", Some("register <- function(generic, class) get(paste0(generic, '.', class))")),
+                ("unload", Some("unload <- function() 1")),
+            ])]),
+            1,
+        )
+        .analyze("root")
+        .unwrap()
+    };
+
+    let literal = analyze("f <- function() get('helper')()");
+    assert!(retained_binding(&literal, "dep", "helper"));
+    assert!(literal.blockers().is_empty(), "{:?}", literal.blockers());
+
+    let dynamic = analyze("f <- function(name) get(name)");
+    assert!(
+        dynamic
+            .blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicLookup)
+    );
+
+    let specialized = analyze("f <- function() register('helper_method', 'cls')");
+    assert!(retained_binding(&specialized, "dep", "helper_method.cls"));
+
+    let finalizer = analyze(
+        "f <- function() reg.finalizer(asNamespace('dep'), function(x) x$unload(), onexit = TRUE)",
+    );
+    assert!(retained_binding(&finalizer, "dep", "unload"));
+}
+
+#[test]
 fn dynamic_namespace_is_allowed_only_without_reflection() {
     let blocked = |source: &str| {
         let plan = Linker::new(
@@ -2431,7 +2516,7 @@ fn dynamic_namespace_is_allowed_only_without_reflection() {
     assert!(!blocked(
         "f <- function(pkg, fun) registerS3method('g', 'c', fun, envir = asNamespace(pkg))"
     ));
-    assert!(!blocked(
+    assert!(blocked(
         "f <- function(ns) asNamespace(ns)$.__NAMESPACE__.$exports"
     ));
     assert!(blocked(

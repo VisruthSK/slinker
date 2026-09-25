@@ -973,6 +973,25 @@ fn construction_expr(
                 .find(|candidate| candidate.site.span == span)
                 .map(|call| &call.site);
             let function = call.function().ok()?;
+            if site.is_none() && matches!(function, AnyRExpression::RExtractExpression(_)) {
+                return Some(ConstructionExpr {
+                    kind: ConstructionExprKind::Sequence {
+                        expressions: std::iter::once(function)
+                            .chain(
+                                call.arguments()
+                                    .ok()?
+                                    .items()
+                                    .iter()
+                                    .filter_map(|argument| argument.ok()?.value()),
+                            )
+                            .filter_map(|expression| {
+                                construction_expr(source, text, expression, calls)
+                            })
+                            .collect(),
+                    },
+                    span,
+                });
+            }
             let callee = site
                 .map(|site| site.callee.clone())
                 .unwrap_or_else(|| ast_text(text, &function));
