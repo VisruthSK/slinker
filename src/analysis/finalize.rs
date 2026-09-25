@@ -330,6 +330,27 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .filter_map(|name| builder.visible_binding(namespace, name))
                 .collect();
             builder.set_exports(namespace, exports);
+            if self.packages.role(package) == LinkedPackageRole::Linked {
+                let index = &self.images[&package].index;
+                let kept = &namespace_ids[self.packages.name(package)].bindings;
+                let removed = index
+                    .binding_names
+                    .iter()
+                    .filter(|name| !kept.contains_key(*name))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let unretained_exports = index
+                    .exports
+                    .values()
+                    .filter(|name| !kept.contains_key(*name))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                builder.set_removed_names(
+                    namespace,
+                    removed.into_iter().collect(),
+                    unretained_exports.into_iter().collect(),
+                );
+            }
         }
         for (owner, dependency) in self.activation_time_dependencies(&namespace_ids) {
             if owner != dependency {

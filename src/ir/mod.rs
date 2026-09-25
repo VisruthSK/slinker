@@ -186,6 +186,8 @@ pub struct MaterializedNamespaceState {
     pub namespace_environment: EnvironmentId,
     pub imports_environment: EnvironmentId,
     pub exports: ExportTable,
+    pub removed_bindings: Vec<String>,
+    pub unretained_exports: Vec<String>,
     pub activation: Option<NamespaceActivationId>,
 }
 
@@ -792,6 +794,8 @@ impl ProgramBuilder {
             namespace_environment,
             imports_environment,
             exports: ExportTable::default(),
+            removed_bindings: Vec::new(),
+            unretained_exports: Vec::new(),
             activation,
         };
         let id = self.add_namespace(Namespace {
@@ -938,6 +942,23 @@ impl ProgramBuilder {
             }
             LinkNamespaceState::External { .. } => {
                 unreachable!("External namespaces have no artifact export table")
+            }
+        }
+    }
+
+    pub fn set_removed_names(
+        &mut self,
+        namespace: NamespaceId,
+        bindings: Vec<String>,
+        exports: Vec<String>,
+    ) {
+        match &mut self.namespaces[namespace.index()].state {
+            LinkNamespaceState::Root(state) | LinkNamespaceState::Linked(state) => {
+                state.removed_bindings = bindings;
+                state.unretained_exports = exports;
+            }
+            LinkNamespaceState::External { .. } => {
+                unreachable!("External namespaces keep their installed names")
             }
         }
     }

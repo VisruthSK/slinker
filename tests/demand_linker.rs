@@ -2674,9 +2674,12 @@ fn dynamic_namespace_is_allowed_only_without_reflection() {
         )
         .analyze("root")
         .unwrap();
-        plan.blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+        plan.blockers().iter().any(|diagnostic| {
+            matches!(
+                diagnostic.code,
+                RejectCode::DynamicPackageDiscovery | RejectCode::DynamicLookup
+            )
+        })
     };
 
     assert!(!blocked(
@@ -2685,8 +2688,11 @@ fn dynamic_namespace_is_allowed_only_without_reflection() {
     assert!(blocked(
         "f <- function(ns) asNamespace(ns)$.__NAMESPACE__.$exports"
     ));
-    assert!(blocked(
+    assert!(!blocked(
         "f <- function(ns, name) exists(name, envir = asNamespace(ns), inherits = FALSE)"
+    ));
+    assert!(blocked(
+        "f <- function(ns, name) exists(name, envir = asNamespace(ns))"
     ));
 }
 

@@ -218,6 +218,27 @@ as an assumption on `LinkIr::assumptions()`, printed by `analyze` and emitted as
 - dynamic `system.file(package = x)` while a Linked package exists;
 - `NextMethod` outside a known method set.
 
+Unresolved names bound nowhere are the first heuristic to retire. Linking cannot change the outcome
+of looking up a name that exists nowhere in the original, so the only risk is a name created in a
+way analysis did not see. Once slinker can prove that nothing in the retained program creates
+namespace or lexical names dynamically (no `assign`/`makeActiveBinding`/`list2env`/`<<-` with a
+computed name or unknown environment, no `sys.function`/`environment<-` rebinding, no unanalyzed
+native code that defines R objects), an unresolved name should stop being an assumption and be
+accepted in strict mode, reported only as a diagnostic about the original package. That proof does
+not exist yet.
+
+Linked namespaces keep their original names. A binding that tree-shaking removed becomes an
+active binding that stops with "`pkg::name` was removed by slinker because the build never
+reached it" (defined after `.onLoad`, so `.onLoad` can still create or assign it), the namespace
+exports its full original export table (every name that exists after `.onLoad`), and
+`.packageName` is set. So `exists(name, envir = asNamespace(ns), inherits = FALSE)` and the
+export table answer exactly as the original does, and such existence checks are sound in strict
+mode. Reading a removed binding's value is a clear error instead of a silently different branch.
+Still not exact: the `imports`/`path`/`dynlibs`/`S3methods` namespace info (reads of those
+block), the imports environment (only retained imports are wired, so a dropped re-exported import
+is not exported), and enumerating namespace values (`as.list`, `mget`), which now meets the
+stubs' errors.
+
 Sound rules stay unconditional: `registerS3method(..., envir = asNamespace(pkg))`, base ALTREP,
 payload relocations into registered namespaces, Root bindings. Source declarations
 (`declare(slinker(...))`) are programmer contracts, not heuristics, and apply in both modes.

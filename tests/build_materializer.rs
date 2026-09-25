@@ -369,7 +369,11 @@ fn private_environments_and_registrations_survive_linking() {
         library(stateroot)
         stopifnot(identical(run(), c("2", "7", "formatted tinystate")))
         stopifnot(identical(local_counter(), 11L), identical(local_counter(), 12L))
-        stopifnot(!exists("unused", envir = asNamespace("tinystate"), inherits = FALSE))
+        stopifnot(exists("unused", envir = asNamespace("tinystate"), inherits = FALSE))
+        removed <- tryCatch(get("unused", envir = asNamespace("tinystate")), error = conditionMessage)
+        stopifnot(grepl("`tinystate::unused` was removed by slinker", removed, fixed = TRUE))
+        stopifnot(setequal(getNamespaceExports("tinystate"), c("counter", "get_value", "set_value", "make", "unused")))
+        stopifnot(exists(".packageName", envir = asNamespace("tinystate"), inherits = FALSE))
         stopifnot(length(find.package("tinystate", quiet = TRUE)) == 0L)
         "#,
     );

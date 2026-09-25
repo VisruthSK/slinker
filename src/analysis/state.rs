@@ -79,7 +79,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
     pub(super) value_closures: HashSet<NodeId>,
     pub(super) unspecialized_calls: HashMap<(PackageId, String), AbstractValue>,
-    pub(super) namespace_registration_targets: HashSet<Span>,
+    pub(super) non_reflective_namespace_uses: HashSet<Span>,
     pub(super) internal_external_bindings: HashSet<(PackageId, String)>,
     pub(super) sources: Sources,
     pub(super) source_ids: HashMap<(PackageId, String), SourceId>,
@@ -138,7 +138,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             next_method_calls: Vec::new(),
             value_closures: HashSet::new(),
             unspecialized_calls: HashMap::new(),
-            namespace_registration_targets: HashSet::new(),
+            non_reflective_namespace_uses: HashSet::new(),
             internal_external_bindings: HashSet::new(),
             sources: Sources::default(),
             source_ids: HashMap::new(),
@@ -1221,14 +1221,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 self.resource_access(node, package, resource)?;
             }
-            self.namespace_registration_targets = expression
+            let uses = expression
                 .calls
                 .iter()
-                .filter(|call| call.callee == "registerS3method")
+                .filter(|call| {
+                    call.callee == "registerS3method"
+                        || (call.callee == "exists"
+                            && self.argument_text(call, "inherits") == Some("FALSE"))
+                })
                 .flat_map(|call| call.arg_names.iter().zip(&call.arg_spans))
                 .filter(|(name, _)| name.as_deref() == Some("envir"))
                 .filter_map(|(_, span)| span.clone())
                 .collect();
+            self.non_reflective_namespace_uses = uses;
             for call in &expression.calls {
                 if !self.guards_active(package, image, &call.guards)? {
                     continue;
@@ -2193,6 +2198,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &str,
         call: &CallSite,
     ) -> Result<()> {
+        if call.callee == "exists"
+            && self.argument_text(call, "inherits") == Some("FALSE")
+            && self.argument_span(call, "envir").is_some_and(|span| {
+                self.non_reflective_namespace_uses.contains(span)
+                    && self.sources.get(&span.source).is_some_and(|source| {
+                        let text = source.text[span.start..span.end].trim_start_matches("base::");
+                        text.starts_with("asNamespace(") || text.starts_with("getNamespace(")
+                    })
+            })
+        {
+            return Ok(());
+        }
         let (formals, target) = reflective_name_formals(&call.callee)
             .expect("reflective lookup is dispatched only for reflective callees");
         let computed_environment = call
@@ -2235,6 +2252,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Ok(())
             }
         }
+    }
+
+    fn argument_span<'a>(&self, call: &'a CallSite, name: &str) -> Option<&'a Span> {
+        call.arg_names
+            .iter()
+            .position(|argument| argument.as_deref() == Some(name))
+            .and_then(|index| call.arg_spans.get(index)?.as_ref())
+    }
+
+    fn argument_text(&self, call: &CallSite, name: &str) -> Option<&str> {
+        let span = self.argument_span(call, name)?;
+        Some(self.sources.get(&span.source)?.text[span.start..span.end].trim())
     }
 
     fn builds_function_name(&self, call: &CallSite, formals: &[&str], target: &str) -> bool {
@@ -2401,7 +2430,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         .map(Cow::Owned)
                 });
                 let Some(name) = name else {
-                    if self.namespace_registration_targets.contains(&call.span) {
+                    if self.non_reflective_namespace_uses.contains(&call.span) {
                         return Ok(());
                     }
                     self.assume(

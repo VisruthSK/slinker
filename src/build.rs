@@ -538,15 +538,17 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         };
         writeln!(
             out,
-            "    .slinker_activate(ns, {}, {})\n  }})",
+            "    .slinker_activate(ns, {}, {}, {})\n  }})",
             r_vector(
                 state
                     .exports
                     .bindings()
                     .iter()
                     .map(|binding| program.binding(*binding).name.as_str())
+                    .chain(state.unretained_exports.iter().map(String::as_str))
             ),
-            s3_matrix(program, namespace)
+            s3_matrix(program, namespace),
+            r_vector(state.removed_bindings.iter().map(String::as_str))
         )
         .expect("String writes cannot fail");
     }
@@ -1041,6 +1043,7 @@ const GENERATED_RUNTIME: &str = r#"
   namespace <- new.env(parent = imports, hash = TRUE)
   info <- new.env(hash = TRUE, parent = baseenv())
   namespace$.__NAMESPACE__. <- info
+  namespace$.packageName <- name
   info$spec <- c(name = name, version = version)
   setNamespaceInfo(namespace, "exports", new.env(hash = TRUE, parent = baseenv()))
   setNamespaceInfo(namespace, "imports", list(base = TRUE))
@@ -1062,12 +1065,21 @@ const GENERATED_RUNTIME: &str = r#"
   bundle <- system.file("slinker", "payload", paste0(package, ".rds"), package = .slinker_root_package, mustWork = TRUE)
   invisible(list2env(readRDS(bundle), envir = namespace))
 }
-.slinker_activate <- function(namespace, exports, s3) {
+.slinker_stub <- function(namespace, package, binding) {
+  makeActiveBinding(binding, function(value) {
+    stop(sprintf("`%s::%s` was removed by slinker because the build never reached it", package, binding), call. = FALSE)
+  }, namespace)
+}
+.slinker_activate <- function(namespace, exports, s3, removed) {
   name <- unname(getNamespaceName(namespace))
   if (nrow(s3)) registerS3methods(s3, name, namespace)
   if (exists(".onLoad", envir = namespace, inherits = FALSE)) {
     get(".onLoad", envir = namespace, inherits = FALSE)("", name)
   }
+  for (binding in removed[!vapply(removed, exists, logical(1), envir = namespace, inherits = FALSE)]) {
+    .slinker_stub(namespace, name, binding)
+  }
+  exports <- exports[vapply(exports, exists, logical(1), envir = namespace)]
   if (length(exports)) namespaceExport(namespace, exports)
   lockEnvironment(namespace, TRUE)
   lockEnvironment(parent.env(namespace), TRUE)
