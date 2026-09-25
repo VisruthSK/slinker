@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-analysis-v5";
+const ANALYSIS_SCHEMA: &str = "slinker-analysis-v6";
 
 #[derive(Deserialize, Serialize)]
 struct CachedIndex {
@@ -524,6 +524,8 @@ mod tests {
                 name: "fixture".into(),
                 registration: None,
                 symbols: Vec::new(),
+                routines: Vec::new(),
+                library: None,
                 safety: NativeSafety::Unanalyzed,
             }],
             lifecycle: LifecycleMetadata::default(),

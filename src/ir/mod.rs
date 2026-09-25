@@ -411,7 +411,7 @@ pub struct S3RegistrationIr {
 #[derive(Clone, Debug)]
 pub struct NativeComponentIr {
     pub namespace: NamespaceId,
-    pub name: String,
+    pub native: crate::package::NativeComponent,
 }
 
 #[derive(Clone, Debug)]
@@ -952,9 +952,9 @@ impl ProgramBuilder {
     pub fn attach_native_component(
         &mut self,
         namespace: NamespaceId,
-        name: String,
+        native: crate::package::NativeComponent,
     ) -> NativeComponentId {
-        let component = self.add_native_component(NativeComponentIr { namespace, name });
+        let component = self.add_native_component(NativeComponentIr { namespace, native });
         self.namespaces[namespace.index()]
             .native_components
             .push(component);

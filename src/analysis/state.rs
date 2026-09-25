@@ -1674,20 +1674,37 @@ impl<P: PackageProvider> AnalyzerState<P> {
             component: component.clone(),
         });
         if let Some(native) = index.dynlibs.iter().find(|native| native.name == component) {
+            if !self.is_root(id) {
+                match &native.library {
+                    Some(library) => self.require(
+                        node,
+                        Need::Resource {
+                            package: id,
+                            resource: library.clone(),
+                        },
+                        EdgeKind::Native,
+                        format!("native component `{component}` ships its compiled library"),
+                    ),
+                    None => self.diagnostic(
+                        node,
+                        id,
+                        None,
+                        RejectCode::MissingResource,
+                        format!("native component `{component}` has no compiled library in the installed image"),
+                        None,
+                    ),
+                }
+            }
             match &native.safety {
-                NativeSafety::Unanalyzed => self.diagnostic(
-                    node,
-                    id,
-                    None,
-                    RejectCode::UnknownNativeEffects,
-                    format!("native component `{component}` is registered but its R callbacks and runtime effects have not been analyzed"),
-                    None,
-                ),
+                NativeSafety::Unanalyzed => {}
                 NativeSafety::Safe(facts) => {
                     for callback in &facts.callbacks {
                         self.require(
                             node,
-                            Need::Binding { package: id, binding: callback.clone() },
+                            Need::Binding {
+                                package: id,
+                                binding: callback.clone(),
+                            },
                             EdgeKind::Callback,
                             format!("native component `{component}` calls R binding `{callback}`"),
                         );
@@ -1699,7 +1716,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     id,
                     None,
                     RejectCode::UnknownNativeEffects,
-                    format!("native component `{component}` has unsupported runtime effects: {}", issues.join("; ")),
+                    format!(
+                        "native component `{component}` has unsupported runtime effects: {}",
+                        issues.join("; ")
+                    ),
                     None,
                 ),
             }

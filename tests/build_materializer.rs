@@ -344,7 +344,7 @@ fn real_pure_r_packages_build_install_and_run() {
         &validation,
         r#"
         library(praise)
-        stopifnot(exists(".slinker_target", envir = asNamespace("praise"), inherits = FALSE))
+        stopifnot(exists(".slinker_target", envir = asNamespace("praise")$.slinker_runtime, inherits = FALSE))
         parts <- praise:::praise_parts
         stopifnot(praise("${adjective}") %in% parts$adjective)
         exclamation <- praise("${EXCLAMATION}")

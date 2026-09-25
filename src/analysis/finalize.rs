@@ -229,7 +229,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
             for native in &image.index.dynlibs {
-                builder.attach_native_component(namespace.namespace, native.name.clone());
+                builder.attach_native_component(namespace.namespace, native.clone());
+                if let (LinkedPackageRole::Linked, Some(library)) = (role, &native.library) {
+                    builder.add_resource(crate::ir::ResourceIr {
+                        package,
+                        path: library.clone(),
+                    });
+                }
             }
             if role == LinkedPackageRole::Linked {
                 linked_namespaces.push(namespace.namespace);

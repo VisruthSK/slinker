@@ -82,7 +82,8 @@ in `tests/fixtures`, for `voucher` with `--external cli,fs`, and for `here` with
 `tests/cran_packages.rs` downloads real CRAN packages, installs their dependencies privately,
 builds them with those dependencies Linked, removes the Linked packages from the runtime library,
 and runs each full testthat suite: `rebus.numbers`, `represtools`, `rslurm`, `qrcode`, `pkgcond`,
-and `doubt` pass.
+and `doubt` pass; `config` passes with the compiled `yaml` library linked; `here` is checked by
+a script until testthat can share the runtime.
 
 ```text
 SourcePackageSnapshot
@@ -104,7 +105,7 @@ Package identity and universe (phase 1):
 - `PackageStore` is an installed-image service keyed by `PackageIdentity`.
 - Worker private-environment labels are `private:<epoch>:<n>` with a per-package-context epoch.
   Binding fragments mentioning a private label are never cached; cache schema is
-  `slinker-analysis-v5`.
+  `slinker-analysis-v6`.
 - The package context registers its image environment as the package namespace before any promise
   is forced, so inspection never loads the real package or runs `.onLoad`. Bindings that exist only
   after `.onLoad` are never requested from the installed image.
@@ -167,6 +168,14 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
 - Custom infix operators (`%op%`) are name references, and `f(x) <- value` references `f<-`.
 - The Root keeps every binding it defines, because its own tests and users reach internals; only
   Root dependencies are tree-shaken.
+- Linked native code: the worker loads each installed compiled library and reads its registered
+  routines, so `useDynLib(pkg, .registration = TRUE)` names resolve. Unanalyzed native components
+  no longer block. The compiled library (`libs/<arch>/<name><ext>`) is a Linked resource copied
+  into the output, and the bootstrap `dyn.load`s it and assigns every routine object before the
+  namespace is populated. A Root keeps its own compiled code and gets its `useDynLib` directive
+  rendered into the generated NAMESPACE.
+- Generated code never resolves base functions through the Root namespace: the bootstrap and its
+  helpers live in `.slinker_runtime` (parent `baseenv()`), and rewritten call sites use `base::`.
 - The construction interpreter memoizes calls whose arguments are all unknown, so dense internal
   call graphs (rlang) stay linear instead of exponential; recursion sees `Unknown`.
 - The CLI runs on a 64 MiB stack thread (the Air parse pool uses the same size), so deeply nested
@@ -225,15 +234,11 @@ packages demand them.
 
 ### Remaining work
 
-1. **Linked native code** (section 9, broader package support): packages with compiled code
-   (`cli`, `fs`) cannot be Linked today. They block with `UnknownNativeEffects`, and the objects
-   created by `useDynLib(..., .registration = TRUE)` (for example `cli`'s `clic_*` routines)
-   surface as `UnresolvedBinding`. The first native step: copy a Linked package's native code
-   wholesale (sources or built shared object, registered routines, and the `useDynLib` load in
-   bootstrap) into the generated package, while still tree-shaking its R bindings like any other
-   Linked namespace. Native routines are opaque retained capabilities; R code that references a
-   registered routine resolves to it instead of an unresolved name. Until then the workaround is
-   `--external <pkg>`.
+1. **Linked native code, remaining** (section 9): compiled libraries are copied wholesale and
+   loaded by the bootstrap (see status). Native code that calls back into R by name can reach R
+   bindings that tree-shaking removed; C callbacks are not analyzed yet. A Linked library whose
+   registered routines cannot be read (its init fails in the worker) still leaves those routine
+   names unresolved.
 2. **Narrower S3 retention** (section 9, static S3): closed generics keep every method. When the
    receiver classes are proven, keeping only their methods, inherited chains, `.default`, and
    `NextMethod` targets would shrink the output. This is an optimization, not a correctness gap.

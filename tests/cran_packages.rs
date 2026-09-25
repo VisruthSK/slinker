@@ -68,6 +68,16 @@ fn doubt_suite_passes_with_unglue_linked() {
 }
 
 #[test]
+fn config_suite_passes_with_compiled_yaml_linked() {
+    LinkedSuite {
+        package: "config",
+        linked: &["yaml"],
+        check: Check::Testthat,
+    }
+    .assert_passes();
+}
+
+#[test]
 fn here_works_with_rprojroot_linked() {
     LinkedSuite {
         package: "here",

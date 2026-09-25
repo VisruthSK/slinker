@@ -437,9 +437,15 @@ fn worker_package_index(
     }
 
     let native_routines = field(&namespace, "nativeRoutines")?;
+    let root = string_field(context, "root")?;
     let dynlibs = strings_field(&namespace, "dynlibs")?
         .into_iter()
         .map(|name| {
+            let compiled = harp::RFunction::new("", ".slinker_native_library")
+                .add(root.as_str())
+                .add(name.as_str())
+                .call()
+                .map_err(r_error)?;
             let native = native_routines.elt(name.as_str()).ok();
             let registered = native
                 .as_ref()
@@ -475,6 +481,8 @@ fn worker_package_index(
                     .zip(symbols)
                     .map(|(binding, symbol)| NativeSymbolBinding { binding, symbol })
                     .collect(),
+                routines: strings_field(&compiled, "routines")?,
+                library: strings_field(&compiled, "library")?.into_iter().next(),
                 safety: NativeSafety::Unanalyzed,
             })
         })

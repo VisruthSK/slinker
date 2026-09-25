@@ -87,7 +87,23 @@ pub struct NativeComponent {
     pub name: String,
     pub registration: Option<NativeRegistration>,
     pub symbols: Vec<NativeSymbolBinding>,
+    pub routines: Vec<String>,
+    pub library: Option<String>,
     pub safety: NativeSafety,
+}
+
+impl NativeComponent {
+    pub fn bindings(&self) -> impl Iterator<Item = NativeSymbolBinding> + '_ {
+        let registered = self.registration.iter().flat_map(|fixes| {
+            self.routines
+                .iter()
+                .map(move |routine| NativeSymbolBinding {
+                    binding: format!("{}{routine}{}", fixes.prefix, fixes.suffix),
+                    symbol: routine.clone(),
+                })
+        });
+        self.symbols.iter().cloned().chain(registered)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

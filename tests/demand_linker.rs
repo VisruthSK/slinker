@@ -1577,6 +1577,8 @@ fn registered_native_symbol_is_not_an_unresolved_r_binding() {
                 binding: "croot_f".into(),
                 symbol: "root_f".into(),
             }],
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Safe(NativeFacts {
                 callbacks: Vec::new(),
             }),
@@ -1604,6 +1606,8 @@ fn opaque_registered_component() -> NativeComponent {
             suffix: "".into(),
         }),
         symbols: Vec::new(),
+        routines: Vec::new(),
+        library: None,
         safety: NativeSafety::Unanalyzed,
     }
 }
@@ -1629,7 +1633,8 @@ fn opaque_registered_selector_is_consumed_by_native_call() {
             && matches!(&node.kind, NodeKind::NativeComponent { name } if name == "root")
     }));
     assert!(
-        plan.blockers()
+        !plan
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
@@ -1775,6 +1780,8 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
             binding: "croot_f".into(),
             symbol: "root_f".into(),
         }],
+        routines: Vec::new(),
+        library: None,
         safety: NativeSafety::Safe(NativeFacts {
             callbacks: Vec::new(),
         }),
@@ -1819,6 +1826,8 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
                 binding: "croot_f".into(),
                 symbol: "root_f".into(),
             }],
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Safe(NativeFacts {
                 callbacks: Vec::new(),
             }),
@@ -1860,6 +1869,8 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
                 binding: "croot_tick".into(),
                 symbol: "root_tick".into(),
             }],
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Safe(NativeFacts {
                 callbacks: Vec::new(),
             }),
@@ -1905,6 +1916,8 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
                 suffix: "".into(),
             }),
             symbols: Vec::new(),
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Unanalyzed,
         }],
         Vec::new(),
@@ -1919,7 +1932,8 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
             && diagnostic.message.contains("croot_tick")
     }));
     assert!(
-        plan.blockers()
+        !plan
+            .blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
@@ -1948,6 +1962,8 @@ fn native_activation_keeps_component_without_widening_r_bindings() {
             name: "foo".into(),
             registration: None,
             symbols: Vec::new(),
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Safe(NativeFacts {
                 callbacks: Vec::new(),
             }),
@@ -1983,6 +1999,8 @@ fn known_native_callback_adds_binding_edge() {
             name: "foo".into(),
             registration: None,
             symbols: Vec::new(),
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Safe(NativeFacts {
                 callbacks: vec!["callback".into()],
             }),
@@ -2030,6 +2048,8 @@ fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
                 binding: "root_a".into(),
                 symbol: "root_a".into(),
             }],
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
                 selector: "root_a".into(),
                 callback_arguments: vec![2],
@@ -2087,6 +2107,8 @@ fn native_summary_accepts_oak_proven_local_closure_callback() {
                 binding: "root_a".into(),
                 symbol: "root_a".into(),
             }],
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
                 selector: "root_a".into(),
                 callback_arguments: vec![1],
@@ -2145,6 +2167,8 @@ fn native_callback_positions_ignore_named_package_and_match_named_selector() {
                 binding: "root_a".into(),
                 symbol: "root_a".into(),
             }],
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
                 selector: "root_a".into(),
                 callback_arguments: vec![2],
@@ -2186,6 +2210,8 @@ fn summarized_native_callbacks_are_not_global_component_roots() {
                 binding: "root_a".into(),
                 symbol: "root_a".into(),
             }],
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
                 selector: "root_a".into(),
                 callback_arguments: vec![2],
@@ -2218,6 +2244,8 @@ fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
                 binding: "root_a".into(),
                 symbol: "root_a".into(),
             }],
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Summarized(Vec::new()),
         }],
         Vec::new(),
@@ -2255,6 +2283,8 @@ fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
             name: "foo".into(),
             registration: None,
             symbols: Vec::new(),
+            routines: Vec::new(),
+            library: None,
             safety: NativeSafety::Unsupported(vec!["dynamic R lookup".into()]),
         }],
         Vec::new(),

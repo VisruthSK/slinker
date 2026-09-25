@@ -419,6 +419,9 @@ pub enum MaterializeError {
 
 fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     let mut out = String::new();
+    out.push_str(
+        ".slinker_runtime <- base::new.env(parent = base::baseenv())\nbase::local(envir = .slinker_runtime, {\n",
+    );
     out.push_str(GENERATED_RUNTIME);
     out.push('\n');
     writeln!(
@@ -443,18 +446,19 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             .map(|on_load| on_load.closure),
         LinkNamespaceState::Linked(_) | LinkNamespaceState::External { .. } => None,
     };
+    let mut root_code = String::new();
     for closure in namespace_closures(program, root) {
         let source = relocated_source(program, program.closure(closure).code)?;
         if Some(closure) == root_on_load {
-            out.push_str(&rename_assignment(&source, ".slinker_original_on_load"));
+            root_code.push_str(&rename_assignment(&source, ".slinker_original_on_load"));
         } else {
-            out.push_str(&source);
+            root_code.push_str(&source);
         }
-        out.push('\n');
+        root_code.push('\n');
     }
 
-    out.push_str(".onLoad <- function(libname, pkgname) {\n  .slinker_check_target()\n");
-    out.push_str("  root <- environment(.onLoad)\n  linked <- list()\n");
+    out.push_str("bootstrap <- function(root, libname, pkgname) {\n  .slinker_check_target()\n");
+    out.push_str("  linked <- list()\n");
     let bootstrap = &program.root_artifact().bootstrap_namespaces;
     for namespace in bootstrap {
         let package = program
@@ -476,6 +480,30 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             r_string(name)
         )
         .expect("String writes cannot fail");
+        for component in &namespace.native_components {
+            let native = &program.native_component(*component).native;
+            let Some(library) = &native.library else {
+                continue;
+            };
+            let symbols = native
+                .bindings()
+                .map(|symbol| {
+                    format!(
+                        "{} = {}",
+                        r_string(&symbol.binding),
+                        r_string(&symbol.symbol)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(
+                out,
+                "    .slinker_load_native(ns, {}, {}, c({symbols}))",
+                r_string(name),
+                r_string(library)
+            )
+            .expect("String writes cannot fail");
+        }
         for import in &namespace.imports {
             writeln!(
                 out,
@@ -540,9 +568,15 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         .expect("String writes cannot fail");
     }
     if root_on_load.is_some() {
-        out.push_str("  .slinker_original_on_load(libname, pkgname)\n");
+        out.push_str(
+            "  get(\".slinker_original_on_load\", envir = root, inherits = FALSE)(libname, pkgname)\n",
+        );
     }
-    out.push_str("}\n");
+    out.push_str("}\n})\n");
+    out.push_str(&root_code);
+    out.push_str(
+        ".onLoad <- function(libname, pkgname) {\n  .slinker_runtime[[\"bootstrap\"]](base::asNamespace(pkgname), libname, pkgname)\n}\n",
+    );
     Ok(out)
 }
 
@@ -585,11 +619,15 @@ fn binding_reference(program: &ProgramIr, binding: crate::ir::BindingId) -> Stri
     let package = r_string(&program.package(namespace.package).identity().name);
     let name = r_string(&program.binding(binding).name);
     match namespace.state {
-        LinkNamespaceState::External { .. } => format!("getExportedValue({package}, {name})"),
+        LinkNamespaceState::External { .. } => format!("base::getExportedValue({package}, {name})"),
         LinkNamespaceState::Root(_) | LinkNamespaceState::Linked(_) => {
-            format!("get({name}, envir = asNamespace({package}), inherits = FALSE)")
+            namespace_get(&package, &name)
         }
     }
+}
+
+fn namespace_get(package: &str, name: &str) -> String {
+    format!("base::get({name}, envir = base::asNamespace({package}), inherits = FALSE)")
 }
 
 fn s3_matrix(
@@ -647,6 +685,33 @@ fn render_namespace(program: &ProgramIr) -> String {
             .expect("String writes cannot fail");
         }
     }
+    for component in &root.native_components {
+        let native = &program.native_component(*component).native;
+        let registration = native.registration.iter().map(|fixes| {
+            format!(
+                ".registration = TRUE, .fixes = c({}, {})",
+                r_string(&fixes.prefix),
+                r_string(&fixes.suffix)
+            )
+        });
+        let symbols = native.symbols.iter().map(|symbol| {
+            format!(
+                "{} = {}",
+                r_binding_name(&symbol.binding),
+                r_string(&symbol.symbol)
+            )
+        });
+        writeln!(
+            out,
+            "useDynLib({})",
+            std::iter::once(r_binding_name(&native.name))
+                .chain(registration)
+                .chain(symbols)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .expect("String writes cannot fail");
+    }
     for registration in &root.s3_registrations {
         let registration = program.s3_registration(*registration);
         let generic = match registration.generic.package {
@@ -696,10 +761,9 @@ fn relocated_source(
                 crate::ir::ExternalBindingAccess::Exported => binding_reference(program, *target),
                 crate::ir::ExternalBindingAccess::Internal => {
                     let namespace = program.namespace(program.binding_namespace(*target));
-                    format!(
-                        "get({}, envir = asNamespace({}), inherits = FALSE)",
-                        r_string(&program.binding(*target).name),
-                        r_string(&program.package(namespace.package).identity().name)
+                    namespace_get(
+                        &r_string(&program.package(namespace.package).identity().name),
+                        &r_string(&program.binding(*target).name),
                     )
                 }
             },
@@ -707,7 +771,7 @@ fn relocated_source(
                 let package = program
                     .package(program.namespace(*target).package)
                     .identity();
-                format!("asNamespace({})", r_string(&package.name))
+                format!("base::asNamespace({})", r_string(&package.name))
             }
             Relocation::Package {
                 target, operation, ..
@@ -721,10 +785,10 @@ fn relocated_source(
                     let package = program
                         .package(target.expect("resolved package operation"))
                         .identity();
-                    format!("asNamespace({})", r_string(&package.name))
+                    format!("base::asNamespace({})", r_string(&package.name))
                 }
                 PackageOperationIr::PackageVersion { version } => {
-                    format!("package_version({})", r_string(version))
+                    format!("base::package_version({})", r_string(version))
                 }
                 PackageOperationIr::FindPackage => {
                     return Err(MaterializeError::InvalidR(
@@ -737,7 +801,7 @@ fn relocated_source(
                 let resource = program.resource(*target);
                 let package = program.package(resource.package).identity();
                 format!(
-                    "system.file(\"slinker\", \"resources\", {}, {}, package = {})",
+                    "base::system.file(\"slinker\", \"resources\", {}, {}, package = {})",
                     r_string(&package.name),
                     r_string(&resource.path),
                     r_string(&program.package(program.root_package()).identity().name)
@@ -907,6 +971,13 @@ const GENERATED_RUNTIME: &str = r#"
   namespace$.__S3MethodsTable__. <- new.env(hash = TRUE, parent = baseenv())
   .Internal(registerNamespace(name, namespace))
   namespace
+}
+.slinker_load_native <- function(namespace, package, library, symbols) {
+  path <- system.file("slinker", "resources", package, library, package = .slinker_root_package, mustWork = TRUE)
+  dll <- dyn.load(path, local = TRUE)
+  for (binding in names(symbols)) {
+    assign(binding, getNativeSymbolInfo(symbols[[binding]], dll), envir = namespace)
+  }
 }
 .slinker_populate <- function(namespace, package) {
   bundle <- system.file("slinker", "payload", paste0(package, ".rds"), package = .slinker_root_package, mustWork = TRUE)

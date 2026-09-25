@@ -115,12 +115,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         namespace_shadowed.extend(image.bindings.keys().cloned());
         namespace_shadowed.extend(self.namespace_builders[&package].bindings.iter().cloned());
         for component in &image.index.dynlibs {
-            namespace_shadowed.extend(
-                component
-                    .symbols
-                    .iter()
-                    .map(|symbol| symbol.binding.clone()),
-            );
+            namespace_shadowed.extend(component.bindings().map(|symbol| symbol.binding));
         }
 
         let namespace_environment = format!("namespace:{}", self.packages.name(package));
@@ -165,12 +160,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         shadowed.extend(image.index.binding_names.iter().cloned());
         shadowed.extend(self.namespace_builders[&package].bindings.iter().cloned());
         for component in &image.index.dynlibs {
-            shadowed.extend(
-                component
-                    .symbols
-                    .iter()
-                    .map(|symbol| symbol.binding.clone()),
-            );
+            shadowed.extend(component.bindings().map(|symbol| symbol.binding));
         }
 
         let mut private_shadowed = BTreeSet::new();

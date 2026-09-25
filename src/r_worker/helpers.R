@@ -37,6 +37,7 @@
 
   list(
     package = package,
+    root = root,
     version = version,
     ns_info = readRDS(file.path(root, "Meta", "nsInfo.rds")),
     image_env = image_env,
@@ -47,6 +48,19 @@
     sysdata_names = sort(sysdata_names),
     dataset_names = sort(ls(data_env, all.names = TRUE))
   )
+}
+
+.slinker_native_library <- function(root, name) {
+  library <- paste(
+    c("libs", if (nzchar(.Platform$r_arch)) .Platform$r_arch, paste0(name, .Platform$dynlib.ext)),
+    collapse = "/"
+  )
+  if (!file.exists(file.path(root, library))) return(list(library = character(), routines = character()))
+  routines <- tryCatch(
+    unlist(lapply(getDLLRegisteredRoutines(dyn.load(file.path(root, library), local = TRUE)), names)),
+    error = function(error) character()
+  )
+  list(library = library, routines = sort(unique(as.character(routines))))
 }
 
 .slinker_deparse_binding <- function(name, value) {

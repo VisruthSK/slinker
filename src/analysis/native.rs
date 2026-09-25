@@ -24,8 +24,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         summaries.iter().find(|summary| {
             summary.selector == selector
                 || native
-                    .symbols
-                    .iter()
+                    .bindings()
                     .any(|symbol| symbol.binding == selector && symbol.symbol == summary.selector)
         })
     }
@@ -191,14 +190,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         index: &'a PackageIndex,
         name: &str,
     ) -> Option<&'a str> {
-        // Only explicit routine bindings are evidence. registrationFixes tells
-        // us how R names registered routines, but not which routines exist.
-        // Treating an arbitrary prefix/suffix match as native would hide real
-        // unresolved R names.
         let mut matches = index
             .dynlibs
             .iter()
-            .filter(|native| native.symbols.iter().any(|symbol| symbol.binding == name));
+            .filter(|native| native.bindings().any(|symbol| symbol.binding == name));
         let first = matches.next()?;
         if matches.next().is_some() {
             None
@@ -221,12 +216,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(None);
         };
         if let StaticArg::String(symbol) = selector {
-            let mut components = image.index.dynlibs.iter().filter(|native| {
-                native
-                    .symbols
-                    .iter()
-                    .any(|binding| binding.symbol == *symbol)
-            });
+            let mut components = image
+                .index
+                .dynlibs
+                .iter()
+                .filter(|native| native.bindings().any(|binding| binding.symbol == *symbol));
             let Some(component) = components.next() else {
                 return Ok(None);
             };
