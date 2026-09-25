@@ -18,7 +18,9 @@ assumption (`--strict false`); `declare(slinker(...))` lets an author state a mi
 ## Decided
 
 - Soundness first. Coverage work waits until known ways a successful build can diverge are closed.
-- Work is organized as tracks, not a global stage order. "Next up" below is the current pick.
+  The Rust track goes before Track A so isolation lands on a smaller, typed codebase.
+- Work is organized as tracks, not a global stage order. "Next up" below is the current pick. Every
+  change in any track also leaves the code it touches cleaner.
 - Retained non-source objects stay R-serialized payload bundles; the IR describes and bounds them
   instead of modeling their object graphs.
 - Linked namespaces are registered under private names, so a slinked package never occupies or
@@ -28,6 +30,11 @@ assumption (`--strict false`); `declare(slinker(...))` lets an author state a mi
   query is rewritten to the private namespace or blocked.
 - Everything linked code addresses by package name is rewired to the private namespace. Registries
   keyed by something else stay shared and the residual divergence is documented (Track A).
+- In-session serialization of Linked-namespace references is documented, not detected.
+- Linked lazy-loaded datasets are carried into the generated package.
+- Root code stays regenerated from installed closures; original comments and layout are not kept.
+- Declarations grow `strings(...)` and `callables(...)` value domains.
+- Performance is tracked with benchmarks run in CI, without fixed budgets.
 
 ## Rules
 
@@ -41,6 +48,8 @@ assumption (`--strict false`); `declare(slinker(...))` lets an author state a mi
   semantic invariants; rewrite tests that pin obsolete details.
 - `PROTOCOL_VERSION` stays `1`. Discover R with `R RHOME` (through `PATHEXT`), `R_HOME` only as a
   fallback, and never pass `R_HOME` to an R frontend.
+- Benchmarks never run in parallel, never use `target-cpu=native` or other `RUSTFLAGS`, and disable
+  the analysis cache unless the benchmark is explicitly the warm-cache case.
 - Commit without any Claude co-author or session trailer. Keep CI green; when Actions cannot run,
   run the gate on Linux through WSL.
 
@@ -68,9 +77,10 @@ acceptance cases here.
 
 ## Next up
 
-1. Track D: fix the analysis regression (rlang no longer finishes in 120 s; it took about 19 s after
-   the memoization fix, and it also blocks `lifecycle`, `pkgload`, and `waldo`).
-2. Track A in full.
+1. Track C: the analysis regression (rlang no longer finishes in 120 s; it took about 19 s after the
+   memoization fix, and the same hang stops `lifecycle`, `pkgload`, and `waldo`), then benchmarks,
+   then the type and cleanup items.
+2. Track A.
 3. Track B.
 
 ---
@@ -80,7 +90,7 @@ acceptance cases here.
 Why: today a Linked namespace is registered under the real name. Loading a slinked package makes
 every later `loadNamespace("cli")` in the session return the partial copy: after
 `library(voucher)`, `cli::cli_progress_bar()` and `library(pillar)` fail with "removed by slinker"
-even though real cli is installed. In the other order the build refuses to load
+even though real cli is installed. In the other order the package refuses to load
 (`LinkedNamespaceCollision`). Both break installation independence and make a package's own test
 suite unrunnable next to testthat.
 
@@ -88,6 +98,7 @@ Registration:
 - Register each Linked namespace under a private key derived from the Root and Linked package names
   that is not a valid package name, so it can never collide. The namespace spec keeps the original
   name and version.
+- `NamespaceActivationIr` carries the private key; the materializer takes it from there.
 - Delete `LinkedNamespaceCollision`, its runtime check, and its tests.
 
 Payload references:
@@ -96,34 +107,35 @@ Payload references:
   every Linked image environment's spec name to its private key (all Linked images of the build in
   one worker), and restore it afterwards. External namespaces keep their real names.
 
-Rewiring everything linked code addresses by package name (relocations, in both relocatable code
-and payload closures; payload language that cannot be rewritten exactly blocks):
+Rewiring everything linked code addresses by package name (relocations in both relocatable code and
+payload closures; payload language that cannot be rewritten exactly blocks):
 - `pkg::f`, `pkg:::f`, `asNamespace`, `getNamespace`, `loadNamespace`, `requireNamespace`,
   `isNamespaceLoaded`, `find.package`, `system.file(package = )` (already resources),
-  `packageVersion`, `packageDescription`, `utils::packageName()` round trips, and
-  `loadedNamespaces()` membership tests on a Linked package;
-- `rlang::is_installed`/`check_installed` and similar wrappers are covered once static discovery
-  is relocated; dynamic forms stay blockers or assumptions;
+  `packageVersion`, `packageDescription`, and `loadedNamespaces()` membership tests on a Linked
+  package;
+- wrappers such as `rlang::is_installed`/`check_installed` are covered once static discovery is
+  relocated; dynamic forms stay blockers or assumptions;
 - name round trips from the namespace itself: `asNamespace(.packageName)`,
-  `asNamespace(getNamespaceName(topenv()))`, `environmentName` feeding a namespace query;
+  `asNamespace(getNamespaceName(topenv()))`, `utils::packageName()` or `environmentName` feeding a
+  namespace or package query;
 - native lookups by name: `.Call(..., PACKAGE = "pkg")`, `getNativeSymbolInfo(, "pkg")`,
-  `is.loaded`. Loading two copies of one DLL works; resolve through the copy's `DllInfo`, never by
-  name;
+  `is.loaded`. Two copies of one DLL load side by side; resolve through the copy's `DllInfo`, never
+  by name;
 - `registerS3method(..., envir = asNamespace("pkg"))` and `S3method(pkg::generic, cls)`;
 - delete `DiscoveryPolicy`: static discovery of a known package becomes a sound relocation (today
   `Reject` blocks every static discovery of a hard dependency).
 
-Residual, documented in the README instead of fixed (registries not keyed by package name):
+Residual, documented in the README instead of fixed:
 - S3 methods a Linked package registers on another package's generic (`format.cli_ansi_string`
   on base `format`) share one table keyed by class. Dispatch from linked code finds its own method
   lexically first; dispatch started outside it (console printing, another package) can reach the
-  real package's method if a different real version is also loaded.
+  real package's method when a different real version is also loaded.
 - C callables (`R_RegisterCCallable("cli", ...)`) are a string literal in compiled code; a loaded C
   consumer can receive either copy's function.
 - S4 class registries (S4 is blocked today).
-- In-session `serialize`/`saveRDS` round trips of objects that reference a Linked namespace write
-  the original name, as the original would; reading one back in a session without the real package
-  fails. Decide later whether reachable uses should be detected.
+- Serializing an object that references a Linked namespace writes the original name, as the
+  original would; reading it back (`readRDS`, callr or future workers) fails without the real
+  package.
 
 Tests:
 - The CRAN harness runs each suite three ways against one build: dependencies uninstalled,
@@ -131,24 +143,27 @@ Tests:
 - `library(voucher); library(pillar)` works with real cli installed, in both orders.
 - A payload closure from a Linked package unserializes into the private namespace with real cli
   loaded.
-- Each rewired form above has a relocation test, and a linked `.Call(PACKAGE = )` reaches its own
-  DLL copy while the real package is loaded.
+- Each rewired form has a relocation test, and a linked `.Call(PACKAGE = )` reaches its own DLL
+  copy while the real package is loaded.
 
 Done when the three-way harness passes for every corpus package and voucher, and here's own
 testthat suite runs against the slinked here with rprojroot Linked (replacing its script check).
 
 ## Track B: Soundness gaps in the current profile
 
-Each item can make a successful build behave differently from the original.
+Each item can make a successful build behave differently from the original, and each gets a test
+that fails before its fix.
 
-- Linked datasets: nothing requests `Need::Dataset`, so `pkg::dataset`, `data(x, package = "pkg")`,
-  and `LazyData` are not carried into the output. Open: model them as resources or block every
-  reachable use.
-- Payload identity: an environment reachable from two namespaces' bundles splits into two objects.
-  Detect it in `.slinker_bundle` and block.
-- Root top-level effects: staging runs the Root's `R/` files, but only resulting bindings survive.
-  A top-level `options()`, `setHook`, `Sys.setenv`, or `registerS3method` is lost. Open: block
-  them, or reproduce them explicitly.
+- Payload bundles become IR entities, one per namespace: the bindings carried, the namespaces its
+  serialized references resolve to (activated first), and the contract: within one bundle R
+  serialization preserves sharing, cycles, private environments and parents, closure enclosures,
+  and attributes; identity is never shared across bundles. An environment reachable from two
+  namespaces' bundles would split into two objects: detect it in `.slinker_bundle` and block.
+- Linked datasets: nothing requests `Need::Dataset` today, so `pkg::dataset`,
+  `data(x, package = "pkg")`, and lazy data used inside a Linked package are not carried. Demand the
+  reachable datasets, copy them into a lazy-load database under the generated package, attach them
+  as the package's lazy data environment for `::`, and relocate `data(x, package = )`. A dataset
+  reached only dynamically blocks.
 - Pre-bootstrap Root code must not resolve a Linked namespace or binding; make it a checked
   property of `RootArtifactIr`.
 - Imports environments: wire every original import name (unretained ones as stubs) so a dropped
@@ -164,51 +179,87 @@ Each item can make a successful build behave differently from the original.
   Suggests package is installed blocks.
 - Diagnostics: collapse derivative missing-name cascades behind one primary blocker.
 
-Each item gets a test that fails before its fix.
+## Track C: Rust cleanup, types, and performance
 
-## Track C: IR and architecture
+Why: about 23k lines of Rust carry invariants in comments, strings, and `unreachable!`; parts of the
+IR exist only for show; finalization reads the provenance graph; and analysis speed has no
+measurement.
 
-Why: parts of `ProgramIr` describe structure nothing produces, parts of what the materializer
-relies on live outside it, and finalization still reads the provenance graph.
+Performance:
+- Regression first: rlang, lifecycle, pkgload, and waldo each exceed 120 s. Profile, fix, and add a
+  deterministic guard (an interpreter work counter asserted in a unit test, not wall time).
+- Benchmarks, run in CI and reported, with no fixed thresholds:
+  - criterion microbenchmarks: Air parse plus Oak semantics of a large closure, the construction
+    interpreter on rlang-style closures, installed index read, cache hit path, image fingerprinting;
+  - end-to-end benchmarks (criterion with small samples, or a `harness = false` bench): `analyze`
+    of rlang, cli, and testthat cold and warm, and `build` of voucher and a corpus package.
+- Profile before optimizing. Known candidates: one JSON worker round trip per binding (batch per
+  package), two `normalize_syntax` calls per parsed closure (merge into one), a single R worker
+  (several worker processes can inspect different packages in parallel), and string-keyed maps in
+  the analyzer (interning).
 
-- Payload bundles become IR entities, one per namespace: the bindings carried, the namespaces its
-  serialized references resolve to (activated first), and the contract: within one bundle R
-  serialization preserves sharing, cycles, private environments and parents, closure enclosures,
-  and attributes; identity is never shared across bundles.
+Invariants into types:
+- Names: about 54 `String` fields and 87 string collections hold package, binding, class, and
+  generic names. Intern them at the worker boundary into typed symbols (`PackageName`,
+  `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
+- `unreachable!` (11) that encode invariants the types do not, such as "bootstrap activates only
+  Linked namespaces": type the collections so the impossible branch does not exist.
+- 179 `.expect()` calls, mostly infallible `writeln!` into `String` in the materializer: generate R
+  through a writer whose API cannot fail.
+- Worker protocol `Result<_, String>` (19) becomes typed errors.
+- Unchecked integer casts in `r_worker` (`usize` to `i32`, `i32`/`isize` to `usize`) and
+  `syntax/oak.rs` (`usize` to `u32`) become checked conversions.
+- Hand-written range comparisons in `syntax/oak.rs` and `finalize.rs` become one span type with
+  `contains` and `overlaps`.
+- Removed bindings and unretained exports become typed slot state instead of parallel string lists.
+
+IR cleanup (breaking):
 - Delete what nothing produces or reads: `ProgramIr.roots`/`Root`/`add_root`, `ProvenanceRecord`
   and `records()`, `environment_bindings`/`EnvironmentBinding`, unused `Value` variants,
   `EnvironmentKind::Private`, `EnvironmentParentIr::{ExternalNamespace, Empty}`,
   `ResidualCapability`, `ImagePhase`, `InstalledObjectLocator` path steps.
 - `NamespaceActivationIr` is the materializer's single source for activation: order, `.onLoad`,
-  native components, private key, stubs, and exports. Delete `RootArtifactIr.bootstrap_namespaces`
-  and the runtime `exists(".onLoad")` discovery. Removed bindings become typed slot state instead
-  of parallel string lists.
+  native components, stubs, and exports. Delete `RootArtifactIr.bootstrap_namespaces` and the
+  runtime `exists(".onLoad")` discovery.
 - Finalization stops reading the graph: External binding uses, activation-time dependencies, and
-  `import(pkg)` expansion come from typed analysis state. Replace string issues with typed
-  diagnostics.
-- Lower Linked `.onLoad` `libname` uses to explicit resources.
-- Proposed, to discuss: split `AnalyzerState` (about 40 fields) into owners (need queue, diagnostic
-  sink, S3 model, relocation plan, reflection facts, parse cache); store provenance as typed
-  derivations and build the explanation graph only for `why`/`path`/`--graph`, merging the two
-  graph export formats.
+  `import(pkg)` expansion come from typed analysis state. String issues become typed diagnostics.
+  Done when finalization output is unchanged with provenance recording disabled (test).
 
-Done when no IR type exists only for show, the materializer reads only IR facts, and finalization
-output is unchanged with provenance recording disabled (test).
+Structure:
+- Split `AnalyzerState` (about 40 fields) into owners with narrow APIs: need queue, diagnostic sink,
+  S3 model, relocation plan, reflection facts, parse cache.
+- Break up the long functions: `finalize_program` (424 lines), `syntax/oak.rs` `translate_index`
+  (334) and the 208-line function after it, `AnalyzerState` `semantic_call` (259),
+  `process_binding` (241), `process_parsed` (217), and the 230-line interpreter call evaluation.
+- Provenance is stored as typed derivations; the explanation graph is built only for
+  `why`/`path`/`--graph`. Merge `GraphExport` and `ExplanationDag` into one export (`export.rs`,
+  `explain.rs`, and `graph.rs` are about 1,670 lines together).
 
-## Track D: Build infrastructure
+Minimal code:
+- Fix the `clippy::pedantic` findings that matter (redundant clones, pass-by-value, `map_or_else`,
+  missing `#[must_use]`) and enable the lints that stay useful in CI.
+- Audit the 544 `.clone()` calls on hot paths once names are interned.
+- Drop a dependency when a few lines replace it (`hex` is used in two places).
+- Prune tests that pin obsolete details as each area is reworked (`tests/` is about 5,600 lines).
 
-- Analysis regression: rlang, lifecycle, pkgload, and waldo each exceed 120 s. Find the blowup, fix
-  it, and add a deterministic guard (an interpreter work budget in a unit test, not wall time).
+## Track D: Build infrastructure and frontend
+
 - Restore GitHub Actions (billing); until then run the gate in WSL before each push.
 - Linux worker startup: fix `package 'methods' in options("defaultPackages") was not found`;
   export `R_SHARE_DIR`, `R_INCLUDE_DIR`, `R_DOC_DIR` as Ark does.
 - Source snapshot: honor `.Rbuildignore` and skip `.git`, `target/`, `renv/`. `source_digest` is
   stored but never checked: detect a source tree changed mid-build, or delete it.
 - One shared `r_executable` helper instead of per-module copies.
-- One worker round trip per parsed closure instead of two `normalize_syntax` calls.
 - Cache CRAN downloads and harness libraries in CI.
-- Open, to discuss: a dry-run `check` command; letting `analyze`/`why`/`path` take a source path
-  like `build`; `--extra-pkgs` on `build`; grouped and JSON diagnostic reports.
+- Frontend, documented in the README as it lands:
+  - `analyze`, `why`, and `path` accept a source package path (staged exactly as `build` does), an
+    installed package name (today's behavior), or an installed package directory, whose parent
+    library goes first in the library order;
+  - `slinker check [PATH]` runs the full build pipeline through preflight, prints the build report,
+    and writes nothing;
+  - `build` takes `--extra-pkgs`;
+  - reports group blockers and assumptions by root cause, show the owning binding and source line,
+    and have a `--json` form.
 
 ## Track E: Retire heuristics
 
@@ -220,7 +271,11 @@ output is unchanged with provenance recording disabled (test).
   static (voucher's `system.file(..., package = package)`).
 - Native: audited summaries make a component sound; a library whose init fails in the worker is a
   blocker instead of missing routine names.
-- Open, to discuss: further declaration kinds (value domains for strings and callables).
+- Declarations, exact domains in both modes, each with parser and analysis tests:
+  - `strings("a", "b")` for a binding used as a name in `get`/`exists`/`match.fun`/`do.call`, as a
+    package in `asNamespace`/`requireNamespace`/`system.file`, or as a generic in `UseMethod`;
+  - `callables(pkg::f, g)` for a function-valued binding passed to `do.call`, `lapply`, or native
+    callbacks.
 
 ## Track F: S3 completion
 
@@ -238,6 +293,7 @@ output is unchanged with provenance recording disabled (test).
   lazy-loaded dataset, `match.arg`/`tryCatch`/`do.call`/`switch`/`eval(bquote())`,
   `requireNamespace`-guarded Suggests code) with a testthat suite. Done when it builds strictly
   with no assumptions and passes the Track A three-way harness.
+- Lower Linked `.onLoad` `libname` uses to explicit resources instead of blocking them.
 - rlang, cli, glue, vctrs, R6 each link in a CRAN harness case, strictly where their code allows;
   R6 generators and re-enclosed methods are modeled or blocked precisely.
 - Typed blockers for S4/S7, representation introspection, and `eval(parse())`/`source()`.
@@ -252,14 +308,6 @@ testthat with every testthat dependency Linked.
 
 ---
 
-## Open questions
-
-- Linked datasets: resources or blockers (Track B)?
-- Root top-level effects: block or reproduce (Track B)?
-- Root code fidelity: keep regenerated code, or preserve original source and srcrefs?
-- In-session serialization of Linked-namespace references: detect, or document (Track A)?
-- The Track C and Track D proposals.
-
 ## Deferred
 
 - Bounded residual runtime over proved finite candidate sets.
@@ -267,6 +315,7 @@ testthat with every testthat dependency Linked.
 - Stronger External verification (exact fingerprints, ABI checks).
 - An R client for `ExplanationDag`; incremental linking.
 - Cross-R-version portability; `Depends` attachment; `LinkingTo`.
+- Preserving the Root's original source, comments, and srcrefs.
 
 ## Traps
 
@@ -276,6 +325,9 @@ testthat with every testthat dependency Linked.
 - Explicit `--external` on a Suggests package is selected optional behavior; its contract is
   promoted into generated `Imports`.
 - `R CMD INSTALL` takes one `--library=<path>` option plus the package path.
+- A package's top-level R code runs once, at install time. Effects outside the namespace
+  (`options()`, `Sys.setenv`) are lost in the original too; effects inside it become bindings the
+  Root already keeps. It is not a gap.
 - R processes `export()` after `.onLoad`, which is why Linked exports and stubs are set during
   activation.
 - R serializes namespace environments by spec name and never passes them to the refhook.
@@ -295,4 +347,5 @@ cargo build --release --all-features
 ```
 
 CI runs format, clippy, MSRV, docs, and R-backed tests on Linux, macOS, Windows, and R-devel for
-pull requests and pushes to `main`.
+pull requests and pushes to `main`. Benchmarks run in their own job, sequentially, on one Linux
+runner.
