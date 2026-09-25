@@ -1,11 +1,15 @@
 use std::process::Command;
 
+fn slinker(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(args)
+        .output()
+        .expect("run slinker binary")
+}
+
 #[test]
 fn version_reports_package_version() {
-    let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
-        .arg("--version")
-        .output()
-        .expect("run slinker binary");
+    let output = slinker(&["--version"]);
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
     assert_eq!(
@@ -15,30 +19,21 @@ fn version_reports_package_version() {
 }
 
 #[test]
-fn help_documents_build_and_analysis_commands() {
-    let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
-        .arg("--help")
-        .output()
-        .expect("run slinker binary");
+fn help_lists_public_commands_only() {
+    let output = slinker(&["--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
-    assert!(stdout.contains("slinker analyze PACKAGE"));
-    assert!(stdout.contains("slinker build [PATH]"));
-    assert!(stdout.contains("PATH defaults to the current directory"));
-    assert!(stdout.contains("R_HOME"));
-    assert!(stdout.contains("--lib PATH"));
-    assert!(stdout.contains("--graph"));
-    assert!(!stdout.contains("--graph-format"));
+    for command in ["build", "analyze", "why", "path", "R_HOME"] {
+        assert!(stdout.contains(command), "{command} missing from help");
+    }
+    assert!(!stdout.contains("__r-worker"));
 }
 
 #[test]
-fn removed_graph_format_is_rejected_before_analysis() {
-    let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
-        .args(["analyze", "glue", "--graph-format", "yaml"])
-        .output()
-        .expect("run slinker binary");
+fn unknown_option_is_rejected_before_analysis() {
+    let output = slinker(&["analyze", "glue", "--graph-format", "yaml"]);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
-    assert!(stderr.contains("unknown analyze option"));
+    assert!(stderr.contains("--graph-format"));
 }

@@ -8,8 +8,7 @@
 slinker analyze voucher
 slinker analyze voucher --lib C:/project/renv/library --lib C:/Users/me/AppData/Local/R/win-library/4.6
 slinker analyze voucher --external cli
-slinker analyze voucher --extra-pkgs posterior distributional
-slinker analyze voucher --graph
+slinker analyze voucher --extra-pkgs posterior,distributional
 slinker analyze voucher --graph
 ```
 
@@ -17,7 +16,7 @@ slinker analyze voucher --graph
 
 `Suggests` is not a dependency graph. A package appearing only in `Suggests` contributes no edge and is not inspected merely because it is installed.
 
-`--extra-pkgs PKG...` explicitly enables optional packages for reachable optional-package code paths. Values are space-separated, for example `--extra-pkgs foo bar baz`. The flag does not make those packages roots, does not retain their full APIs, and does not recursively follow their `Suggests`. If retained code never reaches an enabled package, that package still stays out of the graph. A standard guarded branch such as `if (requireNamespace("foo")) foo::bar()` is excluded unless `foo` is selected, External, or otherwise required by the package's effective imports.
+`--extra-pkgs PKG[,PKG...]` explicitly enables optional packages for reachable optional-package code paths. Values are comma-separated or repeated, for example `--extra-pkgs foo,bar --extra-pkgs baz`. The flag does not make those packages roots, does not retain their full APIs, and does not recursively follow their `Suggests`. If retained code never reaches an enabled package, that package still stays out of the graph. A standard guarded branch such as `if (requireNamespace("foo")) foo::bar()` is excluded unless `foo` is selected, External, or otherwise required by the package's effective imports.
 
 `--external` leaves named third-party namespaces external after resolving their exact installed identity. Base packages remain part of the target R platform.
 

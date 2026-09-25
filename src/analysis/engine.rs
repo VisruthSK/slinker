@@ -474,14 +474,7 @@ impl<P: PackageProvider> Linker<P> {
                                         .normalized_shapes
                                         .get(&(package.clone(), name.clone()))
                                         .cloned()
-                                        .unwrap_or_else(|| {
-                                            Digest(format!(
-                                                "{:x}",
-                                                <sha2::Sha256 as sha2::Digest>::digest(
-                                                    closure.source.as_bytes(),
-                                                )
-                                            ))
-                                        }),
+                                        .unwrap_or_else(|| Digest::of(closure.source.as_bytes())),
                                     locator,
                                 },
                             )
@@ -1074,13 +1067,8 @@ impl<P: PackageProvider> Linker<P> {
                 self.parsed_bindings.insert(key, ParseState::Blocked);
                 continue;
             }
-            self.normalized_shapes.insert(
-                key.clone(),
-                Digest(format!(
-                    "{:x}",
-                    <sha2::Sha256 as sha2::Digest>::digest(normalized.as_bytes())
-                )),
-            );
+            self.normalized_shapes
+                .insert(key.clone(), Digest::of(&normalized));
             work.push(Work {
                 key,
                 owner_binding,
@@ -2921,13 +2909,8 @@ impl<P: PackageProvider> Linker<P> {
             self.parsed_bindings.insert(key, ParseState::Blocked);
             return Ok(None);
         }
-        self.normalized_shapes.insert(
-            key.clone(),
-            Digest(format!(
-                "{:x}",
-                <sha2::Sha256 as sha2::Digest>::digest(normalized.as_bytes())
-            )),
-        );
+        self.normalized_shapes
+            .insert(key.clone(), Digest::of(&normalized));
         match OakParser.parse_binding_with_context(source, source_text.as_ref(), &context) {
             Ok(parsed) => {
                 let parsed = Arc::new(parsed);

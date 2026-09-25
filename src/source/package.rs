@@ -206,7 +206,7 @@ fn digest_tree(root: &Path) -> Result<Digest, SourcePackageError> {
         }
         hash.update([0xff]);
     }
-    Ok(Digest(format!("{:x}", hash.finalize())))
+    Ok(Digest::finish(hash))
 }
 
 fn collect_files(

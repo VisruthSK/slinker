@@ -7,6 +7,16 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Digest(pub String);
 
+impl Digest {
+    pub fn of(bytes: impl AsRef<[u8]>) -> Self {
+        Self::finish(Sha256::new_with_prefix(bytes))
+    }
+
+    pub(crate) fn finish(hash: Sha256) -> Self {
+        Self(hex::encode(hash.finalize()))
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PackageId {
     pub name: String,
@@ -162,7 +172,7 @@ fn fingerprint_image(root: &Path) -> Result<Digest> {
         }
         hash.update([0xff]);
     }
-    Ok(Digest(format!("{:x}", hash.finalize())))
+    Ok(Digest::finish(hash))
 }
 
 pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<str>>) -> Digest {
@@ -172,7 +182,7 @@ pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<st
         hash.update(value.as_ref().as_bytes());
         hash.update([0]);
     }
-    Digest(format!("{:x}", hash.finalize()))
+    Digest::finish(hash)
 }
 
 #[cfg(test)]

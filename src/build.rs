@@ -655,7 +655,6 @@ fn validate_program_code(
     program: &ProgramIr,
     runtime: &TargetRuntimeHandle,
 ) -> Result<(), MaterializeError> {
-    use sha2::Digest as _;
     for (code_id, code) in program.indexed_codes() {
         let emitted = relocated_source(program, code_id)?;
         let normalized = normalize_r_source(runtime, &emitted)?;
@@ -675,10 +674,7 @@ fn validate_program_code(
                 | Relocation::Resource { site, .. } => site.code == code_id,
             });
         if !relocated {
-            let digest = crate::package::Digest(format!(
-                "{:x}",
-                sha2::Sha256::digest(normalized.as_bytes())
-            ));
+            let digest = crate::package::Digest::of(&normalized);
             if &digest != code.normalized_shape() {
                 return Err(MaterializeError::InvalidR(format!(
                     "CodeIr {code_id:?} changed normalized shape before emission: expected {}, got {}; normalized source {normalized:?}",
@@ -824,7 +820,7 @@ fn payload_key(program: &ProgramIr, payload: &PayloadRef) -> String {
         hash.update(format!("{step:?}").as_bytes());
         hash.update([0]);
     }
-    format!("{:x}", hash.finalize())
+    hex::encode(hash.finalize())
 }
 
 fn r_executable(r_home: &Path) -> Option<PathBuf> {
