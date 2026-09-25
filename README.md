@@ -62,7 +62,7 @@ Air parses reachable installed closure units with the exact parser revision used
 
 Target capture does not enumerate the installed package universe. Package discovery stays demand-driven: each package name is located and fingerprinted once, the first time retained code needs it, and that answer, including absence, is frozen for the invocation.
 
-Installed package identities use SHA-256 fingerprints computed from current file bytes. Disposable typed index and per-binding analysis artifacts are stored under cache schema `slinker-analysis-v5`; corrupt or stale entries are cache misses. Binding fragments that mention worker-local private-environment labels are never cached, because those labels identify objects only within one inspection epoch.
+Installed package identities use SHA-256 fingerprints computed from current file bytes. Disposable typed index and per-binding analysis artifacts are stored under cache schema `slinker-analysis-v6`; corrupt or stale entries are cache misses. Binding fragments that mention worker-local private-environment labels are never cached, because those labels identify objects only within one inspection epoch.
 
 Target capture and installed-image work run in isolated Rust worker processes. Each worker owns one single-threaded embedded R runtime loaded from `R_HOME` through Harp/libr; no live R object enters the linker process. Workers reuse synthetic lazy-load environments across requests and never call `loadNamespace()` or package lifecycle hooks.
 
