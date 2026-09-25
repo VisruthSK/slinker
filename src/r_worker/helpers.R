@@ -18,6 +18,7 @@
     stop(sprintf("installed R lazy-load database missing for %s", package), call. = FALSE)
   }
   base::lazyLoad(code_db, envir = image_env)
+  assign(".__NAMESPACE__.", get(".__NAMESPACE__.", envir = image_env), envir = image_env)
 
   before <- ls(image_env, all.names = TRUE)
   sysdata_db <- file.path(root, "R", "sysdata")

@@ -803,7 +803,7 @@ fn copy_root_resources(source: &Path, output: &Path) -> Result<(), std::io::Erro
         let name = entry.file_name();
         if matches!(
             name.to_str(),
-            Some("DESCRIPTION" | "NAMESPACE" | "R" | "target" | ".git")
+            Some("DESCRIPTION" | "NAMESPACE" | "MD5" | "R" | "target" | ".git")
         ) {
             continue;
         }

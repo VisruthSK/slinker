@@ -19,7 +19,7 @@ use crate::syntax::facts::{
 use crate::syntax::source::{SourceId, Span};
 use crate::{Error, Result};
 use air_r_parser::{RParserOptions, parse};
-use air_r_syntax::{AnyRExpression, RBinaryExpression, RRoot};
+use air_r_syntax::{AnyRExpression, RBinaryExpression, RCall, RRoot};
 use biome_rowan::{AstNode, AstNodeList, AstSeparatedList};
 use oak_semantic::semantic_index::{
     DefinitionKind, NamespaceAccessKind, ScopeId, ScopeKind, SemanticDiagnostic, SemanticIndex,
@@ -361,9 +361,100 @@ impl OakParser {
             return Err(error.to_string());
         }
         let root = parsed.tree();
+        let Some(evaluated) = evaluated_quotation_text(text, &root, context) else {
+            let index = build_semantic_index(&root, context);
+            return Ok(translate_index(source, text, context, &root, &index));
+        };
+        let parsed = parse(&evaluated, RParserOptions::default());
+        if let Some(error) = parsed.error() {
+            return Err(error.to_string());
+        }
+        let root = parsed.tree();
         let index = build_semantic_index(&root, context);
-        Ok(translate_index(source, text, context, &root, &index))
+        Ok(translate_index(source, &evaluated, context, &root, &index))
     }
+}
+
+fn evaluated_quotation_text(text: &str, root: &RRoot, context: &OakParseContext) -> Option<String> {
+    let mut blanks = Vec::new();
+    for call in root.syntax().descendants().filter_map(RCall::cast) {
+        let Some((callee, callee_range)) = base_callee(&call, context) else {
+            continue;
+        };
+        let Some(argument) = sole_positional_argument(&call) else {
+            continue;
+        };
+        match callee.as_str() {
+            "evalq" => blanks.push(callee_range),
+            "eval" => {
+                let AnyRExpression::RCall(quotation) = argument else {
+                    continue;
+                };
+                let Some((quoter, quoter_range)) = base_callee(&quotation, context) else {
+                    continue;
+                };
+                if !matches!(quoter.as_str(), "quote" | "bquote")
+                    || sole_positional_argument(&quotation).is_none()
+                {
+                    continue;
+                }
+                blanks.extend([callee_range, quoter_range]);
+                if quoter == "bquote" {
+                    blanks.extend(
+                        quotation
+                            .syntax()
+                            .descendants()
+                            .filter_map(RCall::cast)
+                            .filter_map(|splice| identifier_callee(&splice))
+                            .filter(|(name, _)| name == ".")
+                            .map(|(_, range)| range),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if blanks.is_empty() {
+        return None;
+    }
+    let mut bytes = text.as_bytes().to_vec();
+    for range in blanks {
+        bytes[range].fill(b' ');
+    }
+    Some(String::from_utf8(bytes).expect("ASCII identifiers are replaced by ASCII spaces"))
+}
+
+fn is_dots_element(name: &str) -> bool {
+    name.strip_prefix("..")
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn identifier_callee(call: &RCall) -> Option<(String, std::ops::Range<usize>)> {
+    let AnyRExpression::RIdentifier(identifier) = call.function().ok()? else {
+        return None;
+    };
+    let range = identifier.syntax().text_trimmed_range();
+    Some((
+        identifier.syntax().text_trimmed().to_string(),
+        text_offset(range.start())..text_offset(range.end()),
+    ))
+}
+
+fn base_callee(
+    call: &RCall,
+    context: &OakParseContext,
+) -> Option<(String, std::ops::Range<usize>)> {
+    identifier_callee(call).filter(|(name, _)| context.resolves_to_base(name))
+}
+
+fn sole_positional_argument(call: &RCall) -> Option<AnyRExpression> {
+    let arguments = call.arguments().ok()?.items();
+    let mut items = arguments.iter();
+    let argument = items.next()?.ok()?;
+    if items.next().is_some() || argument.name_clause().is_some() {
+        return None;
+    }
+    argument.value()
 }
 
 fn build_semantic_index(root: &RRoot, context: &OakParseContext) -> SemanticIndex {
@@ -384,6 +475,9 @@ fn translate_index(
         for (use_id, use_site) in index.uses(scope).iter() {
             let symbol = index.symbols(scope).symbol(use_site.symbol());
             let name = symbol.name().to_owned();
+            if is_dots_element(&name) {
+                continue;
+            }
             let range = use_site.range();
             let start = text_offset(range.start());
             let end = text_offset(range.end());
@@ -459,6 +553,12 @@ fn translate_index(
                 return None;
             }
             let kind = match live_use.callee_kind {
+                CalleeKind::DefinitelyLexical
+                    if text.as_bytes().get(skip_trivia(text, live_use.end)) == Some(&b'(')
+                        && !reaches_only_closures(text, index, live_use) =>
+                {
+                    NameRefKind::ShadowedCallee
+                }
                 CalleeKind::DefinitelyLexical => return None,
                 CalleeKind::DefinitelyExternal => NameRefKind::External,
                 CalleeKind::ConditionalFallthrough => NameRefKind::ConditionalFallthrough,
@@ -3523,19 +3623,34 @@ fn local_closure_arguments(
             index
                 .reaching_definitions(use_site.scope, use_site.use_id)
                 .any(|(scope, definition_id)| {
-                    let definition = &index.definitions(scope)[definition_id];
-                    if !matches!(definition.kind(), DefinitionKind::Assignment(_)) {
-                        return false;
-                    }
-                    assignment_rhs_after(text, text_offset(definition.range().end()), "<-")
-                        .and_then(|(start, _)| text.get(start..))
-                        .is_some_and(|rhs| {
-                            rhs.starts_with("function")
-                                && word_boundary_after(rhs, "function".len())
-                        })
+                    definition_is_closure(text, index, scope, definition_id)
                 })
         })
         .collect()
+}
+
+fn reaches_only_closures(text: &str, index: &SemanticIndex, live_use: &LiveUse) -> bool {
+    let mut definitions = index
+        .reaching_definitions(live_use.scope, live_use.use_id)
+        .peekable();
+    definitions.peek().is_some()
+        && definitions
+            .all(|(scope, definition_id)| definition_is_closure(text, index, scope, definition_id))
+}
+
+fn definition_is_closure(
+    text: &str,
+    index: &SemanticIndex,
+    scope: ScopeId,
+    definition_id: oak_semantic::semantic_index::DefinitionId,
+) -> bool {
+    let definition = &index.definitions(scope)[definition_id];
+    matches!(definition.kind(), DefinitionKind::Assignment(_))
+        && assignment_rhs_after(text, text_offset(definition.range().end()), "<-")
+            .and_then(|(start, _)| text.get(start..))
+            .is_some_and(|rhs| {
+                rhs.starts_with("function") && word_boundary_after(rhs, "function".len())
+            })
 }
 
 fn named_argument_split(text: &str, start: usize, end: usize) -> Option<(String, usize)> {
@@ -4206,6 +4321,56 @@ mod tests {
         let names = reference_names(&parsed);
         assert!(!names.contains(&"foo"));
         assert!(names.contains(&"bar"));
+    }
+
+    #[test]
+    fn evaluated_quotation_is_live_code_in_the_calling_frame() {
+        let parsed =
+            parse_source("f <- function(root) eval(bquote(function(...) path(.(root), ...)))");
+        let names = reference_names(&parsed);
+        assert!(names.contains(&"path"));
+        assert!(!names.contains(&"root"));
+        assert!(
+            reference_names(&parse_source("f <- function() eval(quote(helper()))"))
+                .contains(&"helper")
+        );
+        assert!(
+            reference_names(&parse_source("f <- function() evalq(helper())")).contains(&"helper")
+        );
+    }
+
+    #[test]
+    fn callee_shadowed_by_a_non_closure_local_can_reach_the_enclosing_function() {
+        let kind = |source| {
+            parse_source(source).expressions[0]
+                .references
+                .iter()
+                .find(|reference| reference.name == "path")
+                .map(|reference| reference.kind)
+        };
+        assert_eq!(
+            kind("f <- function(path) path(path, 'x')"),
+            Some(NameRefKind::ShadowedCallee)
+        );
+        assert_eq!(
+            kind("f <- function() { path <- function() 1; path() }"),
+            None
+        );
+    }
+
+    #[test]
+    fn dots_elements_are_never_free_names() {
+        let parsed = parse_source("f <- function(...) if (!missing(..1)) ..12 else ..x");
+        let names = reference_names(&parsed);
+        assert!(!names.contains(&"..1"));
+        assert!(!names.contains(&"..12"));
+        assert!(names.contains(&"..x"));
+    }
+
+    #[test]
+    fn quotation_evaluated_elsewhere_stays_inert() {
+        let parsed = parse_source("f <- function(env) eval(quote(helper()), env)");
+        assert!(!reference_names(&parsed).contains(&"helper"));
     }
 
     #[test]

@@ -126,6 +126,7 @@ pub(super) fn static_string_arg(call: &CallSite) -> Option<&str> {
         }
         "packageVersion" => matched_static_arg(call, &["pkg"], "pkg"),
         "find.package" => matched_static_arg(call, &["package"], "package"),
+        "UseMethod" => matched_static_arg(call, &["generic", "object"], "generic"),
         _ => call.args.first().and_then(Option::as_ref),
     }?;
     match argument {

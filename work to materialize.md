@@ -78,7 +78,7 @@ User constraints:
 `slinker build [PATH]` runs the complete pipeline and produces installable packages for the
 synthetic fixtures (root-only, Linked, transitive External, explicit External `Suggests`, private
 environments with Linked S3 registration), for the vendored real packages `praise` and `pkgconfig`
-in `tests/fixtures`, and for `voucher` with `--external cli,fs`.
+in `tests/fixtures`, for `voucher` with `--external cli,fs`, and for `here` with rprojroot Linked.
 
 ```text
 SourcePackageSnapshot
@@ -144,6 +144,19 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
 - `system.file()` without `package =` is a base lookup, not a package resource. A dynamic
   `package =` blocks only when the program retains a Linked package, because only Linked
   installations disappear.
+- S3: every registered method of a Root/Linked namespace is analyzed and retained, because runtime
+  dispatch can reach it. `UseMethod("g")` with a static generic closes `g`: every registered
+  method for `g` and every `g.*` binding in a Root/Linked namespace is retained. An External
+  package that registers methods for `g` blocks, as does a dynamic generic name. `NextMethod` is
+  supported only inside a method of a closed generic.
+- Closures held inside retained values (lists, structured objects, private bindings) are executed
+  by analysis, because anyone holding the value can call them. Unresolved names in such
+  value-only closures are not blockers: the preserved enclosure leaves them equally unbound in the
+  original.
+- `eval(quote(x))`, `eval(bquote(x))`, and `evalq(x)` in the calling frame are analyzed as live
+  code. A callee bound by a local non-closure (for example a parameter named `path`) also
+  retains the enclosing function of that name, matching R's function lookup. `..1` is never a
+  free name.
 - Materializer code validation uses the same Harp normalizer as analysis.
 - Blockers live on `LinkIr::blockers()` (sorted `Diagnostic`s); provenance holds only successful
   derivations. Preflight reports every blocker, then freezes inputs; a blocked build publishes
@@ -160,15 +173,9 @@ Finalization and materialization (phases 3, 5, 6, 9, 10):
    Linked namespace. Native routines are opaque retained capabilities; R code that references a
    registered routine resolves to it instead of an unresolved name. Until then the workaround is
    `--external <pkg>`.
-2. **Closed method-set S3 dispatch** (section 9, static S3 and bounded residual runtime): a
-   `UseMethod` whose receiver class is not statically proven blocks with `ObjectSystem`. That is
-   often too strict. `rprojroot::as_root_criterion` is `UseMethod("as_root_criterion", x)` with
-   exactly three methods (`.character`, `.default`, `.root_criterion`), all in rprojroot itself.
-   `here` stores its criterion in `.root_env` at `.onLoad`/`i_am()` time, so the class cannot be
-   proven. The case isn't hopeless: the method set is small and closed, and keeping all of them
-   would be correct whenever no other retained or External namespace registers methods for that
-   generic. slinker just can't handle "keep every method of this generic" yet, so `here` blocks
-   unless built with `--external rprojroot`.
+2. **Narrower S3 retention** (section 9, static S3): closed generics keep every method. When the
+   receiver classes are proven, keeping only their methods, inherited chains, `.default`, and
+   `NextMethod` targets would shrink the output. This is an optimization, not a correctness gap.
 3. **Linked `.onLoad` libname** (4.10, 3.3): analyze whether a retained Linked `.onLoad` observes
    `libname`; lower to resources or block with `UnsupportedLinkedLibname`. Today it receives `""`.
 4. **Reflection and host-environment semantics** (3.6, 3.7): exact reflection over closed

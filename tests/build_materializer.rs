@@ -238,7 +238,7 @@ fn blocked_preflight_reports_every_blocker_and_publishes_nothing() {
         "blockedroot",
         "",
         "export(discover, dispatch)\n",
-        "discover <- function(package) requireNamespace(package)\ndispatch <- function(x) UseMethod('dispatch')\n",
+        "discover <- function(package) requireNamespace(package)\ndispatch <- function(x, generic) UseMethod(generic)\n",
     );
     let output = fixture.path().join("generated-blockedroot");
     let result = Command::new(env!("CARGO_BIN_EXE_slinker"))

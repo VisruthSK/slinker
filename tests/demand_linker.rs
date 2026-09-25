@@ -378,12 +378,15 @@ fn private_closure(name: &str, environment: &str, source: &str) -> PrivateBindin
 }
 
 #[test]
-fn retaining_structured_object_does_not_execute_nested_closure() {
+fn retaining_structured_object_executes_nested_closures() {
     let mut root = package_with!(
         "root",
         &[
             ("generator_funs", None),
-            ("dead_dependency", Some("dead_dependency <- function() 1")),
+            (
+                "nested_dependency",
+                Some("nested_dependency <- function() 1")
+            ),
         ],
         Vec::new(),
         export("generator_funs"),
@@ -396,14 +399,14 @@ fn retaining_structured_object_does_not_execute_nested_closure() {
     binding.object_kind = ObjectKind::List;
     binding.embedded_closures.push(EmbeddedClosureSource {
         path: "$[[1]]".into(),
-        source: Arc::from(".slinker_embedded <- function() dead_dependency()"),
+        source: Arc::from(".slinker_embedded <- function() nested_dependency()"),
         environment: "namespace:root".into(),
     });
 
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
-    assert!(!retained_binding(&plan, "root", "dead_dependency"));
+    assert!(retained_binding(&plan, "root", "nested_dependency"));
 }
 
 #[test]
@@ -2258,7 +2261,7 @@ fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
 }
 
 #[test]
-fn dependency_activation_does_not_root_unreachable_s3_methods() {
+fn dependency_activation_retains_registered_s3_methods() {
     let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
     let foo = package_with!(
         "foo",
@@ -2284,7 +2287,7 @@ fn dependency_activation_does_not_root_unreachable_s3_methods() {
         .analyze("root")
         .unwrap();
     assert!(retained_binding(&plan, "foo", "x"));
-    assert!(!retained_binding(&plan, "foo", "print.foo"));
+    assert!(retained_binding(&plan, "foo", "print.foo"));
 }
 
 #[test]
@@ -3179,42 +3182,136 @@ fn unselected_suggested_attachment_call_is_ignored() {
 }
 
 #[test]
-fn root_s3_registration_is_available_without_rooting_unknown_dispatch_method() {
-    let root = package_with!(
-        "root",
+fn closed_generic_retains_every_registered_and_lexical_method() {
+    let root = package("root", &[("f", Some("f <- function(x) foo::criterion(x)"))]);
+    let foo = package_with!(
+        "foo",
         &[
-            ("foo", Some("foo <- function(x) UseMethod(\"foo\")")),
-            ("foo.bar", Some("foo.bar <- function(x) 1")),
+            (
+                "criterion",
+                Some("criterion <- function(x) UseMethod(\"criterion\")")
+            ),
+            (
+                "criterion.character",
+                Some("criterion.character <- function(x) helper(x)")
+            ),
+            (
+                "criterion.default",
+                Some("criterion.default <- function(x) x")
+            ),
+            ("as_criterion", Some("as_criterion <- function(x) x")),
+            ("helper", Some("helper <- function(x) x")),
+            ("unrelated", Some("unrelated <- function() 1")),
         ],
         Vec::new(),
-        export("foo"),
+        export("criterion"),
         vec![S3Registration {
             generic: slinker::package::GenericSpec {
                 package: None,
-                name: "foo".into(),
+                name: "criterion".into(),
             },
-            class: "bar".into(),
-            method: "foo.bar".into(),
+            class: "root_criterion".into(),
+            method: "as_criterion".into(),
         }],
         Vec::new(),
         Vec::new(),
         "",
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
 
-    assert!(!retained_binding(&plan, "root", "foo.bar"));
-    assert!(program_has_s3_registration(
-        &plan, "root", None, "foo", "bar", "foo.bar"
-    ));
+    assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
+    for method in [
+        "criterion.character",
+        "criterion.default",
+        "as_criterion",
+        "helper",
+    ] {
+        assert!(retained_binding(&plan, "foo", method), "{method}");
+    }
+    assert!(!retained_binding(&plan, "foo", "unrelated"));
+}
+
+#[test]
+fn external_method_registration_opens_a_closed_generic() {
+    let root = package(
+        "root",
+        &[
+            ("f", Some("f <- function(x) { bar::g(); criterion(x) }")),
+            (
+                "criterion",
+                Some("criterion <- function(x) UseMethod(\"criterion\")"),
+            ),
+        ],
+    );
+    let bar = package_with!(
+        "bar",
+        &[
+            ("g", Some("g <- function() 1")),
+            ("criterion.bar", Some("criterion.bar <- function(x) 1")),
+        ],
+        Vec::new(),
+        export("g"),
+        vec![S3Registration {
+            generic: slinker::package::GenericSpec {
+                package: Some("root".into()),
+                name: "criterion".into(),
+            },
+            class: "bar".into(),
+            method: "criterion.bar".into(),
+        }],
+        Vec::new(),
+        Vec::new(),
+        "",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, bar]), 1)
+        .with_external_packages(["bar".into()])
+        .analyze("root")
+        .unwrap();
+
     assert!(plan.blockers().iter().any(|diagnostic| {
-        diagnostic.code == RejectCode::ObjectSystem && diagnostic.message.contains("UseMethod")
+        diagnostic.code == RejectCode::ObjectSystem
+            && diagnostic.message.contains("External package `bar`")
     }));
 }
 
 #[test]
-fn reachable_operator_dispatch_blocks_while_registration_stays_namespace_state() {
+fn next_method_is_supported_only_inside_a_closed_method_set() {
+    let root = package(
+        "root",
+        &[
+            ("f", Some("f <- function(x) { criterion(x); stray(x) }")),
+            (
+                "criterion",
+                Some("criterion <- function(x) UseMethod(\"criterion\")"),
+            ),
+            (
+                "criterion.child",
+                Some("criterion.child <- function(x) NextMethod()"),
+            ),
+            (
+                "criterion.default",
+                Some("criterion.default <- function(x) x"),
+            ),
+            ("stray", Some("stray <- function(x) NextMethod()")),
+        ],
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    let next_method_blockers = plan
+        .blockers()
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("NextMethod"))
+        .map(|diagnostic| diagnostic.binding.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(next_method_blockers, [Some("stray")]);
+}
+
+#[test]
+fn registered_operator_method_is_retained_with_its_dependencies() {
     let mut root = package_with!(
         "root",
         &[
@@ -3222,7 +3319,11 @@ fn reachable_operator_dispatch_blocks_while_registration_stays_namespace_state()
             ("criterion", None),
             (
                 "|.root_criterion",
-                Some("`|.root_criterion` <- function(e1, e2) e1"),
+                Some("`|.root_criterion` <- function(e1, e2) is_root_criterion(e2)"),
+            ),
+            (
+                "is_root_criterion",
+                Some("is_root_criterion <- function(x) TRUE")
             ),
         ],
         Vec::new(),
@@ -3248,11 +3349,9 @@ fn reachable_operator_dispatch_blocks_while_registration_stays_namespace_state()
         .analyze("root")
         .unwrap();
 
-    assert!(!retained_binding(&plan, "root", "|.root_criterion"));
-    assert!(plan.blockers().iter().any(|diagnostic| {
-        diagnostic.code == RejectCode::ObjectSystem
-            && diagnostic.message.contains("outside PureRStatic")
-    }));
+    assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
+    assert!(retained_binding(&plan, "root", "|.root_criterion"));
+    assert!(retained_binding(&plan, "root", "is_root_criterion"));
     let registration = plan
         .program()
         .s3_registrations()

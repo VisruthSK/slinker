@@ -59,6 +59,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
         }
+        self.finalize_s3_dispatch(&retained);
         let mut blockers = self.diagnostics;
         blockers.sort_by(|left, right| {
             (&left.package, left.code, &left.binding, &left.message).cmp(&(
@@ -528,6 +529,67 @@ impl<P: PackageProvider> AnalyzerState<P> {
             package: identity.name.clone(),
             platform,
             requirements,
+        }
+    }
+
+    fn finalize_s3_dispatch(&mut self, retained: &BTreeSet<PackageId>) {
+        let mut open_registrations = Vec::new();
+        for &package in retained {
+            if self.closed_generics.is_empty()
+                || self.packages.role(package) != LinkedPackageRole::External
+                || self.packages.is_platform(package)
+            {
+                continue;
+            }
+            match self.packages.index(package) {
+                Ok(index) => open_registrations.extend(
+                    index
+                        .s3
+                        .iter()
+                        .map(|registration| registration.generic.name.clone())
+                        .filter(|generic| self.closed_generics.contains_key(generic))
+                        .map(|generic| (package, generic)),
+                ),
+                Err(error) => {
+                    let node = self.need_node(&Need::Activation { package });
+                    self.diagnostic(
+                        node,
+                        package,
+                        None,
+                        RejectCode::ObjectSystem,
+                        format!("cannot read External S3 registrations: {error}"),
+                        None,
+                    );
+                }
+            }
+        }
+        for (external, generic) in open_registrations {
+            let message = format!(
+                "External package `{}` registers S3 methods for `{generic}`, so its method set is open",
+                self.packages.name(external)
+            );
+            for (node, package, span) in self.closed_generics[&generic].clone() {
+                self.diagnostic(
+                    node,
+                    package,
+                    None,
+                    RejectCode::ObjectSystem,
+                    message.clone(),
+                    Some(span),
+                );
+            }
+        }
+        for (node, package, binding, span) in std::mem::take(&mut self.next_method_calls) {
+            if !self.closed_methods.contains(&(package, binding.clone())) {
+                self.diagnostic(
+                    node,
+                    package,
+                    Some(&binding),
+                    RejectCode::ObjectSystem,
+                    "NextMethod is not inside a method of a closed S3 generic",
+                    Some(span),
+                );
+            }
         }
     }
 
