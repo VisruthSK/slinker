@@ -204,13 +204,23 @@ fn explicit_external_promotes_declared_suggests_contract() {
         .output()
         .expect("run explicit Suggests build");
     assert_success(&result, "slinker build explicit Suggests");
-    let description =
-        fs::read_to_string(output.join("DESCRIPTION")).expect("generated DESCRIPTION");
-    assert!(
-        description.contains("Imports: suggestedexternal (>= 1.0.0)"),
-        "generated DESCRIPTION:\n{description}"
+    let description = slinker::Description::parse(
+        &fs::read_to_string(output.join("DESCRIPTION")).expect("generated DESCRIPTION"),
     );
-    assert!(description.contains("Suggests: suggestedexternal (>= 1.0.0)"));
+    let rendered = |relations: Vec<&slinker::Relation>| {
+        relations
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rendered(description.imports_parsed().values().collect()),
+        ["suggestedexternal (>= 1.0.0)"]
+    );
+    assert_eq!(
+        rendered(description.suggests_parsed().values().collect()),
+        ["suggestedexternal (>= 1.0.0)"]
+    );
 
     let validation = fixture.path().join("validation");
     fs::create_dir(&validation).expect("validation library");

@@ -475,7 +475,8 @@ fn absolute_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn discover_r_home() -> io::Result<PathBuf> {
-    if let Ok(output) = ProcessCommand::new("R").arg("RHOME").output()
+    if let Ok(r) = which::which("R")
+        && let Ok(output) = ProcessCommand::new(r).arg("RHOME").output()
         && output.status.success()
         && let Some(home) = parse_r_home(&String::from_utf8_lossy(&output.stdout))
     {

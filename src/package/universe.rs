@@ -91,12 +91,7 @@ impl<P: PackageProvider> TargetUniverse<P> {
         let id = PackageId::from_index(self.packages.len());
         let (role, availability) = if self.root.as_deref() == Some(name) {
             (PackageRole::Root, PackageAvailability::Root(id))
-        } else if self.explicit_external.contains(name)
-            || matches!(
-                package.description.priority_parsed(),
-                Some(Ok(Priority::Base))
-            )
-        {
+        } else if self.explicit_external.contains(name) || is_platform(&package) {
             (PackageRole::External, PackageAvailability::External(id))
         } else {
             (PackageRole::Linked, PackageAvailability::Linked(id))
@@ -128,6 +123,11 @@ impl<P: PackageProvider> TargetUniverse<P> {
 
     pub fn is_external(&self, id: PackageId) -> bool {
         self.role(id) == PackageRole::External
+    }
+
+    /// Whether the package belongs to the selected R platform rather than a third party.
+    pub fn is_platform(&self, id: PackageId) -> bool {
+        is_platform(self.package(id))
     }
 
     pub fn is_base_binding(&self, name: &str) -> bool {
@@ -166,6 +166,13 @@ impl<P: PackageProvider> TargetUniverse<P> {
                 .collect(),
         )
     }
+}
+
+fn is_platform(package: &InstalledPackage) -> bool {
+    matches!(
+        package.description.priority_parsed(),
+        Some(Ok(Priority::Base))
+    )
 }
 
 /// Exact installed image and physical location selected for each finalized package.

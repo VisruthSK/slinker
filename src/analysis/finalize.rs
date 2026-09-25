@@ -1,4 +1,5 @@
 use super::state::AnalyzerState;
+use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::build::{PackageOperation, PendingRelocation};
 use crate::ir::{
@@ -6,10 +7,11 @@ use crate::ir::{
     MaterializedSlotSource, PackageIr, PackageOperationIr, PackageRole as LinkedPackageRole,
     ProgramIr, RootArtifactIr, TargetContract,
 };
-use crate::metadata::{RelationField, relations};
+use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{Digest, ImportSpec, PackageAvailability, PackageId, PackageProvider};
+use crate::source::generated_description;
 use crate::syntax::{SourceOrigin, Sources, Span};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -30,7 +32,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .union(&self.external)
             .copied()
             .collect::<BTreeSet<_>>();
-        let program = self.finalize_program(root, &retained);
+        let (program, issues) = self.finalize_program(&retained);
+        let node = self.need_node(&Need::Activation { package: root });
+        for issue in issues {
+            self.diagnostic(
+                node,
+                root,
+                None,
+                RejectCode::UnsupportedRootTransformation,
+                issue,
+                None,
+            );
+        }
         let mut blockers = crate::ir::AnalysisBlockerSet::default();
         for diagnostic in &self.diagnostics {
             blockers.push(diagnostic_blocker(diagnostic));
@@ -50,9 +63,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn finalize_program(
         &self,
-        root: PackageId,
         retained: &BTreeSet<PackageId>,
-    ) -> ProgramIr {
+    ) -> (ProgramIr, Vec<String>) {
         let target = &self.packages.target_environment().target;
         let mut builder = ProgramIr::builder(TargetContract {
             r_version: target.r_version.clone(),
@@ -63,42 +75,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .iter()
             .map(|package| (*package, self.packages.role(*package)))
             .collect::<Vec<_>>();
-        let external_names = ordered
-            .iter()
-            .filter(|(_, role)| *role == LinkedPackageRole::External)
-            .map(|(package, _)| self.packages.name(*package))
-            .collect::<HashSet<_>>();
-        let mut external_requirements = BTreeMap::<String, BTreeSet<String>>::new();
-        for (package, role) in &ordered {
-            if !matches!(role, LinkedPackageRole::Root | LinkedPackageRole::Linked) {
-                continue;
-            }
-            let Some(image) = self.images.get(package) else {
-                continue;
-            };
-            if let Ok(imports) = relations(&image.index.description, RelationField::Imports) {
-                for relation in imports {
-                    if external_names.contains(relation.package()) {
-                        external_requirements
-                            .entry(relation.package().to_owned())
-                            .or_default()
-                            .insert(relation.to_string());
-                    }
-                }
-            }
-            if let Ok(suggests) = relations(&image.index.description, RelationField::Suggests) {
-                for relation in suggests {
-                    if external_names.contains(relation.package())
-                        && self.explicit_external_packages.contains(relation.package())
-                    {
-                        external_requirements
-                            .entry(relation.package().to_owned())
-                            .or_default()
-                            .insert(relation.to_string());
-                    }
-                }
-            }
-        }
+        let mut issues = Vec::new();
+        let mut contracts = Vec::new();
+        let mut declared = self.declared_external_requirements(&ordered);
         for (package, role) in &ordered {
             let identity = self.packages.identity(*package).clone();
             let package_ir = match role {
@@ -108,19 +87,36 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 LinkedPackageRole::Linked => PackageIr::Linked {
                     build_identity: identity,
                 },
-                LinkedPackageRole::External => PackageIr::External {
-                    contract: ExternalPackageContract {
-                        package: identity.name.clone(),
-                        requirements: external_requirements
-                            .get(&identity.name)
-                            .map(|requirements| requirements.iter().cloned().collect())
-                            .unwrap_or_default(),
-                    },
-                    analyzed_identity: identity,
-                },
+                LinkedPackageRole::External => {
+                    let contract = self.external_contract(
+                        *package,
+                        declared.remove(identity.name.as_str()).unwrap_or_default(),
+                        &mut issues,
+                    );
+                    contracts.push(contract.clone());
+                    PackageIr::External {
+                        contract,
+                        analyzed_identity: identity,
+                    }
+                }
             };
             builder.add_package(*package, package_ir);
         }
+        contracts.sort_by(|left, right| left.package.cmp(&right.package));
+        let mut unreached = self
+            .explicit_external_packages
+            .iter()
+            .filter(|name| {
+                self.packages
+                    .availability(name)
+                    .and_then(PackageAvailability::package)
+                    .is_none_or(|package| !retained.contains(&package))
+            })
+            .collect::<Vec<_>>();
+        unreached.sort();
+        issues.extend(unreached.into_iter().map(|name| {
+            format!("`--external {name}` names a package the retained program never reaches")
+        }));
 
         let mut linked_namespaces = Vec::new();
         let mut namespace_ids = HashMap::new();
@@ -175,17 +171,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     source,
                 }
             });
-            let exports = image
-                .index
-                .exports
-                .values()
-                .filter(|name| names.contains(*name))
-                .cloned();
             let namespace = builder.finish_materialized_namespace(
                 package,
                 role,
                 slots,
-                exports,
                 image.index.lifecycle.on_load.then(|| ".onLoad".into()),
             );
             for registration in &namespace_builder.registrations {
@@ -284,6 +273,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
         }
+        for &package in retained {
+            if self.packages.is_external(package) {
+                continue;
+            }
+            let namespace = namespace_ids[self.packages.name(package)].namespace;
+            let exports = self.images[&package]
+                .index
+                .exports
+                .values()
+                .filter_map(|name| builder.visible_binding(namespace, name))
+                .collect();
+            builder.set_exports(namespace, exports);
+        }
         for (namespace, dependencies) in &namespace_dependencies {
             builder.set_activation_dependencies(*namespace, dependencies.iter().copied().collect());
         }
@@ -307,83 +309,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             remaining.remove(&next);
             ordered_linked.push(next);
         }
-        let root_image = self.images.get(&root).expect("Root image finalized");
-        let root_namespace = &namespace_ids[self.packages.name(root)];
-        let mut namespace_source = String::new();
-        for binding in root_image.index.exports.values() {
-            if root_namespace.bindings.contains_key(binding) {
-                namespace_source
-                    .push_str(&format!("export({})\n", namespace_directive_name(binding)));
-            }
-        }
-        let mut external_namespace_imports = Vec::new();
-        let mut linked_imports = Vec::new();
-        for import in &root_image.index.imports {
-            let (name, imported) = match import {
-                ImportSpec::All { package, except } => {
-                    if except.is_empty() {
-                        (package, Vec::new())
-                    } else {
-                        continue;
-                    }
-                }
-                ImportSpec::From { package, bindings } => (
-                    package,
-                    bindings
-                        .iter()
-                        .filter_map(|binding| {
-                            namespace_ids
-                                .get(package)
-                                .and_then(|namespace| namespace.bindings.get(&binding.remote))
-                                .copied()
-                        })
-                        .collect(),
-                ),
-            };
-            let Some(namespace) = namespace_ids.get(name) else {
-                continue;
-            };
-            match self
-                .packages
-                .availability(name)
-                .and_then(PackageAvailability::package)
-                .filter(|package| retained.contains(package))
-                .map(|package| self.packages.role(package))
-            {
-                Some(LinkedPackageRole::External) => {
-                    match import {
-                        ImportSpec::All { .. } => namespace_source
-                            .push_str(&format!("import({})\n", namespace_directive_name(name))),
-                        ImportSpec::From { bindings, .. } => {
-                            for binding in bindings {
-                                namespace_source.push_str(&format!(
-                                    "importFrom({}, {})\n",
-                                    namespace_directive_name(name),
-                                    namespace_directive_name(&binding.remote)
-                                ));
-                            }
-                        }
-                    }
-                    external_namespace_imports.push(crate::ir::ExternalImportIr {
-                        namespace: namespace.namespace,
-                        bindings: imported,
-                    });
-                }
-                Some(LinkedPackageRole::Linked) => linked_imports.push(crate::ir::LinkedImportIr {
-                    namespace: namespace.namespace,
-                    bindings: imported,
-                }),
-                Some(LinkedPackageRole::Root) | None => {}
-            }
-        }
-        let contracts = external_requirements
-            .into_iter()
-            .map(|(package, requirements)| ExternalPackageContract {
-                package,
-                requirements: requirements.into_iter().collect(),
-            })
-            .collect::<Vec<_>>();
-        let mut retained_resources = Vec::new();
         for relocation in &self.pending_relocations {
             let source = pending_relocation_span(relocation);
             let Some(entry) = self.sources.get(&source.source) else {
@@ -437,7 +362,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         package: *package,
                         path: resource.clone(),
                     });
-                    retained_resources.push(resource_id);
                     builder.add_relocation(crate::ir::Relocation::Resource {
                         site,
                         target: resource_id,
@@ -465,21 +389,105 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }),
             }
         }
-        let description = self.root_description.as_ref().map_or_else(
-            || Arc::<str>::from(""),
-            |source| Arc::from(rewrite_description_imports(source, &contracts)),
-        );
+        let imports = contracts
+            .iter()
+            .flat_map(|contract| contract.requirements.iter().cloned())
+            .collect::<Vec<_>>();
+        let description = match &self.root_description {
+            None => Arc::from(""),
+            Some(source) => generated_description(
+                source,
+                |name| {
+                    self.packages
+                        .availability(name)
+                        .and_then(PackageAvailability::package)
+                        .is_some_and(|package| {
+                            retained.contains(&package)
+                                && self.packages.role(package) == LinkedPackageRole::Linked
+                        })
+                },
+                &imports,
+            )
+            .map_or_else(
+                |problems| {
+                    issues.extend(problems);
+                    Arc::from("")
+                },
+                Arc::from,
+            ),
+        };
         builder.set_root_artifact(RootArtifactIr {
             description,
-            namespace: namespace_source.into(),
-            external_description_requirements: contracts,
-            external_namespace_imports,
-            linked_imports,
             bootstrap_namespaces: ordered_linked,
-            original_on_load: None,
-            retained_resources,
         });
-        builder.finish()
+        (builder.finish(), issues)
+    }
+
+    fn declared_external_requirements(
+        &self,
+        ordered: &[(PackageId, LinkedPackageRole)],
+    ) -> HashMap<&str, Vec<Relation>> {
+        let mut declared = HashMap::<&str, Vec<Relation>>::new();
+        for (package, role) in ordered {
+            if *role == LinkedPackageRole::External {
+                declared.entry(self.packages.name(*package)).or_default();
+            }
+        }
+        for (package, role) in ordered {
+            if *role == LinkedPackageRole::External {
+                continue;
+            }
+            let description = &self.images[package].index.description;
+            let suggested = relations(description, RelationField::Suggests)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|relation| self.explicit_external_packages.contains(relation.package()));
+            for relation in relations(description, RelationField::Imports)
+                .unwrap_or_default()
+                .into_iter()
+                .chain(suggested)
+            {
+                if let Some(requirements) = declared.get_mut(relation.package()) {
+                    requirements.push(relation);
+                }
+            }
+        }
+        declared
+    }
+
+    fn external_contract(
+        &self,
+        package: PackageId,
+        declared: Vec<Relation>,
+        issues: &mut Vec<String>,
+    ) -> ExternalPackageContract {
+        let identity = self.packages.identity(package);
+        let platform = self.packages.is_platform(package);
+        let requirements = if declared.is_empty() {
+            Vec::new()
+        } else {
+            intersect_requirements(&identity.name, &declared).unwrap_or_else(|problem| {
+                issues.push(problem);
+                Vec::new()
+            })
+        };
+        if !platform && declared.is_empty() {
+            issues.push(format!(
+                "External package `{}` has no declared DESCRIPTION requirement in the retained program",
+                identity.name
+            ));
+        }
+        if let Some(unmet) = requirements
+            .iter()
+            .find(|relation| !relation.requirement().matches(&identity.version))
+        {
+            issues.push(format!("analyzed {identity} does not satisfy `{unmet}`"));
+        }
+        ExternalPackageContract {
+            package: identity.name.clone(),
+            platform,
+            requirements,
+        }
     }
 
     pub(super) fn finalize_syntax_observations(&mut self) {
@@ -577,56 +585,6 @@ pub(super) fn pending_relocation_span(rewrite: &PendingRelocation) -> &Span {
         | PendingRelocation::ResourceAccess { source, .. }
         | PendingRelocation::PackageOperation { source, .. } => source,
     }
-}
-
-pub(super) fn namespace_directive_name(name: &str) -> String {
-    if name.bytes().enumerate().all(|(index, byte)| {
-        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.' && index > 0
-    }) {
-        name.to_owned()
-    } else {
-        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
-    }
-}
-
-pub(super) fn rewrite_description_imports(
-    source: &str,
-    contracts: &[ExternalPackageContract],
-) -> String {
-    let imports = contracts
-        .iter()
-        .flat_map(|contract| contract.requirements.iter())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let lines = source.lines().collect::<Vec<_>>();
-    let mut output = Vec::new();
-    let mut index = 0;
-    let mut inserted = false;
-    while index < lines.len() {
-        let line = lines[index];
-        if line.starts_with("Imports:") {
-            if !imports.is_empty() {
-                output.push(format!("Imports: {imports}"));
-            }
-            inserted = true;
-            index += 1;
-            while index < lines.len()
-                && lines[index].chars().next().is_some_and(char::is_whitespace)
-            {
-                index += 1;
-            }
-            continue;
-        }
-        output.push(line.to_owned());
-        index += 1;
-    }
-    if !inserted && !imports.is_empty() {
-        output.push(format!("Imports: {imports}"));
-    }
-    let mut result = output.join("\n");
-    result.push('\n');
-    result
 }
 
 pub(super) fn spans_overlap(left: &Span, right: &Span) -> bool {

@@ -14,7 +14,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use thiserror::Error;
 
@@ -66,6 +65,10 @@ impl TargetRuntimeHandle {
 
     pub fn target(&self) -> &TargetEnvironment {
         &self.target
+    }
+
+    pub(crate) fn worker(&self) -> crate::Result<WorkerClient> {
+        WorkerClient::spawn(self.r_home.clone(), &self.target)
     }
 }
 
@@ -241,20 +244,26 @@ impl PureRStatic {
         if ir.program().root_artifact().description.is_empty() {
             blockers.insert("Root source-package DESCRIPTION plan is missing".into());
         }
-        for (_, package) in ir.program().packages() {
-            if let crate::ir::PackageIr::External { contract, .. } = package
-                && contract.requirements.is_empty()
-            {
-                blockers.insert(format!(
-                    "External package `{}` has no declared runtime requirement",
-                    contract.package
-                ));
-            }
-        }
         for value in ir.program().values() {
             if matches!(value, Value::Payload(payload) if !payload.locator.path.is_empty()) {
                 blockers
                     .insert("nested payload reconstruction is not supported by PureRStatic".into());
+            }
+        }
+        let program = ir.program();
+        for import in &program.root_namespace().imports {
+            let target = program.binding(import.target);
+            let external = matches!(
+                program
+                    .namespace(program.binding_namespace(import.target))
+                    .state,
+                crate::ir::LinkNamespaceState::External { .. }
+            );
+            if external && target.name != import.local {
+                blockers.insert(format!(
+                    "Root imports External `{}` as `{}`, which NAMESPACE cannot express",
+                    target.name, import.local
+                ));
             }
         }
         if blockers.is_empty() {
@@ -333,7 +342,7 @@ pub fn materialize(
     )?;
     fs::write(
         package_root.join("NAMESPACE"),
-        buildable.program.root_artifact().namespace.as_bytes(),
+        render_namespace(buildable.program),
     )?;
     copy_root_resources(
         buildable.materialization.source_files().root(),
@@ -350,11 +359,9 @@ pub fn materialize(
         }
     }
     let generated = generate_r_source(buildable.program)?;
-    validate_program_code(
-        buildable.program,
-        buildable.materialization.target_runtime(),
-    )?;
-    validate_r_source(buildable.materialization.target_runtime(), &generated)?;
+    let mut worker = buildable.materialization.target_runtime().worker()?;
+    validate_program_code(buildable.program, &mut worker)?;
+    validate_r_source(&mut worker, &generated)?;
     fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
     copy_linked_resources(buildable.program, buildable.materialization, &package_root)?;
     fs::rename(&package_root, output)?;
@@ -371,6 +378,8 @@ pub enum MaterializeError {
     InvalidOutput(PathBuf),
     #[error("generated R source failed target-R validation: {0}")]
     InvalidR(String),
+    #[error("target-R worker failed during materialization: {0}")]
+    Worker(#[from] crate::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -393,12 +402,14 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         r_string(&program.package(program.root_package()).identity().name)
     )
     .expect("String writes cannot fail");
-    let root_namespace = program
-        .namespaces()
-        .iter()
-        .position(|namespace| matches!(namespace.state, LinkNamespaceState::Root(_)))
-        .map(|index| &program.namespaces()[index])
-        .expect("ProgramIr Root namespace");
+    let root_namespace = program.root_namespace();
+    let root_on_load = match &root_namespace.state {
+        LinkNamespaceState::Root(state) => state
+            .activation
+            .and_then(|activation| program.activation(activation).on_load.as_ref())
+            .map(|on_load| on_load.closure),
+        LinkNamespaceState::Linked(_) | LinkNamespaceState::External { .. } => None,
+    };
 
     for (name, binding) in &root_namespace.bindings {
         let LinkBindingState::Materialized { initial, .. } = &program.binding(*binding).state
@@ -411,7 +422,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         match program.value(*value) {
             Value::Closure(closure) => {
                 let source = relocated_source(program, program.closure(*closure).code)?;
-                if name == ".onLoad" {
+                if Some(*closure) == root_on_load {
                     out.push_str(&rename_assignment(&source, ".slinker_original_on_load"));
                 } else {
                     out.push_str(&source);
@@ -553,6 +564,48 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     Ok(out)
 }
 
+fn render_namespace(program: &ProgramIr) -> String {
+    let root = program.root_namespace();
+    let mut out = String::new();
+    if let LinkNamespaceState::Root(state) = &root.state {
+        for binding in state.exports.bindings() {
+            writeln!(out, "export({})", r_string(&program.binding(*binding).name))
+                .expect("String writes cannot fail");
+        }
+    }
+    for import in &root.imports {
+        let target = program.namespace(program.binding_namespace(import.target));
+        if let LinkNamespaceState::External { package } = target.state {
+            writeln!(
+                out,
+                "importFrom({}, {})",
+                r_string(&program.package(package).identity().name),
+                r_string(&program.binding(import.target).name)
+            )
+            .expect("String writes cannot fail");
+        }
+    }
+    for registration in &root.s3_registrations {
+        let registration = program.s3_registration(*registration);
+        let generic = match registration.generic.package {
+            Some(package) => format!(
+                "{}::{}",
+                r_binding_name(&program.package(package).identity().name),
+                r_binding_name(&registration.generic.name)
+            ),
+            None => r_string(&registration.generic.name),
+        };
+        writeln!(
+            out,
+            "S3method({generic}, {}, {})",
+            r_string(&registration.class),
+            r_string(&program.binding(registration.method).name)
+        )
+        .expect("String writes cannot fail");
+    }
+    out
+}
+
 fn relocated_source(
     program: &ProgramIr,
     code: crate::ir::CodeId,
@@ -648,9 +701,9 @@ fn relocated_source(
     Ok(source)
 }
 
-fn validate_r_source(runtime: &TargetRuntimeHandle, source: &str) -> Result<(), MaterializeError> {
-    let normalized = normalize_r_source(runtime, source)?;
-    let normalized_again = normalize_r_source(runtime, &normalized)?;
+fn validate_r_source(worker: &mut WorkerClient, source: &str) -> Result<(), MaterializeError> {
+    let normalized = worker.normalize_syntax(source)?;
+    let normalized_again = worker.normalize_syntax(&normalized)?;
     if normalized == normalized_again {
         Ok(())
     } else {
@@ -662,12 +715,12 @@ fn validate_r_source(runtime: &TargetRuntimeHandle, source: &str) -> Result<(), 
 
 fn validate_program_code(
     program: &ProgramIr,
-    runtime: &TargetRuntimeHandle,
+    worker: &mut WorkerClient,
 ) -> Result<(), MaterializeError> {
     for (code_id, code) in program.indexed_codes() {
         let emitted = relocated_source(program, code_id)?;
-        let normalized = normalize_r_source(runtime, &emitted)?;
-        let normalized_again = normalize_r_source(runtime, &normalized)?;
+        let normalized = worker.normalize_syntax(&emitted)?;
+        let normalized_again = worker.normalize_syntax(&normalized)?;
         if normalized != normalized_again {
             return Err(MaterializeError::InvalidR(format!(
                 "CodeIr {code_id:?} is not stable across target-R emission round trip"
@@ -694,30 +747,6 @@ fn validate_program_code(
         }
     }
     Ok(())
-}
-
-fn normalize_r_source(
-    runtime: &TargetRuntimeHandle,
-    source: &str,
-) -> Result<String, MaterializeError> {
-    let temporary = tempfile::Builder::new().prefix("slinker-code-").tempdir()?;
-    let source_path = temporary.path().join("generated.R");
-    fs::write(&source_path, source)?;
-    let executable = r_executable(runtime.r_home())
-        .ok_or_else(|| MaterializeError::InvalidR("selected R executable is missing".into()))?;
-    let output = Command::new(executable)
-        .args(["--slave", "--no-save", "--no-restore", "--vanilla", "-e"])
-        .arg(format!("expressions <- parse(file={}, keep.source = FALSE); cat(paste(vapply(expressions, function(expression) paste(deparse(expression, width.cutoff=500L, control=c('keepInteger','keepNA','niceNames')), collapse='\\n'), character(1L), USE.NAMES=FALSE), collapse='\\n'))", r_string(&source_path.to_string_lossy().replace('\\', "/"))))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(MaterializeError::InvalidR(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ))
-    }
 }
 
 fn copy_root_resources(source: &Path, output: &Path) -> Result<(), std::io::Error> {
@@ -830,16 +859,6 @@ fn payload_key(program: &ProgramIr, payload: &PayloadRef) -> String {
         hash.update([0]);
     }
     hex::encode(hash.finalize())
-}
-
-fn r_executable(r_home: &Path) -> Option<PathBuf> {
-    [
-        r_home.join("bin/x64/R.exe"),
-        r_home.join("bin/R.exe"),
-        r_home.join("bin/R"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
 }
 
 const GENERATED_RUNTIME: &str = r#"

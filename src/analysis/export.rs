@@ -473,6 +473,7 @@ fn reject_code_name(code: RejectCode) -> &'static str {
         RejectCode::UnknownNativeLookup => "unknown_native_lookup",
         RejectCode::UnresolvedBinding => "unresolved_binding",
         RejectCode::UnsupportedObject => "unsupported_object",
+        RejectCode::UnsupportedRootTransformation => "unsupported_root_transformation",
         RejectCode::UnsupportedTopLevelEffect => "unsupported_top_level_effect",
     }
 }

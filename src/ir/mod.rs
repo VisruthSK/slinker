@@ -113,11 +113,13 @@ impl PackageIr {
     }
 }
 
-/// DESCRIPTION-governed runtime requirement for an External package.
+/// DESCRIPTION-governed runtime requirement for an External package. Platform packages ship with
+/// the selected R, so the target contract already satisfies them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalPackageContract {
     pub package: String,
-    pub requirements: Vec<String>,
+    pub platform: bool,
+    pub requirements: Vec<crate::Relation>,
 }
 
 /// One stable namespace binding slot.
@@ -384,28 +386,12 @@ pub enum LinkedLibnameUse {
     LoweredToResources,
 }
 
-#[derive(Clone, Debug)]
-pub struct ExternalImportIr {
-    pub namespace: NamespaceId,
-    pub bindings: Vec<BindingId>,
-}
-
-#[derive(Clone, Debug)]
-pub struct LinkedImportIr {
-    pub namespace: NamespaceId,
-    pub bindings: Vec<BindingId>,
-}
-
+/// Root source-package transformation decided at finalization: the generated `DESCRIPTION` and
+/// the order in which the Root `.onLoad` wrapper activates Linked namespaces.
 #[derive(Clone, Debug, Default)]
 pub struct RootArtifactIr {
     pub description: Arc<str>,
-    pub namespace: Arc<str>,
-    pub external_description_requirements: Vec<ExternalPackageContract>,
-    pub external_namespace_imports: Vec<ExternalImportIr>,
-    pub linked_imports: Vec<LinkedImportIr>,
     pub bootstrap_namespaces: Vec<NamespaceId>,
-    pub original_on_load: Option<ClosureId>,
-    pub retained_resources: Vec<ResourceId>,
 }
 
 #[derive(Clone, Debug)]
@@ -575,6 +561,13 @@ impl ProgramIr {
         &self.namespaces[id.index()]
     }
 
+    pub fn root_namespace(&self) -> &Namespace<LinkPhase> {
+        self.namespaces
+            .iter()
+            .find(|namespace| matches!(namespace.state, LinkNamespaceState::Root(_)))
+            .expect("ProgramIr has one Root namespace")
+    }
+
     pub fn binding(&self, id: BindingId) -> &Binding<LinkPhase> {
         &self.bindings[id.index()]
     }
@@ -723,7 +716,6 @@ impl ProgramBuilder {
         package: PackageId,
         role: PackageRole,
         slots: impl IntoIterator<Item = MaterializedSlot>,
-        exports: impl IntoIterator<Item = String>,
         on_load: Option<String>,
     ) -> FinalizedNamespace {
         assert!(matches!(role, PackageRole::Root | PackageRole::Linked));
@@ -770,7 +762,6 @@ impl ProgramBuilder {
                 "duplicate namespace slot"
             );
         }
-        let exports = ExportTable::new(exports.into_iter().map(|name| bindings[&name]).collect());
         let activation = on_load.and_then(|name| {
             let binding = bindings.get(&name)?;
             let LinkBindingState::Materialized {
@@ -795,7 +786,7 @@ impl ProgramBuilder {
         let state = MaterializedNamespaceState {
             namespace_environment,
             imports_environment,
-            exports,
+            exports: ExportTable::default(),
             activation,
         };
         let id = self.add_namespace(Namespace {
@@ -921,6 +912,29 @@ impl ProgramBuilder {
             .s3_registrations
             .push(registration);
         registration
+    }
+
+    /// The binding a namespace sees under `name`: its own slot, else an import.
+    pub fn visible_binding(&self, namespace: NamespaceId, name: &str) -> Option<BindingId> {
+        let namespace = &self.namespaces[namespace.index()];
+        namespace.bindings.get(name).copied().or_else(|| {
+            namespace
+                .imports
+                .iter()
+                .find(|import| import.local == name)
+                .map(|import| import.target)
+        })
+    }
+
+    pub fn set_exports(&mut self, namespace: NamespaceId, bindings: Vec<BindingId>) {
+        match &mut self.namespaces[namespace.index()].state {
+            LinkNamespaceState::Root(state) | LinkNamespaceState::Linked(state) => {
+                state.exports = ExportTable::new(bindings);
+            }
+            LinkNamespaceState::External { .. } => {
+                unreachable!("External namespaces have no artifact export table")
+            }
+        }
     }
 
     pub fn attach_import(&mut self, namespace: NamespaceId, local: String, target: BindingId) {
