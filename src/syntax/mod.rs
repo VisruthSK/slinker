@@ -5,10 +5,10 @@ pub mod source;
 pub use facts::{
     ActiveBindingDef, BindingCertainty, BindingDeclaration, BindingDef, CallSite, CalleeKind,
     ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
-    ConstructionTarget, DeclaredDomain, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef,
-    NameRefKind, PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourcePackage,
-    ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect,
-    SyntaxEffectKind,
+    ConstructionTarget, DeclaredCallable, DeclaredDomain, EvalPhase, LexicalBindingId,
+    LexicalScopeId, NameRef, NameRefKind, PackageGuard, PackageRef, ParsedExpression, ParsedRFile,
+    ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment,
+    SyntaxEffect, SyntaxEffectKind,
 };
 pub use oak::assigned_value_start;
 pub(crate) use oak::{

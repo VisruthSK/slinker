@@ -2040,6 +2040,62 @@ fn known_native_callback_adds_binding_edge() {
 }
 
 #[test]
+fn declared_callables_link_a_native_callback_parameter() {
+    let analyze = |source: &str| {
+        let dep = package_with!(
+            "dep",
+            &[
+                ("a", Some(source)),
+                ("callback", Some("callback <- function(x) x")),
+                ("other", Some("other <- function(x) x")),
+                ("unrelated", Some("unrelated <- function() 3")),
+            ],
+            Vec::new(),
+            export("a"),
+            Vec::new(),
+            vec![NativeComponent {
+                name: "root".into(),
+                registration: Some(NativeRegistration {
+                    prefix: String::new(),
+                    suffix: String::new(),
+                }),
+                symbols: vec![NativeSymbolBinding {
+                    binding: "root_a".into(),
+                    symbol: "root_a".into(),
+                }],
+                library: NativeLibrary::Missing,
+                safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
+                    selector: "root_a".into(),
+                    callback_arguments: vec![2],
+                }]),
+            }],
+            Vec::new(),
+            "",
+        );
+        Linker::new(FakeProvider::new(vec![root_calling("dep", "a"), dep]), 1)
+            .analyze("root")
+            .unwrap()
+    };
+    let unknown_callback = |plan: &slinker::analysis::LinkIr| {
+        plan.blockers().iter().any(|diagnostic| {
+            diagnostic.code == RejectCode::UnknownNativeEffects
+                && diagnostic.message.contains("not statically linkable")
+        })
+    };
+
+    let undeclared = analyze("a <- function(fun) .Call(root_a, 1, fun)");
+    assert!(unknown_callback(&undeclared), "{:?}", undeclared.blockers());
+
+    let declared = analyze(
+        "a <- function(fun) { declare(slinker(fun = callables(callback, dep::other))); .Call(root_a, 1, fun) }",
+    );
+    assert!(!unknown_callback(&declared), "{:?}", declared.blockers());
+    assert!(retained_binding(&declared, "dep", "callback"));
+    assert!(retained_binding(&declared, "dep", "other"));
+    assert!(!retained_binding(&declared, "dep", "unrelated"));
+}
+
+#[test]
 fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
     let dep = package_with!(
         "dep",

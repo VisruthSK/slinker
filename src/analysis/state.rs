@@ -60,6 +60,7 @@ pub(super) struct NativeCallbackContext<'a> {
     pub(super) binding: &'a str,
     pub(super) lexical_environment: &'a str,
     pub(super) component: &'a str,
+    pub(super) parsed: &'a ParsedRFile,
     pub(super) call: &'a CallSite,
 }
 
@@ -3046,7 +3047,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 self.s3_dispatch(site, parsed, None, call)?;
             }
             ".Call" | ".External" | ".C" | ".Fortran" => {
-                self.native_call(from, current, image, binding, lexical_environment, call)?;
+                self.native_call(site, parsed, call)?;
             }
             "getNativeSymbolInfo" if !self.is_root(current) => {
                 self.linked_native_symbol_query(from, current, image, binding, call);
@@ -3153,13 +3154,17 @@ OpenReason::Unresolved(_)) => self.diagnostic(
 
     fn native_call(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        image: &PackageImage,
-        binding: &str,
-        lexical_environment: &str,
+        site: ParsedSite<'_>,
+        parsed: &ParsedRFile,
         call: &CallSite,
     ) -> Result<()> {
+        let ParsedSite {
+            node: from,
+            package: current,
+            image,
+            binding,
+            lexical_environment,
+        } = site;
         if let Some(target) =
             self.native_component_for_call(current, image, lexical_environment, call)?
         {
@@ -3184,6 +3189,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 binding,
                 lexical_environment,
                 component: &component,
+                parsed,
                 call,
             })?;
             if !self.is_root(current) {

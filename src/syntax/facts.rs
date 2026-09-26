@@ -329,11 +329,20 @@ pub struct BindingDeclaration {
     pub span: Span,
 }
 
-/// The exact values a declared binding can hold: alternative S3 class vectors, or strings.
+/// The exact values a declared binding can hold: alternative S3 class vectors, strings, or
+/// functions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeclaredDomain {
     Classes(Vec<Vec<String>>),
     Strings(BTreeSet<String>),
+    Callables(BTreeSet<DeclaredCallable>),
+}
+
+/// A function named as `pkg::f`, `pkg:::f`, or a bare `f` resolved where it is used.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeclaredCallable {
+    pub package: Option<String>,
+    pub name: String,
 }
 
 impl ParsedRFile {
@@ -376,7 +385,7 @@ impl ParsedRFile {
         self.visible_domains(binding, use_scope)
             .filter_map(|domain| match domain {
                 DeclaredDomain::Classes(classes) => Some(classes.clone()),
-                DeclaredDomain::Strings(_) => None,
+                DeclaredDomain::Strings(_) | DeclaredDomain::Callables(_) => None,
             })
             .reduce(|domain, classes| {
                 domain
@@ -395,8 +404,22 @@ impl ParsedRFile {
         self.visible_domains(binding, use_scope)
             .filter_map(|domain| match domain {
                 DeclaredDomain::Strings(strings) => Some(strings.clone()),
-                DeclaredDomain::Classes(_) => None,
+                DeclaredDomain::Classes(_) | DeclaredDomain::Callables(_) => None,
             })
             .reduce(|domain, strings| domain.intersection(&strings).cloned().collect())
+    }
+
+    /// The functions `binding` can hold at `use_scope`, narrowed by every visible declaration.
+    pub fn callable_domain_for(
+        &self,
+        binding: &LexicalBindingId,
+        use_scope: LexicalScopeId,
+    ) -> Option<BTreeSet<DeclaredCallable>> {
+        self.visible_domains(binding, use_scope)
+            .filter_map(|domain| match domain {
+                DeclaredDomain::Callables(callables) => Some(callables.clone()),
+                DeclaredDomain::Classes(_) | DeclaredDomain::Strings(_) => None,
+            })
+            .reduce(|domain, callables| domain.intersection(&callables).cloned().collect())
     }
 }

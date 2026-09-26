@@ -1,5 +1,7 @@
 use super::NodeId;
-use super::arguments::{matched_call_arg_index, matched_static_arg, native_call_argument_index};
+use super::arguments::{
+    declared_callables, matched_call_arg_index, matched_static_arg, native_call_argument_index,
+};
 use super::relocation::PendingRelocation;
 use super::resolution::{BindingTarget, OpenReason, Resolution};
 use super::state::{AnalyzerState, NativeCallTarget, NativeCallbackContext};
@@ -10,7 +12,16 @@ use crate::package::{
     NameLookup, NativeInterface, NativeLibrary, NativeRoutineSummary, NativeSafety, PackageId,
     PackageImage, PackageIndex, PackageProvider,
 };
-use crate::syntax::{CallSite, StaticArg};
+use crate::syntax::{CallSite, DeclaredCallable, Span, StaticArg};
+
+struct CallbackSite<'a> {
+    node: NodeId,
+    package: PackageId,
+    binding: &'a str,
+    selector: &'a str,
+    position: usize,
+    span: &'a Span,
+}
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn native_selector(call: &CallSite) -> Option<&str> {
@@ -44,6 +55,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             binding,
             lexical_environment,
             component,
+            parsed,
             call,
         } = context;
         let Some(native) = image
@@ -118,27 +130,94 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
 
-            match self.resolve_lexical_name(current, image, lexical_environment, callback_name)? {
+            let resolution =
+                self.resolve_lexical_name(current, image, lexical_environment, callback_name)?;
+            let declared = callback_index.and_then(|index| declared_callables(parsed, call, index));
+            let site = CallbackSite {
+                node: native_node,
+                package: current,
+                binding,
+                selector,
+                position,
+                span: &call.span,
+            };
+            match declared {
+                Some(callables) => {
+                    for callable in callables {
+                        let resolution = self.declared_callable_resolution(
+                            current,
+                            image,
+                            lexical_environment,
+                            &callable,
+                        )?;
+                        self.require_native_callback(&site, &callable.name, resolution);
+                    }
+                }
+                None => self.require_native_callback(&site, callback_name, resolution),
+            }
+        }
+        Ok(())
+    }
+
+    fn declared_callable_resolution(
+        &mut self,
+        current: PackageId,
+        image: &PackageImage,
+        lexical_environment: &str,
+        callable: &DeclaredCallable,
+    ) -> Result<Resolution<BindingTarget>> {
+        let Some(name) = &callable.package else {
+            return self.resolve_lexical_name(current, image, lexical_environment, &callable.name);
+        };
+        let binding = callable.name.clone().into();
+        Ok(match self.packages.resolve(name)? {
+            None => Resolution::OpenDynamic(OpenReason::MissingPackage {
+                package: name.clone(),
+                binding: Some(callable.name.clone()),
+            }),
+            Some(package) if self.packages.is_external(package) => {
+                self.external.insert(package);
+                Resolution::Static(BindingTarget::External { package, binding })
+            }
+            Some(package) => Resolution::Static(BindingTarget::Imported { package, binding }),
+        })
+    }
+
+    fn require_native_callback(
+        &mut self,
+        site: &CallbackSite<'_>,
+        callback_name: &str,
+        resolution: Resolution<BindingTarget>,
+    ) {
+        let &CallbackSite {
+            node: native_node,
+            package: current,
+            binding,
+            selector,
+            position,
+            span: call_span,
+        } = site;
+        match resolution {
                 Resolution::Static(BindingTarget::Namespace { package, binding: callback }) => self.require_at(
                     native_node,
                     Need::Binding { package, binding: callback.clone() },
                     EdgeKind::Callback,
                     format!("native routine `{selector}` invokes argument #{position} as R binding `{callback}`"),
-                    Some(call.span.clone()),
+                    Some(call_span.clone()),
                 ),
                 Resolution::Static(BindingTarget::Private { package, environment, binding: callback }) => self.require_at(
                     native_node,
                     Need::PrivateBinding { package, environment: environment.clone(), binding: callback.clone() },
                     EdgeKind::Callback,
                     format!("native routine `{selector}` invokes argument #{position} as private R binding `{callback}` in {environment}"),
-                    Some(call.span.clone()),
+                    Some(call_span.clone()),
                 ),
                 Resolution::Static(BindingTarget::Closure { package, closure }) => self.require_at(
                     native_node,
                     Need::ClosureExecution { package, closure },
                     EdgeKind::Callback,
                     format!("native routine `{selector}` invokes argument #{position} as a retained closure"),
-                    Some(call.span.clone()),
+                    Some(call_span.clone()),
                 ),
                 Resolution::Static(BindingTarget::Imported { package, binding: callback }) => {
                     self.require_at(
@@ -146,14 +225,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         Need::Activation { package },
                         EdgeKind::Callback,
                         format!("native callback `{callback}` requires imported namespace activation"),
-                        Some(call.span.clone()),
+                        Some(call_span.clone()),
                     );
                     self.require_at(
                         native_node,
                         Need::Binding { package, binding: callback.clone() },
                         EdgeKind::Callback,
                         format!("native routine `{selector}` invokes imported callback argument #{position} `{callback}`"),
-                        Some(call.span.clone()),
+                        Some(call_span.clone()),
                     );
                 }
                 Resolution::Static(BindingTarget::External { package, binding: callback }) => {
@@ -161,14 +240,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         package,
                         &callback,
                         ExternalBindingAccess::Exported,
-                        Some(call.span.clone()),
+                        Some(call_span.clone()),
                     );
                     self.depend(
                         native_node,
                         target,
                         EdgeKind::Callback,
                         format!("native routine `{selector}` invokes External callback argument #{position} `{callback}`"),
-                        Some(call.span.clone()),
+                        Some(call_span.clone()),
                     );
                 }
                 Resolution::Static(BindingTarget::Base) => {}
@@ -183,11 +262,9 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     format!(
                         "native routine `{selector}` invokes callback argument #{position} `{callback_name}`, but its R callable identity is not statically linkable"
                     ),
-                    Some(call.span.clone()),
+                    Some(call_span.clone()),
                 ),
             }
-        }
-        Ok(())
     }
 
     pub(super) fn linked_native_selector(

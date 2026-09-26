@@ -1,4 +1,4 @@
-use crate::syntax::{CallSite, ConstructionCall, ParsedRFile, Span, StaticArg};
+use crate::syntax::{CallSite, ConstructionCall, DeclaredCallable, ParsedRFile, Span, StaticArg};
 use std::collections::BTreeSet;
 
 pub(super) trait NamedArguments {
@@ -121,6 +121,16 @@ pub(super) fn declared_strings(
     let index = matched_call_arg_index(call, formals, target)?;
     let binding = call.arg_bindings.get(index)?.as_ref()?;
     parsed.string_domain_for(binding, call.scope)
+}
+
+/// The functions a `callables()` declaration allows for the argument at `index`.
+pub(super) fn declared_callables(
+    parsed: &ParsedRFile,
+    call: &CallSite,
+    index: usize,
+) -> Option<BTreeSet<DeclaredCallable>> {
+    let binding = call.arg_bindings.get(index)?.as_ref()?;
+    parsed.callable_domain_for(binding, call.scope)
 }
 
 pub(super) fn native_selector_span(call: &CallSite) -> Option<&Span> {

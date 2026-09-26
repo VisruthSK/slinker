@@ -12,10 +12,10 @@
 
 use crate::syntax::facts::{
     ActiveBindingDef, BindingDeclaration, CallSite, CalleeKind, ConstructionArgument,
-    ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredDomain,
-    EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind, PackageGuard, PackageRef,
-    ParsedExpression, ParsedRFile, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind,
-    StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredCallable,
+    DeclaredDomain, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind,
+    PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourcePackage, ResourceRef,
+    SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use crate::{Error, Result};
@@ -660,7 +660,7 @@ fn collect_slinker_declaration(
                                 != std::mem::discriminant(&domain)
                     }) =>
                 {
-                    format!("declarations for `{name}` mix s3() classes with strings()")
+                    format!("declarations for `{name}` mix s3(), strings(), and callables()")
                 }
                 Some(binding) => {
                     collected.declarations.push(BindingDeclaration {
@@ -675,7 +675,7 @@ fn collect_slinker_declaration(
             },
             (None, _) => "slinker() declarations must name the binding they constrain".to_owned(),
             (Some(name), None) => format!(
-                "declaration for `{name}` must be s3(\"class\", ...), one_of(s3(...), ...), or strings(\"value\", ...) with literal strings"
+                "declaration for `{name}` must be s3(\"class\", ...), one_of(s3(...), ...), or strings(\"value\", ...) with literal strings, or callables(pkg::f, g, ...)"
             ),
         };
         collected.issues.push(SemanticIssue {
@@ -692,8 +692,25 @@ fn declared_domain(text: &str, value: &AnyRExpression) -> Option<DeclaredDomain>
         "strings" => literal_strings(text, &arguments)
             .map(|strings| DeclaredDomain::Strings(strings.into_iter().collect())),
         "s3" | "one_of" => declared_classes(text, value).map(DeclaredDomain::Classes),
+        "callables" if !arguments.is_empty() => arguments
+            .iter()
+            .map(|argument| declared_callable(ast_text(text, argument).trim()))
+            .collect::<Option<BTreeSet<_>>>()
+            .map(DeclaredDomain::Callables),
         _ => None,
     }
+}
+
+fn declared_callable(text: &str) -> Option<DeclaredCallable> {
+    let (package, name) = match text.split_once(":::").or_else(|| text.split_once("::")) {
+        Some((package, name)) => (Some(package), name),
+        None => (None, text),
+    };
+    let symbol = |candidate: &str| matches!(static_arg(candidate), Some(StaticArg::Symbol(symbol)) if symbol == candidate);
+    (package.is_none_or(symbol) && symbol(name)).then(|| DeclaredCallable {
+        package: package.map(str::to_owned),
+        name: name.to_owned(),
+    })
 }
 
 fn declared_classes(text: &str, value: &AnyRExpression) -> Option<Vec<Vec<String>>> {
@@ -4984,6 +5001,44 @@ mod tests {
                     .any(|issue| issue.kind == SemanticIssueKind::InvalidDeclaration),
                 "{malformed}"
             );
+        }
+    }
+
+    #[test]
+    fn callable_declarations_name_exact_functions() {
+        let parsed = parse_source(
+            "f <- function(fun) { declare(slinker(fun = callables(pkg::g, pkg:::h, local_fn))); print(fun) }",
+        );
+        assert!(parsed.issues.is_empty(), "{:?}", parsed.issues);
+        let print = parsed.expressions[0]
+            .calls
+            .iter()
+            .find(|call| call.callee == "print")
+            .unwrap();
+        let callable = |package: Option<&str>, name: &str| DeclaredCallable {
+            package: package.map(str::to_owned),
+            name: name.to_owned(),
+        };
+        assert_eq!(
+            parsed.callable_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+            Some(
+                [
+                    callable(Some("pkg"), "g"),
+                    callable(Some("pkg"), "h"),
+                    callable(None, "local_fn"),
+                ]
+                .into_iter()
+                .collect()
+            )
+        );
+        assert!(names_inert(&parsed, "callables"));
+        for malformed in [
+            "f <- function(x) declare(slinker(x = callables()))",
+            "f <- function(x) declare(slinker(x = callables('g')))",
+            "f <- function(x) declare(slinker(x = callables(g(1))))",
+        ] {
+            let parsed = parse_source(malformed);
+            assert!(parsed.declarations.is_empty(), "{malformed}");
         }
     }
 
