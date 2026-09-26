@@ -134,6 +134,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             exports: root_exports,
             native_components: namespaces.root_natives,
             on_load: root_on_load,
+            activated_s3: builder.linked_generic_registrations(root_namespace),
         });
         (builder.finish(), issues)
     }

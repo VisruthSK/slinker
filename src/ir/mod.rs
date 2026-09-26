@@ -404,6 +404,7 @@ pub struct RootArtifactIr {
     pub exports: ExportTable,
     pub native_components: Vec<crate::package::NativeComponent>,
     pub on_load: Option<ClosureId>,
+    pub activated_s3: Vec<S3RegistrationId>,
 }
 
 #[derive(Clone, Debug)]
@@ -883,6 +884,35 @@ impl ProgramBuilder {
             .s3_registrations
             .push(registration);
         registration
+    }
+
+    pub fn linked_generic_registrations(&self, namespace: NamespaceId) -> Vec<S3RegistrationId> {
+        let owner = &self.namespaces[namespace.index()];
+        owner
+            .s3_registrations
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let generic = &self.s3_registrations[id.index()].generic;
+                match generic.package {
+                    Some(package) => {
+                        matches!(self.packages[&package], PackageIr::Linked { .. })
+                    }
+                    None => {
+                        !owner.bindings.contains_key(generic.name.as_str())
+                            && self.visible_binding(namespace, &generic.name).is_some_and(
+                                |binding| {
+                                    matches!(
+                                        self.namespaces[self.binding_namespace(binding).index()]
+                                            .state,
+                                        LinkNamespaceState::Linked(_)
+                                    )
+                                },
+                            )
+                    }
+                }
+            })
+            .collect()
     }
 
     /// The binding a namespace sees under `name`: its own slot, else an import.

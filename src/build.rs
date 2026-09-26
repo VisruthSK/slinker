@@ -526,7 +526,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
                             .map(|(name, _)| name.as_str()),
                     )
             ),
-            s3_matrix(program, namespace),
+            s3_matrix(program, &namespace.s3_registrations),
             r_vector(
                 activation
                     .unretained
@@ -560,6 +560,15 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         emit!(
             out,
             "  .slinker_populate(root, {})",
+            r_string(&program.package(root.package).identity().name)
+        );
+    }
+    let activated_s3 = &program.root_artifact().activated_s3;
+    if !activated_s3.is_empty() {
+        emit!(
+            out,
+            "  registerS3methods({}, {}, root)",
+            s3_matrix(program, activated_s3),
             r_string(&program.package(root.package).identity().name)
         );
     }
@@ -648,9 +657,8 @@ fn namespace_expression(program: &ProgramIr, package: PackageId) -> String {
     )
 }
 
-fn s3_matrix(program: &ProgramIr, namespace: &crate::ir::Namespace) -> String {
-    let rows = namespace
-        .s3_registrations
+fn s3_matrix(program: &ProgramIr, registrations: &[crate::ir::S3RegistrationId]) -> String {
+    let rows = registrations
         .iter()
         .map(|registration| program.s3_registration(*registration))
         .collect::<Vec<_>>();
@@ -721,7 +729,11 @@ fn render_namespace(program: &ProgramIr) -> String {
                 .join(", ")
         );
     }
-    for registration in &root.s3_registrations {
+    for registration in root
+        .s3_registrations
+        .iter()
+        .filter(|registration| !program.root_artifact().activated_s3.contains(registration))
+    {
         let registration = program.s3_registration(*registration);
         let generic = match registration.generic.package {
             Some(package) => format!(
