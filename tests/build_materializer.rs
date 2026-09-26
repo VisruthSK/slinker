@@ -836,15 +836,39 @@ fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
         "ticks <- function() c(by_name(), by_symbol(), by_name())\n",
     );
     let output = fixture.path().join("generated-nativeroot");
-    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
-        .args(["build", "--strict", "false", "--lib"])
-        .arg(&build_library)
-        .arg("--output")
-        .arg(&output)
-        .arg(&root_source)
-        .output()
-        .expect("run native build");
-    assert_success(&result, "slinker build native fixture");
+    let build = |summaries: Option<&Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_slinker"));
+        command
+            .args(["build", "--lib"])
+            .arg(&build_library)
+            .arg("--output")
+            .arg(&output)
+            .arg(&root_source)
+            .env_remove("SLINKER_NATIVE_SUMMARIES");
+        if let Some(summaries) = summaries {
+            command.env("SLINKER_NATIVE_SUMMARIES", summaries);
+        }
+        command.output().expect("run native build")
+    };
+    let unaudited = build(None);
+    let stderr = String::from_utf8_lossy(&unaudited.stderr);
+    assert!(!unaudited.status.success(), "{stderr}");
+    assert!(!output.exists());
+    let key = "package `tinyc` version `1.0.0` image `";
+    let fingerprint = stderr
+        .find(key)
+        .map(|start| &stderr[start + key.len()..])
+        .and_then(|rest| rest.split('`').next())
+        .unwrap_or_else(|| panic!("UnknownNativeEffects names the manifest key: {stderr}"));
+    let summaries = fixture.path().join("native-summaries.json");
+    fs::write(
+        &summaries,
+        format!(
+            r#"{{"schema": 1, "packages": [{{"package": "tinyc", "version": "1.0.0", "image_fingerprint": "{fingerprint}", "components": [{{"component": "tinyc", "safety": "safe"}}]}}]}}"#
+        ),
+    )
+    .expect("audited native summary: tinyc.c makes no R callbacks");
+    assert_success(&build(Some(&summaries)), "slinker build native fixture");
 
     let behavior = "library(nativeroot); stopifnot(identical(ticks(), 1:3), isTRUE(same_copy()))";
     let original = fixture.path().join("original");

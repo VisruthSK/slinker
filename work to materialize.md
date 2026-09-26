@@ -12,8 +12,8 @@ reshape APIs, IR types, CLI flags, formats, and tests.
 `slinker build .` turns an R source package into another source package whose dependencies are
 linked into it. The result behaves exactly like the original, whether or not its Linked
 dependencies are installed. The primary workflow is slinking in CI, so correctness comes before
-coverage. Anything slinker cannot prove is a blocker (`--strict true`, the default) or a recorded
-assumption (`--strict false`); `declare(slinker(...))` lets an author state a missing fact.
+coverage. Anything slinker cannot prove is a blocker; `declare(slinker(...))` lets an author state a
+missing fact.
 
 ## Decided
 
@@ -41,8 +41,8 @@ assumption (`--strict false`); `declare(slinker(...))` lets an author state a mi
   rediscovers semantics. Provenance never influences construction or finalization.
 - Only `PureRStatic::check` creates a `BuildableProgram`. A known-unsupported operation fails in
   analysis or preflight, never during materialization.
-- Every heuristic goes through `AnalyzerState::assume`; sound rules and declarations apply in both
-  modes. Prefer retiring a heuristic over adding one.
+- Anything unproven is a blocker. Only sound rules and declarations accept behavior; never add a
+  heuristic.
 - Delete a replaced API, representation, flag, or format in the same change. Keep tests that prove
   semantic invariants; rewrite tests that pin obsolete details.
 - `PROTOCOL_VERSION` stays `1`. Discover R with `R RHOME` (through `PATHEXT`), `R_HOME` only as a
@@ -71,10 +71,10 @@ assumption (`--strict false`); `declare(slinker(...))` lets an author state a mi
 ## Regression corpus
 
 Keep passing: `tests/build_materializer.rs` (synthetic fixtures, vendored `praise`/`pkgconfig`);
-`tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, `qrcode`, `pkgcond`, `doubt`,
-`config`, `here`, and `voucher` with cli and fs Linked under `--strict false`), each run against one
-build with its Linked dependencies absent, installed, and loaded. Each item adds its own acceptance
-cases here.
+`tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, `qrcode`, and `here`, each run
+against one build with its Linked dependencies absent, installed, and loaded; `pkgcond`, `doubt`,
+`config`, and `voucher` with cli and fs Linked block with their exact unproven behavior until a sound
+rule covers it). Each item adds its own acceptance cases here.
 
 ## Next up
 
@@ -98,8 +98,7 @@ that fails before its fix.
 - Imports environments: wire every original import name (unretained ones as stubs) so a dropped
   re-exported import is still exported and lookups through imports answer as the original.
 - Namespace info: fill `imports`, `dynlibs`, and `S3methods` truthfully; `path` stays blocked.
-- Namespace enumeration (`as.list(ns)`, `mget(ls(ns), ns)`, `eapply(ns, ...)`) reads stubs: block it
-  or record an assumption.
+- Namespace enumeration (`as.list(ns)`, `mget(ls(ns), ns)`, `eapply(ns, ...)`) reads stubs: block it.
 - An unregistered `g.cls` in a Root/Linked namespace is found lexically by dispatch from that
   namespace's code, even for base generics; retain it whenever the namespace calls the generic.
 - Relocated code: compare the reparsed post-rewrite AST with the pre-rewrite AST plus the intended
@@ -144,14 +143,14 @@ Minimal code:
   - `slinker check [PATH]` runs the full build pipeline through preflight, prints the build report,
     and writes nothing;
   - `build` takes `--extra-pkgs`;
-  - reports group blockers and assumptions by root cause, show the owning binding and source line,
+  - reports group blockers by root cause, show the owning binding and source line,
     and have a `--json` form.
 
 ## Track E: Retire heuristics
 
 - Unresolved names: prove nothing in the retained program creates names dynamically (`assign`,
   `makeActiveBinding`, `list2env`, `<<-` with computed names or unknown environments,
-  `environment<-`, unanalyzed native code defining R objects); then accept them in strict mode.
+  `environment<-`, unanalyzed native code defining R objects); then accept them.
 - Value provenance for reflection: `asNamespace(ns)$.__NAMESPACE__.$exports` reads the export table.
 - Default-argument specialization: a formal defaulting to a constant that no caller passes is
   static (voucher's `system.file(..., package = package)`).
@@ -177,10 +176,10 @@ Minimal code:
   ordinary CRAN packages (roxygen NAMESPACE, S3 classes and methods, `NextMethod`, closures and
   factories, private `.state` environment, `.onLoad`/`.onAttach`, `system.file` resources, a
   lazy-loaded dataset, `match.arg`/`tryCatch`/`do.call`/`switch`/`eval(bquote())`,
-  `requireNamespace`-guarded Suggests code) with a testthat suite. Done when it builds strictly
-  with no assumptions and passes the three-way installation harness.
+  `requireNamespace`-guarded Suggests code) with a testthat suite. Done when it builds
+  and passes the three-way installation harness.
 - Lower Linked `.onLoad` `libname` uses to explicit resources instead of blocking them.
-- rlang, cli, glue, vctrs, R6 each link in a CRAN harness case, strictly where their code allows;
+- rlang, cli, glue, vctrs, R6 each link in a CRAN harness case where their code allows;
   R6 generators and re-enclosed methods are modeled or blocked precisely.
 - Typed blockers for S4/S7, representation introspection, and `eval(parse())`/`source()`.
 - Precision cases from real packages: `globals`, `futile.logger`, `gsubfn`.

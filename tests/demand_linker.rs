@@ -1,7 +1,7 @@
 #![cfg(feature = "air")]
 
 use slinker::analysis::{
-    EdgeKind, ExplanationDag, GraphEdgeReasonExport, LinkPolicy, Linker, NodeKind, RejectCode,
+    EdgeKind, ExplanationDag, GraphEdgeReasonExport, Linker, NodeKind, RejectCode,
 };
 use slinker::package::{
     BindingImage, BindingOrigin, ClosureSource, Digest, EmbeddedClosureSource, ExportMap,
@@ -2606,8 +2606,8 @@ fn finalization_does_not_depend_on_provenance() {
         format!("{:?}", unrecorded.program())
     );
     assert_eq!(
-        format!("{:?}{:?}", recorded.blockers(), recorded.assumptions()),
-        format!("{:?}{:?}", unrecorded.blockers(), unrecorded.assumptions())
+        format!("{:?}", recorded.blockers()),
+        format!("{:?}", unrecorded.blockers())
     );
 }
 
@@ -2679,34 +2679,18 @@ fn find_package_of_a_linked_package_blocks_before_materialization() {
 }
 
 #[test]
-fn loose_mode_records_assumptions_that_strict_mode_blocks() {
-    let analyze = |strict| {
-        Linker::new(
-            FakeProvider::new(vec![package(
-                "root",
-                &[("f", Some("f <- function() missing_everywhere()"))],
-            )]),
-            1,
-        )
-        .with_policy(LinkPolicy { strict })
-        .analyze("root")
-        .unwrap()
-    };
-
-    let strict = analyze(true);
+fn unresolved_name_blocks() {
+    let plan = Linker::new(
+        FakeProvider::new(vec![package(
+            "root",
+            &[("f", Some("f <- function() missing_everywhere()"))],
+        )]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
     assert!(
-        strict
-            .blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::UnresolvedBinding)
-    );
-    assert!(strict.assumptions().is_empty());
-
-    let loose = analyze(false);
-    assert!(loose.blockers().is_empty(), "{:?}", loose.blockers());
-    assert!(
-        loose
-            .assumptions()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnresolvedBinding)
     );

@@ -10,7 +10,6 @@ mod native;
 pub mod need;
 mod object_world;
 mod parse_cache;
-pub mod policy;
 mod reflection;
 mod relocation;
 mod resolution;
@@ -36,7 +35,6 @@ pub use export::{
 pub use finalize::LinkIr;
 pub use graph::{Edge, EdgeKind, Graph, Node, NodeId, NodeKind};
 pub use need::{GenericId, LifecycleHook, Need, S3Id};
-pub use policy::LinkPolicy;
 
 pub const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
 
@@ -46,12 +44,6 @@ pub struct Linker<P: PackageProvider>(AnalyzerState<P>);
 impl<P: PackageProvider> Linker<P> {
     pub fn new(packages: P, jobs: usize) -> Self {
         Self(AnalyzerState::new(packages, jobs))
-    }
-
-    #[must_use]
-    pub fn with_policy(mut self, policy: LinkPolicy) -> Self {
-        self.0.policy = policy;
-        self
     }
 
     #[must_use]

@@ -12,7 +12,6 @@ use super::reflection::ReflectionFacts;
 use super::relocation::{NamespaceCall, PendingRelocation, RelocationPlan, SyntaxObservation};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
 use super::s3::{CallableId, S3Model, callable_target};
-use crate::analysis::policy::LinkPolicy;
 use crate::analysis::{
     Diagnostic, EdgeKind, GenericId, Graph, LifecycleHook, Need, NodeId, NodeKind, RejectCode, S3Id,
 };
@@ -64,7 +63,6 @@ pub(super) struct NativeCallbackContext<'a> {
 
 pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) packages: TargetUniverse<P>,
-    pub(super) policy: LinkPolicy,
     pub(super) extra_packages: HashSet<String>,
     pub(super) explicit_external_packages: HashSet<String>,
     pub(super) jobs: usize,
@@ -104,7 +102,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn new(packages: P, jobs: usize) -> Self {
         Self {
             packages: TargetUniverse::new(packages),
-            policy: LinkPolicy::default(),
             extra_packages: HashSet::new(),
             explicit_external_packages: HashSet::new(),
             jobs: jobs.max(1),
@@ -1829,14 +1826,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
             match &native.safety {
-                NativeSafety::Unanalyzed => self.assume(
-                    node,
-                    id,
-                    None,
-                    RejectCode::UnknownNativeEffects,
-                    format!("native component `{component}` has unanalyzed C-to-R callbacks"),
-                    None,
-                ),
+                NativeSafety::Unanalyzed => {
+                    let identity = self.packages.identity(id);
+                    let message = format!(
+                        "native component `{component}` has unanalyzed C-to-R callbacks; an audited SLINKER_NATIVE_SUMMARIES entry for package `{}` version `{}` image `{}` makes it analyzable",
+                        identity.name, identity.version, identity.image_fingerprint.0
+                    );
+                    self.diagnostic(
+                        node,
+                        id,
+                        None,
+                        RejectCode::UnknownNativeEffects,
+                        message,
+                        None,
+                    );
+                }
                 NativeSafety::Safe(facts) => {
                     for callback in &facts.callbacks {
                         self.require(
@@ -2294,7 +2298,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     );
                 }
             }
-            _ => self.assume(
+            _ => self.diagnostic(
                 from,
                 current,
                 Some(binding),
@@ -2485,7 +2489,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         binding: &str,
         call: &CallSite,
     ) {
-        self.assume(
+        self.diagnostic(
             from,
             current,
             Some(binding),
@@ -2727,7 +2731,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 Ok(())
             }
             _ => {
-                self.assume(
+                self.diagnostic(
                     from,
                     current,
                     Some(binding),
@@ -3125,7 +3129,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             if self.reflection.is_non_reflective_namespace_use(&call.span) {
                 return Ok(());
             }
-            self.assume(
+            self.diagnostic(
                 from,
                 current,
                 Some(binding),
@@ -3159,7 +3163,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             }
         };
         if literal.is_none() {
-            self.assume(
+            self.diagnostic(
                 from,
                 current,
                 Some(binding),
@@ -3473,21 +3477,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         span: Option<Span>,
     ) {
         let diagnostic = self.new_diagnostic(node, package, binding, code, message.into(), span);
-        self.diagnostics.record(node, true, diagnostic);
-    }
-
-    pub(super) fn assume(
-        &mut self,
-        node: NodeId,
-        package: PackageId,
-        binding: Option<&str>,
-        code: RejectCode,
-        message: impl Into<String>,
-        span: Option<Span>,
-    ) {
-        let diagnostic = self.new_diagnostic(node, package, binding, code, message.into(), span);
-        self.diagnostics
-            .record(node, self.policy.strict, diagnostic);
+        self.diagnostics.record(node, diagnostic);
     }
 
     fn new_diagnostic(

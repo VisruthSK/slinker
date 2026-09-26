@@ -35,18 +35,19 @@ The private copies still share session-wide registries that are not keyed by pac
 
 The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then calls the Root's original `.onLoad`. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
 
-### Strict mode
+### Unproven behavior
 
-`--strict` defaults to `true`: anything slinker cannot prove blocks the build. With `--strict false`, a fixed set of heuristics is allowed instead and each use is recorded as an assumption, listed by `analyze` and printed by `build` as `slinker: assumed <code> in <pkg>::<binding>: <message>`:
+Anything slinker cannot prove blocks the build; there is no mode that accepts a heuristic instead. In particular these block:
 
-- unanalyzed native code (its C-to-R callbacks are not checked);
-- a free name bound nowhere (assumed to fail as in the original);
+- unanalyzed native code, whose C-to-R callbacks are not checked, unless an audited native summary covers it (the blocker names the exact package, version, and image fingerprint to audit);
+- a free name bound nowhere;
 - a dynamic namespace or package name passed to a namespace or package query (`asNamespace`, `requireNamespace`, `getExportedValue`, `isNamespaceLoaded`, `packageDescription`, ...);
 - `get`/`get0`/`exists`/`match.fun`/`do.call` with a computed name or environment;
 - `system.file(package = x)` with a computed `x` while a package is Linked;
 - `NextMethod()` outside a known method set.
 
-Everything else, including every real blocker, behaves the same in both modes.
+A declaration can supply the missing fact where the code is the author's own.
+
 
 ### Declarations
 
@@ -59,7 +60,7 @@ f <- function(x) {
 }
 ```
 
-`s3("a", "b")` is one exact class vector; `one_of()` lists alternatives; classes are literal strings. The declaration applies to the binding throughout the function wherever it appears, and nested functions that capture the binding may narrow it but never widen it. When every call of an S3 generic passes a declared class, only the matching methods and `.default` are retained. Declarations are contracts, not heuristics: they apply in both strict modes, and a malformed one is an `InvalidDeclaration` blocker. Everything inside `declare()` is inert for analysis.
+`s3("a", "b")` is one exact class vector; `one_of()` lists alternatives; classes are literal strings. The declaration applies to the binding throughout the function wherever it appears, and nested functions that capture the binding may narrow it but never widen it. When every call of an S3 generic passes a declared class, only the matching methods and `.default` are retained. Declarations are contracts, not heuristics; a malformed one is an `InvalidDeclaration` blocker. Everything inside `declare()` is inert for analysis.
 
 ## Analyze
 
@@ -130,9 +131,9 @@ The semantic stack is deliberately narrow: `harp`, `libr`, `air_r_parser`, `air_
 
 ## Native packages
 
-Native opacity widens the demanded native component, not the package's R namespace. A Linked package's compiled library is copied into the generated package and loaded by its bootstrap, while unrelated R wrappers remain eligible for elimination. The worker loads each installed library to read its registered routines, so `useDynLib(pkg, .registration = TRUE)` names resolve. A Root keeps and compiles its own native code. A Linked DLL is a separate copy that loads next to any real one, and its namespace records it under `DLLs`. String selectors (`.Call("routine", PACKAGE = "pkg")`) and `getNativeSymbolInfo(name, "pkg")` in Linked code resolve through that copy's `DllInfo`, never by name; when the DLL forces symbols they fail in every copy, as in the original, and stay as written. A string selector that is not a registered routine of its interface, or `getNativeSymbolInfo` without `PACKAGE` on a Linked routine, blocks. Unanalyzed native code blocks in strict mode and is an assumption with `--strict false`.
+Native opacity widens the demanded native component, not the package's R namespace. A Linked package's compiled library is copied into the generated package and loaded by its bootstrap, while unrelated R wrappers remain eligible for elimination. The worker loads each installed library to read its registered routines, so `useDynLib(pkg, .registration = TRUE)` names resolve. A Root keeps and compiles its own native code. A Linked DLL is a separate copy that loads next to any real one, and its namespace records it under `DLLs`. String selectors (`.Call("routine", PACKAGE = "pkg")`) and `getNativeSymbolInfo(name, "pkg")` in Linked code resolve through that copy's `DllInfo`, never by name; when the DLL forces symbols they fail in every copy, as in the original, and stay as written. A string selector that is not a registered routine of its interface, or `getNativeSymbolInfo` without `PACKAGE` on a Linked routine, blocks. Unanalyzed native code blocks.
 
-Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema `1` keys each JSON entry by package name, version, and slinker's installed-image fingerprint, so a summary cannot silently transfer to a different native build. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and continue to produce `UnknownNativeEffects`.
+Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema `1` keys each JSON entry by package name, version, and slinker's installed-image fingerprint, so a summary cannot silently transfer to a different native build. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and block the build with `UnknownNativeEffects`.
 
 ## Root, Linked, and External packages
 

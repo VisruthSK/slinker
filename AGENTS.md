@@ -78,9 +78,9 @@ Enforce that construction boundary through Rust visibility and constructors wher
 
 Known unsupported behavior must fail during analysis or preflight. Do not postpone a known semantic failure until materialization.
 
-Every heuristic must go through `AnalyzerState::assume`. Sound rules and explicit declarations apply in both strict modes.
+Anything analysis cannot prove is a blocker. Only sound rules and explicit declarations accept behavior; there is no mode that records a heuristic instead of blocking.
 
-Prefer removing a heuristic to introducing another one.
+Do not introduce heuristics.
 
 Do not duplicate semantic knowledge between analysis, IR, finalization, workers, and materialization. A semantic fact should have one owner and explicit typed representations when it crosses subsystem boundaries.
 

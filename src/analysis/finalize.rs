@@ -25,7 +25,6 @@ pub struct LinkIr {
     program: ProgramIr,
     provenance: crate::ir::ProvenanceIr,
     blockers: Vec<Diagnostic>,
-    assumptions: Vec<Diagnostic>,
     sources: Sources,
     construction_evaluations: usize,
 }
@@ -49,7 +48,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .any(|package| self.packages.role(*package) == LinkedPackageRole::Linked)
         {
             for (node, package, span) in self.relocations.take_dynamic_resource_lookups() {
-                self.assume(
+                self.diagnostic(
                     node,
                     package,
                     None,
@@ -60,12 +59,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         self.finalize_s3_dispatch(&retained);
-        let (blockers, assumptions) = self.diagnostics.into_sorted();
+        let blockers = self.diagnostics.into_sorted();
         LinkIr {
             program,
             provenance: crate::ir::ProvenanceIr::from_analysis(self.graph, self.roots),
             blockers,
-            assumptions,
             sources: self.parses.into_sources(),
             packages: self.packages.sources(retained),
             construction_evaluations: self.construction_evaluations,
@@ -948,7 +946,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         .any(|registration| registration.method == binding)
                 });
             if !registered && !self.s3.is_closed_method(package, &binding) {
-                self.assume(
+                self.diagnostic(
                     node,
                     package,
                     Some(&binding),
@@ -991,10 +989,6 @@ impl LinkIr {
     /// Every independent semantic blocker, sorted deterministically.
     pub fn blockers(&self) -> &[Diagnostic] {
         &self.blockers
-    }
-
-    pub fn assumptions(&self) -> &[Diagnostic] {
-        &self.assumptions
     }
 
     /// Exact selected installed image and build-time location of every finalized package.

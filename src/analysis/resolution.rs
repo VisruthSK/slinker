@@ -625,7 +625,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             Resolution::Static(BindingTarget::Local | BindingTarget::Base) => {}
             Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
-                self.assume(
+                self.diagnostic(
                     from,
                     requester,
                     binding,

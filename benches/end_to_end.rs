@@ -12,7 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const ANALYZED: [&str; 3] = ["rlang", "cli", "testthat"];
-const BUILT: [(&str, bool); 2] = [("voucher", false), ("rebus.numbers", true)];
+const BUILT: [&str; 2] = ["here", "rebus.numbers"];
 
 fn jobs() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
@@ -94,18 +94,16 @@ fn provision(r_home: &Path, package: &str) -> (PathBuf, PathBuf) {
     (source, library)
 }
 
-fn build(r_home: &Path, package: &str, strict: bool) {
+fn build(r_home: &Path, package: &str) {
     let (source, library) = provision(r_home, package);
     let work = tempfile::tempdir().expect("build work directory");
     let output = work.path().join("output");
-    let strict = if strict { "true" } else { "false" };
     let start = Instant::now();
     let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
         .arg("build")
         .arg(&source)
         .arg("--lib")
         .arg(&library)
-        .args([OsStr::new("--strict"), OsStr::new(strict)])
         .arg("--output")
         .arg(&output)
         .env("SLINKER_CACHE_DIR", work.path().join("cache"))
@@ -128,8 +126,8 @@ fn r_string(value: impl AsRef<OsStr>) -> String {
 fn run() {
     let r_home = common::discover_r_home();
     analyze_installed(&r_home);
-    for (package, strict) in BUILT {
-        build(&r_home, package, strict);
+    for package in BUILT {
+        build(&r_home, package);
     }
 }
 

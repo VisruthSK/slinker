@@ -46,34 +46,23 @@ pub struct Diagnostic {
 #[derive(Default)]
 pub(super) struct DiagnosticSink {
     blockers: Vec<Diagnostic>,
-    assumptions: Vec<Diagnostic>,
     recorded: HashSet<(NodeId, RejectCode, String)>,
 }
 
 impl DiagnosticSink {
-    pub(super) fn record(&mut self, node: NodeId, blocking: bool, diagnostic: Diagnostic) {
-        if !self
+    pub(super) fn record(&mut self, node: NodeId, diagnostic: Diagnostic) {
+        if self
             .recorded
             .insert((node, diagnostic.code, diagnostic.message.clone()))
         {
-            return;
-        }
-        if blocking {
             self.blockers.push(diagnostic);
-        } else {
-            self.assumptions.push(diagnostic);
         }
     }
 
-    pub(super) fn into_sorted(self) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
-        let Self {
-            mut blockers,
-            mut assumptions,
-            ..
-        } = self;
+    pub(super) fn into_sorted(self) -> Vec<Diagnostic> {
+        let mut blockers = self.blockers;
         blockers.sort_by(diagnostic_order);
-        assumptions.sort_by(diagnostic_order);
-        (blockers, assumptions)
+        blockers
     }
 }
 

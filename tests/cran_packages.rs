@@ -14,7 +14,6 @@ fn rebus_numbers_suite_passes_with_rebus_base_linked() {
         package: "rebus.numbers",
         linked: &["rebus.base"],
         checks: &[Check::Testthat],
-        strict: true,
     }
     .assert_passes();
 }
@@ -25,7 +24,6 @@ fn rslurm_suite_passes_with_whisker_linked() {
         package: "rslurm",
         linked: &["whisker"],
         checks: &[Check::Testthat],
-        strict: true,
     }
     .assert_passes();
 }
@@ -36,7 +34,6 @@ fn represtools_suite_passes_with_whisker_linked() {
         package: "represtools",
         linked: &["whisker"],
         checks: &[Check::Testthat],
-        strict: true,
     }
     .assert_passes();
 }
@@ -47,42 +44,45 @@ fn qrcode_suite_passes_with_assertthat_linked() {
         package: "qrcode",
         linked: &["assertthat"],
         checks: &[Check::Testthat],
-        strict: true,
     }
     .assert_passes();
 }
 
 #[test]
-fn pkgcond_suite_passes_with_assertthat_linked() {
+fn pkgcond_blocks_on_computed_scope_lookups() {
     LinkedSuite {
         package: "pkgcond",
         linked: &["assertthat"],
-        checks: &[Check::Testthat],
-        strict: false,
+        checks: &[],
     }
-    .assert_passes();
+    .assert_blocks(&[
+        "DynamicLookup in pkgcond::find_scope: exists() looks up a name that is not a static string",
+        "DynamicLookup in pkgcond::find_scope: get() looks up a name that is not a static string",
+    ]);
 }
 
 #[test]
-fn doubt_suite_passes_with_unglue_linked() {
+fn doubt_blocks_on_a_computed_lookup() {
     LinkedSuite {
         package: "doubt",
         linked: &["unglue"],
-        checks: &[Check::Testthat],
-        strict: false,
+        checks: &[],
     }
-    .assert_passes();
+    .assert_blocks(&[
+        "DynamicLookup in doubt::?: get() looks up a name that is not a static string",
+    ]);
 }
 
 #[test]
-fn config_suite_passes_with_compiled_yaml_linked() {
+fn config_blocks_on_unaudited_yaml_native_code() {
     LinkedSuite {
         package: "config",
         linked: &["yaml"],
-        checks: &[Check::Testthat],
-        strict: false,
+        checks: &[],
     }
-    .assert_passes();
+    .assert_blocks(&[
+        "UnknownNativeEffects in yaml: native component `yaml` has unanalyzed C-to-R callbacks",
+    ]);
 }
 
 #[test]
@@ -109,69 +109,39 @@ fn here_suite_passes_with_rprojroot_linked() {
                 "#,
             ),
         ],
-        strict: true,
     }
     .assert_passes();
 }
 
 #[test]
-fn voucher_suite_passes_with_cli_and_fs_linked() {
+fn voucher_blocks_on_unproven_cli_and_fs_behavior() {
     LinkedSuite {
         package: "voucher",
         linked: &["cli", "fs"],
-        checks: &[
-            Check::Testthat,
-            Check::Script(
-                r#"
-                options(cli.num_colors = 1, cli.unicode = FALSE, cli.dynamic = FALSE, width = 80)
-                project <- tempfile("voucher-")
-                dir.create(project)
-                setwd(project)
-                messages <- capture.output(type = "message", {
-                  voucher::use_vouch()
-                  voucher::add("alice", write = TRUE)
-                  voucher::denounce("bob", write = TRUE, reason = "spam")
-                  voucher::add("github:carol", write = TRUE)
-                  status <- tryCatch(voucher::check(c("alice", "bob", "dave")), error = conditionMessage)
-                })
-                writeLines(readLines(file.path(".github", "VOUCHED.td")))
-                print(status)
-                writeLines(messages)
-                "#,
-            ),
-            Check::Coexisting(&format!("library(voucher)\nlibrary(pillar)\n{COEXISTING}")),
-            Check::Coexisting(&format!("library(pillar)\nlibrary(voucher)\n{COEXISTING}")),
-        ],
-        strict: false,
+        checks: &[],
     }
-    .assert_passes();
+    .assert_blocks(&[
+        "DynamicLookup in cli::find_function_symbol: exists() looks up a name that is not a static string",
+        "DynamicLookup in fs::register_s3_method: get() looks up a name that is not a static string",
+        "DynamicLookup in voucher: dynamic system.file() package can name a Linked package",
+        "asNamespace() with a dynamic namespace name",
+        "getNamespaceVersion() with a dynamic package name can name a Linked package",
+        "ObjectSystem in fs::compare.fs_path: NextMethod is not inside a registered method",
+        "UnknownNativeEffects in cli: native component `cli` has unanalyzed C-to-R callbacks",
+        "UnknownNativeEffects in fs: native component `fs` has unanalyzed C-to-R callbacks",
+        "UnresolvedBinding in cli::",
+    ]);
 }
-
-const COEXISTING: &str = r#"
-options(cli.num_colors = 1, cli.dynamic = FALSE)
-stopifnot(length(format(pillar::pillar(1:3))) > 0)
-bar <- cli::cli_progress_bar(total = 2)
-cli::cli_progress_update(id = bar)
-cli::cli_progress_done(id = bar)
-project <- tempfile("voucher-")
-dir.create(project)
-setwd(project)
-invisible(capture.output(type = "message", voucher::use_vouch()))
-cat(readLines(file.path(".github", "VOUCHED.td"))[[1]], "\n")
-cat(identical(getNamespaceName(asNamespace("cli")), c(name = "cli")), "\n")
-"#;
 
 struct LinkedSuite<'a> {
     package: &'a str,
     linked: &'a [&'a str],
     checks: &'a [Check<'a>],
-    strict: bool,
 }
 
 enum Check<'a> {
     Testthat,
     Script(&'a str),
-    Coexisting(&'a str),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -191,11 +161,7 @@ struct Provisioned {
 }
 
 impl LinkedSuite<'_> {
-    fn assert_passes(&self) {
-        let r_home = discover_r_home();
-        let provisioned = self.provision(&r_home);
-        let work = tempfile::tempdir().expect("work directory");
-        let output = work.path().join(self.package);
+    fn build(&self, provisioned: &Provisioned, output: &Path) -> std::process::Output {
         let external = provisioned.external.join(",");
         let mut arguments = vec![
             OsStr::new("build"),
@@ -205,14 +171,41 @@ impl LinkedSuite<'_> {
             OsStr::new("--output"),
             output.as_os_str(),
         ];
-        if !self.strict {
-            arguments.extend([OsStr::new("--strict"), OsStr::new("false")]);
-        }
         if !external.is_empty() {
             arguments.extend([OsStr::new("--external"), OsStr::new(&external)]);
         }
+        slinker(&arguments)
+    }
+
+    fn assert_blocks(&self, expected: &[&str]) {
+        let r_home = discover_r_home();
+        let provisioned = self.provision(&r_home);
+        let work = tempfile::tempdir().expect("work directory");
+        let output = work.path().join(self.package);
+        let result = self.build(&provisioned, &output);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{} built: {stderr}", self.package);
+        assert!(stderr.contains("build preflight failed"), "{stderr}");
+        assert!(
+            !output.exists(),
+            "a blocked build published {}",
+            output.display()
+        );
+        for blocker in expected {
+            assert!(
+                stderr.contains(blocker),
+                "missing blocker `{blocker}`:\n{stderr}"
+            );
+        }
+    }
+
+    fn assert_passes(&self) {
+        let r_home = discover_r_home();
+        let provisioned = self.provision(&r_home);
+        let work = tempfile::tempdir().expect("work directory");
+        let output = work.path().join(self.package);
         assert_success(
-            &slinker(&arguments),
+            &self.build(&provisioned, &output),
             &format!("slinker build {}", self.package),
         );
 
@@ -241,7 +234,6 @@ impl LinkedSuite<'_> {
                 Check::Testthat | Check::Script(_) => {
                     &[State::Absent, State::Installed, State::Loaded]
                 }
-                Check::Coexisting(_) => &[State::Installed, State::Loaded],
             };
             let results = states
                 .iter()
@@ -257,7 +249,7 @@ impl LinkedSuite<'_> {
                     );
                     match check {
                         Check::Testthat => fs::read_to_string(&summary).expect("test summary"),
-                        Check::Script(_) | Check::Coexisting(_) => stdout,
+                        Check::Script(_) => stdout,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -327,7 +319,7 @@ impl LinkedSuite<'_> {
                 package = r_string(self.package),
                 summary = r_string(summary),
             ),
-            Check::Script(script) | Check::Coexisting(script) => (*script).to_owned(),
+            Check::Script(script) => (*script).to_owned(),
         };
         let setup = match state {
             State::Absent => format!(
@@ -363,21 +355,12 @@ impl LinkedSuite<'_> {
             testing_needs_linked: false,
             external: Vec::new(),
         };
-        let extra = match self
-            .checks
-            .iter()
-            .any(|check| matches!(check, Check::Coexisting(_)))
-        {
-            true => "\"pillar\"",
-            false => "character()",
-        };
         run_r_with_site_profile(
             r_home,
             &format!(
                 r#"
                 package <- {package}
                 linked <- {linked}
-                extra <- {extra}
                 if (identical(unname(getOption("repos")["CRAN"]), "@CRAN@")) {{
                   options(repos = c(CRAN = "https://cloud.r-project.org"))
                 }}
@@ -409,7 +392,7 @@ impl LinkedSuite<'_> {
                   function(dependencies) any(linked %in% dependencies),
                   logical(1)
                 )]
-                testing <- setdiff(closure(c("testthat", extra)), runtime)
+                testing <- setdiff(closure("testthat"), runtime)
                 provide({dependencies}, hard)
                 provide({runtime_library}, runtime)
                 provide({testing_library}, setdiff(testing, linked), setdiff(closure(usable), c(runtime, testing, linked)))

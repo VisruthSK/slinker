@@ -309,7 +309,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     ),
                 }
             }
-            Some(_) => self.assume(
+            Some(_) => self.diagnostic(
                 from,
                 current,
                 Some(binding),
