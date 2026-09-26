@@ -675,20 +675,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<ExecutionOutcome> {
         let name = call.callee.as_str();
         let value = match name {
-            "new.env" => {
-                let parent =
-                    construction_argument(call, arguments, &["hash", "parent", "size"], "parent")
-                        .and_then(|value| self.abstract_environment(context, value));
-                let environment = self
-                    .objects
-                    .graph_mut(context.package)
-                    .derive_environment(parent);
-                let object = self
-                    .objects
-                    .graph_mut(context.package)
-                    .environment_object(environment);
-                AbstractValue::Object(object)
-            }
+            "new.env" => self.construct_new_env(context, call, arguments),
             "environment" => arguments
                 .first()
                 .and_then(|value| self.abstract_closure(context, value))
@@ -737,22 +724,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 [AbstractValue::Logical(value)] => AbstractValue::Logical(!value),
                 _ => AbstractValue::Unknown,
             },
-            "c" => {
-                let mut values = Vec::new();
-                for value in arguments {
-                    match value {
-                        AbstractValue::Vector(items) => values.extend(items.iter().cloned()),
-                        AbstractValue::Unknown => {
-                            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
-                        }
-                        value => values.push(value.clone()),
-                    }
-                    if values.len() > 32 {
-                        return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
-                    }
-                }
-                AbstractValue::Vector(values)
-            }
+            "c" => fold_c(arguments),
             "names" => arguments
                 .first()
                 .and_then(|value| self.abstract_names(context, value))
@@ -767,143 +739,193 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 });
             }
             "lapply" => self.evaluate_reenclosing_lapply(context, arguments),
-            "list2env" => {
-                let Some(AbstractValue::Object(values)) =
-                    construction_argument(call, arguments, &["x", "envir", "parent", "hash"], "x")
-                else {
-                    return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
-                };
-                let environment = construction_argument(
-                    call,
-                    arguments,
-                    &["x", "envir", "parent", "hash"],
-                    "envir",
-                )
-                .and_then(|value| self.abstract_environment(context, value));
-                let parent = construction_argument(
-                    call,
-                    arguments,
-                    &["x", "envir", "parent", "hash"],
-                    "parent",
-                )
-                .and_then(|value| self.abstract_environment(context, value));
-                let environment = self.objects.graph_mut(context.package).list2env(
-                    *values,
-                    None,
-                    environment,
-                    parent,
-                );
-                self.schedule_environment_closures(context, environment, &call.arguments);
-                let object = self
-                    .objects
-                    .graph_mut(context.package)
-                    .environment_object(environment);
-                AbstractValue::Object(object)
-            }
-            "assign" => {
-                let field = construction_argument(
-                    call,
-                    arguments,
-                    &["x", "value", "pos", "envir", "inherits", "immediate"],
-                    "x",
-                );
-                let value = construction_argument(
-                    call,
-                    arguments,
-                    &["x", "value", "pos", "envir", "inherits", "immediate"],
-                    "value",
-                );
-                let environment = construction_argument(
-                    call,
-                    arguments,
-                    &["x", "value", "pos", "envir", "inherits", "immediate"],
-                    "envir",
-                )
-                .and_then(|value| self.abstract_environment(context, value));
-                if let (
-                    Some(AbstractValue::String(field)),
-                    Some(AbstractValue::Object(value)),
-                    Some(environment),
-                ) = (field, value, environment)
-                {
-                    self.objects
-                        .graph_mut(context.package)
-                        .set_environment_binding(environment, field, *value);
-                } else if let Some(environment) = environment {
-                    self.objects
-                        .graph_mut(context.package)
-                        .mark_environment_unknown_fields(environment);
-                }
-                AbstractValue::Null
-            }
+            "list2env" => self.construct_list2env(context, call, arguments),
+            "assign" => self.construct_assign(context, call, arguments),
             "requireNamespace" | "loadNamespace" | "getNamespace" | "asNamespace" => {
-                if context.specialized
-                    && let Some(AbstractValue::String(package)) = construction_argument(
-                        call,
-                        arguments,
-                        namespace_formals(name),
-                        namespace_target(name),
-                    )
-                {
-                    self.reflection
-                        .record_contextual_namespace_call(span, package);
-                }
-                match construction_argument(
-                    call,
-                    arguments,
-                    namespace_formals(name),
-                    namespace_target(name),
-                ) {
-                    Some(AbstractValue::String(package))
-                        if matches!(name, "getNamespace" | "asNamespace")
-                            && package == self.packages.name(context.package) =>
-                    {
-                        self.own_namespace_object(context)
-                    }
-                    _ => AbstractValue::Unknown,
-                }
+                self.construct_namespace_call(context, call, span, arguments)
             }
-            "reg.finalizer" => {
-                if let [
-                    object,
-                    AbstractValue::Function {
-                        parameters,
-                        body,
-                        captures,
-                    },
-                    ..,
-                ] = arguments
-                {
-                    self.evaluate_inline_function(
-                        context,
-                        call,
-                        std::slice::from_ref(object),
-                        parameters.clone(),
-                        body.clone(),
-                        captures.clone(),
-                    )?;
-                }
-                AbstractValue::Null
-            }
-            callee => {
-                if let Some((formals, target)) = reflective_name_formals(callee)
-                    && let Some(AbstractValue::String(name)) =
-                        construction_argument(call, arguments, formals, target)
-                {
-                    let name = name.clone();
-                    self.retain_reflective_name(
-                        context.node,
-                        context.package,
-                        context.image,
-                        context.lexical_environment,
-                        &name,
-                        span,
-                    )?;
-                }
-                AbstractValue::Unknown
-            }
+            "reg.finalizer" => self.construct_finalizer(context, call, arguments)?,
+            callee => self.construct_reflective_call(context, call, span, arguments, callee)?,
         };
         Ok(ExecutionOutcome::value(value))
+    }
+
+    fn construct_new_env(
+        &mut self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        arguments: &[AbstractValue],
+    ) -> AbstractValue {
+        let parent = construction_argument(call, arguments, &["hash", "parent", "size"], "parent")
+            .and_then(|value| self.abstract_environment(context, value));
+        let environment = self
+            .objects
+            .graph_mut(context.package)
+            .derive_environment(parent);
+        let object = self
+            .objects
+            .graph_mut(context.package)
+            .environment_object(environment);
+        AbstractValue::Object(object)
+    }
+
+    fn construct_list2env(
+        &mut self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        arguments: &[AbstractValue],
+    ) -> AbstractValue {
+        let Some(AbstractValue::Object(values)) =
+            construction_argument(call, arguments, &["x", "envir", "parent", "hash"], "x")
+        else {
+            return AbstractValue::Unknown;
+        };
+        let environment =
+            construction_argument(call, arguments, &["x", "envir", "parent", "hash"], "envir")
+                .and_then(|value| self.abstract_environment(context, value));
+        let parent =
+            construction_argument(call, arguments, &["x", "envir", "parent", "hash"], "parent")
+                .and_then(|value| self.abstract_environment(context, value));
+        let environment =
+            self.objects
+                .graph_mut(context.package)
+                .list2env(*values, None, environment, parent);
+        self.schedule_environment_closures(context, environment, &call.arguments);
+        let object = self
+            .objects
+            .graph_mut(context.package)
+            .environment_object(environment);
+        AbstractValue::Object(object)
+    }
+
+    fn construct_assign(
+        &mut self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        arguments: &[AbstractValue],
+    ) -> AbstractValue {
+        let field = construction_argument(
+            call,
+            arguments,
+            &["x", "value", "pos", "envir", "inherits", "immediate"],
+            "x",
+        );
+        let value = construction_argument(
+            call,
+            arguments,
+            &["x", "value", "pos", "envir", "inherits", "immediate"],
+            "value",
+        );
+        let environment = construction_argument(
+            call,
+            arguments,
+            &["x", "value", "pos", "envir", "inherits", "immediate"],
+            "envir",
+        )
+        .and_then(|value| self.abstract_environment(context, value));
+        if let (
+            Some(AbstractValue::String(field)),
+            Some(AbstractValue::Object(value)),
+            Some(environment),
+        ) = (field, value, environment)
+        {
+            self.objects
+                .graph_mut(context.package)
+                .set_environment_binding(environment, field, *value);
+        } else if let Some(environment) = environment {
+            self.objects
+                .graph_mut(context.package)
+                .mark_environment_unknown_fields(environment);
+        }
+        AbstractValue::Null
+    }
+
+    fn construct_namespace_call(
+        &mut self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        span: &Span,
+        arguments: &[AbstractValue],
+    ) -> AbstractValue {
+        let name = call.callee.as_str();
+        if context.specialized
+            && let Some(AbstractValue::String(package)) = construction_argument(
+                call,
+                arguments,
+                namespace_formals(name),
+                namespace_target(name),
+            )
+        {
+            self.reflection
+                .record_contextual_namespace_call(span, package);
+        }
+        match construction_argument(
+            call,
+            arguments,
+            namespace_formals(name),
+            namespace_target(name),
+        ) {
+            Some(AbstractValue::String(package))
+                if matches!(name, "getNamespace" | "asNamespace")
+                    && package == self.packages.name(context.package) =>
+            {
+                self.own_namespace_object(context)
+            }
+            _ => AbstractValue::Unknown,
+        }
+    }
+
+    fn construct_finalizer(
+        &mut self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        arguments: &[AbstractValue],
+    ) -> Result<AbstractValue> {
+        if let [
+            object,
+            AbstractValue::Function {
+                parameters,
+                body,
+                captures,
+            },
+            ..,
+        ] = arguments
+        {
+            self.evaluate_inline_function(
+                context,
+                call,
+                std::slice::from_ref(object),
+                parameters.clone(),
+                body.clone(),
+                captures.clone(),
+            )?;
+        }
+        Ok(AbstractValue::Null)
+    }
+
+    fn construct_reflective_call(
+        &mut self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        span: &Span,
+        arguments: &[AbstractValue],
+        callee: &str,
+    ) -> Result<AbstractValue> {
+        if let Some((formals, target)) = reflective_name_formals(callee)
+            && let Some(AbstractValue::String(name)) =
+                construction_argument(call, arguments, formals, target)
+        {
+            let name = name.clone();
+            self.retain_reflective_name(
+                context.node,
+                context.package,
+                context.image,
+                context.lexical_environment,
+                &name,
+                span,
+            )?;
+        }
+        Ok(AbstractValue::Unknown)
     }
 
     pub(super) fn abstract_environment(
@@ -1227,4 +1249,21 @@ pub(super) fn bind_construction_arguments(
             .unwrap_or(AbstractValue::Unknown);
         state.locals.insert(parameter.clone(), value);
     }
+}
+
+fn fold_c(arguments: &[AbstractValue]) -> AbstractValue {
+    let mut values = Vec::new();
+    for value in arguments {
+        match value {
+            AbstractValue::Vector(items) => values.extend(items.iter().cloned()),
+            AbstractValue::Unknown => {
+                return AbstractValue::Unknown;
+            }
+            value => values.push(value.clone()),
+        }
+        if values.len() > 32 {
+            return AbstractValue::Unknown;
+        }
+    }
+    AbstractValue::Vector(values)
 }
