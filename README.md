@@ -16,6 +16,8 @@ Third-party dependencies are Linked by default; base-priority packages and every
 
 The Root keeps every binding it defines. Linked namespaces keep their real names and their full original export table; a binding that tree-shaking removed becomes an active binding that stops with "`pkg::name` was removed by slinker because the build never reached it", so `exists()` and export reflection answer as the original does. If a namespace with a Linked package's name is already loaded, loading the generated package fails with `LinkedNamespaceCollision`.
 
+The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then calls the Root's original `.onLoad`. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
+
 ### Strict mode
 
 `--strict` defaults to `true`: anything slinker cannot prove blocks the build. With `--strict false`, a fixed set of heuristics is allowed instead and each use is recorded as an assumption, listed by `analyze` and printed by `build` as `slinker: assumed <code> in <pkg>::<binding>: <message>`:

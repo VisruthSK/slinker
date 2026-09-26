@@ -31,7 +31,6 @@ id_type!(ClosureId);
 id_type!(EnvironmentId);
 id_type!(CodeId);
 id_type!(CodeOccurrenceId);
-id_type!(NamespaceActivationId);
 id_type!(S3RegistrationId);
 id_type!(NativeComponentId);
 id_type!(ResourceId);
@@ -142,10 +141,12 @@ pub enum LinkNamespaceState {
 pub struct MaterializedNamespaceState {
     pub namespace_environment: EnvironmentId,
     pub imports_environment: EnvironmentId,
-    pub exports: ExportTable,
-    pub removed_bindings: Vec<String>,
-    pub unretained_exports: Vec<String>,
-    pub activation: Option<NamespaceActivationId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterializedRole {
+    Root,
+    Linked,
 }
 
 #[derive(Clone, Debug)]
@@ -296,31 +297,23 @@ pub enum PackageOperationIr {
     PackageVersion { version: String },
 }
 
+/// One Linked namespace activation, in the order the Root `.onLoad` wrapper performs them.
 #[derive(Clone, Debug)]
 pub struct NamespaceActivationIr {
-    pub dependencies: Vec<NamespaceId>,
-    pub on_load: Option<OnLoadIr>,
+    pub namespace: NamespaceId,
+    pub on_load: Option<BindingId>,
+    pub exports: ExportTable,
+    pub unretained_exports: Vec<String>,
+    pub stubs: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct OnLoadIr {
-    pub closure: ClosureId,
-    pub package_name: String,
-    pub libname: LinkedLibnameUse,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LinkedLibnameUse {
-    SemanticallyUnused,
-    LoweredToResources,
-}
-
-/// Root source-package transformation decided at finalization: the generated `DESCRIPTION` and
-/// the order in which the Root `.onLoad` wrapper activates Linked namespaces.
+/// Root source-package transformation decided at finalization: the generated `DESCRIPTION`, the
+/// `NAMESPACE` exports, and the original Root `.onLoad` that the generated wrapper calls last.
 #[derive(Clone, Debug, Default)]
 pub struct RootArtifactIr {
     pub description: Arc<str>,
-    pub bootstrap_namespaces: Vec<NamespaceId>,
+    pub exports: ExportTable,
+    pub on_load: Option<ClosureId>,
 }
 
 #[derive(Clone, Debug)]
@@ -498,10 +491,6 @@ impl ProgramIr {
         &self.values[id.index()]
     }
 
-    pub fn activation(&self, id: NamespaceActivationId) -> &NamespaceActivationIr {
-        &self.activations[id.index()]
-    }
-
     pub fn s3_registration(&self, id: S3RegistrationId) -> &S3RegistrationIr {
         &self.s3_registrations[id.index()]
     }
@@ -538,8 +527,6 @@ pub struct ProgramBuilder {
 #[derive(Debug)]
 pub struct FinalizedNamespace {
     pub namespace: NamespaceId,
-    pub namespace_environment: Option<EnvironmentId>,
-    pub imports_environment: Option<EnvironmentId>,
     pub bindings: BTreeMap<String, BindingId>,
 }
 
@@ -607,11 +594,9 @@ impl ProgramBuilder {
     pub fn finish_materialized_namespace(
         &mut self,
         package: PackageId,
-        role: PackageRole,
+        role: MaterializedRole,
         slots: impl IntoIterator<Item = MaterializedSlot>,
-        on_load: Option<String>,
     ) -> FinalizedNamespace {
-        assert!(matches!(role, PackageRole::Root | PackageRole::Linked));
         let namespace = NamespaceId::from_index(self.namespaces.len());
         let imports_environment = self.add_environment(Environment {
             kind: EnvironmentKind::Imports(namespace),
@@ -653,43 +638,17 @@ impl ProgramBuilder {
                 "duplicate namespace slot"
             );
         }
-        let activation = on_load.and_then(|name| {
-            let binding = bindings.get(&name)?;
-            let LinkBindingState::Materialized {
-                initial: InitialBindingState::Value(value),
-                ..
-            } = &self.bindings[binding.index()].state
-            else {
-                return None;
-            };
-            let Value::Closure(closure) = &self.values[value.index()] else {
-                return None;
-            };
-            Some(self.add_activation(NamespaceActivationIr {
-                dependencies: Vec::new(),
-                on_load: Some(OnLoadIr {
-                    closure: *closure,
-                    package_name: self.packages[&package].identity().name.clone(),
-                    libname: LinkedLibnameUse::SemanticallyUnused,
-                }),
-            }))
-        });
         let state = MaterializedNamespaceState {
             namespace_environment,
             imports_environment,
-            exports: ExportTable::default(),
-            removed_bindings: Vec::new(),
-            unretained_exports: Vec::new(),
-            activation,
         };
         let id = self.add_namespace(Namespace {
             package,
             bindings: bindings.clone(),
             imports: Vec::new(),
             state: match role {
-                PackageRole::Root => LinkNamespaceState::Root(state),
-                PackageRole::Linked => LinkNamespaceState::Linked(state),
-                PackageRole::External => unreachable!(),
+                MaterializedRole::Root => LinkNamespaceState::Root(state),
+                MaterializedRole::Linked => LinkNamespaceState::Linked(state),
             },
             s3_registrations: Vec::new(),
             native_components: Vec::new(),
@@ -697,8 +656,6 @@ impl ProgramBuilder {
         assert_eq!(id, namespace);
         FinalizedNamespace {
             namespace,
-            namespace_environment: Some(namespace_environment),
-            imports_environment: Some(imports_environment),
             bindings,
         }
     }
@@ -731,8 +688,6 @@ impl ProgramBuilder {
         assert_eq!(id, namespace);
         FinalizedNamespace {
             namespace,
-            namespace_environment: None,
-            imports_environment: None,
             bindings: slots,
         }
     }
@@ -767,10 +722,8 @@ impl ProgramBuilder {
         id
     }
 
-    pub fn add_activation(&mut self, activation: NamespaceActivationIr) -> NamespaceActivationId {
-        let id = NamespaceActivationId::from_index(self.activations.len());
+    pub fn add_activation(&mut self, activation: NamespaceActivationIr) {
         self.activations.push(activation);
-        id
     }
 
     pub fn add_s3_registration(&mut self, registration: S3RegistrationIr) -> S3RegistrationId {
@@ -810,34 +763,6 @@ impl ProgramBuilder {
         })
     }
 
-    pub fn set_exports(&mut self, namespace: NamespaceId, bindings: Vec<BindingId>) {
-        match &mut self.namespaces[namespace.index()].state {
-            LinkNamespaceState::Root(state) | LinkNamespaceState::Linked(state) => {
-                state.exports = ExportTable::new(bindings);
-            }
-            LinkNamespaceState::External { .. } => {
-                unreachable!("External namespaces have no artifact export table")
-            }
-        }
-    }
-
-    pub fn set_removed_names(
-        &mut self,
-        namespace: NamespaceId,
-        bindings: Vec<String>,
-        exports: Vec<String>,
-    ) {
-        match &mut self.namespaces[namespace.index()].state {
-            LinkNamespaceState::Root(state) | LinkNamespaceState::Linked(state) => {
-                state.removed_bindings = bindings;
-                state.unretained_exports = exports;
-            }
-            LinkNamespaceState::External { .. } => {
-                unreachable!("External namespaces keep their installed names")
-            }
-        }
-    }
-
     pub fn attach_import(&mut self, namespace: NamespaceId, local: String, target: BindingId) {
         self.namespaces[namespace.index()]
             .imports
@@ -872,7 +797,7 @@ impl ProgramBuilder {
         self.relocations.push(relocation);
     }
 
-    pub fn binding_code(&self, binding: BindingId) -> Option<CodeId> {
+    pub fn binding_closure(&self, binding: BindingId) -> Option<ClosureId> {
         let LinkBindingState::Materialized {
             initial: InitialBindingState::Value(value),
             ..
@@ -883,7 +808,12 @@ impl ProgramBuilder {
         let Value::Closure(closure) = &self.values[value.index()] else {
             return None;
         };
-        Some(self.closures[closure.index()].code)
+        Some(*closure)
+    }
+
+    pub fn binding_code(&self, binding: BindingId) -> Option<CodeId> {
+        self.binding_closure(binding)
+            .map(|closure| self.closures[closure.index()].code)
     }
 
     pub fn binding_name(&self, binding: BindingId) -> &str {
@@ -894,23 +824,6 @@ impl ProgramBuilder {
         match &self.bindings[binding.index()].state {
             LinkBindingState::Materialized { namespace, .. }
             | LinkBindingState::External { namespace, .. } => *namespace,
-        }
-    }
-
-    pub fn set_activation_dependencies(
-        &mut self,
-        namespace: NamespaceId,
-        mut dependencies: Vec<NamespaceId>,
-    ) {
-        dependencies.sort();
-        dependencies.dedup();
-        let state = &self.namespaces[namespace.index()].state;
-        let activation = match state {
-            LinkNamespaceState::Root(state) | LinkNamespaceState::Linked(state) => state.activation,
-            LinkNamespaceState::External { .. } => None,
-        };
-        if let Some(activation) = activation {
-            self.activations[activation.index()].dependencies = dependencies;
         }
     }
 

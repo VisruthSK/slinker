@@ -3,9 +3,9 @@ use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::build::{PackageOperation, PendingRelocation};
 use crate::ir::{
-    ExternalBindingAccess, ExternalPackageContract, MaterializedSlot, MaterializedSlotSource,
-    PackageIr, PackageOperationIr, PackageRole as LinkedPackageRole, ProgramIr, RootArtifactIr,
-    TargetContract,
+    ExportTable, ExternalBindingAccess, ExternalPackageContract, MaterializedRole,
+    MaterializedSlot, MaterializedSlotSource, PackageIr, PackageOperationIr,
+    PackageRole as LinkedPackageRole, ProgramIr, RootArtifactIr, TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{ImportSpec, PackageAvailability, PackageId, PackageProvider};
@@ -101,6 +101,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         let mut issues = Vec::new();
+        let mut on_load_bindings = HashMap::<crate::ir::NamespaceId, crate::ir::BindingId>::new();
         let mut contracts = Vec::new();
         let mut declared = self.declared_external_requirements(&ordered);
         for (package, role) in &ordered {
@@ -147,25 +148,29 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let mut namespace_ids = HashMap::new();
         for (package, role) in ordered {
             let package_name = self.packages.name(package);
-            if role == LinkedPackageRole::External {
-                let bindings = self.graph.nodes.iter().filter_map(|node| match &node.kind {
-                    NodeKind::ExternalBinding { name } if node.package == package_name => {
-                        let access = if self
-                            .internal_external_bindings
-                            .contains(&(package, name.clone()))
-                        {
-                            ExternalBindingAccess::Internal
-                        } else {
-                            ExternalBindingAccess::Exported
-                        };
-                        Some((name.clone(), access))
-                    }
-                    _ => None,
-                });
-                let namespace = builder.finish_external_namespace(package, bindings);
-                namespace_ids.insert(package_name.to_owned(), namespace);
-                continue;
-            }
+            let materialized = match role {
+                LinkedPackageRole::Root => MaterializedRole::Root,
+                LinkedPackageRole::Linked => MaterializedRole::Linked,
+                LinkedPackageRole::External => {
+                    let bindings = self.graph.nodes.iter().filter_map(|node| match &node.kind {
+                        NodeKind::ExternalBinding { name } if node.package == package_name => {
+                            let access = if self
+                                .internal_external_bindings
+                                .contains(&(package, name.clone()))
+                            {
+                                ExternalBindingAccess::Internal
+                            } else {
+                                ExternalBindingAccess::Exported
+                            };
+                            Some((name.clone(), access))
+                        }
+                        _ => None,
+                    });
+                    let namespace = builder.finish_external_namespace(package, bindings);
+                    namespace_ids.insert(package_name.to_owned(), namespace);
+                    continue;
+                }
+            };
             let image = self
                 .images
                 .get(&package)
@@ -210,12 +215,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     source,
                 }
             });
-            let namespace = builder.finish_materialized_namespace(
-                package,
-                role,
-                slots,
-                image.index.lifecycle.on_load.then(|| ".onLoad".into()),
-            );
+            let namespace = builder.finish_materialized_namespace(package, materialized, slots);
+            if image.index.lifecycle.on_load {
+                match namespace.bindings.get(".onLoad") {
+                    Some(&binding) => {
+                        on_load_bindings.insert(namespace.namespace, binding);
+                    }
+                    None => issues.push(format!(
+                        "`{package_name}::.onLoad` runs when the namespace loads but is not retained"
+                    )),
+                }
+            }
             for registration in &namespace_builder.registrations {
                 let Some(&method) = namespace.bindings.get(&registration.method) else {
                     continue;
@@ -318,6 +328,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
         }
+        let mut root_exports = ExportTable::default();
+        let mut linked_contents = HashMap::new();
         for &package in retained {
             if self.packages.is_external(package) {
                 continue;
@@ -329,7 +341,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .values()
                 .filter_map(|name| builder.visible_binding(namespace, name))
                 .collect();
-            builder.set_exports(namespace, exports);
             if self.packages.role(package) == LinkedPackageRole::Linked {
                 let index = &self.images[&package].index;
                 let kept = &namespace_ids[self.packages.name(package)].bindings;
@@ -345,11 +356,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .filter(|name| !kept.contains_key(*name))
                     .cloned()
                     .collect::<BTreeSet<_>>();
-                builder.set_removed_names(
+                linked_contents.insert(
                     namespace,
-                    removed.into_iter().collect(),
-                    unretained_exports.into_iter().collect(),
+                    (
+                        ExportTable::new(exports),
+                        unretained_exports.into_iter().collect(),
+                        removed.into_iter().collect(),
+                    ),
                 );
+            } else {
+                root_exports = ExportTable::new(exports);
             }
         }
         for (owner, dependency) in self.activation_time_dependencies(&namespace_ids) {
@@ -360,12 +376,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .insert(dependency);
             }
         }
-        for (namespace, dependencies) in &namespace_dependencies {
-            builder.set_activation_dependencies(*namespace, dependencies.iter().copied().collect());
-        }
         let linked_set = linked_namespaces.iter().copied().collect::<BTreeSet<_>>();
         let mut remaining = linked_set.clone();
-        let mut ordered_linked = Vec::new();
         while !remaining.is_empty() {
             let next = remaining
                 .iter()
@@ -387,8 +399,26 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     *remaining.iter().next().expect("remaining namespace")
                 });
             remaining.remove(&next);
-            ordered_linked.push(next);
+            let (exports, unretained_exports, stubs) = linked_contents
+                .remove(&next)
+                .expect("every Linked namespace has activation contents");
+            builder.add_activation(crate::ir::NamespaceActivationIr {
+                namespace: next,
+                on_load: on_load_bindings.get(&next).copied(),
+                exports,
+                unretained_exports,
+                stubs,
+            });
         }
+        let root = self.root.expect("root package established before analysis");
+        let root_namespace = namespace_ids[self.packages.name(root)].namespace;
+        let root_on_load = on_load_bindings.get(&root_namespace).and_then(|&binding| {
+            let closure = builder.binding_closure(binding);
+            if closure.is_none() {
+                issues.push("the Root `.onLoad` is not relocatable source, so the generated wrapper cannot call it".into());
+            }
+            closure
+        });
         for relocation in &self.pending_relocations {
             let source = pending_relocation_span(relocation);
             let SourceOrigin::InstalledBinding {
@@ -501,7 +531,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         builder.set_root_artifact(RootArtifactIr {
             description,
-            bootstrap_namespaces: ordered_linked,
+            exports: root_exports,
+            on_load: root_on_load,
         });
         (builder.finish(), issues)
     }

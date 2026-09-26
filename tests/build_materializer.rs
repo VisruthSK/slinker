@@ -97,6 +97,56 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
 }
 
 #[test]
+fn linked_on_load_outside_the_namespace_environment_still_runs() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("wrappedload");
+    write_package(
+        &dependency_source,
+        "wrappedload",
+        "",
+        "export(loaded)\n",
+        "state <- new.env(parent = emptyenv())\nstate$loaded <- FALSE\nloaded <- function() state$loaded\n.onLoad <- local(function(libname, pkgname) state$loaded <- TRUE)\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+    run_r(
+        &r_home,
+        &build_library,
+        "library(wrappedload); stopifnot(isTRUE(loaded()))",
+    );
+
+    let root_source = fixture.path().join("wraproot");
+    write_package(
+        &root_source,
+        "wraproot",
+        "Imports: wrappedload\n",
+        "importFrom(wrappedload, loaded)\nexport(check)\n",
+        "check <- function() loaded()\n",
+    );
+    let output = fixture.path().join("generated-wraproot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .args(["--output"])
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run linked build");
+    assert_success(&result, "slinker build wrapped .onLoad fixture");
+
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &output, &validation);
+    run_r(
+        &r_home,
+        &validation,
+        "library(wraproot); stopifnot(isTRUE(check()))",
+    );
+}
+
+#[test]
 fn linked_code_keeps_internal_access_to_an_external_package() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

@@ -2505,18 +2505,22 @@ fn activation_order_follows_lifecycle_dependencies_not_only_imports() {
 
     let order = plan
         .program()
-        .root_artifact()
-        .bootstrap_namespaces
+        .activations()
         .iter()
-        .map(|namespace| {
-            plan.program()
-                .package(plan.program().namespace(*namespace).package)
+        .map(|activation| {
+            let package = plan
+                .program()
+                .package(plan.program().namespace(activation.namespace).package)
                 .identity()
                 .name
-                .clone()
+                .clone();
+            (package, activation.on_load.is_some())
         })
         .collect::<Vec<_>>();
-    assert_eq!(order, ["beta", "alpha"]);
+    assert_eq!(
+        order,
+        [("beta".to_owned(), false), ("alpha".to_owned(), true)]
+    );
 }
 
 #[test]

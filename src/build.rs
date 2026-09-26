@@ -430,13 +430,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     )
     .expect("String writes cannot fail");
     let root = program.root_namespace();
-    let root_on_load = match &root.state {
-        LinkNamespaceState::Root(state) => state
-            .activation
-            .and_then(|activation| program.activation(activation).on_load.as_ref())
-            .map(|on_load| on_load.closure),
-        LinkNamespaceState::Linked(_) | LinkNamespaceState::External { .. } => None,
-    };
+    let root_on_load = program.root_artifact().on_load;
     let mut root_code = String::new();
     for closure in namespace_closures(program, root) {
         let source = relocated_source(program, program.closure(closure).code)?;
@@ -457,10 +451,9 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
 
     out.push_str("bootstrap <- function(root, libname, pkgname) {\n  .slinker_check_target()\n");
     out.push_str("  linked <- list()\n");
-    let bootstrap = &program.root_artifact().bootstrap_namespaces;
-    for namespace in bootstrap {
+    for activation in program.activations() {
         let package = program
-            .package(program.namespace(*namespace).package)
+            .package(program.namespace(activation.namespace).package)
             .identity();
         writeln!(
             out,
@@ -470,7 +463,8 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         )
         .expect("String writes cannot fail");
     }
-    for namespace in bootstrap.iter().map(|id| program.namespace(*id)) {
+    for activation in program.activations() {
+        let namespace = program.namespace(activation.namespace);
         let name = &program.package(namespace.package).identity().name;
         writeln!(
             out,
@@ -524,22 +518,24 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             writeln!(out, "    .slinker_populate(ns, {})", r_string(name))
                 .expect("String writes cannot fail");
         }
-        let LinkNamespaceState::Linked(state) = &namespace.state else {
-            unreachable!("bootstrap activates only Linked namespaces");
-        };
         writeln!(
             out,
-            "    .slinker_activate(ns, {}, {}, {})\n  }})",
+            "    .slinker_activate(ns, {}, {}, {}, {})\n  }})",
             r_vector(
-                state
+                activation
                     .exports
                     .bindings()
                     .iter()
                     .map(|binding| program.binding(*binding).name.as_str())
-                    .chain(state.unretained_exports.iter().map(String::as_str))
+                    .chain(activation.unretained_exports.iter().map(String::as_str))
             ),
             s3_matrix(program, namespace),
-            r_vector(state.removed_bindings.iter().map(String::as_str))
+            r_vector(activation.stubs.iter().map(String::as_str)),
+            if activation.on_load.is_some() {
+                "TRUE"
+            } else {
+                "FALSE"
+            }
         )
         .expect("String writes cannot fail");
     }
@@ -667,11 +663,9 @@ fn r_vector<'a>(values: impl Iterator<Item = &'a str>) -> String {
 fn render_namespace(program: &ProgramIr) -> String {
     let root = program.root_namespace();
     let mut out = String::new();
-    if let LinkNamespaceState::Root(state) = &root.state {
-        for binding in state.exports.bindings() {
-            writeln!(out, "export({})", r_string(&program.binding(*binding).name))
-                .expect("String writes cannot fail");
-        }
+    for binding in program.root_artifact().exports.bindings() {
+        writeln!(out, "export({})", r_string(&program.binding(*binding).name))
+            .expect("String writes cannot fail");
     }
     for import in &root.imports {
         let target = program.namespace(program.binding_namespace(import.target));
@@ -1055,12 +1049,10 @@ const GENERATED_RUNTIME: &str = r#"
     stop(sprintf("`%s::%s` was removed by slinker because the build never reached it", package, binding), call. = FALSE)
   }, namespace)
 }
-.slinker_activate <- function(namespace, exports, s3, removed) {
+.slinker_activate <- function(namespace, exports, s3, removed, on_load) {
   name <- unname(getNamespaceName(namespace))
   if (nrow(s3)) registerS3methods(s3, name, namespace)
-  if (exists(".onLoad", envir = namespace, inherits = FALSE)) {
-    get(".onLoad", envir = namespace, inherits = FALSE)("", name)
-  }
+  if (on_load) get(".onLoad", envir = namespace, inherits = FALSE)("", name)
   for (binding in removed[!vapply(removed, exists, logical(1), envir = namespace, inherits = FALSE)]) {
     .slinker_stub(namespace, name, binding)
   }
