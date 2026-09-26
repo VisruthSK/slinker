@@ -48,12 +48,13 @@ struct WorkerRuntime {
 }
 
 impl WorkerRuntime {
-    fn start(target: &protocol::TargetSpec) -> std::result::Result<Self, String> {
+    fn start(target: &protocol::TargetSpec) -> std::result::Result<Self, InspectionError> {
         if !target.r_home.is_dir() {
             return Err(format!(
                 "selected R home does not exist: {}",
                 target.r_home.display()
-            ));
+            )
+            .into());
         }
         sanitize_environment(&target.r_home);
         let libraries = harp::library::RLibraries::from_r_home_path(&target.r_home);
@@ -100,7 +101,8 @@ impl WorkerRuntime {
             return Err(format!(
                 "R architecture mismatch: worker expected {}, initialized {actual_arch}",
                 target.arch
-            ));
+            )
+            .into());
         }
         Ok(Self {
             worker: target.worker,
@@ -109,21 +111,21 @@ impl WorkerRuntime {
         })
     }
 
-    fn validate_syntax(&self, source: &str) -> std::result::Result<(), String> {
+    fn validate_syntax(&self, source: &str) -> std::result::Result<(), InspectionError> {
         harp::parse_exprs(source)
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(InspectionError::from)
     }
 
-    fn normalize_syntax(&self, source: &str) -> std::result::Result<String, String> {
+    fn normalize_syntax(&self, source: &str) -> std::result::Result<String, InspectionError> {
         harp::RFunction::new("", ".slinker_normalize_source")
             .add(source)
             .call()
             .and_then(String::try_from)
-            .map_err(|error| error.to_string())
+            .map_err(InspectionError::from)
     }
 
-    fn target(&self) -> std::result::Result<protocol::WorkerTarget, String> {
+    fn target(&self) -> std::result::Result<protocol::WorkerTarget, InspectionError> {
         let string = |code| {
             harp::parse_eval_base(code)
                 .and_then(String::try_from)
@@ -151,14 +153,15 @@ impl WorkerRuntime {
     fn package_index(
         &mut self,
         package: &protocol::PackageSpec,
-    ) -> std::result::Result<WorkerPackageIndex, String> {
+    ) -> std::result::Result<WorkerPackageIndex, InspectionError> {
         let key = package.root.to_string_lossy().into_owned();
         if !self._contexts.contains_key(&key) {
             if !package.root.is_dir() {
                 return Err(format!(
                     "installed package directory does not exist: {}",
                     package.root.display()
-                ));
+                )
+                .into());
             }
             let context = harp::RFunction::new("", ".slinker_package_context")
                 .add(package.root.to_string_lossy().into_owned())
@@ -200,31 +203,21 @@ impl WorkerRuntime {
     ) -> std::result::Result<protocol::WorkerBinding, WorkerOperationError> {
         let index = self
             .package_index(package)
-            .map_err(|message| WorkerOperationError {
-                code: WorkerErrorCode::PackageMetadata,
-                message,
-            })?;
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let key = package.root.to_string_lossy();
         let context = self
             ._contexts
             .get(key.as_ref())
             .expect("package context created by index request");
-        let image_environment =
-            field(&context.image, "image_env").map_err(|message| WorkerOperationError {
-                code: WorkerErrorCode::PackageMetadata,
-                message,
-            })?;
+        let image_environment = field(&context.image, "image_env")
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         if !harp::environment::Environment::new(image_environment).exists(name) {
-            return Err(WorkerOperationError {
-                code: WorkerErrorCode::MissingBinding,
-                message: format!("installed image has no binding {name}"),
-            });
+            return Err(WorkerOperationError::with(WorkerErrorCode::MissingBinding)(
+                format!("installed image has no binding {name}").into(),
+            ));
         }
         self.binding_value(package, name, index)
-            .map_err(|message| WorkerOperationError {
-                code: WorkerErrorCode::BindingForce,
-                message,
-            })
+            .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
     }
 
     fn binding_value(
@@ -232,7 +225,7 @@ impl WorkerRuntime {
         package: &protocol::PackageSpec,
         name: &str,
         index: WorkerPackageIndex,
-    ) -> std::result::Result<protocol::WorkerBinding, String> {
+    ) -> std::result::Result<protocol::WorkerBinding, InspectionError> {
         let key = package.root.to_string_lossy();
         let context = self
             ._contexts
@@ -243,16 +236,14 @@ impl WorkerRuntime {
         let environment = harp::environment::Environment::new(image_environment);
         let binding = harp::environment_iter::Binding::new(&environment, name.into())
             .map_err(|error| format!("failed to inspect binding {name}: {error}"))?;
-        let origin =
-            if Vec::<String>::try_from(&context.image.elt("sysdata_names").map_err(r_error)?)
-                .map_err(r_error)?
-                .iter()
-                .any(|candidate| candidate == name)
-            {
-                BindingOrigin::Sysdata
-            } else {
-                BindingOrigin::Code
-            };
+        let origin = if Vec::<String>::try_from(&context.image.elt("sysdata_names")?)?
+            .iter()
+            .any(|candidate| candidate == name)
+        {
+            BindingOrigin::Sysdata
+        } else {
+            BindingOrigin::Code
+        };
         let mut scanner = ObjectScanner::new(
             environment.inner.sexp,
             package.name.clone(),
@@ -265,7 +256,8 @@ impl WorkerRuntime {
             return Err(format!(
                 "installed binding identity changed while inspecting {}::{name}",
                 package.name
-            ));
+            )
+            .into());
         }
         Ok(protocol::WorkerBinding {
             package_name: package.name.clone(),
@@ -282,73 +274,95 @@ impl WorkerRuntime {
         names: &[String],
     ) -> std::result::Result<Vec<u8>, WorkerOperationError> {
         self.package_index(package)
-            .map_err(|message| WorkerOperationError {
-                code: WorkerErrorCode::PackageMetadata,
-                message,
-            })?;
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let context = self
             ._contexts
             .get(package.root.to_string_lossy().as_ref())
             .expect("package context created by index request");
-        let image_environment =
-            field(&context.image, "image_env").map_err(|message| WorkerOperationError {
-                code: WorkerErrorCode::PackageMetadata,
-                message,
-            })?;
+        let image_environment = field(&context.image, "image_env")
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         harp::RFunction::new("", ".slinker_bundle")
             .add(image_environment)
             .add(names.to_vec())
             .call()
             .and_then(|bundle| Vec::<u8>::try_from(&bundle))
-            .map_err(|error| WorkerOperationError {
-                code: WorkerErrorCode::BindingForce,
-                message: format!("failed to serialize payload bundle: {error}"),
+            .map_err(|error| {
+                WorkerOperationError::with(WorkerErrorCode::BindingForce)(
+                    format!("failed to serialize payload bundle: {error}").into(),
+                )
             })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum InspectionError {
+    #[error(transparent)]
+    R(Box<harp::Error>),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<harp::Error> for InspectionError {
+    fn from(error: harp::Error) -> Self {
+        Self::R(Box::new(error))
+    }
+}
+
+impl From<String> for InspectionError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
     }
 }
 
 #[derive(Debug)]
 struct WorkerOperationError {
     code: WorkerErrorCode,
-    message: String,
+    error: InspectionError,
 }
 
-fn r_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
+impl WorkerOperationError {
+    fn with(code: WorkerErrorCode) -> impl FnOnce(InspectionError) -> Self {
+        move |error| Self { code, error }
+    }
 }
 
 fn field(
     object: &harp::object::RObject,
     name: &str,
-) -> std::result::Result<harp::object::RObject, String> {
-    object.elt(name).map_err(r_error)
+) -> std::result::Result<harp::object::RObject, InspectionError> {
+    Ok(object.elt(name)?)
 }
 
-fn string_field(object: &harp::object::RObject, name: &str) -> std::result::Result<String, String> {
-    String::try_from(field(object, name)?).map_err(r_error)
+fn string_field(
+    object: &harp::object::RObject,
+    name: &str,
+) -> std::result::Result<String, InspectionError> {
+    Ok(String::try_from(field(object, name)?)?)
 }
 
 fn strings_field(
     object: &harp::object::RObject,
     name: &str,
-) -> std::result::Result<Vec<String>, String> {
-    Vec::<String>::try_from(field(object, name)?).map_err(r_error)
+) -> std::result::Result<Vec<String>, InspectionError> {
+    Ok(Vec::<String>::try_from(field(object, name)?)?)
 }
 
 fn list_field(
     object: &harp::object::RObject,
     name: &str,
-) -> std::result::Result<Vec<harp::object::RObject>, String> {
-    Vec::<harp::object::RObject>::try_from(field(object, name)?).map_err(r_error)
+) -> std::result::Result<Vec<harp::object::RObject>, InspectionError> {
+    Ok(Vec::<harp::object::RObject>::try_from(field(
+        object, name,
+    )?)?)
 }
 
 fn worker_package_index(
     context: &harp::object::RObject,
-) -> std::result::Result<WorkerPackageIndex, String> {
+) -> std::result::Result<WorkerPackageIndex, InspectionError> {
     let namespace = field(context, "ns_info")?;
     let image_environment = field(context, "image_env")?;
     let installed_exports = field(&namespace, "exports")?;
-    let export_bindings = Vec::<String>::try_from(&installed_exports).map_err(r_error)?;
+    let export_bindings = Vec::<String>::try_from(&installed_exports)?;
     let mut export_names = names(installed_exports.sexp);
     if export_names.len() != export_bindings.len() {
         export_names = export_bindings.clone();
@@ -363,8 +377,7 @@ fn worker_package_index(
             .param("pattern", pattern)
             .param("all.names", true)
             .call()
-            .and_then(Vec::<String>::try_from)
-            .map_err(r_error)?;
+            .and_then(Vec::<String>::try_from)?;
         exports.extend(matches.into_iter().map(|name| (name.clone(), name)));
     }
 
@@ -373,15 +386,15 @@ fn worker_package_index(
         .map(|item| {
             if harp::utils::r_typeof(item.sexp) == libr::STRSXP {
                 return Ok(ImportSpec::All {
-                    package: String::try_from(item).map_err(r_error)?,
+                    package: String::try_from(item)?,
                     except: Vec::new(),
                 });
             }
-            let values = Vec::<harp::object::RObject>::try_from(&item).map_err(r_error)?;
+            let values = Vec::<harp::object::RObject>::try_from(&item)?;
             let package = values
                 .first()
-                .ok_or_else(|| "installed import has no package".to_owned())
-                .and_then(|value| String::try_from(value).map_err(r_error))?;
+                .ok_or_else(|| InspectionError::from("installed import has no package".to_owned()))
+                .and_then(|value| Ok(String::try_from(value)?))?;
             if names(item.sexp).iter().any(|name| name == "except") {
                 return Ok(ImportSpec::All {
                     package,
@@ -391,7 +404,7 @@ fn worker_package_index(
             let remote_object = values
                 .get(1)
                 .ok_or_else(|| "installed importFrom has no bindings".to_owned())?;
-            let remote = Vec::<String>::try_from(remote_object).map_err(r_error)?;
+            let remote = Vec::<String>::try_from(remote_object)?;
             let mut local = names(remote_object.sexp);
             if local.len() != remote.len() {
                 local = remote.clone();
@@ -411,14 +424,13 @@ fn worker_package_index(
                     .collect(),
             })
         })
-        .collect::<std::result::Result<Vec<_>, String>>()?;
+        .collect::<std::result::Result<Vec<_>, InspectionError>>()?;
 
     let s3_object = field(&namespace, "S3methods")?;
-    let s3_values = Vec::<Option<String>>::try_from(s3_object.clone()).map_err(r_error)?;
+    let s3_values = Vec::<Option<String>>::try_from(s3_object.clone())?;
     let dimensions = Vec::<i32>::try_from(harp::object::RObject::from(harp::object::r_dim(
         s3_object.sexp,
-    )))
-    .map_err(r_error)?;
+    )))?;
     let dimension = |index: usize| {
         usize::try_from(dimensions.get(index).copied().unwrap_or_default()).map_err(|_| {
             format!("installed S3 registration table has invalid dimensions {dimensions:?}")
@@ -461,8 +473,7 @@ fn worker_package_index(
             let compiled = harp::RFunction::new("", ".slinker_native_library")
                 .add(root.as_str())
                 .add(name.as_str())
-                .call()
-                .map_err(r_error)?;
+                .call()?;
             let native = native_routines.elt(name.as_str()).ok();
             let registered = native
                 .as_ref()
@@ -503,7 +514,7 @@ fn worker_package_index(
                 safety: NativeSafety::Unanalyzed,
             })
         })
-        .collect::<std::result::Result<Vec<_>, String>>()?;
+        .collect::<std::result::Result<Vec<_>, InspectionError>>()?;
     Ok(WorkerPackageIndex {
         name: string_field(context, "package")?,
         version: string_field(context, "version")?,
@@ -554,7 +565,7 @@ impl ObjectScanner {
         name: &str,
         origin: BindingOrigin,
         value: harp::environment_iter::BindingValue,
-    ) -> std::result::Result<BindingImage, String> {
+    ) -> std::result::Result<BindingImage, InspectionError> {
         let (representation, object) = match value {
             harp::environment_iter::BindingValue::Active { .. } => {
                 return Ok(BindingImage {
@@ -616,7 +627,7 @@ impl ObjectScanner {
         &mut self,
         name: &str,
         value: harp::environment_iter::BindingValue,
-    ) -> std::result::Result<PrivateBindingImage, String> {
+    ) -> std::result::Result<PrivateBindingImage, InspectionError> {
         let (representation, object) = match value {
             harp::environment_iter::BindingValue::Active { .. } => {
                 return Ok(PrivateBindingImage {
@@ -695,7 +706,7 @@ impl ObjectScanner {
         path: &str,
         binding: Option<&str>,
         depth: usize,
-    ) -> std::result::Result<ObjectFacts, String> {
+    ) -> std::result::Result<ObjectFacts, InspectionError> {
         if depth > 128 {
             return Ok(ObjectFacts::issue(
                 ObjectKind::Other("depth".into()),
@@ -732,8 +743,7 @@ impl ObjectScanner {
             libr::CLOSXP => {
                 let closure_environment = harp::RFunction::new("base", "environment")
                     .add(value)
-                    .call()
-                    .map_err(r_error)?;
+                    .call()?;
                 let environment = self.environment_ref(closure_environment.sexp)?;
                 let source = self.deparse(binding, value)?.into();
                 match binding {
@@ -841,16 +851,19 @@ impl ObjectScanner {
         &self,
         binding: Option<&str>,
         value: libr::SEXP,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<String, InspectionError> {
         harp::RFunction::new("", ".slinker_deparse_binding")
             .add(binding.unwrap_or(".slinker_embedded"))
             .add(value)
             .call()
             .and_then(String::try_from)
-            .map_err(r_error)
+            .map_err(InspectionError::from)
     }
 
-    fn environment_ref(&mut self, environment: libr::SEXP) -> std::result::Result<String, String> {
+    fn environment_ref(
+        &mut self,
+        environment: libr::SEXP,
+    ) -> std::result::Result<String, InspectionError> {
         if environment == self.image_environment {
             return Ok(format!("namespace:{}", self.package));
         }
@@ -869,12 +882,12 @@ impl ObjectScanner {
         if harp::utils::r_env_is_ns_env(environment) {
             return harp::utils::r_envir_name(environment)
                 .map(|name| format!("namespace:{name}"))
-                .map_err(r_error);
+                .map_err(InspectionError::from);
         }
         if harp::utils::r_env_is_pkg_env(environment) {
             return harp::utils::r_envir_name(environment)
                 .map(|name| format!("unsupported:{name}"))
-                .map_err(r_error);
+                .map_err(InspectionError::from);
         }
         let pointer = environment;
         if let Some(id) = self.private_ids.get(&pointer) {
@@ -890,7 +903,7 @@ impl ObjectScanner {
         &mut self,
         environment: libr::SEXP,
         id: &str,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), InspectionError> {
         let pointer = environment;
         if !self.visiting.insert(pointer) || self.private_environments.contains_key(id) {
             return Ok(());
@@ -907,11 +920,11 @@ impl ObjectScanner {
         let bindings = harp::environment::Environment::view(environment)
             .iter()
             .map(|binding| {
-                let binding = binding.map_err(r_error)?;
+                let binding = binding?;
                 let name = String::from(binding.name);
                 Ok((name.clone(), self.private_binding(&name, binding.value)?))
             })
-            .collect::<std::result::Result<HashMap<_, _>, String>>()?;
+            .collect::<std::result::Result<HashMap<_, _>, InspectionError>>()?;
         self.private_environments.insert(
             id.into(),
             PrivateEnvironmentImage {
@@ -1030,7 +1043,9 @@ fn sanitize_environment(r_home: &std::path::Path) {
     }
 }
 
-fn configure_libraries(libraries: &[std::path::PathBuf]) -> std::result::Result<(), String> {
+fn configure_libraries(
+    libraries: &[std::path::PathBuf],
+) -> std::result::Result<(), InspectionError> {
     if libraries.is_empty() {
         return Ok(());
     }
@@ -1042,13 +1057,13 @@ fn configure_libraries(libraries: &[std::path::PathBuf]) -> std::result::Result<
         .add(libraries)
         .call()
         .map(|_| ())
-        .map_err(|error| format!("failed to select R library universe: {error}"))
+        .map_err(|error| format!("failed to select R library universe: {error}").into())
 }
 
-fn install_helpers() -> std::result::Result<(), String> {
+fn install_helpers() -> std::result::Result<(), InspectionError> {
     harp::parse_eval_global(include_str!("helpers.R"))
         .map(|_| ())
-        .map_err(|error| format!("failed to initialize installed-image helpers: {error}"))
+        .map_err(|error| format!("failed to initialize installed-image helpers: {error}").into())
 }
 
 pub fn run(protocol_path: &std::path::Path) -> Result<()> {
@@ -1111,18 +1126,16 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                                     target,
                                 }
                             }
-                            Err(message) => worker_failure(
+                            Err(error) => operation_failure(
                                 None,
-                                WorkerErrorCode::RuntimeStartup,
-                                message,
+                                WorkerOperationError::with(WorkerErrorCode::RuntimeStartup)(error),
                                 None,
                                 None,
                             ),
                         },
-                        Err(message) => worker_failure(
+                        Err(error) => operation_failure(
                             None,
-                            WorkerErrorCode::RuntimeStartup,
-                            message,
+                            WorkerOperationError::with(WorkerErrorCode::RuntimeStartup)(error),
                             None,
                             None,
                         ),
@@ -1140,10 +1153,10 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                         accepted: true,
                         message: None,
                     },
-                    Err(message) => WorkerResponse::SyntaxValidation {
+                    Err(error) => WorkerResponse::SyntaxValidation {
                         request_id,
                         accepted: false,
-                        message: Some(message),
+                        message: Some(error.to_string()),
                     },
                 },
                 None => worker_failure(
@@ -1157,10 +1170,9 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
             WorkerRequest::NormalizeSyntax { request_id, source } => match runtime.as_ref() {
                 Some(runtime) => match runtime.normalize_syntax(&source) {
                     Ok(source) => WorkerResponse::NormalizedSyntax { request_id, source },
-                    Err(message) => worker_failure(
+                    Err(error) => operation_failure(
                         Some(request_id),
-                        WorkerErrorCode::TargetSyntaxRejection,
-                        message,
+                        WorkerOperationError::with(WorkerErrorCode::TargetSyntaxRejection)(error),
                         None,
                         None,
                     ),
@@ -1179,10 +1191,9 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
             } => match runtime.as_mut() {
                 Some(runtime) => match runtime.package_index(&package) {
                     Ok(index) => WorkerResponse::PackageIndex { request_id, index },
-                    Err(message) => worker_failure(
+                    Err(error) => operation_failure(
                         Some(request_id),
-                        WorkerErrorCode::PackageMetadata,
-                        message,
+                        WorkerOperationError::with(WorkerErrorCode::PackageMetadata)(error),
                         Some(&package),
                         None,
                     ),
@@ -1205,13 +1216,9 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                         request_id,
                         binding,
                     },
-                    Err(error) => worker_failure(
-                        Some(request_id),
-                        error.code,
-                        error.message,
-                        Some(&package),
-                        Some(name),
-                    ),
+                    Err(error) => {
+                        operation_failure(Some(request_id), error, Some(&package), Some(name))
+                    }
                 },
                 None => worker_failure(
                     Some(request_id),
@@ -1228,13 +1235,7 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
             } => match runtime.as_mut() {
                 Some(runtime) => match runtime.serialize_bundle(&package, &names) {
                     Ok(bytes) => WorkerResponse::Payload { request_id, bytes },
-                    Err(error) => worker_failure(
-                        Some(request_id),
-                        error.code,
-                        error.message,
-                        Some(&package),
-                        None,
-                    ),
+                    Err(error) => operation_failure(Some(request_id), error, Some(&package), None),
                 },
                 None => worker_failure(
                     Some(request_id),
@@ -1250,6 +1251,21 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn operation_failure(
+    request_id: Option<u64>,
+    error: WorkerOperationError,
+    package: Option<&protocol::PackageSpec>,
+    binding: Option<String>,
+) -> WorkerResponse {
+    worker_failure(
+        request_id,
+        error.code,
+        error.error.to_string(),
+        package,
+        binding,
+    )
 }
 
 fn worker_failure(
