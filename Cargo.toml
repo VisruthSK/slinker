@@ -48,3 +48,16 @@ r-metadata = "0.3.0"
 clap = { version = "4.6.7", features = ["derive"] }
 hex = "0.4.3"
 which = "8.0.6"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "micro"
+harness = false
+required-features = ["air"]
+
+[[bench]]
+name = "end_to_end"
+harness = false
+required-features = ["air"]

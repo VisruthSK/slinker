@@ -3,13 +3,20 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheLocation {
+    Default,
+    Directory(PathBuf),
+    Disabled,
+}
 
 /// Disposable, schema-scoped analysis cache.
 #[derive(Debug)]
 pub struct Cache {
-    analysis: PathBuf,
+    analysis: Option<PathBuf>,
 }
 
 impl Cache {
@@ -17,12 +24,15 @@ impl Cache {
     ///
     /// An explicitly configured root is validated eagerly. Automatically selected caches may
     /// fall back to a process-private temporary directory.
-    pub fn new(schema: &str) -> Result<Self> {
-        let explicit = std::env::var_os("SLINKER_CACHE_DIR").map(PathBuf::from);
-        let root = explicit.clone().unwrap_or_else(default_root);
+    pub fn new(location: CacheLocation, schema: &str) -> Result<Self> {
+        let (root, explicit) = match location {
+            CacheLocation::Disabled => return Ok(Self { analysis: None }),
+            CacheLocation::Directory(root) => (root, true),
+            CacheLocation::Default => (default_root(), false),
+        };
         let analysis = root.join("analysis").join(schema);
         if let Err(source) = fs::create_dir_all(&analysis) {
-            if explicit.is_some() {
+            if explicit {
                 return Err(Error::Io {
                     path: analysis,
                     source,
@@ -36,19 +46,18 @@ impl Cache {
                 path: fallback.clone(),
                 source,
             })?;
-            return Ok(Self { analysis: fallback });
+            return Ok(Self {
+                analysis: Some(fallback),
+            });
         }
-        Ok(Self { analysis })
-    }
-
-    /// Return the schema-scoped path for an immutable cache object.
-    pub fn path(&self, name: impl AsRef<Path>) -> PathBuf {
-        self.analysis.join(name)
+        Ok(Self {
+            analysis: Some(analysis),
+        })
     }
 
     /// Read a typed cache object. Every I/O or decoding problem is a cache miss.
-    pub fn read<T: DeserializeOwned>(&self, path: &Path) -> Option<T> {
-        fs::read(path)
+    pub fn read<T: DeserializeOwned>(&self, name: &str) -> Option<T> {
+        fs::read(self.analysis.as_ref()?.join(name))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     }
@@ -56,7 +65,11 @@ impl Cache {
     /// Publish a typed object atomically without replacing an existing destination.
     ///
     /// Publication is best effort because computed semantic data never depends on the cache.
-    pub fn publish<T: Serialize>(&self, path: &Path, value: &T) {
+    pub fn publish<T: Serialize>(&self, name: &str, value: &T) {
+        let Some(analysis) = &self.analysis else {
+            return;
+        };
+        let path = &analysis.join(name);
         let Ok(bytes) = serde_json::to_vec(value) else {
             return;
         };
@@ -107,44 +120,52 @@ mod tests {
         value: usize,
     }
 
-    fn cache() -> Cache {
+    fn root() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let analysis = std::env::temp_dir().join(format!(
+        std::env::temp_dir().join(format!(
             "slinker-cache-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&analysis).expect("create test cache");
-        Cache { analysis }
+        ))
+    }
+
+    fn cache(root: PathBuf) -> Cache {
+        Cache::new(CacheLocation::Directory(root), "schema").expect("create test cache")
     }
 
     #[test]
     fn corrupt_entry_is_a_miss() {
-        let cache = cache();
-        let path = cache.path("entry");
-        fs::write(&path, b"{truncated").expect("write corrupt entry");
+        let root = root();
+        let cache = cache(root.clone());
+        fs::write(root.join("analysis/schema/entry"), b"{truncated").expect("write corrupt entry");
 
-        assert_eq!(cache.read::<Entry>(&path), None);
+        assert_eq!(cache.read::<Entry>("entry"), None);
+    }
+
+    #[test]
+    fn disabled_cache_never_returns_a_published_entry() {
+        let cache = Cache::new(CacheLocation::Disabled, "schema").expect("disabled cache");
+        cache.publish("entry", &Entry { value: 1 });
+
+        assert_eq!(cache.read::<Entry>("entry"), None);
     }
 
     #[test]
     fn concurrent_publication_keeps_one_complete_immutable_entry() {
-        let cache = Arc::new(cache());
-        let path = cache.path("entry");
+        let cache = Arc::new(cache(root()));
         let writers = (0..8)
             .map(|value| {
                 let cache = Arc::clone(&cache);
-                let path = path.clone();
-                std::thread::spawn(move || cache.publish(&path, &Entry { value }))
+                std::thread::spawn(move || cache.publish("entry", &Entry { value }))
             })
             .collect::<Vec<_>>();
         for writer in writers {
             writer.join().expect("cache writer");
         }
 
-        let winner = cache.read::<Entry>(&path).expect("complete winner");
+        let winner = cache.read::<Entry>("entry").expect("complete winner");
         assert!(winner.value < 8);
-        cache.publish(&path, &Entry { value: 99 });
-        assert_eq!(cache.read::<Entry>(&path), Some(winner));
+        cache.publish("entry", &Entry { value: 99 });
+        assert_eq!(cache.read::<Entry>("entry"), Some(winner));
     }
 }

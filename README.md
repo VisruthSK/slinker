@@ -96,6 +96,10 @@ Target capture and installed-image work run in isolated Rust worker processes. E
 
 Air parsing uses one reusable Rayon pool. Independent reachable closures are parsed in parallel. Oak then supplies semantic scope/evaluation information for those parsed closures; linker-specific package/resource recognition consumes only semantically live sites.
 
+The construction interpreter evaluates an installed closure at most once per requesting node, callee, and named argument values; `LinkIr::construction_evaluations` reports how many bodies it evaluated.
+
+`cargo bench --bench micro` runs criterion microbenchmarks: Air and Oak on large closures, the construction interpreter on rlang-style closures, installed-image location and fingerprinting, the uncached installed index read, and the index cache hit. `cargo bench --bench end_to_end` analyzes rlang, cli, and testthat with the cache disabled and warm, and builds voucher and rebus.numbers with a fresh cache, printing wall time next to the retained binding count and construction evaluations so a timing change can be checked against its workload. Both need R and the analyzed packages installed; the build benchmark provisions its sources and dependencies from CRAN. CI runs them sequentially in their own job without thresholds.
+
 
 ## Metadata and semantic dependencies
 

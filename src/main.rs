@@ -12,6 +12,7 @@ use slinker::analysis::{
     NodeKind,
 };
 use slinker::build::{BuildContext, PureRStatic, materialize};
+use slinker::cache::CacheLocation;
 use slinker::package::PackageStore;
 use slinker::source::{SourcePackageSnapshot, stage_root};
 use slinker::{TargetEnvironment, TargetEnvironmentRequest};
@@ -177,6 +178,12 @@ impl UniverseArgs {
     }
 }
 
+fn cache_location() -> CacheLocation {
+    env::var_os("SLINKER_CACHE_DIR").map_or(CacheLocation::Default, |root| {
+        CacheLocation::Directory(PathBuf::from(root))
+    })
+}
+
 fn absolute_libraries(universe: &UniverseArgs) -> io::Result<Vec<PathBuf>> {
     universe
         .libraries
@@ -191,7 +198,7 @@ fn link(args: &AnalysisArgs) -> Result<(TargetEnvironment, LinkIr), Box<dyn Erro
     target_request.libraries = absolute_libraries(&args.universe)?;
     let target = target_request.capture()?;
 
-    let store = PackageStore::new(r_home, target.clone())?;
+    let store = PackageStore::new(r_home, target.clone(), cache_location())?;
     let plan = Linker::new(store, args.universe.jobs.get())
         .with_external_packages(args.universe.external.iter().cloned())
         .with_policy(args.universe.policy())
@@ -217,7 +224,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
         .chain(libraries)
         .collect();
     let target = target_request.capture()?;
-    let store = PackageStore::new(r_home.clone(), target.clone())?;
+    let store = PackageStore::new(r_home.clone(), target.clone(), cache_location())?;
     let ir = Linker::new(store, args.universe.jobs.get())
         .with_external_packages(args.universe.external.iter().cloned())
         .with_policy(args.universe.policy())

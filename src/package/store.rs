@@ -1,4 +1,4 @@
-use crate::cache::Cache;
+use crate::cache::{Cache, CacheLocation};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
     InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
@@ -225,7 +225,7 @@ pub struct PackageStore {
 }
 
 impl PackageStore {
-    pub fn new(r_home: PathBuf, target: TargetEnvironment) -> Result<Self> {
+    pub fn new(r_home: PathBuf, target: TargetEnvironment, cache: CacheLocation) -> Result<Self> {
         let target_fingerprint = fingerprint_strings(
             std::iter::once(target.r_home.to_string_lossy().into_owned())
                 .chain(std::iter::once(format!(
@@ -244,7 +244,7 @@ impl PackageStore {
             locator: PackageLocator::new(target),
             indexes: HashMap::new(),
             bindings: HashMap::new(),
-            cache: Cache::new(ANALYSIS_SCHEMA)?,
+            cache: Cache::new(cache, ANALYSIS_SCHEMA)?,
             r_home,
             target_fingerprint,
             worker: None,
@@ -327,21 +327,21 @@ impl PackageStore {
         .0
     }
 
-    fn index_cache_path(&self, identity: &PackageIdentity) -> PathBuf {
-        self.cache.path(format!(
+    fn index_cache_name(&self, identity: &PackageIdentity) -> String {
+        format!(
             "{}-{}.index.slinker",
             identity.name,
             self.cache_key(identity)
-        ))
+        )
     }
 
-    fn binding_cache_path(&self, identity: &PackageIdentity, binding: &str) -> PathBuf {
+    fn binding_cache_name(&self, identity: &PackageIdentity, binding: &str) -> String {
         let binding = fingerprint_strings([binding]).0;
-        self.cache.path(format!(
+        format!(
             "{}-{}-{binding}.binding.slinker",
             identity.name,
             self.cache_key(identity)
-        ))
+        )
     }
 
     fn worker(&mut self) -> Result<&mut WorkerClient> {
@@ -355,7 +355,7 @@ impl PackageStore {
     fn load_cached_index(&self, package: &InstalledPackage) -> Option<Arc<PackageIndex>> {
         let cached = self
             .cache
-            .read::<CachedIndex>(&self.index_cache_path(&package.identity))
+            .read::<CachedIndex>(&self.index_cache_name(&package.identity))
             .filter(|entry| {
                 entry.schema == ANALYSIS_SCHEMA
                     && entry.target == self.target_fingerprint
@@ -371,7 +371,7 @@ impl PackageStore {
     ) -> Result<Option<Arc<PackageImage>>> {
         let Some(cached) = self
             .cache
-            .read::<CachedBinding>(&self.binding_cache_path(&package.identity, binding))
+            .read::<CachedBinding>(&self.binding_cache_name(&package.identity, binding))
             .filter(|entry| {
                 entry.schema == ANALYSIS_SCHEMA
                     && entry.target == self.target_fingerprint
@@ -437,7 +437,7 @@ impl PackageProvider for PackageStore {
                     index: worker,
                 };
                 self.cache
-                    .publish(&self.index_cache_path(&package.identity), &cached);
+                    .publish(&self.index_cache_name(&package.identity), &cached);
                 index
             }
         };
@@ -469,7 +469,7 @@ impl PackageProvider for PackageStore {
                         binding: binding.clone(),
                     };
                     self.cache
-                        .publish(&self.binding_cache_path(&package.identity, name), &cached);
+                        .publish(&self.binding_cache_name(&package.identity, name), &cached);
                 }
                 Self::package_image(&package.identity, index, binding)?
             }

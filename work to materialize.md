@@ -77,7 +77,7 @@ acceptance cases here.
 
 ## Next up
 
-1. Track C: benchmarks, then the type and cleanup items.
+1. Track C: the type and cleanup items.
 2. Track A.
 3. Track B.
 
@@ -180,19 +180,15 @@ that fails before its fix.
 ## Track C: Rust cleanup, types, and performance
 
 Why: about 23k lines of Rust carry invariants in comments, strings, and `unreachable!`; parts of the
-IR exist only for show; finalization reads the provenance graph; and analysis speed has no
-measurement.
+IR exist only for show; and finalization reads the provenance graph.
 
 Performance:
-- Benchmarks, run in CI and reported, with no fixed thresholds:
-  - criterion microbenchmarks: Air parse plus Oak semantics of a large closure, the construction
-    interpreter on rlang-style closures, installed index read, cache hit path, image fingerprinting;
-  - end-to-end benchmarks (criterion with small samples, or a `harness = false` bench): `analyze`
-    of rlang, cli, and testthat cold and warm, and `build` of voucher and a corpus package.
-- Profile before optimizing. Known candidates: one JSON worker round trip per binding (batch per
-  package), two `normalize_syntax` calls per parsed closure (merge into one), a single R worker
-  (several worker processes can inspect different packages in parallel), and string-keyed maps in
-  the analyzer (interning).
+- Profile with `cargo bench` before optimizing. Measured: Air plus Oak grows about quadratically
+  with closure size (400 statements 346 ms, 1000 statements 2.1 s), and warm rlang analysis still
+  takes 21 s of its 32 s cold time. Unmeasured candidates: one JSON worker round trip per binding
+  (batch per package), two `normalize_syntax` calls per parsed closure (merge into one), a single
+  R worker (several worker processes can inspect different packages in parallel), and string-keyed
+  maps in the analyzer (interning).
 
 Invariants into types:
 - Names: about 54 `String` fields and 87 string collections hold package, binding, class, and
