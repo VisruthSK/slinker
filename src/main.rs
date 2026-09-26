@@ -450,10 +450,7 @@ fn edge_location(plan: &LinkIr, edge: &Edge) -> String {
     let Some(span) = &edge.span else {
         return String::new();
     };
-    let source = plan
-        .sources()
-        .display(&span.source)
-        .unwrap_or_else(|| format!("source#{}", span.source.0));
+    let source = plan.sources().display(&span.source);
     format!(" @ {source}:{}..{}", span.start, span.end)
 }
 

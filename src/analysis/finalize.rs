@@ -10,7 +10,7 @@ use crate::ir::{
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{ImportSpec, PackageAvailability, PackageId, PackageProvider};
 use crate::source::generated_description;
-use crate::syntax::{SourceOrigin, Sources};
+use crate::syntax::Sources;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -403,17 +403,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         });
         for relocation in &self.pending_relocations {
             let source = relocation.source();
-            let SourceOrigin::InstalledBinding {
-                package: owner_package,
-                binding: owner_binding,
-            } = &self
-                .sources
-                .get(&source.source)
-                .expect("relocation spans come from registered sources")
-                .origin
-            else {
-                unreachable!("relocations are planned only inside installed bindings");
-            };
+            let origin = self.sources.origin(&source.source);
+            let (owner_package, owner_binding) = (&origin.package, &origin.binding);
             let Some(code) = namespace_ids[owner_package.as_str()]
                 .bindings
                 .get(owner_binding)

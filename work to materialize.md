@@ -193,8 +193,6 @@ Invariants into types:
 - Names: about 54 `String` fields and 87 string collections hold package, binding, class, and
   generic names. Intern them at the worker boundary into typed symbols (`PackageName`,
   `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
-- Finalization recovers a relocation's owning binding from the source map behind `unreachable!`;
-  `PendingRelocation` should carry its owner (including private-closure source keys) as a type.
 - Removed bindings and unretained exports become typed slot state instead of parallel string lists.
 
 Structure:

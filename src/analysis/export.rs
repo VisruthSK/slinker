@@ -2,7 +2,7 @@ use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::analysis::diagnostic::RejectCode;
 use crate::analysis::graph::{Edge, EdgeKind, Node, NodeKind};
-use crate::syntax::{SourceOrigin, Sources, Span};
+use crate::syntax::{Sources, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -438,14 +438,11 @@ pub(crate) fn root_reason(kind: &NodeKind) -> Option<GraphEdgeReasonExport> {
 pub(crate) fn stable_source(sources: &Sources, span: Option<&Span>) -> Option<GraphSourceExport> {
     let span = span?;
     let source = sources.get(&span.source)?;
-    match &source.origin {
-        SourceOrigin::InstalledBinding { package, binding } => Some(GraphSourceExport {
-            owner: format!("{package}::{binding}"),
-            start: span.start,
-            end: span.end,
-        }),
-        SourceOrigin::File(_) => None,
-    }
+    Some(GraphSourceExport {
+        owner: source.origin.display(),
+        start: span.start,
+        end: span.end,
+    })
 }
 
 fn reject_code_name(code: RejectCode) -> &'static str {
