@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
     pub r_home: PathBuf,
     pub arch: String,
+    pub worker: u64,
     #[serde(default)]
     pub libraries: Vec<PathBuf>,
 }

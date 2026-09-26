@@ -77,6 +77,7 @@ impl WorkerProbe {
                     "x86" => "i386".into(),
                     arch => arch.into(),
                 },
+                worker: 1,
                 libraries,
             },
         })?;

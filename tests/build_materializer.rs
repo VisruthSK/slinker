@@ -147,6 +147,38 @@ fn linked_on_load_outside_the_namespace_environment_still_runs() {
 }
 
 #[test]
+fn graph_export_is_identical_across_runs() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let source = fixture.path().join("privategraph");
+    write_package(
+        &source,
+        "privategraph",
+        "",
+        "export(count)\n",
+        "counter <- local({\n  n <- 0\n  helper <- function() n + 1\n  function() helper()\n})\ncount <- function() counter()\n",
+    );
+    let library = fixture.path().join("library");
+    fs::create_dir(&library).expect("library");
+    install_package(&r_home, &source, &library);
+    let graph = |run: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
+            .args(["analyze", "privategraph", "--graph", "--lib"])
+            .arg(&library)
+            .env("SLINKER_CACHE_DIR", fixture.path().join(run))
+            .output()
+            .expect("run slinker analyze");
+        assert_success(&output, "slinker analyze --graph");
+        output.stdout
+    };
+    let first = graph("first");
+    let second = graph("second");
+
+    assert!(String::from_utf8_lossy(&first).contains("private:"));
+    assert!(first == second, "--graph output differs between runs");
+}
+
+#[test]
 fn linked_code_keeps_internal_access_to_an_external_package() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

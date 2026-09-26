@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempPath;
 
 pub(crate) struct WorkerClient {
@@ -81,6 +82,7 @@ impl WorkerClient {
             target: TargetSpec {
                 r_home,
                 arch: worker_arch().into(),
+                worker: next_worker(),
                 libraries,
             },
         })?;
@@ -301,6 +303,11 @@ impl Drop for WorkerClient {
         let _ = self.input.flush();
         let _ = self.child.wait();
     }
+}
+
+fn next_worker() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 fn protocol_file() -> Result<(File, TempPath)> {
