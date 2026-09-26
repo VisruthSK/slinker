@@ -10,6 +10,7 @@ mod native;
 pub mod need;
 mod object_world;
 pub mod policy;
+mod relocation;
 mod resolution;
 mod s3;
 mod state;

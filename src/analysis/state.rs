@@ -5,14 +5,15 @@ use super::arguments::{
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
 use super::namespace::NamespaceBuilder;
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
+use super::relocation::{NamespaceCall, PendingRelocation};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
 use super::s3::{CallableId, Invocation, S3Generic, S3GenericKey, callable_target};
 use crate::analysis::policy::{DiscoveryPolicy, LinkPolicy};
 use crate::analysis::{
     Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode, S3Id,
 };
-use crate::build::{PackageOperation, PendingRelocation};
 use crate::ir::ExternalBindingAccess;
+use crate::ir::NamespaceOperation;
 use crate::metadata::{RelationField, relations};
 use crate::package::{
     BindingImage, BindingRepresentation, ClosureSource, Digest, ImportSpec, NativeSafety,
@@ -2430,20 +2431,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(call.span.clone()),
                 );
             }
-            "requireNamespace" => self.namespace_operation(
-                from,
-                current,
-                binding,
-                call,
-                PackageOperation::RequireNamespace { result: true },
-            )?,
+            "requireNamespace" => {
+                self.namespace_operation(from, current, binding, call, NamespaceCall::Require)?
+            }
             "loadNamespace" => {
                 self.namespace_operation(
                     from,
                     current,
                     binding,
                     call,
-                    PackageOperation::LoadNamespace,
+                    NamespaceCall::Operation(NamespaceOperation::Load),
                 )?;
             }
             "getNamespace" => {
@@ -2452,7 +2449,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     current,
                     binding,
                     call,
-                    PackageOperation::GetNamespace,
+                    NamespaceCall::Operation(NamespaceOperation::Get),
                 )?;
             }
             "asNamespace" => {
@@ -2461,7 +2458,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     current,
                     binding,
                     call,
-                    PackageOperation::AsNamespace,
+                    NamespaceCall::Operation(NamespaceOperation::As),
                 )?;
             }
             "getNamespaceImports" | "getNamespaceInfo" => {
@@ -2524,7 +2521,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         current: PackageId,
         binding: &str,
         call: &CallSite,
-        operation: PackageOperation,
+        operation: NamespaceCall,
     ) -> Result<()> {
         let name = static_string_arg(call).map(Cow::Borrowed).or_else(|| {
             self.contextual_namespace_calls
@@ -2553,12 +2550,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let suggested = self.package_is_suggested_only(current, &name)?;
         let discovery_policy = if self.optional_package_selected(&name) {
             DiscoveryPolicy::Internalize
-        } else if suggested && matches!(operation, PackageOperation::RequireNamespace { .. }) {
+        } else if suggested && operation == NamespaceCall::Require {
             self.pending_relocations
-                .push(PendingRelocation::PackageOperation {
+                .push(PendingRelocation::RequireNamespace {
                     source: call.span.clone(),
-                    package: None,
-                    operation: PackageOperation::RequireNamespace { result: false },
+                    result: false,
                 });
             return Ok(());
         } else if suggested {
@@ -2590,12 +2586,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     format!("`{name}` is installed but is not configured External"),
                     Some(call.span.clone()),
                 ),
-                None if matches!(operation, PackageOperation::RequireNamespace { .. }) => {
+                None if operation == NamespaceCall::Require => {
                     self.pending_relocations
-                        .push(PendingRelocation::PackageOperation {
+                        .push(PendingRelocation::RequireNamespace {
                             source: call.span.clone(),
-                            package: None,
-                            operation: PackageOperation::RequireNamespace { result: false },
+                            result: false,
                         });
                 }
                 None => self.record_missing_package(
@@ -2619,21 +2614,25 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         format!("specialized {} requires `{name}`", call.callee),
                         Some(call.span.clone()),
                     );
-                    self.pending_relocations
-                        .push(PendingRelocation::PackageOperation {
+                    self.pending_relocations.push(match operation {
+                        NamespaceCall::Require => PendingRelocation::RequireNamespace {
                             source: call.span.clone(),
-                            package: Some(foreign),
+                            result: true,
+                        },
+                        NamespaceCall::Operation(operation) => PendingRelocation::NamespaceLoad {
+                            source: call.span.clone(),
+                            package: foreign,
                             operation,
-                        });
+                        },
+                    });
                 }
-                None if matches!(operation, PackageOperation::RequireNamespace { .. })
+                None if operation == NamespaceCall::Require
                     && !self.optional_package_selected(&name) =>
                 {
                     self.pending_relocations
-                        .push(PendingRelocation::PackageOperation {
+                        .push(PendingRelocation::RequireNamespace {
                             source: call.span.clone(),
-                            package: None,
-                            operation: PackageOperation::RequireNamespace { result: false },
+                            result: false,
                         });
                 }
                 None => self.record_missing_package(
@@ -2746,12 +2745,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 ),
                 Some(foreign) => {
                     self.pending_relocations
-                        .push(PendingRelocation::PackageOperation {
+                        .push(PendingRelocation::PackageVersion {
                             source: call.span.clone(),
-                            package: Some(foreign),
-                            operation: PackageOperation::PackageVersion {
-                                version: self.packages.identity(foreign).version.to_string(),
-                            },
+                            version: self.packages.identity(foreign).version.to_string(),
                         });
                 }
                 None => self.record_missing_package(

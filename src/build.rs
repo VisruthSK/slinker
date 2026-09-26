@@ -3,11 +3,10 @@ use crate::analysis::LinkIr;
 use crate::ir::{
     LinkBindingState, LinkNamespaceState, ProgramIr, RelocationTarget, ResourceId, Value,
 };
-use crate::package::{BindingName, PackageId};
+use crate::package::PackageId;
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::PackageSpec;
 use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
-use crate::syntax::Span;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -15,35 +14,6 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use thiserror::Error;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PackageOperation {
-    RequireNamespace { result: bool },
-    LoadNamespace,
-    GetNamespace,
-    AsNamespace,
-    PackageVersion { version: String },
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum PendingRelocation {
-    NamespaceAccess {
-        source: Span,
-        package: PackageId,
-        binding: BindingName,
-        internal: bool,
-    },
-    ResourceAccess {
-        source: Span,
-        package: PackageId,
-        resource: String,
-    },
-    PackageOperation {
-        source: Span,
-        package: Option<PackageId>,
-        operation: PackageOperation,
-    },
-}
 
 /// Selected target-R physical handle available to staging and materialization.
 #[derive(Debug)]

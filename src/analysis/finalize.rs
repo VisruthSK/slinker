@@ -1,10 +1,10 @@
+use super::relocation::PendingRelocation;
 use super::state::AnalyzerState;
 use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
-use crate::build::{PackageOperation, PendingRelocation};
 use crate::ir::{
     ExportTable, ExternalBindingAccess, ExternalPackageContract, InvalidRelocation,
-    MaterializedRole, MaterializedSlot, MaterializedSlotSource, NamespaceOperation, PackageIr,
+    MaterializedRole, MaterializedSlot, MaterializedSlotSource, PackageIr,
     PackageRole as LinkedPackageRole, ProgramIr, RelocationTarget, RootArtifactIr, TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
@@ -405,7 +405,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             closure
         });
         for relocation in &self.pending_relocations {
-            let source = pending_relocation_span(relocation);
+            let source = relocation.source();
             let SourceOrigin::InstalledBinding {
                 package: owner_package,
                 binding: owner_binding,
@@ -422,7 +422,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .get(owner_binding)
                 .and_then(|binding| builder.binding_code(*binding))
             else {
-                if reaches_removed_installation(relocation) {
+                if relocation.reaches_removed_installation() {
                     issues.push(FinalizationIssue::NonRelocatableCode {
                         package: owner_package.clone(),
                         binding: owner_binding.clone(),
@@ -464,30 +464,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         target: resource_id,
                     }
                 }
-                PendingRelocation::PackageOperation {
+                PendingRelocation::RequireNamespace { result, .. } => {
+                    RelocationTarget::RequireNamespace { result: *result }
+                }
+                PendingRelocation::NamespaceLoad {
                     package, operation, ..
-                } => {
-                    let namespace = |operation| {
-                        package.map(|package| RelocationTarget::Namespace { package, operation })
-                    };
-                    let target = match operation {
-                        PackageOperation::RequireNamespace { result } => {
-                            Some(RelocationTarget::RequireNamespace { result: *result })
-                        }
-                        PackageOperation::LoadNamespace => namespace(NamespaceOperation::Load),
-                        PackageOperation::GetNamespace => namespace(NamespaceOperation::Get),
-                        PackageOperation::AsNamespace => namespace(NamespaceOperation::As),
-                        PackageOperation::PackageVersion { version } => {
-                            Some(RelocationTarget::PackageVersion {
-                                version: version.clone(),
-                            })
-                        }
-                    };
-                    let Some(target) = target else {
-                        issues.push(FinalizationIssue::UnresolvedNamespaceOperation);
-                        continue;
-                    };
-                    target
+                } => RelocationTarget::Namespace {
+                    package: *package,
+                    operation: *operation,
+                },
+                PendingRelocation::PackageVersion { version, .. } => {
+                    RelocationTarget::PackageVersion {
+                        version: version.clone(),
+                    }
                 }
             };
             if let Err(invalid) = builder.relocate(code, source.start, source.end, target) {
@@ -714,7 +703,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let pending_relocations = self
             .pending_relocations
             .iter()
-            .map(pending_relocation_span)
+            .map(PendingRelocation::source)
             .cloned()
             .collect::<Vec<_>>();
         for observation in self.observations.clone() {
@@ -773,24 +762,6 @@ impl LinkIr {
     }
 }
 
-fn reaches_removed_installation(relocation: &PendingRelocation) -> bool {
-    match relocation {
-        PendingRelocation::NamespaceAccess { .. } => false,
-        PendingRelocation::ResourceAccess { .. } => true,
-        PendingRelocation::PackageOperation { operation, .. } => {
-            matches!(operation, PackageOperation::PackageVersion { .. })
-        }
-    }
-}
-
-pub(super) fn pending_relocation_span(rewrite: &PendingRelocation) -> &Span {
-    match rewrite {
-        PendingRelocation::NamespaceAccess { source, .. }
-        | PendingRelocation::ResourceAccess { source, .. }
-        | PendingRelocation::PackageOperation { source, .. } => source,
-    }
-}
-
 pub(super) fn spans_overlap(left: &Span, right: &Span) -> bool {
     left.source == right.source && left.start < right.end && right.start < left.end
 }
@@ -820,7 +791,6 @@ pub(super) enum FinalizationIssue {
         identity: crate::package::PackageIdentity,
         requirement: Relation,
     },
-    UnresolvedNamespaceOperation,
     InvalidRelocation(InvalidRelocation),
     Description(String),
 }
@@ -859,9 +829,6 @@ impl std::fmt::Display for FinalizationIssue {
                 f,
                 "External package `{package}` has no declared DESCRIPTION requirement in the retained program"
             ),
-            Self::UnresolvedNamespaceOperation => {
-                f.write_str("a namespace-loading relocation has no resolved package")
-            }
             Self::InvalidRelocation(invalid) => invalid.fmt(f),
             Self::UnsatisfiedRequirement {
                 identity,
