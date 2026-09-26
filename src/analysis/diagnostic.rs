@@ -19,6 +19,7 @@ pub enum RejectCode {
     LifecycleHook,
     MissingDependency,
     MissingResource,
+    NativeLoadFailure,
     ObjectSystem,
     PackageAttachmentUnsupported,
     SemanticAmbiguity,

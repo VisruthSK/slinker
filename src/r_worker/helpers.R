@@ -85,25 +85,25 @@
     collapse = "/"
   )
   interfaces <- c(c = ".C", call = ".Call", fortran = ".Fortran", external = ".External")
-  unregistered <- lapply(interfaces, function(interface) character())
   if (!file.exists(file.path(root, library))) {
-    return(list(library = character(), routines = unregistered, force_symbols = NA))
+    return(list(library = character()))
   }
-  loaded <- tryCatch(
+  tryCatch(
     {
       dll <- dyn.load(file.path(root, library), local = TRUE)
       registered <- getDLLRegisteredRoutines(dll)
       list(
+        library = library,
         routines = lapply(interfaces, function(interface) {
           sort(unique(as.character(names(registered[[interface]]))))
         }),
-        force_symbols = if (is.logical(unclass(dll)$forceSymbols)) unclass(dll)$forceSymbols else NA
+        force_symbols = isTRUE(unclass(dll)$forceSymbols)
       )
     },
-    error = function(error) list(routines = unregistered, force_symbols = NA)
+    error = function(error) list(library = library, error = conditionMessage(error))
   )
-  c(list(library = library), loaded)
 }
+
 
 .slinker_deparse_binding <- function(name, value) {
   rhs <- paste(

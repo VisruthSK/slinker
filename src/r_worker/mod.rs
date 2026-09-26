@@ -9,7 +9,7 @@ pub mod protocol;
 use crate::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClassName, ClosureSource,
     EmbeddedClosureSource, EmbeddedEnvironmentRef, ExportMap, ImportBinding, ImportSpec,
-    NameLookup, NativeComponent, NativeRegistration, NativeRoutines, NativeSafety,
+    NameLookup, NativeComponent, NativeLibrary, NativeRegistration, NativeRoutines, NativeSafety,
     NativeSymbolBinding, ObjectIssue, ObjectKind, PackageName, PrivateBindingImage,
     PrivateEnvironmentImage, S3Registration,
 };
@@ -673,21 +673,7 @@ fn worker_package_index(
                     .zip(symbols)
                     .map(|(binding, symbol)| NativeSymbolBinding { binding, symbol })
                     .collect(),
-                routines: {
-                    let routines = field(&compiled, "routines")?;
-                    NativeRoutines {
-                        c: strings_field(&routines, "c")?,
-                        call: strings_field(&routines, "call")?,
-                        fortran: strings_field(&routines, "fortran")?,
-                        external: strings_field(&routines, "external")?,
-                    }
-                },
-                name_lookup: match bool::try_from(field(&compiled, "force_symbols")?) {
-                    Ok(true) => NameLookup::Forced,
-                    Ok(false) => NameLookup::Allowed,
-                    Err(_) => NameLookup::Unknown,
-                },
-                library: strings_field(&compiled, "library")?.into_iter().next(),
+                library: native_library(&compiled)?,
                 safety: NativeSafety::Unanalyzed,
             })
         })
@@ -706,6 +692,35 @@ fn worker_package_index(
         binding_names: strings_field(context, "binding_names")?,
         datasets: strings_field(context, "dataset_names")?,
         has_sysdata: !strings_field(context, "sysdata_names")?.is_empty(),
+    })
+}
+
+fn native_library(
+    compiled: &harp::object::RObject,
+) -> std::result::Result<NativeLibrary, InspectionError> {
+    let Some(library) = strings_field(compiled, "library")?.into_iter().next() else {
+        return Ok(NativeLibrary::Missing);
+    };
+    if names(compiled.sexp).iter().any(|name| name == "error") {
+        return Ok(NativeLibrary::Unloadable {
+            library,
+            error: string_field(compiled, "error")?,
+        });
+    }
+    let routines = field(compiled, "routines")?;
+    Ok(NativeLibrary::Loaded {
+        library,
+        routines: NativeRoutines {
+            c: strings_field(&routines, "c")?,
+            call: strings_field(&routines, "call")?,
+            fortran: strings_field(&routines, "fortran")?,
+            external: strings_field(&routines, "external")?,
+        },
+        name_lookup: if bool::try_from(field(compiled, "force_symbols")?)? {
+            NameLookup::Forced
+        } else {
+            NameLookup::Allowed
+        },
     })
 }
 

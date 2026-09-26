@@ -480,7 +480,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             r_string(package.registered_namespace().as_str())
         );
         for native in &activation.native_components {
-            let Some(library) = &native.library else {
+            let Some(library) = native.library.path() else {
                 continue;
             };
             let symbols = native

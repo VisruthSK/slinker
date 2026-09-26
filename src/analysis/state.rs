@@ -20,7 +20,7 @@ use crate::ir::NamespaceOperation;
 use crate::metadata::{RelationField, relations};
 use crate::package::{
     BindingImage, BindingName, BindingRepresentation, ClosureSource, ComponentName, Digest,
-    ImportSpec, NativeSafety, ObjectKind, PackageId, PackageImage, PackageProvider,
+    ImportSpec, NativeLibrary, NativeSafety, ObjectKind, PackageId, PackageImage, PackageProvider,
     PrivateBindingImage, ResourcePath, SyntaxValidation, TargetUniverse,
 };
 use crate::syntax::{
@@ -1804,13 +1804,23 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .iter()
             .find(|native| *component == native.name)
         {
+            if let NativeLibrary::Unloadable { error, .. } = &native.library {
+                self.diagnostic(
+                    node,
+                    id,
+                    None,
+                    RejectCode::NativeLoadFailure,
+                    format!("native component `{component}` failed to load in the worker, so its registered routines are unknown: {error}"),
+                    None,
+                );
+            }
             if !self.is_root(id) {
-                match &native.library {
+                match native.library.path() {
                     Some(library) => self.require(
                         node,
                         Need::Resource {
                             package: id,
-                            resource: library.clone().into(),
+                            resource: library.to_owned().into(),
                         },
                         EdgeKind::Native,
                         format!("native component `{component}` ships its compiled library"),
@@ -1825,6 +1835,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     ),
                 }
             }
+
             match &native.safety {
                 NativeSafety::Unanalyzed => {
                     let identity = self.packages.identity(id);

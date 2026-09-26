@@ -154,8 +154,6 @@ Minimal code:
 - Value provenance for reflection: `asNamespace(ns)$.__NAMESPACE__.$exports` reads the export table.
 - Default-argument specialization: a formal defaulting to a constant that no caller passes is
   static (voucher's `system.file(..., package = package)`).
-- Native: audited summaries make a component sound; a library whose init fails in the worker is a
-  blocker instead of missing routine names.
 - Declarations, exact domains in both modes, each with parser and analysis tests:
   - `strings("a", "b")` for a binding used as a name in `get`/`exists`/`match.fun`/`do.call`, as a
     package in `asNamespace`/`requireNamespace`/`system.file`, or as a generic in `UseMethod`;

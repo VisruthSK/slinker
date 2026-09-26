@@ -806,6 +806,69 @@ fn name_addressed_queries_answer_for_the_linked_copy() {
 }
 
 #[test]
+fn linked_native_library_whose_init_fails_in_the_worker_blocks() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let provider_source = fixture.path().join("ccprov");
+    write_package(&provider_source, "ccprov", "", "useDynLib(ccprov)\n", "");
+    fs::create_dir_all(provider_source.join("src")).expect("src directory");
+    fs::write(
+        provider_source.join("src/ccprov.c"),
+        "#include <R.h>\n#include <Rinternals.h>\n#include <R_ext/Rdynload.h>\nstatic int ccprov_value(void) { return 7; }\nvoid R_init_ccprov(DllInfo *dll) { R_RegisterCCallable(\"ccprov\", \"ccprov_value\", (DL_FUNC) &ccprov_value); }\n",
+    )
+    .expect("provider C source");
+    let linked_source = fixture.path().join("ccuse");
+    write_package(
+        &linked_source,
+        "ccuse",
+        "Imports: ccprov\n",
+        "import(ccprov)\nuseDynLib(ccuse, .registration = TRUE, .fixes = \"C_\")\nexport(tick)\n",
+        "tick <- function() .Call(C_ccuse_tick)\n",
+    );
+    fs::create_dir_all(linked_source.join("src")).expect("src directory");
+    fs::write(
+        linked_source.join("src/ccuse.c"),
+        "#include <R.h>\n#include <Rinternals.h>\n#include <R_ext/Rdynload.h>\nstatic int (*value)(void) = NULL;\nSEXP ccuse_tick(void) { return Rf_ScalarInteger(value()); }\nstatic const R_CallMethodDef calls[] = {{\"ccuse_tick\", (DL_FUNC) &ccuse_tick, 0}, {NULL, NULL, 0}};\nvoid R_init_ccuse(DllInfo *dll) { R_registerRoutines(dll, NULL, calls, NULL, NULL); value = (int (*)(void)) R_GetCCallable(\"ccprov\", \"ccprov_value\"); }\n",
+    )
+    .expect("consumer C source");
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &provider_source, &build_library);
+    install_package(&r_home, &linked_source, &build_library);
+    run_r(
+        &r_home,
+        &build_library,
+        "stopifnot(identical(ccuse::tick(), 7L))",
+    );
+
+    let root_source = fixture.path().join("ccroot");
+    write_package(
+        &root_source,
+        "ccroot",
+        "Imports: ccuse\n",
+        "importFrom(ccuse, tick)\nexport(check)\n",
+        "check <- function() tick()\n",
+    );
+    let output = fixture.path().join("generated-ccroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run failing-init build");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("native component `ccuse` failed to load in the worker")
+            && stderr.contains("function 'ccprov_value' not provided by package 'ccprov'"),
+        "{stderr}"
+    );
+    assert!(!output.exists());
+}
+
+#[test]
 fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

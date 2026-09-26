@@ -316,6 +316,7 @@ fn reject_code_name(code: RejectCode) -> &'static str {
         RejectCode::LifecycleHook => "lifecycle_hook",
         RejectCode::MissingDependency => "missing_dependency",
         RejectCode::MissingResource => "missing_resource",
+        RejectCode::NativeLoadFailure => "native_load_failure",
         RejectCode::ObjectSystem => "object_system",
         RejectCode::PackageAttachmentUnsupported => "package_attachment_unsupported",
         RejectCode::SemanticAmbiguity => "semantic_ambiguity",

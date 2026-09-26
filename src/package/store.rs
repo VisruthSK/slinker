@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-analysis-v7";
+const ANALYSIS_SCHEMA: &str = "slinker-analysis-v8";
 
 #[derive(Deserialize, Serialize)]
 struct CachedIndex {
@@ -511,7 +511,7 @@ impl PackageProvider for PackageStore {
 mod tests {
     use super::*;
     use crate::Description;
-    use crate::package::{Digest, LifecycleMetadata, NativeComponent};
+    use crate::package::{Digest, LifecycleMetadata, NativeComponent, NativeLibrary};
 
     fn package_index() -> PackageIndex {
         PackageIndex {
@@ -528,9 +528,7 @@ mod tests {
                 name: "fixture".into(),
                 registration: None,
                 symbols: Vec::new(),
-                routines: Default::default(),
-                name_lookup: Default::default(),
-                library: None,
+                library: NativeLibrary::Missing,
                 safety: NativeSafety::Unanalyzed,
             }],
             lifecycle: LifecycleMetadata::default(),

@@ -7,8 +7,8 @@ use crate::Result;
 use crate::analysis::{EdgeKind, Need, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    NameLookup, NativeInterface, NativeRoutineSummary, NativeSafety, PackageId, PackageImage,
-    PackageIndex, PackageProvider,
+    NameLookup, NativeInterface, NativeLibrary, NativeRoutineSummary, NativeSafety, PackageId,
+    PackageImage, PackageIndex, PackageProvider,
 };
 use crate::syntax::{CallSite, StaticArg};
 
@@ -221,11 +221,12 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     && !matches!(argument, Some(StaticArg::String(library)) if library == component)
             });
         let registered = NativeInterface::of_callee(&call.callee)
-            .is_some_and(|interface| native.routines.of(interface).contains(symbol));
+            .zip(native.library.routines())
+            .is_some_and(|(interface, routines)| routines.of(interface).contains(symbol));
         let source = call.arg_spans.get(index).cloned().flatten();
-        match (native.name_lookup, source) {
-            (NameLookup::Forced, _) if !names_other_library => {}
-            (NameLookup::Allowed, Some(source)) if registered && !names_other_library => {
+        match (native.library.name_lookup(), source) {
+            (Some(NameLookup::Forced), _) if !names_other_library => {}
+            (Some(NameLookup::Allowed), Some(source)) if registered && !names_other_library => {
                 self.relocations.push(PendingRelocation::NativeSymbol {
                     source,
                     package: current,
@@ -264,8 +265,14 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     return;
                 };
                 if image.index.dynlibs.iter().any(|native| {
-                    native.name_lookup != NameLookup::Forced
-                        && native.routines.names().contains(symbol.as_str())
+                    matches!(
+                        &native.library,
+                        NativeLibrary::Loaded {
+                            name_lookup: NameLookup::Allowed,
+                            routines,
+                            ..
+                        } if routines.names().contains(symbol.as_str())
+                    )
                 }) {
                     self.diagnostic(
                         from,
@@ -288,9 +295,13 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 else {
                     return;
                 };
-                match (native.name_lookup, call.arg_spans.get(index).cloned().flatten()) {
-                    (NameLookup::Forced, _) => {}
-                    (NameLookup::Allowed, Some(source)) => {
+                match (
+                    native.library.name_lookup(),
+                    call.arg_spans.get(index).cloned().flatten(),
+                ) {
+                    (Some(NameLookup::Forced), _) => {}
+                    (Some(NameLookup::Allowed), Some(source)) => {
+
                         self.relocations.push(PendingRelocation::NativeLibrary {
                             source,
                             package: current,

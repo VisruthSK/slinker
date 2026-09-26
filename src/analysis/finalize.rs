@@ -319,10 +319,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
             for native in &image.index.dynlibs {
-                if let (LinkedPackageRole::Linked, Some(library)) = (role, &native.library) {
+                if let (LinkedPackageRole::Linked, Some(library)) = (role, native.library.path()) {
                     builder.add_resource(crate::ir::ResourceIr {
                         package,
-                        path: library.clone(),
+                        path: library.to_owned(),
                     });
                 }
             }

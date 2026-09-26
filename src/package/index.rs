@@ -87,10 +87,46 @@ pub struct NativeComponent {
     pub name: String,
     pub registration: Option<NativeRegistration>,
     pub symbols: Vec<NativeSymbolBinding>,
-    pub routines: NativeRoutines,
-    pub name_lookup: NameLookup,
-    pub library: Option<String>,
+    pub library: NativeLibrary,
     pub safety: NativeSafety,
+}
+
+/// The installed compiled library of a native component as the worker found it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum NativeLibrary {
+    Missing,
+    Unloadable {
+        library: String,
+        error: String,
+    },
+    Loaded {
+        library: String,
+        routines: NativeRoutines,
+        name_lookup: NameLookup,
+    },
+}
+
+impl NativeLibrary {
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::Unloadable { library, .. } | Self::Loaded { library, .. } => Some(library),
+        }
+    }
+
+    pub fn routines(&self) -> Option<&NativeRoutines> {
+        match self {
+            Self::Loaded { routines, .. } => Some(routines),
+            Self::Missing | Self::Unloadable { .. } => None,
+        }
+    }
+
+    pub fn name_lookup(&self) -> Option<NameLookup> {
+        match self {
+            Self::Loaded { name_lookup, .. } => Some(*name_lookup),
+            Self::Missing | Self::Unloadable { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -140,10 +176,8 @@ impl NativeInterface {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum NameLookup {
-    #[default]
-    Unknown,
     Forced,
     Allowed,
 }
@@ -151,9 +185,10 @@ pub enum NameLookup {
 impl NativeComponent {
     pub fn bindings(&self) -> impl Iterator<Item = NativeSymbolBinding> + '_ {
         let registered = self.registration.iter().flat_map(|fixes| {
-            self.routines
-                .names()
+            self.library
+                .routines()
                 .into_iter()
+                .flat_map(NativeRoutines::names)
                 .map(move |routine| NativeSymbolBinding {
                     binding: format!("{}{routine}{}", fixes.prefix, fixes.suffix),
                     symbol: routine.to_owned(),
