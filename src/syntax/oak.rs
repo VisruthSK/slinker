@@ -20,7 +20,9 @@ use crate::syntax::facts::{
 use crate::syntax::source::{SourceId, Span, TextRange};
 use crate::{Error, Result};
 use air_r_parser::{RParserOptions, parse};
-use air_r_syntax::{AnyRExpression, RBinaryExpression, RCall, RRoot};
+use air_r_syntax::{
+    AnyRExpression, RBinaryExpression, RCall, RFunctionDefinition, RIfStatement, RRoot,
+};
 use biome_rowan::{AstNode, AstNodeList, AstSeparatedList};
 use oak_semantic::semantic_index::{
     DefinitionKind, NamespaceAccessKind, ScopeId, ScopeKind, SemanticDiagnostic, SemanticIndex,
@@ -1296,18 +1298,7 @@ fn construction_expr(
         AnyRExpression::RIdentifier(identifier) => ConstructionExprKind::Symbol {
             name: identifier.name_token().ok()?.text_trimmed().to_owned(),
         },
-        AnyRExpression::AnyRValue(_) => {
-            let value = text.get(span.start..span.end)?.trim();
-            if let Some(StaticArg::String(value)) = static_arg(value) {
-                ConstructionExprKind::String { value }
-            } else if let Ok(integer) = value.strip_suffix('L').unwrap_or(value).parse::<i64>() {
-                ConstructionExprKind::Integer { value: integer }
-            } else {
-                ConstructionExprKind::Double {
-                    value: value.to_owned(),
-                }
-            }
-        }
+        AnyRExpression::AnyRValue(_) => construction_value(text.get(span.start..span.end)?.trim()),
         AnyRExpression::RBracedExpressions(block) => ConstructionExprKind::Sequence {
             expressions: block
                 .expressions()
@@ -1319,87 +1310,10 @@ fn construction_expr(
             return construction_expr(source, text, parenthesized.body().ok()?, calls);
         }
         AnyRExpression::RBinaryExpression(binary) => {
-            let operator = binary.operator().ok()?.text_trimmed().to_owned();
-            let left = binary.left().ok()?;
-            let right = binary.right().ok()?;
-            if operator == "<-" || operator == "=" {
-                ConstructionExprKind::Assign {
-                    target: construction_target(source, text, left, calls),
-                    value: Box::new(construction_expr(source, text, right, calls)?),
-                }
-            } else {
-                ConstructionExprKind::Call {
-                    call: ConstructionCall {
-                        qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
-                        callee: operator,
-                        callee_kind: CalleeKind::DefinitelyExternal,
-                        arguments: vec![
-                            ConstructionArgument {
-                                name: None,
-                                value: construction_expr(source, text, left, calls),
-                            },
-                            ConstructionArgument {
-                                name: None,
-                                value: construction_expr(source, text, right, calls),
-                            },
-                        ],
-                    },
-                }
-            }
+            construction_binary(source, text, &binary, calls)?
         }
         AnyRExpression::RCall(call) => {
-            let site = calls
-                .iter()
-                .find(|candidate| candidate.site.span == span)
-                .map(|call| &call.site);
-            let function = call.function().ok()?;
-            if site.is_none() && matches!(function, AnyRExpression::RExtractExpression(_)) {
-                return Some(ConstructionExpr {
-                    kind: ConstructionExprKind::Sequence {
-                        expressions: std::iter::once(function)
-                            .chain(
-                                call.arguments()
-                                    .ok()?
-                                    .items()
-                                    .iter()
-                                    .filter_map(|argument| argument.ok()?.value()),
-                            )
-                            .filter_map(|expression| {
-                                construction_expr(source, text, expression, calls)
-                            })
-                            .collect(),
-                    },
-                    span,
-                });
-            }
-            let callee = site
-                .map(|site| site.callee.clone())
-                .unwrap_or_else(|| ast_text(text, &function));
-            ConstructionExprKind::Call {
-                call: ConstructionCall {
-                    callee,
-                    callee_kind: site
-                        .map(|site| site.callee_kind)
-                        .unwrap_or(CalleeKind::DefinitelyLexical),
-                    qualified_package: site.and_then(|site| site.qualified_package.clone()),
-                    arguments: call
-                        .arguments()
-                        .ok()?
-                        .items()
-                        .iter()
-                        .filter_map(|argument| argument.ok())
-                        .map(|argument| ConstructionArgument {
-                            name: argument
-                                .name_clause()
-                                .and_then(|clause| clause.name().ok())
-                                .map(|name| ast_text(text, &name)),
-                            value: argument
-                                .value()
-                                .and_then(|value| construction_expr(source, text, value, calls)),
-                        })
-                        .collect(),
-                },
-            }
+            return construction_call(source, text, &call, span, calls);
         }
         AnyRExpression::RExtractExpression(extract) => ConstructionExprKind::Member {
             object: Box::new(construction_expr(
@@ -1411,40 +1325,24 @@ fn construction_expr(
             name: extract.right().ok().map(|name| ast_text(text, &name)),
         },
         AnyRExpression::RSubset2(subset) => {
-            let mut arguments = subset
+            let index = subset
                 .arguments()
                 .ok()?
                 .items()
                 .iter()
-                .filter_map(|argument| argument.ok());
-            let index = arguments.next()?.value()?;
-            ConstructionExprKind::Index {
-                object: Box::new(construction_expr(
-                    source,
-                    text,
-                    subset.function().ok()?,
-                    calls,
-                )?),
-                index: Box::new(construction_expr(source, text, index, calls)?),
-            }
+                .find_map(|argument| argument.ok())?
+                .value()?;
+            construction_index(source, text, subset.function().ok()?, index, calls)?
         }
         AnyRExpression::RSubset(subset) => {
-            let mut arguments = subset
+            let index = subset
                 .arguments()
                 .ok()?
                 .items()
                 .iter()
-                .filter_map(|item| item.ok());
-            let index = arguments.next()?.value()?;
-            ConstructionExprKind::Index {
-                object: Box::new(construction_expr(
-                    source,
-                    text,
-                    subset.function().ok()?,
-                    calls,
-                )?),
-                index: Box::new(construction_expr(source, text, index, calls)?),
-            }
+                .find_map(|item| item.ok())?
+                .value()?;
+            construction_index(source, text, subset.function().ok()?, index, calls)?
         }
         AnyRExpression::RUnaryExpression(unary) => ConstructionExprKind::Call {
             call: ConstructionCall {
@@ -1457,45 +1355,187 @@ fn construction_expr(
                 }],
             },
         },
-        AnyRExpression::RIfStatement(statement) => ConstructionExprKind::If {
-            condition: Box::new(construction_expr(
-                source,
-                text,
-                statement.condition().ok()?,
-                calls,
-            )?),
-            consequence: Box::new(construction_expr(
-                source,
-                text,
-                statement.consequence().ok()?,
-                calls,
-            )?),
-            alternative: statement
-                .else_clause()
-                .and_then(|clause| clause.alternative().ok())
-                .and_then(|alternative| construction_expr(source, text, alternative, calls))
-                .map(Box::new),
-        },
-        AnyRExpression::RFunctionDefinition(function) => ConstructionExprKind::Function {
-            parameters: function
-                .parameters()
-                .ok()?
-                .items()
-                .iter()
-                .filter_map(|parameter| parameter.ok())
-                .filter_map(|parameter| parameter.name().ok())
-                .map(|name| ast_text(text, &name))
-                .collect(),
-            body: Box::new(construction_expr(
-                source,
-                text,
-                function.body().ok()?,
-                calls,
-            )?),
-        },
+        AnyRExpression::RIfStatement(statement) => {
+            construction_if(source, text, &statement, calls)?
+        }
+        AnyRExpression::RFunctionDefinition(function) => {
+            construction_function(source, text, &function, calls)?
+        }
         _ => ConstructionExprKind::Unknown,
     };
     Some(ConstructionExpr { kind, span })
+}
+
+fn construction_value(value: &str) -> ConstructionExprKind {
+    if let Some(StaticArg::String(value)) = static_arg(value) {
+        ConstructionExprKind::String { value }
+    } else if let Ok(integer) = value.strip_suffix('L').unwrap_or(value).parse::<i64>() {
+        ConstructionExprKind::Integer { value: integer }
+    } else {
+        ConstructionExprKind::Double {
+            value: value.to_owned(),
+        }
+    }
+}
+
+fn construction_binary(
+    source: &SourceId,
+    text: &str,
+    binary: &RBinaryExpression,
+    calls: &[LiveCall],
+) -> Option<ConstructionExprKind> {
+    let operator = binary.operator().ok()?.text_trimmed().to_owned();
+    let left = binary.left().ok()?;
+    let right = binary.right().ok()?;
+    Some(if operator == "<-" || operator == "=" {
+        ConstructionExprKind::Assign {
+            target: construction_target(source, text, left, calls),
+            value: Box::new(construction_expr(source, text, right, calls)?),
+        }
+    } else {
+        ConstructionExprKind::Call {
+            call: ConstructionCall {
+                qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
+                callee: operator,
+                callee_kind: CalleeKind::DefinitelyExternal,
+                arguments: vec![
+                    ConstructionArgument {
+                        name: None,
+                        value: construction_expr(source, text, left, calls),
+                    },
+                    ConstructionArgument {
+                        name: None,
+                        value: construction_expr(source, text, right, calls),
+                    },
+                ],
+            },
+        }
+    })
+}
+
+fn construction_call(
+    source: &SourceId,
+    text: &str,
+    call: &RCall,
+    span: Span,
+    calls: &[LiveCall],
+) -> Option<ConstructionExpr> {
+    let site = calls
+        .iter()
+        .find(|candidate| candidate.site.span == span)
+        .map(|call| &call.site);
+    let function = call.function().ok()?;
+    if site.is_none() && matches!(function, AnyRExpression::RExtractExpression(_)) {
+        return Some(ConstructionExpr {
+            kind: ConstructionExprKind::Sequence {
+                expressions: std::iter::once(function)
+                    .chain(
+                        call.arguments()
+                            .ok()?
+                            .items()
+                            .iter()
+                            .filter_map(|argument| argument.ok()?.value()),
+                    )
+                    .filter_map(|expression| construction_expr(source, text, expression, calls))
+                    .collect(),
+            },
+            span,
+        });
+    }
+    let callee = site
+        .map(|site| site.callee.clone())
+        .unwrap_or_else(|| ast_text(text, &function));
+    let kind = ConstructionExprKind::Call {
+        call: ConstructionCall {
+            callee,
+            callee_kind: site
+                .map(|site| site.callee_kind)
+                .unwrap_or(CalleeKind::DefinitelyLexical),
+            qualified_package: site.and_then(|site| site.qualified_package.clone()),
+            arguments: call
+                .arguments()
+                .ok()?
+                .items()
+                .iter()
+                .filter_map(|argument| argument.ok())
+                .map(|argument| ConstructionArgument {
+                    name: argument
+                        .name_clause()
+                        .and_then(|clause| clause.name().ok())
+                        .map(|name| ast_text(text, &name)),
+                    value: argument
+                        .value()
+                        .and_then(|value| construction_expr(source, text, value, calls)),
+                })
+                .collect(),
+        },
+    };
+    Some(ConstructionExpr { kind, span })
+}
+
+fn construction_index(
+    source: &SourceId,
+    text: &str,
+    object: AnyRExpression,
+    index: AnyRExpression,
+    calls: &[LiveCall],
+) -> Option<ConstructionExprKind> {
+    Some(ConstructionExprKind::Index {
+        object: Box::new(construction_expr(source, text, object, calls)?),
+        index: Box::new(construction_expr(source, text, index, calls)?),
+    })
+}
+
+fn construction_if(
+    source: &SourceId,
+    text: &str,
+    statement: &RIfStatement,
+    calls: &[LiveCall],
+) -> Option<ConstructionExprKind> {
+    Some(ConstructionExprKind::If {
+        condition: Box::new(construction_expr(
+            source,
+            text,
+            statement.condition().ok()?,
+            calls,
+        )?),
+        consequence: Box::new(construction_expr(
+            source,
+            text,
+            statement.consequence().ok()?,
+            calls,
+        )?),
+        alternative: statement
+            .else_clause()
+            .and_then(|clause| clause.alternative().ok())
+            .and_then(|alternative| construction_expr(source, text, alternative, calls))
+            .map(Box::new),
+    })
+}
+
+fn construction_function(
+    source: &SourceId,
+    text: &str,
+    function: &RFunctionDefinition,
+    calls: &[LiveCall],
+) -> Option<ConstructionExprKind> {
+    Some(ConstructionExprKind::Function {
+        parameters: function
+            .parameters()
+            .ok()?
+            .items()
+            .iter()
+            .filter_map(|parameter| parameter.ok())
+            .filter_map(|parameter| parameter.name().ok())
+            .map(|name| ast_text(text, &name))
+            .collect(),
+        body: Box::new(construction_expr(
+            source,
+            text,
+            function.body().ok()?,
+            calls,
+        )?),
+    })
 }
 
 fn construction_target(

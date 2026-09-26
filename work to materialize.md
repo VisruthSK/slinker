@@ -195,9 +195,6 @@ Invariants into types:
   `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
 
 Structure:
-- Break up the long functions: `finalize_program` (424 lines), `syntax/oak.rs` `translate_index`
-  (334) and the 208-line function after it, `AnalyzerState` `semantic_call` (259),
-  `process_binding` (241), `process_parsed` (217), and the 230-line interpreter call evaluation.
 - Provenance is stored as typed derivations; the explanation graph is built only for
   `why`/`path`/`--graph`. Merge `GraphExport` and `ExplanationDag` into one export (`export.rs`,
   `explain.rs`, and `graph.rs` are about 1,670 lines together).
