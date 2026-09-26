@@ -192,3 +192,13 @@ pub(super) fn reflective_name_formals(
         _ => None,
     }
 }
+
+pub(super) fn only_package_argument(call: &CallSite, rewritable: &[&str]) -> bool {
+    call.args.len()
+        == 1 + call
+            .arg_names
+            .iter()
+            .flatten()
+            .filter(|name| rewritable.contains(&name.as_str()))
+            .count()
+}

@@ -18,6 +18,8 @@ The Root keeps every binding it defines. Each Linked namespace is registered und
 
 Linked code that names a Linked namespace, including its own (`pkg::f`, `asNamespace("pkg")`, `requireNamespace("pkg")`), is rewritten to the private namespace. A payload closure containing such a site is rebuilt from its rewritten source and replaces the original in its binding before the payload is serialized; the build blocks if the closure sits inside a list or attribute, or if the original is still referenced from anywhere else in a payload. A computed name that resolves to the Linked package itself is a dynamic namespace target.
 
+Static `asNamespace`, `getNamespace`, `loadNamespace`, `requireNamespace`, and `packageVersion` calls on a declared dependency are rewritten: a Linked target to its private namespace, `TRUE`, or its recorded version; an External one stays as written. Naming an installed package that is not a declared dependency blocks, as do `find.package` on a Linked package and arguments the private namespace cannot honor, such as `lib.loc` or `versionCheck`.
+
 The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then calls the Root's original `.onLoad`. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
 
 ### Strict mode

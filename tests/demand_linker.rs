@@ -1,8 +1,7 @@
 #![cfg(feature = "air")]
 
 use slinker::analysis::{
-    DiscoveryPolicy, EdgeKind, ExplanationDag, GraphEdgeReasonExport, LinkPolicy, Linker, NodeKind,
-    RejectCode,
+    EdgeKind, ExplanationDag, GraphEdgeReasonExport, LinkPolicy, Linker, NodeKind, RejectCode,
 };
 use slinker::package::{
     BindingImage, BindingOrigin, ClosureSource, Digest, EmbeddedClosureSource, ExportMap,
@@ -229,6 +228,23 @@ macro_rules! package_with {
             },
         )
     };
+}
+
+fn package_importing(name: &str, bindings: &[(&str, Option<&str>)], imports: &str) -> PackageImage {
+    let exports = bindings
+        .iter()
+        .map(|(binding, _)| ((*binding).to_owned(), (*binding).into()))
+        .collect::<ExportMap>();
+    package_with!(
+        name,
+        bindings,
+        Vec::new(),
+        exports,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        format!("Imports: {imports}\n"),
+    )
 }
 
 fn package_from_fixture(
@@ -1255,10 +1271,6 @@ fn constant_argument_specializes_private_namespace_helper() {
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_external_packages(["foo".into()])
-        .with_policy(LinkPolicy {
-            namespace_discovery: DiscoveryPolicy::ExternalOnly,
-            ..LinkPolicy::default()
-        })
         .analyze("root")
         .unwrap();
 
@@ -1321,10 +1333,6 @@ fn bounded_string_operations_specialize_namespace_helper() {
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_external_packages(["foo".into()])
-        .with_policy(LinkPolicy {
-            namespace_discovery: DiscoveryPolicy::ExternalOnly,
-            ..LinkPolicy::default()
-        })
         .analyze("root")
         .unwrap();
 
@@ -1395,10 +1403,6 @@ fn resolved_null_coalescing_helper_propagates_constant() {
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_external_packages(["foo".into()])
-        .with_policy(LinkPolicy {
-            namespace_discovery: DiscoveryPolicy::ExternalOnly,
-            ..LinkPolicy::default()
-        })
         .analyze("root")
         .unwrap();
 
@@ -1433,10 +1437,6 @@ fn bounded_switch_propagates_selected_package() {
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_external_packages(["foo".into()])
-        .with_policy(LinkPolicy {
-            namespace_discovery: DiscoveryPolicy::ExternalOnly,
-            ..LinkPolicy::default()
-        })
         .analyze("root")
         .unwrap();
 
@@ -1449,26 +1449,26 @@ fn bounded_switch_propagates_selected_package() {
 }
 
 #[test]
-fn explicit_discovery_policy_can_internalize() {
-    let root = package(
+fn static_discovery_of_a_declared_dependency_links_it() {
+    let root = package_importing(
         "root",
         &[("f", Some("f <- function() requireNamespace(\"foo\")"))],
+        "foo",
     );
     let foo = package("foo", &[("x", Some("x <- function() 1"))]);
-    let policy = LinkPolicy {
-        namespace_discovery: DiscoveryPolicy::Internalize,
-        ..LinkPolicy::default()
-    };
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_policy(policy)
         .analyze("root")
         .unwrap();
+    assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
     assert!(
         plan.provenance()
             .nodes()
             .iter()
             .any(|node| { node.package == "foo" && matches!(node.kind, NodeKind::Activation) })
     );
+    assert!(plan.program().relocations().iter().any(|relocation| {
+        relocation.target == slinker::ir::RelocationTarget::RequireNamespace { result: true }
+    }));
 }
 
 #[test]
@@ -2626,13 +2626,9 @@ fn external_internal_access_is_preserved_in_the_program() {
 #[test]
 fn find_package_of_a_linked_package_blocks_before_materialization() {
     let analyze = |source: &str| {
-        let root = package("root", &[("f", Some(source))]);
+        let root = package_importing("root", &[("f", Some(source))], "foo");
         let foo = package("foo", &[("x", Some("x <- function() 1"))]);
         Linker::new(FakeProvider::new(vec![root, foo]), 1)
-            .with_policy(LinkPolicy {
-                namespace_discovery: DiscoveryPolicy::Internalize,
-                ..LinkPolicy::default()
-            })
             .analyze("root")
             .unwrap()
     };
@@ -2661,10 +2657,7 @@ fn loose_mode_records_assumptions_that_strict_mode_blocks() {
             )]),
             1,
         )
-        .with_policy(LinkPolicy {
-            strict,
-            ..LinkPolicy::default()
-        })
+        .with_policy(LinkPolicy { strict })
         .analyze("root")
         .unwrap()
     };
@@ -4792,4 +4785,37 @@ fn explanation_dag_attributes_roots_and_redundant_edges() {
             .iter()
             .any(|edge| { edge.from == f.id && edge.to == c.id && edge.reachability_redundant })
     );
+}
+
+#[test]
+fn linked_discovery_with_unhonored_arguments_blocks() {
+    let analyze = |source: &str| {
+        let root = package_importing("root", &[("f", Some(source))], "foo");
+        let foo = package("foo", &[("x", Some("x <- function() 1"))]);
+        Linker::new(FakeProvider::new(vec![root, foo]), 1)
+            .analyze("root")
+            .unwrap()
+    };
+    let blocks = |source: &str| {
+        analyze(source).blockers().iter().any(|diagnostic| {
+            diagnostic.code == RejectCode::UnsupportedRootTransformation
+                && diagnostic.message.contains("foo")
+        })
+    };
+
+    assert!(blocks(
+        "f <- function() loadNamespace('foo', versionCheck = list(op = '>=', version = '2.0'))"
+    ));
+    assert!(blocks(
+        "f <- function() packageVersion('foo', lib.loc = 'x')"
+    ));
+    assert!(blocks(
+        "f <- function() requireNamespace('foo', lib.loc = 'x')"
+    ));
+    assert!(!blocks(
+        "f <- function() requireNamespace('foo', quietly = TRUE)"
+    ));
+    assert!(!blocks(
+        "f <- function() asNamespace('foo', base.OK = FALSE)"
+    ));
 }

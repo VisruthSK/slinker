@@ -1,6 +1,6 @@
 use super::arguments::{
-    matched_call_arg_index, matched_static_arg, native_selector_span, reflective_name_formals,
-    static_package_arg, static_string_arg,
+    matched_call_arg_index, matched_static_arg, native_selector_span, only_package_argument,
+    reflective_name_formals, static_package_arg, static_string_arg,
 };
 use super::diagnostic::DiagnosticSink;
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
@@ -12,7 +12,7 @@ use super::reflection::ReflectionFacts;
 use super::relocation::{NamespaceCall, PendingRelocation, RelocationPlan, SyntaxObservation};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
 use super::s3::{CallableId, S3Model, callable_target};
-use crate::analysis::policy::{DiscoveryPolicy, LinkPolicy};
+use crate::analysis::policy::LinkPolicy;
 use crate::analysis::{
     Diagnostic, EdgeKind, GenericId, Graph, LifecycleHook, Need, NodeId, NodeKind, RejectCode, S3Id,
 };
@@ -88,7 +88,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) dependencies: HashMap<NodeId, HashSet<NodeId>>,
     pub(super) provenance: bool,
     pub(super) root: Option<PackageId>,
-    pub(super) suggested_only: HashMap<PackageId, HashSet<String>>,
+    declared_dependencies: HashMap<PackageId, DeclaredDependencies>,
     pub(super) namespace_imports: HashMap<PackageId, NamespaceImports>,
     pub(super) non_returning_bindings: HashMap<PackageId, BTreeSet<String>>,
     pub(super) namespace_builders: HashMap<PackageId, NamespaceBuilder>,
@@ -128,7 +128,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             dependencies: HashMap::new(),
             provenance: true,
             root: None,
-            suggested_only: HashMap::new(),
+            declared_dependencies: HashMap::new(),
             namespace_imports: HashMap::new(),
             non_returning_bindings: HashMap::new(),
             namespace_builders: HashMap::new(),
@@ -2099,7 +2099,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         name: &str,
     ) -> Result<bool> {
-        if !self.suggested_only.contains_key(&package) {
+        Ok(self
+            .declared_dependencies(package)?
+            .suggested_only
+            .contains(name))
+    }
+
+    fn package_is_required(&mut self, package: PackageId, name: &str) -> Result<bool> {
+        Ok(self.declared_dependencies(package)?.required.contains(name))
+    }
+
+    fn declared_dependencies(&mut self, package: PackageId) -> Result<&DeclaredDependencies> {
+        if !self.declared_dependencies.contains_key(&package) {
             let index = Arc::clone(&self.images[&package].index);
             let mut required = HashSet::new();
             for import in &index.imports {
@@ -2118,8 +2129,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 required.insert(dependency.package().to_owned());
             }
-
-            let suggested = relations(&index.description, RelationField::Suggests)
+            let suggested_only = relations(&index.description, RelationField::Suggests)
                 .map_err(Error::Analysis)?
                 .into_iter()
                 .filter_map(|dependency| {
@@ -2127,12 +2137,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     (!required.contains(&name)).then_some(name)
                 })
                 .collect::<HashSet<_>>();
-            self.suggested_only.insert(package, suggested);
+            self.declared_dependencies.insert(
+                package,
+                DeclaredDependencies {
+                    required,
+                    suggested_only,
+                },
+            );
         }
-        Ok(self
-            .suggested_only
-            .get(&package)
-            .is_some_and(|packages| packages.contains(name)))
+        Ok(&self.declared_dependencies[&package])
     }
 
     pub(super) fn handle_superassignment(
@@ -2666,121 +2679,135 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             );
             return Ok(());
         };
-        if name == self.packages.name(current) {
-            if self.is_root(current) {
+        let target = match self.discovered_package(from, current, call, &name)? {
+            Discovered::Linked(target) => target,
+            Discovered::Settled => return Ok(()),
+            Discovered::Optional if operation != NamespaceCall::Require => return Ok(()),
+            Discovered::Optional | Discovered::Missing => {
+                if operation == NamespaceCall::Require {
+                    self.relocations.push(PendingRelocation::RequireNamespace {
+                        source: call.span.clone(),
+                        loaded: None,
+                    });
+                } else {
+                    self.record_missing_package(
+                        from,
+                        current,
+                        &name,
+                        EdgeKind::Discovery,
+                        format!("{} requires unavailable namespace {name}", call.callee),
+                        Some(call.span.clone()),
+                    );
+                }
                 return Ok(());
             }
-            if literal.is_none() {
-                self.assume(
-                    from,
-                    current,
-                    Some(binding),
-                    RejectCode::DynamicPackageDiscovery,
-                    format!(
-                        "{}() names this Linked package through a computed value, which cannot be rewritten to its private namespace",
-                        call.callee
-                    ),
-                    Some(call.span.clone()),
-                );
-                return Ok(());
-            }
-            self.relocations.push(PendingRelocation::namespace(
-                call.span.clone(),
+        };
+        if literal.is_none() {
+            self.assume(
+                from,
                 current,
-                operation,
-            ));
+                Some(binding),
+                RejectCode::DynamicPackageDiscovery,
+                format!(
+                    "{}() names Linked `{name}` through a computed value, which cannot be rewritten to its private namespace",
+                    call.callee
+                ),
+                Some(call.span.clone()),
+            );
             return Ok(());
         }
-        let suggested = self.package_is_suggested_only(current, &name)?;
-        let discovery_policy = if self.optional_package_selected(&name) {
-            DiscoveryPolicy::Internalize
-        } else if suggested && operation == NamespaceCall::Require {
-            self.relocations.push(PendingRelocation::RequireNamespace {
-                source: call.span.clone(),
-                loaded: None,
-            });
-            return Ok(());
-        } else if suggested {
-            return Ok(());
-        } else {
-            self.policy.namespace_discovery
+        let rewritable = match operation {
+            NamespaceCall::Require => &["quietly"][..],
+            NamespaceCall::Operation(NamespaceOperation::As) => &["base.OK"][..],
+            NamespaceCall::Operation(NamespaceOperation::Get | NamespaceOperation::Load) => &[],
         };
-        match discovery_policy {
-            DiscoveryPolicy::Reject => self.diagnostic(
+        if !only_package_argument(call, rewritable) {
+            self.diagnostic(
+                from,
+                current,
+                None,
+                RejectCode::UnsupportedRootTransformation,
+                format!(
+                    "{}() on Linked `{name}` passes arguments that its private namespace cannot honor",
+                    call.callee
+                ),
+                Some(call.span.clone()),
+            );
+            return Ok(());
+        }
+        if target != current {
+            self.require_at(
+                from,
+                Need::Activation { package: target },
+                EdgeKind::Discovery,
+                format!("{} names Linked `{name}`", call.callee),
+                Some(call.span.clone()),
+            );
+        }
+        self.relocations.push(PendingRelocation::namespace(
+            call.span.clone(),
+            target,
+            operation,
+        ));
+        Ok(())
+    }
+
+    fn discovered_package(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        call: &CallSite,
+        name: &str,
+    ) -> Result<Discovered> {
+        if name == self.packages.name(current) {
+            return Ok(if self.is_root(current) {
+                Discovered::Settled
+            } else {
+                Discovered::Linked(current)
+            });
+        }
+        let selected = self.optional_package_selected(name);
+        if !selected && self.package_is_suggested_only(current, name)? {
+            return Ok(Discovered::Optional);
+        }
+        let Some(target) = self.packages.resolve(name)? else {
+            return Ok(if selected {
+                self.record_missing_package(
+                    from,
+                    current,
+                    name,
+                    EdgeKind::Discovery,
+                    format!("{} requires unavailable package {name}", call.callee),
+                    Some(call.span.clone()),
+                );
+                Discovered::Settled
+            } else {
+                Discovered::Missing
+            });
+        };
+        if self.packages.is_external(target) {
+            self.external.insert(target);
+            return Ok(Discovered::Settled);
+        }
+        if self.is_root(target) {
+            return Ok(Discovered::Settled);
+        }
+        if !selected && !self.package_is_required(current, name)? {
+            self.diagnostic(
                 from,
                 current,
                 None,
                 RejectCode::DynamicPackageDiscovery,
                 format!(
-                    "reachable {} for `{name}` is not specialized by policy",
-                    call.callee
+                    "{}() names `{name}`, which is installed but not a declared dependency of `{}`",
+                    call.callee,
+                    self.packages.name(current)
                 ),
                 Some(call.span.clone()),
-            ),
-            DiscoveryPolicy::ExternalOnly => match self.packages.resolve(&name)? {
-                Some(foreign) if self.packages.is_external(foreign) => {
-                    self.external.insert(foreign);
-                }
-                Some(_) => self.diagnostic(
-                    from,
-                    current,
-                    None,
-                    RejectCode::DynamicPackageDiscovery,
-                    format!("`{name}` is installed but is not configured External"),
-                    Some(call.span.clone()),
-                ),
-                None if operation == NamespaceCall::Require => {
-                    self.relocations.push(PendingRelocation::RequireNamespace {
-                        source: call.span.clone(),
-                        loaded: None,
-                    });
-                }
-                None => self.record_missing_package(
-                    from,
-                    current,
-                    &name,
-                    EdgeKind::Discovery,
-                    format!("{} requires unavailable namespace {name}", call.callee),
-                    Some(call.span.clone()),
-                ),
-            },
-            DiscoveryPolicy::Internalize => match self.packages.resolve(&name)? {
-                Some(foreign) if self.packages.is_external(foreign) => {
-                    self.external.insert(foreign);
-                }
-                Some(foreign) => {
-                    self.require_at(
-                        from,
-                        Need::Activation { package: foreign },
-                        EdgeKind::Discovery,
-                        format!("specialized {} requires `{name}`", call.callee),
-                        Some(call.span.clone()),
-                    );
-                    self.relocations.push(PendingRelocation::namespace(
-                        call.span.clone(),
-                        foreign,
-                        operation,
-                    ));
-                }
-                None if operation == NamespaceCall::Require
-                    && !self.optional_package_selected(&name) =>
-                {
-                    self.relocations.push(PendingRelocation::RequireNamespace {
-                        source: call.span.clone(),
-                        loaded: None,
-                    });
-                }
-                None => self.record_missing_package(
-                    from,
-                    current,
-                    &name,
-                    EdgeKind::Discovery,
-                    format!("{} requires unavailable namespace {name}", call.callee),
-                    Some(call.span.clone()),
-                ),
-            },
+            );
+            return Ok(Discovered::Settled);
         }
-        Ok(())
+        Ok(Discovered::Linked(target))
     }
 
     pub(super) fn call_resolves_definitely_to_base(
@@ -2821,78 +2848,45 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             );
             return Ok(());
         };
-        if self.is_root(current) && name == self.packages.name(current) {
-            return Ok(());
-        }
-        if self.package_is_suggested_only(current, name)? && !self.optional_package_selected(name) {
-            return Ok(());
-        }
-        let discovery_policy = if self.optional_package_selected(name) {
-            DiscoveryPolicy::Internalize
-        } else {
-            self.policy.namespace_discovery
+        let name = name.to_owned();
+        let target = match self.discovered_package(from, current, call, &name)? {
+            Discovered::Linked(target) => target,
+            Discovered::Settled | Discovered::Optional => return Ok(()),
+            Discovered::Missing => {
+                self.record_missing_package(
+                    from,
+                    current,
+                    &name,
+                    EdgeKind::Discovery,
+                    format!("{} requires unavailable package {name}", call.callee),
+                    Some(call.span.clone()),
+                );
+                return Ok(());
+            }
         };
-        match discovery_policy {
-            DiscoveryPolicy::Reject => self.diagnostic(
+        if !version {
+            self.diagnostic(
                 from,
                 current,
                 None,
-                RejectCode::DynamicPackageDiscovery,
-                format!(
-                    "reachable package identity query for `{name}` is not specialized by policy"
-                ),
+                RejectCode::UnsupportedRootTransformation,
+                format!("find.package(\"{name}\") has no installed path once `{name}` is Linked"),
                 Some(call.span.clone()),
-            ),
-            DiscoveryPolicy::ExternalOnly => match self.packages.resolve(name)? {
-                Some(foreign) if self.packages.is_external(foreign) => {
-                    self.external.insert(foreign);
-                }
-                Some(_) => self.diagnostic(
-                    from,
-                    current,
-                    None,
-                    RejectCode::DynamicPackageDiscovery,
-                    format!("package identity query for `{name}` is not External"),
-                    Some(call.span.clone()),
-                ),
-                None => self.record_missing_package(
-                    from,
-                    current,
-                    name,
-                    EdgeKind::Discovery,
-                    format!("{} requires unavailable package {name}", call.callee),
-                    Some(call.span.clone()),
-                ),
-            },
-            DiscoveryPolicy::Internalize => match self.packages.resolve(name)? {
-                Some(foreign) if self.packages.is_external(foreign) => {
-                    self.external.insert(foreign);
-                }
-                Some(_) if !version => self.diagnostic(
-                    from,
-                    current,
-                    None,
-                    RejectCode::UnsupportedRootTransformation,
-                    format!(
-                        "find.package(\"{name}\") has no installed path once `{name}` is Linked"
-                    ),
-                    Some(call.span.clone()),
-                ),
-                Some(foreign) => {
-                    self.relocations.push(PendingRelocation::PackageVersion {
-                        source: call.span.clone(),
-                        version: self.packages.identity(foreign).version.to_string(),
-                    });
-                }
-                None => self.record_missing_package(
-                    from,
-                    current,
-                    name,
-                    EdgeKind::Discovery,
-                    format!("{} requires unavailable package {name}", call.callee),
-                    Some(call.span.clone()),
-                ),
-            },
+            );
+        } else if !only_package_argument(call, &[]) {
+            self.diagnostic(
+                from,
+                current,
+                None,
+                RejectCode::UnsupportedRootTransformation,
+                format!("packageVersion() on Linked `{name}` passes a library location"),
+                Some(call.span.clone()),
+            );
+        } else {
+            self.relocations.push(PendingRelocation::PackageVersion {
+                source: call.span.clone(),
+                version: self.packages.identity(target).version.to_string(),
+            });
         }
         Ok(())
     }
@@ -3110,4 +3104,16 @@ pub(super) fn is_r_constant(name: &str) -> bool {
             | "NA_complex_"
             | "NA_character_"
     )
+}
+
+enum Discovered {
+    Linked(PackageId),
+    Settled,
+    Optional,
+    Missing,
+}
+
+struct DeclaredDependencies {
+    required: HashSet<String>,
+    suggested_only: HashSet<String>,
 }

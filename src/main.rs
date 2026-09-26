@@ -178,7 +178,6 @@ impl UniverseArgs {
     fn policy(&self) -> LinkPolicy {
         LinkPolicy {
             strict: self.strict,
-            ..LinkPolicy::default()
         }
     }
 }
