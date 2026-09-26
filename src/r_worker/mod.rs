@@ -61,6 +61,8 @@ impl WorkerRuntime {
             .iter()
             .map(|argument| argument.as_ptr().cast_mut())
             .collect::<Vec<_>>();
+        let argument_count = i32::try_from(pointers.len())
+            .map_err(|_| "R startup arguments exceed the C argument count".to_owned())?;
         // Safety: the worker owns the only R runtime in this process, performs
         // initialization on its protocol thread, and keeps argv alive for the
         // process lifetime. Harp initializes all dynamic libr bindings before
@@ -68,7 +70,7 @@ impl WorkerRuntime {
         unsafe {
             harp::CONSOLE_THREAD_ID = Some(std::thread::current().id());
             libr::set(libr::R_SignalHandlers, 0);
-            libr::Rf_initialize_R(pointers.len() as i32, pointers.as_mut_ptr());
+            libr::Rf_initialize_R(argument_count, pointers.as_mut_ptr());
             libr::set(libr::R_CStackLimit, usize::MAX);
             libr::setup_Rmainloop();
         }
@@ -407,8 +409,13 @@ fn worker_package_index(
         s3_object.sexp,
     )))
     .map_err(r_error)?;
-    let rows = dimensions.first().copied().unwrap_or_default().max(0) as usize;
-    let columns = dimensions.get(1).copied().unwrap_or_default().max(0) as usize;
+    let dimension = |index: usize| {
+        usize::try_from(dimensions.get(index).copied().unwrap_or_default()).map_err(|_| {
+            format!("installed S3 registration table has invalid dimensions {dimensions:?}")
+        })
+    };
+    let rows = dimension(0)?;
+    let columns = dimension(1)?;
     let mut s3 = Vec::with_capacity(rows);
     for row in 0..rows {
         let generic = s3_values
@@ -754,8 +761,9 @@ impl ObjectScanner {
             libr::VECSXP => {
                 let names = names(value);
                 for index in 0..harp::object::r_length(value) {
-                    let member = names
-                        .get(index as usize)
+                    let member = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| names.get(index))
                         .filter(|name| !name.is_empty())
                         .map_or_else(|| format!("[[{}]]", index + 1), |name| format!("${name}"));
                     facts.merge(self.scan_value(

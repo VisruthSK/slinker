@@ -199,8 +199,6 @@ Invariants into types:
 - 179 `.expect()` calls, mostly infallible `writeln!` into `String` in the materializer: generate R
   through a writer whose API cannot fail.
 - Worker protocol `Result<_, String>` (19) becomes typed errors.
-- Unchecked integer casts in `r_worker` (`usize` to `i32`, `i32`/`isize` to `usize`) and
-  `syntax/oak.rs` (`usize` to `u32`) become checked conversions.
 - Hand-written range comparisons in `syntax/oak.rs` and `finalize.rs` become one span type with
   `contains` and `overlaps`.
 - Removed bindings and unretained exports become typed slot state instead of parallel string lists.

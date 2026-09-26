@@ -357,6 +357,9 @@ impl OakParser {
         text: &str,
         context: &OakParseContext,
     ) -> std::result::Result<ParsedRFile, String> {
+        if u32::try_from(text.len()).is_err() {
+            return Err("source exceeds the 4 GiB text size Air can address".into());
+        }
         let parsed = parse(text, RParserOptions::default());
         if let Some(error) = parsed.error() {
             return Err(error.to_string());
@@ -509,7 +512,11 @@ impl LexicalScopes {
         let ids = index
             .scope_ids()
             .enumerate()
-            .map(|(position, scope)| (scope, LexicalScopeId(position as u32)))
+            .map(|(position, scope)| {
+                let position =
+                    u32::try_from(position).expect("Air scopes are bounded by its u32 text size");
+                (scope, LexicalScopeId(position))
+            })
             .collect::<HashMap<_, _>>();
         let parents = index
             .scope_ids()
@@ -519,7 +526,8 @@ impl LexicalScopes {
     }
 
     fn at(&self, index: &SemanticIndex, offset: usize) -> (ScopeId, LexicalScopeId) {
-        let (scope, _) = index.scope_at((offset as u32).into());
+        let offset = u32::try_from(offset).expect("offsets lie within text Air accepted");
+        let (scope, _) = index.scope_at(offset.into());
         (scope, self.ids[&scope])
     }
 
