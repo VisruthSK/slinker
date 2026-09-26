@@ -22,6 +22,7 @@ pub struct LinkIr {
     blockers: Vec<Diagnostic>,
     assumptions: Vec<Diagnostic>,
     sources: Sources,
+    construction_evaluations: usize,
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
@@ -72,6 +73,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             assumptions,
             sources: self.sources,
             packages: self.packages.sources(retained),
+            construction_evaluations: self.construction_evaluations,
         }
     }
 
@@ -747,6 +749,10 @@ impl LinkIr {
     /// Diagnostic source map retained for provenance rendering only.
     pub fn sources(&self) -> &Sources {
         &self.sources
+    }
+
+    pub fn construction_evaluations(&self) -> usize {
+        self.construction_evaluations
     }
 }
 

@@ -2723,6 +2723,42 @@ fn construction_interpreter_does_not_reevaluate_unspecialized_calls() {
 }
 
 #[test]
+fn construction_interpreter_evaluates_each_call_signature_once_per_requester() {
+    let levels = 10;
+    let sources = (0..levels)
+        .map(|level| {
+            let next = format!("f{}", level + 1);
+            (
+                format!("f{level}"),
+                format!(
+                    "f{level} <- function(x, flag) {{ if (flag) {next}(\"a\", flag) else {next}(\"a\", flag); {next}(\"a\", flag) }}"
+                ),
+            )
+        })
+        .chain(std::iter::once((
+            format!("f{levels}"),
+            format!("f{levels} <- function(x, flag) x"),
+        )))
+        .collect::<Vec<_>>();
+    let bindings = sources
+        .iter()
+        .map(|(name, source)| (name.as_str(), Some(source.as_str())))
+        .collect::<Vec<_>>();
+    let plan = Linker::new(FakeProvider::new(vec![package("root", &bindings)]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(retained_binding(&plan, "root", &format!("f{levels}")));
+    let requesters = bindings.len();
+    let signatures = bindings.len();
+    assert!(
+        plan.construction_evaluations() <= requesters * signatures,
+        "{} construction evaluations for {requesters} bindings",
+        plan.construction_evaluations()
+    );
+}
+
+#[test]
 fn non_closure_binding_never_invokes_air() {
     let root = package("root", &[("constant", None)]);
     let plan = Linker::new(FakeProvider::new(vec![root]), 4)

@@ -76,7 +76,7 @@ pub struct PackageRef {
 }
 
 /// Oak's lexical classification for a live callee use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CalleeKind {
     DefinitelyLexical,
@@ -133,13 +133,13 @@ pub enum StaticEnvironment {
     Namespace(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConstructionExpr {
     pub kind: ConstructionExprKind,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConstructionExprKind {
     Unknown,
@@ -188,7 +188,7 @@ pub enum ConstructionExprKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConstructionCall {
     pub callee: String,
     pub callee_kind: CalleeKind,
@@ -196,13 +196,13 @@ pub struct ConstructionCall {
     pub arguments: Vec<ConstructionArgument>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConstructionArgument {
     pub name: Option<String>,
     pub value: Option<ConstructionExpr>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConstructionTarget {
     Local {

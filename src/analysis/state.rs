@@ -2,7 +2,7 @@ use super::arguments::{
     matched_call_arg_index, matched_static_arg, native_selector_span, reflective_name_formals,
     static_package_arg, static_string_arg,
 };
-use super::execute::{AbstractValue, ExecutionContext};
+use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
 use super::namespace::NamespaceBuilder;
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
@@ -78,7 +78,8 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) closed_methods: HashSet<(PackageId, String)>,
     pub(super) next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
     pub(super) value_closures: HashSet<NodeId>,
-    pub(super) unspecialized_calls: HashMap<(PackageId, String), AbstractValue>,
+    pub(super) construction_calls: HashMap<ConstructionCallKey, AbstractValue>,
+    pub(super) construction_evaluations: usize,
     pub(super) non_reflective_namespace_uses: HashSet<Span>,
     pub(super) internal_external_bindings: HashSet<(PackageId, String)>,
     pub(super) sources: Sources,
@@ -137,7 +138,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             closed_methods: HashSet::new(),
             next_method_calls: Vec::new(),
             value_closures: HashSet::new(),
-            unspecialized_calls: HashMap::new(),
+            construction_calls: HashMap::new(),
+            construction_evaluations: 0,
             non_reflective_namespace_uses: HashSet::new(),
             internal_external_bindings: HashSet::new(),
             sources: Sources::default(),
@@ -563,11 +565,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 None,
             );
         }
-        let context = self.oak_parse_context(id, &image, &environment)?;
         if let Some(parsed) = self.parsed_source(
             id,
             Arc::clone(&closure_object.source),
-            context,
+            &image,
+            &environment,
             ParseRequest {
                 owner_binding: &owner_source,
                 source_key: &source_key,
@@ -911,11 +913,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     None,
                 );
             }
-            let context = self.oak_parse_context(id, &image, &closure.environment)?;
             if let Some(parsed) = self.parsed_source(
                 id,
                 Arc::clone(&closure.source),
-                context,
+                &image,
+                &closure.environment,
                 ParseRequest {
                     owner_binding: &source_key,
                     source_key: &source_key,
@@ -1319,11 +1321,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             package: id,
             binding: binding.to_owned(),
         });
-        let context = self.oak_parse_context(id, package_image, &closure.environment)?;
         self.parsed_source(
             id,
             Arc::clone(&closure.source),
-            context,
+            package_image,
+            &closure.environment,
             ParseRequest {
                 owner_binding: binding,
                 source_key: binding,
@@ -1336,7 +1338,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         id: PackageId,
         source_text: Arc<str>,
-        context: OakParseContext,
+        image: &PackageImage,
+        lexical_environment: &str,
         request: ParseRequest<'_>,
     ) -> Result<Option<Arc<ParsedRFile>>> {
         let ParseRequest {
@@ -1375,6 +1378,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         self.normalized_shapes
             .insert(key.clone(), Digest::of(&normalized));
+        let context = self.oak_parse_context(id, image, lexical_environment)?;
         match OakParser.parse_binding_with_context(source, source_text.as_ref(), &context) {
             Ok(parsed) => {
                 let parsed = Arc::new(parsed);

@@ -77,9 +77,7 @@ acceptance cases here.
 
 ## Next up
 
-1. Track C: the analysis regression (rlang no longer finishes in 120 s; it took about 19 s after the
-   memoization fix, and the same hang stops `lifecycle`, `pkgload`, and `waldo`), then benchmarks,
-   then the type and cleanup items.
+1. Track C: benchmarks, then the type and cleanup items.
 2. Track A.
 3. Track B.
 
@@ -186,8 +184,6 @@ IR exist only for show; finalization reads the provenance graph; and analysis sp
 measurement.
 
 Performance:
-- Regression first: rlang, lifecycle, pkgload, and waldo each exceed 120 s. Profile, fix, and add a
-  deterministic guard (an interpreter work counter asserted in a unit test, not wall time).
 - Benchmarks, run in CI and reported, with no fixed thresholds:
   - criterion microbenchmarks: Air parse plus Oak semantics of a large closure, the construction
     interpreter on rlang-style closures, installed index read, cache hit path, image fingerprinting;

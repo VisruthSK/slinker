@@ -11,10 +11,10 @@ use crate::syntax::{
     ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
     ConstructionTarget, ParsedRFile, Span,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum AbstractValue {
     Unknown,
     Null,
@@ -26,13 +26,21 @@ pub(super) enum AbstractValue {
     Function {
         parameters: Vec<String>,
         body: ConstructionExpr,
-        captures: HashMap<String, AbstractValue>,
+        captures: BTreeMap<String, AbstractValue>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ConstructionCallKey {
+    node: NodeId,
+    package: PackageId,
+    owner: String,
+    arguments: Vec<(Option<String>, AbstractValue)>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ExecutionState {
-    pub(super) locals: HashMap<String, AbstractValue>,
+    pub(super) locals: BTreeMap<String, AbstractValue>,
 }
 
 impl AbstractValue {
@@ -557,7 +565,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         arguments: &[AbstractValue],
         parameters: Vec<String>,
         body: ConstructionExpr,
-        captures: HashMap<String, AbstractValue>,
+        captures: BTreeMap<String, AbstractValue>,
     ) -> Result<ExecutionOutcome> {
         let mut nested = ExecutionState { locals: captures };
         bind_construction_arguments(&mut nested, &parameters, call, arguments);
@@ -604,20 +612,28 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let specialized = arguments
             .iter()
             .any(|value| !matches!(value, AbstractValue::Unknown));
-        let memo = (context.package, owner.clone());
-        if !specialized {
-            if let Some(value) = self.unspecialized_calls.get(&memo) {
-                return Ok(ExecutionOutcome::value(value.clone()));
-            }
-            self.unspecialized_calls
-                .insert(memo.clone(), AbstractValue::Unknown);
+        let memo = ConstructionCallKey {
+            node: context.node,
+            package: context.package,
+            owner: owner.clone(),
+            arguments: call
+                .arguments
+                .iter()
+                .map(|argument| argument.name.clone())
+                .zip(arguments.iter().cloned())
+                .collect(),
+        };
+        if let Some(value) = self.construction_calls.get(&memo) {
+            return Ok(ExecutionOutcome::value(value.clone()));
         }
-        let parse_context =
-            self.oak_parse_context(context.package, context.image, &closure.environment)?;
+        self.construction_calls
+            .insert(memo.clone(), AbstractValue::Unknown);
+        self.construction_evaluations += 1;
         let Some(parsed) = self.parsed_source(
             context.package,
             closure.source,
-            parse_context,
+            context.image,
+            &closure.environment,
             ParseRequest {
                 owner_binding: &owner,
                 source_key: &owner,
@@ -646,9 +662,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 break;
             }
         }
-        if !specialized {
-            self.unspecialized_calls.insert(memo, value.clone());
-        }
+        self.construction_calls.insert(memo, value.clone());
         Ok(ExecutionOutcome::value(value))
     }
 
