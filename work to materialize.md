@@ -179,16 +179,15 @@ that fails before its fix.
 
 ## Track C: Rust cleanup, types, and performance
 
-Why: about 23k lines of Rust carry invariants in comments, strings, and `unreachable!`; parts of the
-IR exist only for show; and finalization reads the provenance graph.
+Why: about 23k lines of Rust carry invariants in comments, strings, and `unreachable!`.
 
 Performance:
 - Profile with `cargo bench` before optimizing. Measured: Air plus Oak grows about quadratically
-  with closure size (400 statements 346 ms, 1000 statements 2.1 s), and warm rlang analysis still
-  takes 21 s of its 32 s cold time. Unmeasured candidates: one JSON worker round trip per binding
-  (batch per package), two `normalize_syntax` calls per parsed closure (merge into one), a single
-  R worker (several worker processes can inspect different packages in parallel), and string-keyed
-  maps in the analyzer (interning).
+  with closure size (400 statements 346 ms, 1000 statements 2.1 s); warm rlang analysis takes 18 s
+  of its 31 s cold time, and its roughly 3,500 `normalize_syntax` round trips (two per parsed
+  closure) cost about 4.6 s before the response-polling fix. Unmeasured candidates: one JSON worker
+  round trip per binding (batch per package), a single R worker (several worker processes can
+  inspect different packages in parallel), and string-keyed maps in the analyzer (interning).
 
 Invariants into types:
 - Names: about 54 `String` fields and 87 string collections hold package, binding, class, and
