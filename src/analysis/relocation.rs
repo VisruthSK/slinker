@@ -1,3 +1,4 @@
+use super::NodeId;
 use crate::ir::NamespaceOperation;
 use crate::package::{BindingName, PackageId};
 use crate::syntax::Span;
@@ -52,5 +53,59 @@ impl PendingRelocation {
             self,
             Self::ResourceAccess { .. } | Self::PackageVersion { .. }
         )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct SyntaxObservation {
+    pub(super) node: NodeId,
+    pub(super) package: PackageId,
+    pub(super) span: Span,
+    pub(super) kind: String,
+}
+
+#[derive(Default)]
+pub(super) struct RelocationPlan {
+    relocations: Vec<PendingRelocation>,
+    dynamic_resource_lookups: Vec<(NodeId, PackageId, Span)>,
+    observations: Vec<SyntaxObservation>,
+}
+
+impl RelocationPlan {
+    pub(super) fn push(&mut self, relocation: PendingRelocation) {
+        self.relocations.push(relocation);
+    }
+
+    pub(super) fn relocations(&self) -> &[PendingRelocation] {
+        &self.relocations
+    }
+
+    pub(super) fn defer_dynamic_resource_lookup(
+        &mut self,
+        node: NodeId,
+        package: PackageId,
+        span: Span,
+    ) {
+        self.dynamic_resource_lookups.push((node, package, span));
+    }
+
+    pub(super) fn take_dynamic_resource_lookups(&mut self) -> Vec<(NodeId, PackageId, Span)> {
+        std::mem::take(&mut self.dynamic_resource_lookups)
+    }
+
+    pub(super) fn observe(&mut self, observation: SyntaxObservation) {
+        self.observations.push(observation);
+    }
+
+    pub(super) fn observations_of_rewritten_syntax(&self) -> Vec<SyntaxObservation> {
+        self.observations
+            .iter()
+            .filter(|observation| {
+                self.relocations
+                    .iter()
+                    .any(|relocation| observation.span.overlaps(relocation.source()))
+            })
+            .cloned()
+            .collect()
     }
 }

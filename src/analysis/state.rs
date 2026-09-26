@@ -7,7 +7,9 @@ use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
 use super::namespace::NamespaceBuilder;
 use super::need::{NeedQueue, Popped};
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
-use super::relocation::{NamespaceCall, PendingRelocation};
+use super::parse_cache::{ParseCache, ParseState};
+use super::reflection::ReflectionFacts;
+use super::relocation::{NamespaceCall, PendingRelocation, RelocationPlan, SyntaxObservation};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
 use super::s3::{CallableId, S3Model, callable_target};
 use crate::analysis::policy::{DiscoveryPolicy, LinkPolicy};
@@ -24,7 +26,7 @@ use crate::package::{
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, OakParseContext,
-    OakParser, PackageGuard, ParsedRFile, SemanticIssueKind, SourceId, Sources, Span, StaticArg,
+    OakParser, PackageGuard, ParsedRFile, SemanticIssueKind, SourceId, Span, StaticArg,
     StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::{Error, Result};
@@ -32,12 +34,6 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-
-#[derive(Clone, Debug)]
-pub(super) enum ParseState {
-    Parsed(Arc<ParsedRFile>),
-    Blocked,
-}
 
 pub(super) struct ParseRequest<'a> {
     pub(super) owner_binding: &'a str,
@@ -67,39 +63,25 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) needs: NeedQueue,
     pub(super) encountered: HashSet<PackageId>,
     pub(super) external: HashSet<PackageId>,
-    pub(super) parsed_bindings: HashMap<(PackageId, String), ParseState>,
+    pub(super) parses: ParseCache,
     pub(super) images: HashMap<PackageId, Arc<PackageImage>>,
     pub(super) objects: ObjectWorld,
     pub(super) diagnostics: DiagnosticSink,
-    pub(super) pending_relocations: Vec<PendingRelocation>,
-    pub(super) dynamic_resource_lookups: Vec<(NodeId, PackageId, Span)>,
+    pub(super) relocations: RelocationPlan,
     pub(super) s3: S3Model,
     pub(super) value_closures: HashSet<NodeId>,
     pub(super) construction_calls: HashMap<ConstructionCallKey, AbstractValue>,
     pub(super) construction_evaluations: usize,
-    pub(super) non_reflective_namespace_uses: HashSet<Span>,
+    pub(super) reflection: ReflectionFacts,
     pub(super) external_bindings: BTreeMap<(PackageId, String), ExternalBindingAccess>,
     pub(super) dependencies: HashMap<NodeId, HashSet<NodeId>>,
     pub(super) provenance: bool,
-    pub(super) sources: Sources,
-    pub(super) source_ids: HashMap<(PackageId, String), SourceId>,
-    pub(super) normalized_shapes: HashMap<(PackageId, String), Digest>,
     pub(super) root: Option<PackageId>,
     pub(super) suggested_only: HashMap<PackageId, HashSet<String>>,
     pub(super) namespace_imports: HashMap<PackageId, NamespaceImports>,
     pub(super) non_returning_bindings: HashMap<PackageId, BTreeSet<String>>,
     pub(super) namespace_builders: HashMap<PackageId, NamespaceBuilder>,
-    pub(super) observations: Vec<SyntaxObservation>,
-    pub(super) contextual_namespace_calls: HashMap<Span, Option<String>>,
     pub(super) root_description: Option<Arc<str>>,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct SyntaxObservation {
-    pub(super) node: NodeId,
-    pub(super) package: PackageId,
-    pub(super) span: Span,
-    pub(super) kind: String,
 }
 
 pub(super) struct NativeCallTarget {
@@ -121,30 +103,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
             needs: NeedQueue::default(),
             encountered: HashSet::new(),
             external: HashSet::new(),
-            parsed_bindings: HashMap::new(),
+            parses: ParseCache::default(),
             images: HashMap::new(),
             objects: ObjectWorld::default(),
             diagnostics: DiagnosticSink::default(),
-            pending_relocations: Vec::new(),
-            dynamic_resource_lookups: Vec::new(),
+            relocations: RelocationPlan::default(),
             s3: S3Model::default(),
             value_closures: HashSet::new(),
             construction_calls: HashMap::new(),
             construction_evaluations: 0,
-            non_reflective_namespace_uses: HashSet::new(),
+            reflection: ReflectionFacts::default(),
             external_bindings: BTreeMap::new(),
             dependencies: HashMap::new(),
             provenance: true,
-            sources: Sources::default(),
-            source_ids: HashMap::new(),
-            normalized_shapes: HashMap::new(),
             root: None,
             suggested_only: HashMap::new(),
             namespace_imports: HashMap::new(),
             non_returning_bindings: HashMap::new(),
             namespace_builders: HashMap::new(),
-            observations: Vec::new(),
-            contextual_namespace_calls: HashMap::new(),
             root_description: None,
         }
     }
@@ -389,7 +365,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
 
             let key = (id, source_key.clone());
-            if self.parsed_bindings.contains_key(&key) || !scheduled.insert(key.clone()) {
+            if self.parses.contains(&key) || !scheduled.insert(key.clone()) {
                 continue;
             }
             let Some(source) =
@@ -451,8 +427,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for (item, result) in work.into_iter().zip(results) {
             match result {
                 Ok(parsed) => {
-                    self.parsed_bindings
-                        .insert(item.key, ParseState::Parsed(Arc::new(parsed)));
+                    self.parses.store(item.key, Arc::new(parsed));
                 }
                 Err(error) => {
                     self.handle_air_rejection(
@@ -1201,7 +1176,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .filter(|(name, _)| name.as_deref() == Some("envir"))
                 .filter_map(|(_, span)| span.clone())
                 .collect();
-            self.non_reflective_namespace_uses = uses;
+            self.reflection.set_non_reflective_namespace_uses(uses);
             for call in &expression.calls {
                 if !self.guards_active(package, image, &call.guards)? {
                     continue;
@@ -1314,7 +1289,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             owner_node,
         } = request;
         let key = (id, source_key.to_owned());
-        if let Some(state) = self.parsed_bindings.get(&key) {
+        if let Some(state) = self.parses.state(&key) {
             return Ok(match state {
                 ParseState::Parsed(parsed) => Some(Arc::clone(parsed)),
                 ParseState::Blocked => None,
@@ -1329,8 +1304,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         match OakParser.parse_binding_with_context(source, source_text.as_ref(), &context) {
             Ok(parsed) => {
                 let parsed = Arc::new(parsed);
-                self.parsed_bindings
-                    .insert(key, ParseState::Parsed(Arc::clone(&parsed)));
+                self.parses.store(key, Arc::clone(&parsed));
                 Ok(Some(parsed))
             }
             Err(error) => {
@@ -1349,12 +1323,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         text: &Arc<str>,
     ) -> Result<Option<SourceId>> {
         let key = (id, source_key.to_owned());
-        let source = self.sources.add_binding(
-            self.packages.name(id).to_owned(),
-            source_key.to_owned(),
-            Arc::clone(text),
-        );
-        self.source_ids.insert(key.clone(), source.clone());
+        let source = self
+            .parses
+            .register(key.clone(), self.packages.name(id), text);
         let normalized = self.packages.normalize_syntax(text)?;
         let normalized_again = self.packages.normalize_syntax(&normalized)?;
         if normalized != normalized_again {
@@ -1368,10 +1339,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 ),
                 Some(Span::new(source, 0, text.len())),
             );
-            self.parsed_bindings.insert(key, ParseState::Blocked);
+            self.parses.block(key);
             return Ok(None);
         }
-        self.normalized_shapes.insert(key, Digest::of(&normalized));
+        self.parses.record_shape(key, Digest::of(&normalized));
         Ok(Some(source))
     }
 
@@ -1384,19 +1355,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
         air_error: String,
     ) -> Result<()> {
         let key = (id, source_key.to_owned());
-        let source_id = self.source_ids.get(&key).cloned().ok_or_else(|| {
+        let (source_id, source_text) = self.parses.registered(&key).ok_or_else(|| {
             Error::Analysis(format!(
                 "missing virtual source for {}::{source_key}",
                 self.packages.name(id)
             ))
         })?;
-        let source_text = Arc::clone(
-            &self
-                .sources
-                .get(&source_id)
-                .ok_or_else(|| Error::Analysis("missing source entry".into()))?
-                .text,
-        );
         let validation = self.packages.validate_syntax(source_text.as_ref())?;
         let span = Some(Span::new(source_id, 0, source_text.len()));
         match validation {
@@ -1421,7 +1385,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 span,
             ),
         }
-        self.parsed_bindings.insert(key, ParseState::Blocked);
+        self.parses.block(key);
         Ok(())
     }
 
@@ -1878,13 +1842,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ),
             Some(reference.span.clone()),
         );
-        self.pending_relocations
-            .push(PendingRelocation::NamespaceAccess {
-                source: reference.span.clone(),
-                package: foreign,
-                binding,
-                internal: reference.internal,
-            });
+        self.relocations.push(PendingRelocation::NamespaceAccess {
+            source: reference.span.clone(),
+            package: foreign,
+            binding,
+            internal: reference.internal,
+        });
         Ok(())
     }
 
@@ -1895,8 +1858,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         resource: &crate::syntax::ResourceRef,
     ) -> Result<()> {
         let Some(package_name) = &resource.package else {
-            self.dynamic_resource_lookups
-                .push((from, current, resource.span.clone()));
+            self.relocations
+                .defer_dynamic_resource_lookup(from, current, resource.span.clone());
             return Ok(());
         };
 
@@ -1976,12 +1939,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             format!("system.file requires {package_name}/{path}"),
             Some(resource.span.clone()),
         );
-        self.pending_relocations
-            .push(PendingRelocation::ResourceAccess {
-                source: resource.span.clone(),
-                package: foreign,
-                resource: path.clone(),
-            });
+        self.relocations.push(PendingRelocation::ResourceAccess {
+            source: resource.span.clone(),
+            package: foreign,
+            resource: path.clone(),
+        });
         Ok(())
     }
 
@@ -2184,9 +2146,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if call.callee == "exists"
             && self.argument_text(call, "inherits") == Some("FALSE")
             && self.argument_span(call, "envir").is_some_and(|span| {
-                self.non_reflective_namespace_uses.contains(span)
-                    && self.sources.get(&span.source).is_some_and(|source| {
-                        let text = source.text[span.start..span.end].trim_start_matches("base::");
+                self.reflection.is_non_reflective_namespace_use(span)
+                    && self.parses.text(span).is_some_and(|text| {
+                        let text = text.trim_start_matches("base::");
                         text.starts_with("asNamespace(") || text.starts_with("getNamespace(")
                     })
             })
@@ -2246,14 +2208,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn argument_text(&self, call: &CallSite, name: &str) -> Option<&str> {
         let span = self.argument_span(call, name)?;
-        Some(self.sources.get(&span.source)?.text[span.start..span.end].trim())
+        Some(self.parses.text(span)?.trim())
     }
 
     fn builds_function_name(&self, call: &CallSite, formals: &[&str], target: &str) -> bool {
         matched_call_arg_index(call, formals, target)
             .and_then(|index| call.arg_spans.get(index)?.as_ref())
             .and_then(|span| {
-                let text = &self.sources.get(&span.source)?.text[span.start..span.end];
+                let text = self.parses.text(span)?;
                 Some(
                     ["paste0(", "paste(", "sprintf(", "as.character("]
                         .iter()
@@ -2477,12 +2439,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     );
                 }
             }
-            "deparse" | "substitute" | "match.call" => self.observations.push(SyntaxObservation {
-                node: from,
-                package: current,
-                span: call.span.clone(),
-                kind: call.callee.clone(),
-            }),
+            "deparse" | "substitute" | "match.call" => {
+                self.relocations.observe(SyntaxObservation {
+                    node: from,
+                    package: current,
+                    span: call.span.clone(),
+                    kind: call.callee.clone(),
+                })
+            }
             _ => {}
         }
         Ok(())
@@ -2497,14 +2461,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
         operation: NamespaceCall,
     ) -> Result<()> {
         let name = static_string_arg(call).map(Cow::Borrowed).or_else(|| {
-            self.contextual_namespace_calls
-                .get(&call.span)
-                .and_then(Option::as_ref)
-                .cloned()
-                .map(Cow::Owned)
+            self.reflection
+                .contextual_namespace(&call.span)
+                .map(|name| Cow::Owned(name.to_owned()))
         });
         let Some(name) = name else {
-            if self.non_reflective_namespace_uses.contains(&call.span) {
+            if self.reflection.is_non_reflective_namespace_use(&call.span) {
                 return Ok(());
             }
             self.assume(
@@ -2524,11 +2486,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let discovery_policy = if self.optional_package_selected(&name) {
             DiscoveryPolicy::Internalize
         } else if suggested && operation == NamespaceCall::Require {
-            self.pending_relocations
-                .push(PendingRelocation::RequireNamespace {
-                    source: call.span.clone(),
-                    result: false,
-                });
+            self.relocations.push(PendingRelocation::RequireNamespace {
+                source: call.span.clone(),
+                result: false,
+            });
             return Ok(());
         } else if suggested {
             return Ok(());
@@ -2560,11 +2521,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(call.span.clone()),
                 ),
                 None if operation == NamespaceCall::Require => {
-                    self.pending_relocations
-                        .push(PendingRelocation::RequireNamespace {
-                            source: call.span.clone(),
-                            result: false,
-                        });
+                    self.relocations.push(PendingRelocation::RequireNamespace {
+                        source: call.span.clone(),
+                        result: false,
+                    });
                 }
                 None => self.record_missing_package(
                     from,
@@ -2587,7 +2547,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         format!("specialized {} requires `{name}`", call.callee),
                         Some(call.span.clone()),
                     );
-                    self.pending_relocations.push(match operation {
+                    self.relocations.push(match operation {
                         NamespaceCall::Require => PendingRelocation::RequireNamespace {
                             source: call.span.clone(),
                             result: true,
@@ -2602,11 +2562,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 None if operation == NamespaceCall::Require
                     && !self.optional_package_selected(&name) =>
                 {
-                    self.pending_relocations
-                        .push(PendingRelocation::RequireNamespace {
-                            source: call.span.clone(),
-                            result: false,
-                        });
+                    self.relocations.push(PendingRelocation::RequireNamespace {
+                        source: call.span.clone(),
+                        result: false,
+                    });
                 }
                 None => self.record_missing_package(
                     from,
@@ -2717,11 +2676,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(call.span.clone()),
                 ),
                 Some(foreign) => {
-                    self.pending_relocations
-                        .push(PendingRelocation::PackageVersion {
-                            source: call.span.clone(),
-                            version: self.packages.identity(foreign).version.to_string(),
-                        });
+                    self.relocations.push(PendingRelocation::PackageVersion {
+                        source: call.span.clone(),
+                        version: self.packages.identity(foreign).version.to_string(),
+                    });
                 }
                 None => self.record_missing_package(
                     from,

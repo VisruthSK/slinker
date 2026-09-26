@@ -44,7 +44,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .iter()
             .any(|package| self.packages.role(*package) == LinkedPackageRole::Linked)
         {
-            for (node, package, span) in std::mem::take(&mut self.dynamic_resource_lookups) {
+            for (node, package, span) in self.relocations.take_dynamic_resource_lookups() {
                 self.assume(
                     node,
                     package,
@@ -62,7 +62,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             provenance: crate::ir::ProvenanceIr::from_analysis(self.graph, self.roots),
             blockers,
             assumptions,
-            sources: self.sources,
+            sources: self.parses.into_sources(),
             packages: self.packages.sources(retained),
             construction_evaluations: self.construction_evaluations,
         }
@@ -179,7 +179,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(binding) => {
                         match (
                             &binding.closure,
-                            self.normalized_shapes.get(&(package, name.clone())),
+                            self.parses.shape(&(package, name.clone())),
                         ) {
                             (Some(closure), Some(normalized_shape))
                                 if closure.environment == namespace_label =>
@@ -398,9 +398,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             closure
         });
-        for relocation in &self.pending_relocations {
+        for relocation in self.relocations.relocations() {
             let source = relocation.source();
-            let origin = self.sources.origin(&source.source);
+            let origin = self.parses.sources().origin(&source.source);
             let (owner_package, owner_binding) = (&origin.package, &origin.binding);
             let Some(code) = namespace_ids[owner_package.as_str()]
                 .bindings
@@ -681,32 +681,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn finalize_syntax_observations(&mut self) {
-        if self.observations.is_empty() || self.pending_relocations.is_empty() {
-            return;
-        }
-        let pending_relocations = self
-            .pending_relocations
-            .iter()
-            .map(PendingRelocation::source)
-            .cloned()
-            .collect::<Vec<_>>();
-        for observation in self.observations.clone() {
-            if pending_relocations
-                .iter()
-                .any(|rewrite| observation.span.overlaps(rewrite))
-            {
-                self.diagnostic(
-                    observation.node,
-                    observation.package,
-                    None,
-                    RejectCode::SyntaxObservation,
-                    format!(
-                        "{} can observe syntax changed by a planned rewrite",
-                        observation.kind
-                    ),
-                    Some(observation.span),
-                );
-            }
+        for observation in self.relocations.observations_of_rewritten_syntax() {
+            self.diagnostic(
+                observation.node,
+                observation.package,
+                None,
+                RejectCode::SyntaxObservation,
+                format!(
+                    "{} can observe syntax changed by a planned rewrite",
+                    observation.kind
+                ),
+                Some(observation.span),
+            );
         }
     }
 }

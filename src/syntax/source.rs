@@ -90,6 +90,10 @@ impl Sources {
         &self.entries[id.0].origin
     }
 
+    pub fn text(&self, span: &Span) -> Option<&str> {
+        self.get(&span.source)?.text.get(span.start..span.end)
+    }
+
     pub fn get(&self, id: &SourceId) -> Option<&SourceEntry> {
         self.entries.get(id.0)
     }

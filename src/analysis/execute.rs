@@ -845,7 +845,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         namespace_target(name),
                     )
                 {
-                    self.record_contextual_namespace_call(span, package);
+                    self.reflection
+                        .record_contextual_namespace_call(span, package);
                 }
                 match construction_argument(
                     call,
@@ -903,17 +904,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         };
         Ok(ExecutionOutcome::value(value))
-    }
-
-    pub(super) fn record_contextual_namespace_call(&mut self, span: &Span, package: &str) {
-        self.contextual_namespace_calls
-            .entry(span.clone())
-            .and_modify(|known| {
-                if known.as_deref() != Some(package) {
-                    *known = None;
-                }
-            })
-            .or_insert_with(|| Some(package.to_owned()));
     }
 
     pub(super) fn abstract_environment(
