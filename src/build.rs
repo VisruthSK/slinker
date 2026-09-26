@@ -2,7 +2,7 @@ use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::ir::{
     ClosureHome, GenericHome, LinkBindingState, LinkNamespaceState, ObjectStep, ProgramIr,
-    RelocationTarget, ResourceId, Value,
+    RegisteredNamespace, RelocationTarget, ResourceId, Value,
 };
 use crate::package::PackageId;
 use crate::r_worker::client::WorkerClient;
@@ -446,13 +446,13 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     }
 
     out.push_str("bootstrap <- function(root, libname, pkgname) {\n  .slinker_check_target()\n");
-    out.push_str("  linked <- list()\n");
+    out.push_str("  on.exit(.slinker_unregister(), add = TRUE)\n");
     for activation in program.activations() {
         let package = program.package(program.namespace(activation.namespace).package);
         let identity = package.identity();
         emit!(
             out,
-            "  linked[[{key}]] <- .slinker_new_namespace({key}, {}, {})",
+            "  namespaces[[{key}]] <- .slinker_new_namespace({key}, {}, {})",
             r_string(&identity.name),
             r_string(identity.version.as_ref()),
             key = r_string(package.registered_namespace().as_str()),
@@ -464,7 +464,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         let name = &package.identity().name;
         emit!(
             out,
-            "  local({{\n    ns <- linked[[{}]]\n    imports <- parent.env(ns)",
+            "  local({{\n    ns <- namespaces[[{}]]\n    imports <- parent.env(ns)",
             r_string(package.registered_namespace().as_str())
         );
         for native in &activation.native_components {
@@ -572,6 +572,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             r_string(&program.package(root.package).identity().name)
         );
     }
+    out.push_str("  .slinker_unregister()\n");
     if root_on_load.is_some() {
         out.push_str(
             "  get(\".slinker_original_on_load\", envir = root, inherits = FALSE)(libname, pkgname)\n",
@@ -651,10 +652,15 @@ fn namespace_get(program: &ProgramIr, binding: crate::ir::BindingId) -> String {
 }
 
 fn namespace_expression(program: &ProgramIr, package: PackageId) -> String {
-    format!(
-        "base::asNamespace({})",
-        r_string(program.package(package).registered_namespace().as_str())
-    )
+    let root = program.package(program.root_package());
+    match program.package(package).registered_namespace() {
+        RegisteredNamespace::Package(name) => format!("base::asNamespace({})", r_string(name)),
+        RegisteredNamespace::Private(key) => format!(
+            "base::asNamespace({})[[\".slinker_runtime\"]][[\"namespaces\"]][[{}]]",
+            r_string(&root.identity().name),
+            r_string(key.as_str())
+        ),
+    }
 }
 
 fn s3_matrix(program: &ProgramIr, registrations: &[crate::ir::S3RegistrationId]) -> String {
@@ -987,6 +993,12 @@ fn r_binding_name(value: &str) -> String {
 }
 
 const GENERATED_RUNTIME: &str = r#"
+namespaces <- new.env(hash = TRUE, parent = emptyenv())
+.slinker_unregister <- function() {
+  for (key in names(namespaces)) {
+    if (identical(.Internal(getRegisteredNamespace(key)), namespaces[[key]])) .Internal(unregisterNamespace(key))
+  }
+}
 .slinker_check_target <- function() {
   actual <- c(
     version = paste0(R.version$major, ".", R.version$minor),

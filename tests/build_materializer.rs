@@ -100,7 +100,7 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
     fs::create_dir(&installed).expect("library with the real Linked package");
     install_package(&r_home, &dependency_source, &installed);
     install_package(&r_home, &output, &installed);
-    let private = "stopifnot(!isNamespaceLoaded('tinylinked')); linked <- environment(get('bfun', envir = parent.env(asNamespace('linkroot')))); stopifnot(isNamespace(linked), identical(unname(getNamespaceName(linked)), 'tinylinked'), identical(environmentName(linked), 'tinylinked'))";
+    let private = "stopifnot(!isNamespaceLoaded('tinylinked'), !any(grepl(':', loadedNamespaces(), fixed = TRUE))); withCallingHandlers(invisible(sessionInfo()), warning = function(w) stop(w)); linked <- environment(get('bfun', envir = parent.env(asNamespace('linkroot')))); stopifnot(isNamespace(linked), identical(unname(getNamespaceName(linked)), 'tinylinked'), identical(environmentName(linked), 'tinylinked'))";
     for library in [&validation, &installed] {
         run_r(&r_home, library, &format!("{behavior}; {private}"));
     }
