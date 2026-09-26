@@ -1,8 +1,8 @@
 #![cfg(feature = "air")]
 
 use slinker::analysis::{
-    DiscoveryPolicy, EdgeKind, ExplanationDag, GraphEdgeReasonExport, GraphExport, LinkPolicy,
-    Linker, NodeKind, RejectCode,
+    DiscoveryPolicy, EdgeKind, ExplanationDag, GraphEdgeReasonExport, LinkPolicy, Linker, NodeKind,
+    RejectCode,
 };
 use slinker::package::{
     BindingImage, BindingOrigin, ClosureSource, Digest, EmbeddedClosureSource, ExportMap,
@@ -4626,30 +4626,29 @@ fn graph_export_is_deterministic_semantic_and_count_consistent() {
         base_bindings: Default::default(),
     };
 
-    let first = GraphExport::from_plan(&first_plan, &target, "root").unwrap();
-    let second = GraphExport::from_plan(&second_plan, &target, "root").unwrap();
+    let first = ExplanationDag::from_plan(&first_plan, &target, "root").unwrap();
+    let second = ExplanationDag::from_plan(&second_plan, &target, "root").unwrap();
     let first_json = serde_json::to_string_pretty(&first).unwrap();
     let second_json = serde_json::to_string_pretty(&second).unwrap();
 
     assert_eq!(first_json, second_json);
-    assert_eq!(first.schema_version, 2);
-    assert_eq!(first.stats.nodes, first.nodes.len());
-    assert_eq!(first.stats.edges, first.edges.len());
-    assert_eq!(first.stats.roots, first.roots.len());
-    assert_eq!(first.stats.nodes, first_plan.provenance().nodes().len());
-    assert_eq!(first.stats.edges, first_plan.provenance().edges().len());
-    assert!(first.nodes.windows(2).all(|pair| pair[0].id <= pair[1].id));
-    assert!(first.roots.windows(2).all(|pair| pair[0] <= pair[1]));
-    assert!(first.edges.windows(2).all(|pair| pair[0] <= pair[1]));
-    assert!(first.edges.iter().any(|edge| {
-        edge.from == "root::f"
-            && edge.to == "foo::bar"
-            && edge.reasons == vec![GraphEdgeReasonExport::QualifiedReference]
-    }));
-    assert!(first.root_reasons.iter().any(|root| {
+    assert_eq!(first.stats.raw_nodes, first_plan.provenance().nodes().len());
+    assert_eq!(first.stats.raw_edges, first_plan.provenance().edges().len());
+    assert!(
+        first
+            .edges
+            .iter()
+            .flat_map(|edge| &edge.evidence)
+            .any(|evidence| {
+                evidence.from_member == "root::f"
+                    && evidence.to_member == "foo::bar"
+                    && evidence.reason == GraphEdgeReasonExport::QualifiedReference
+            })
+    );
+    assert!(first.roots.iter().any(|root| {
         root.id == "root::f" && root.reasons == vec![GraphEdgeReasonExport::ExportRoot]
     }));
-    assert!(first.root_reasons.iter().any(|root| {
+    assert!(first.roots.iter().any(|root| {
         root.id == "package:root" && root.reasons == vec![GraphEdgeReasonExport::PackageRoot]
     }));
 }
@@ -4672,11 +4671,11 @@ fn graph_export_survives_blocked_analysis() {
         libraries: Vec::new(),
         base_bindings: Default::default(),
     };
-    let export = GraphExport::from_plan(&plan, &target, "root").unwrap();
+    let export = ExplanationDag::from_plan(&plan, &target, "root").unwrap();
     let json = serde_json::to_string(&export).unwrap();
 
-    assert!(!export.nodes.is_empty());
-    assert!(!export.blockers.is_empty());
+    assert!(!export.components.is_empty());
+    assert!(!export.diagnostics.is_empty());
     assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
 }
 

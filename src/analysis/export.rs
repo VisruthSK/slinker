@@ -1,27 +1,10 @@
 use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::analysis::diagnostic::RejectCode;
-use crate::analysis::graph::{Edge, EdgeKind, Node, NodeKind};
+use crate::analysis::graph::{Edge, EdgeKind, Graph, Node, NodeKind};
 use crate::syntax::{Sources, Span};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-
-pub const GRAPH_SCHEMA_VERSION: u32 = 2;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct GraphExport {
-    pub schema_version: u32,
-    pub package: PackageIdentityExport,
-    pub target: TargetIdentityExport,
-    pub nodes: Vec<GraphNodeExport>,
-    pub edges: Vec<GraphEdgeExport>,
-    pub roots: Vec<String>,
-    pub root_reasons: Vec<GraphRootReasonExport>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub blockers: Vec<GraphBlockerExport>,
-    pub stats: GraphStatsExport,
-}
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageIdentityExport {
@@ -35,12 +18,6 @@ pub struct TargetIdentityExport {
     pub r_version: String,
     pub platform: String,
     pub arch: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct GraphNodeExport {
-    pub id: String,
-    pub kind: GraphNodeKindExport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -59,17 +36,6 @@ pub enum GraphNodeKindExport {
     PackageMetadata,
     MissingPackage,
     Rejection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct GraphEdgeExport {
-    pub from: String,
-    pub to: String,
-    pub reasons: Vec<GraphEdgeReasonExport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<GraphSourceExport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -103,198 +69,87 @@ pub struct GraphSourceExport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct GraphRootReasonExport {
-    pub id: String,
-    pub reasons: Vec<GraphEdgeReasonExport>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GraphBlockerExport {
     pub kind: String,
     pub owner: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct GraphStatsExport {
-    pub nodes: usize,
-    pub edges: usize,
-    pub roots: usize,
+pub(crate) fn root_identity(
+    plan: &LinkIr,
+    root_name: &str,
+) -> Result<PackageIdentityExport, String> {
+    let root_package = plan
+        .program()
+        .package(plan.program().root_package())
+        .identity();
+    if root_package.name != root_name {
+        return Err(format!(
+            "requested root `{root_name}` disagrees with ProgramIr root `{}`",
+            root_package.name
+        ));
+    }
+    Ok(PackageIdentityExport {
+        name: root_package.name.clone(),
+        version: root_package.version.to_string(),
+        image_fingerprint: root_package.image_fingerprint.0.clone(),
+    })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphExportError(String);
-
-impl GraphExportError {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+pub(crate) fn target_identity(target: &TargetEnvironment) -> TargetIdentityExport {
+    TargetIdentityExport {
+        r_version: target.target.r_version.clone(),
+        platform: target.target.os.clone(),
+        arch: target.target.arch.clone(),
     }
 }
 
-impl fmt::Display for GraphExportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "internal error: {}", self.0)
+pub(crate) fn semantic_node_ids(graph: &Graph) -> Result<Vec<String>, String> {
+    let mut node_ids = Vec::with_capacity(graph.nodes.len());
+    let mut seen_ids = BTreeMap::<String, usize>::new();
+    for (index, node) in graph.nodes.iter().enumerate() {
+        if node.id.0 != index {
+            return Err(format!(
+                "graph node index {index} carries inconsistent internal id {}",
+                node.id.0
+            ));
+        }
+        let id = semantic_node_id(node);
+        if let Some(previous) = seen_ids.insert(id.clone(), index) {
+            return Err(format!(
+                "semantic node id `{id}` is ambiguous between internal nodes {previous} and {index}"
+            ));
+        }
+        node_ids.push(id);
     }
+    Ok(node_ids)
 }
 
-impl std::error::Error for GraphExportError {}
-
-impl GraphExport {
-    pub fn from_plan(
-        plan: &LinkIr,
-        target: &TargetEnvironment,
-        root_name: &str,
-    ) -> Result<Self, GraphExportError> {
-        let graph = plan.provenance().graph();
-        let root_package = plan
-            .program()
-            .package(plan.program().root_package())
-            .identity();
-        if root_package.name != root_name {
-            return Err(GraphExportError::new(format!(
-                "requested root `{root_name}` disagrees with ProgramIr root `{}`",
-                root_package.name
-            )));
-        }
-
-        let mut node_ids = Vec::with_capacity(graph.nodes.len());
-        let mut seen_ids = BTreeMap::<String, usize>::new();
-        let mut nodes = Vec::with_capacity(graph.nodes.len());
-        for (index, node) in graph.nodes.iter().enumerate() {
-            if node.id.0 != index {
-                return Err(GraphExportError::new(format!(
-                    "graph node index {index} carries inconsistent internal id {}",
-                    node.id.0
-                )));
+pub(crate) fn blockers(plan: &LinkIr, node_ids: &[String]) -> Vec<GraphBlockerExport> {
+    let mut blockers = plan
+        .blockers()
+        .iter()
+        .filter(|diagnostic| diagnostic.code != RejectCode::MissingDependency)
+        .map(|diagnostic| {
+            let owner = diagnostic
+                .node
+                .and_then(|id| node_ids.get(id.0).cloned())
+                .or_else(|| {
+                    diagnostic
+                        .binding
+                        .as_ref()
+                        .map(|binding| format!("{}::{binding}", diagnostic.package))
+                })
+                .unwrap_or_else(|| format!("package:{}", diagnostic.package));
+            GraphBlockerExport {
+                kind: reject_code_name(diagnostic.code).to_owned(),
+                owner,
+                message: diagnostic.message.clone(),
             }
-            let id = semantic_node_id(node);
-            if let Some(previous) = seen_ids.insert(id.clone(), index) {
-                return Err(GraphExportError::new(format!(
-                    "semantic node id `{id}` is ambiguous between internal nodes {previous} and {index}"
-                )));
-            }
-            node_ids.push(id.clone());
-            nodes.push(GraphNodeExport {
-                id,
-                kind: node_kind(&node.kind),
-            });
-        }
-        nodes.sort_by(|left, right| {
-            left.id
-                .cmp(&right.id)
-                .then_with(|| left.kind.cmp(&right.kind))
-        });
-
-        // Preserve one exported edge for every internal edge. The internal graph
-        // deliberately distinguishes provenance by detail/span, so coalescing
-        // source/target pairs here would make diagnostic edge counts drift.
-        let mut edges = Vec::with_capacity(graph.edges.len());
-        for edge in &graph.edges {
-            let from = node_ids.get(edge.from.0).cloned().ok_or_else(|| {
-                GraphExportError::new(format!(
-                    "edge references missing source node {}",
-                    edge.from.0
-                ))
-            })?;
-            let from_node = graph.nodes.get(edge.from.0).ok_or_else(|| {
-                GraphExportError::new(format!(
-                    "edge references missing source node {}",
-                    edge.from.0
-                ))
-            })?;
-            let to_node = graph.nodes.get(edge.to.0).ok_or_else(|| {
-                GraphExportError::new(format!("edge references missing target node {}", edge.to.0))
-            })?;
-            let to = node_ids[edge.to.0].clone();
-            edges.push(GraphEdgeExport {
-                from,
-                to,
-                reasons: vec![edge_reason(edge, &from_node.kind, &to_node.kind)],
-                detail: (!edge.reason.is_empty()).then(|| edge.reason.clone()),
-                source: stable_source(plan.sources(), edge.span.as_ref()),
-            });
-        }
-        edges.sort();
-
-        // Roots are metadata in the linker today. Keep them out of `nodes` and
-        // `edges` so inspection cannot change graph counts; root_reasons makes
-        // their semantic cause explicit without synthesizing graph structure.
-        let mut root_indices = BTreeSet::new();
-        let mut roots = Vec::with_capacity(plan.provenance().roots().len());
-        let mut root_reasons = Vec::with_capacity(plan.provenance().roots().len());
-        for root in plan.provenance().roots() {
-            if !root_indices.insert(root.0) {
-                continue;
-            }
-            let node = graph.nodes.get(root.0).ok_or_else(|| {
-                GraphExportError::new(format!("root references missing node {}", root.0))
-            })?;
-            let id = node_ids[root.0].clone();
-            let reason = root_reason(&node.kind).ok_or_else(|| {
-                GraphExportError::new(format!(
-                    "graph root `{id}` of kind `{}` has no diagnostic root representation",
-                    node_kind(&node.kind).as_str()
-                ))
-            })?;
-            roots.push(id.clone());
-            root_reasons.push(GraphRootReasonExport {
-                id,
-                reasons: vec![reason],
-            });
-        }
-        roots.sort();
-        root_reasons.sort();
-
-        let mut blockers = plan
-            .blockers()
-            .iter()
-            .filter(|diagnostic| diagnostic.code != RejectCode::MissingDependency)
-            .map(|diagnostic| {
-                let owner = diagnostic
-                    .node
-                    .and_then(|id| node_ids.get(id.0).cloned())
-                    .or_else(|| {
-                        diagnostic
-                            .binding
-                            .as_ref()
-                            .map(|binding| format!("{}::{binding}", diagnostic.package))
-                    })
-                    .unwrap_or_else(|| format!("package:{}", diagnostic.package));
-                GraphBlockerExport {
-                    kind: reject_code_name(diagnostic.code).to_owned(),
-                    owner,
-                    message: diagnostic.message.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-        blockers.sort();
-
-        let stats = GraphStatsExport {
-            nodes: nodes.len(),
-            edges: edges.len(),
-            roots: roots.len(),
-        };
-
-        Ok(Self {
-            schema_version: GRAPH_SCHEMA_VERSION,
-            package: PackageIdentityExport {
-                name: root_package.name.clone(),
-                version: root_package.version.to_string(),
-                image_fingerprint: root_package.image_fingerprint.0.clone(),
-            },
-            target: TargetIdentityExport {
-                r_version: target.target.r_version.clone(),
-                platform: target.target.os.clone(),
-                arch: target.target.arch.clone(),
-            },
-            nodes,
-            edges,
-            roots,
-            root_reasons,
-            blockers,
-            stats,
         })
-    }
+        .collect::<Vec<_>>();
+    blockers.sort();
+    blockers
 }
 
 impl GraphNodeKindExport {

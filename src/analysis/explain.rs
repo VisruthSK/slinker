@@ -2,9 +2,9 @@ use crate::TargetEnvironment;
 use crate::analysis::Graph;
 use crate::analysis::LinkIr;
 use crate::analysis::export::{
-    GraphBlockerExport, GraphEdgeReasonExport, GraphExport, GraphNodeKindExport, GraphSourceExport,
-    PackageIdentityExport, TargetIdentityExport, edge_reason, node_kind, root_reason,
-    semantic_node_id, stable_source,
+    GraphBlockerExport, GraphEdgeReasonExport, GraphNodeKindExport, GraphSourceExport,
+    PackageIdentityExport, TargetIdentityExport, blockers, edge_reason, node_kind, root_identity,
+    root_reason, semantic_node_ids, stable_source, target_identity,
 };
 use crate::ir::PackageRole;
 use serde::{Deserialize, Serialize};
@@ -166,10 +166,9 @@ impl ExplanationDag {
         target: &TargetEnvironment,
         root_name: &str,
     ) -> Result<Self, ExplanationError> {
-        let raw = GraphExport::from_plan(plan, target, root_name)
-            .map_err(|error| ExplanationError(error.to_string()))?;
+        let root_package = root_identity(plan, root_name).map_err(ExplanationError)?;
         let graph = plan.provenance().graph();
-        let node_ids = graph.nodes.iter().map(semantic_node_id).collect::<Vec<_>>();
+        let node_ids = semantic_node_ids(&graph).map_err(ExplanationError)?;
         let adjacency = adjacency(&graph);
         let (component_of, component_members) = strongly_connected_components(&adjacency);
         let component_ids = component_members
@@ -309,14 +308,14 @@ impl ExplanationDag {
         };
         Ok(Self {
             schema_version: EXPLANATION_SCHEMA_VERSION,
-            root_package: raw.package,
-            target: raw.target,
+            root_package,
+            target: target_identity(target),
             components,
             edges,
             projected_edges,
             roots,
             packages,
-            diagnostics: raw.blockers,
+            diagnostics: blockers(plan, &node_ids),
             stats,
         })
     }

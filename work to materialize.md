@@ -195,9 +195,6 @@ Invariants into types:
   `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
 
 Structure:
-- Provenance is stored as typed derivations; the explanation graph is built only for
-  `why`/`path`/`--graph`. Merge `GraphExport` and `ExplanationDag` into one export (`export.rs`,
-  `explain.rs`, and `graph.rs` are about 1,670 lines together).
 
 Minimal code:
 - Fix the `clippy::pedantic` findings that matter (redundant clones, pass-by-value, `map_or_else`,

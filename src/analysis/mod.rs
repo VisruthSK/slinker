@@ -30,9 +30,8 @@ pub use explain::{
     ProjectedExplanationEdge,
 };
 pub use export::{
-    GRAPH_SCHEMA_VERSION, GraphBlockerExport, GraphEdgeExport, GraphEdgeReasonExport, GraphExport,
-    GraphExportError, GraphNodeExport, GraphNodeKindExport, GraphRootReasonExport,
-    GraphSourceExport, GraphStatsExport, PackageIdentityExport, TargetIdentityExport,
+    GraphBlockerExport, GraphEdgeReasonExport, GraphNodeKindExport, GraphSourceExport,
+    PackageIdentityExport, TargetIdentityExport,
 };
 pub use finalize::LinkIr;
 pub use graph::{Edge, EdgeKind, Graph, Node, NodeId, NodeKind};
