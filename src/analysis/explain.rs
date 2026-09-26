@@ -398,7 +398,7 @@ fn component_id(members: &[usize], node_ids: &[String]) -> String {
         digest.update(id.len().to_le_bytes());
         digest.update(id.as_bytes());
     }
-    format!("component:{}", hex::encode(digest.finalize()))
+    format!("component:{}", crate::package::Digest::finish(digest).0)
 }
 
 fn edge_id(from: &str, to: &str) -> String {
@@ -406,7 +406,7 @@ fn edge_id(from: &str, to: &str) -> String {
     digest.update(from.as_bytes());
     digest.update([0]);
     digest.update(to.as_bytes());
-    format!("edge:{}", hex::encode(digest.finalize()))
+    format!("edge:{}", crate::package::Digest::finish(digest).0)
 }
 
 fn presentation(members: &[ExplanationMember]) -> (PresentationClass, PresentationVisibility) {

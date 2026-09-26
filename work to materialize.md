@@ -190,16 +190,13 @@ Performance:
   inspect different packages in parallel), and string-keyed maps in the analyzer (interning).
 
 Invariants into types:
-- `PackageName`, `BindingName`, `ClassName`, `GenericName`, `ComponentName`, and `ResourcePath` are
-  distinct string newtypes.
-  Interning them so they hash and compare as integers is unmeasured; do it only if a profile shows
-  name hashing matters.
+- Intern the name newtypes so they hash and compare as integers, but only if a profile shows name
+  hashing matters.
 
 Minimal code:
 - Fix the `clippy::pedantic` findings that matter (redundant clones, pass-by-value, `map_or_else`,
   missing `#[must_use]`) and enable the lints that stay useful in CI.
 - Audit the 544 `.clone()` calls on hot paths once names are interned.
-- Drop a dependency when a few lines replace it (`hex` is used in two places).
 - Prune tests that pin obsolete details as each area is reworked (`tests/` is about 5,600 lines).
 
 ## Track D: Build infrastructure and frontend

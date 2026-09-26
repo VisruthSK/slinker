@@ -13,7 +13,12 @@ impl Digest {
     }
 
     pub(crate) fn finish(hash: Sha256) -> Self {
-        Self(hex::encode(hash.finalize()))
+        Self(
+            hash.finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
     }
 }
 
