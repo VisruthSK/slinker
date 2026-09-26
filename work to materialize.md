@@ -206,8 +206,6 @@ Invariants into types:
 - Removed bindings and unretained exports become typed slot state instead of parallel string lists.
 
 IR cleanup (breaking):
-- `NamespaceActivationIr` also owns the Linked native components the bootstrap loads; they are still
-  read from the namespace.
 - Finalization stops reading the graph: External binding uses, activation-time dependencies, and
   `import(pkg)` expansion come from typed analysis state. String issues become typed diagnostics.
   Done when finalization output is unchanged with provenance recording disabled (test).

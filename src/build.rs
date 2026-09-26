@@ -472,8 +472,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             r_string(name)
         )
         .expect("String writes cannot fail");
-        for component in &namespace.native_components {
-            let native = &program.native_component(*component).native;
+        for native in &activation.native_components {
             let Some(library) = &native.library else {
                 continue;
             };
@@ -679,8 +678,7 @@ fn render_namespace(program: &ProgramIr) -> String {
             .expect("String writes cannot fail");
         }
     }
-    for component in &root.native_components {
-        let native = &program.native_component(*component).native;
+    for native in &program.root_artifact().native_components {
         let registration = native.registration.iter().map(|fixes| {
             format!(
                 ".registration = TRUE, .fixes = c({}, {})",

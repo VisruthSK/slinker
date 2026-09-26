@@ -145,6 +145,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }));
 
         let mut linked_namespaces = Vec::new();
+        let mut root_native_components = Vec::new();
+        let mut linked_native_components = HashMap::new();
         let mut namespace_ids = HashMap::new();
         for (package, role) in ordered {
             let package_name = self.packages.name(package);
@@ -243,8 +245,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     method,
                 );
             }
+            match materialized {
+                MaterializedRole::Root => root_native_components = image.index.dynlibs.clone(),
+                MaterializedRole::Linked => {
+                    linked_native_components
+                        .insert(namespace.namespace, image.index.dynlibs.clone());
+                }
+            }
             for native in &image.index.dynlibs {
-                builder.attach_native_component(namespace.namespace, native.clone());
                 if let (LinkedPackageRole::Linked, Some(library)) = (role, &native.library) {
                     builder.add_resource(crate::ir::ResourceIr {
                         package,
@@ -405,6 +413,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             builder.add_activation(crate::ir::NamespaceActivationIr {
                 namespace: next,
                 on_load: on_load_bindings.get(&next).copied(),
+                native_components: linked_native_components.remove(&next).unwrap_or_default(),
                 exports,
                 unretained_exports,
                 stubs,
@@ -532,6 +541,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         builder.set_root_artifact(RootArtifactIr {
             description,
             exports: root_exports,
+            native_components: root_native_components,
             on_load: root_on_load,
         });
         (builder.finish(), issues)

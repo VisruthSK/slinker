@@ -32,7 +32,6 @@ id_type!(EnvironmentId);
 id_type!(CodeId);
 id_type!(CodeOccurrenceId);
 id_type!(S3RegistrationId);
-id_type!(NativeComponentId);
 id_type!(ResourceId);
 
 /// Final package runtime contract.
@@ -156,7 +155,6 @@ pub struct Namespace {
     pub imports: Vec<ImportBindingIr>,
     pub state: LinkNamespaceState,
     pub s3_registrations: Vec<S3RegistrationId>,
-    pub native_components: Vec<NativeComponentId>,
 }
 
 #[derive(Clone, Debug)]
@@ -302,17 +300,20 @@ pub enum PackageOperationIr {
 pub struct NamespaceActivationIr {
     pub namespace: NamespaceId,
     pub on_load: Option<BindingId>,
+    pub native_components: Vec<crate::package::NativeComponent>,
     pub exports: ExportTable,
     pub unretained_exports: Vec<String>,
     pub stubs: Vec<String>,
 }
 
 /// Root source-package transformation decided at finalization: the generated `DESCRIPTION`, the
-/// `NAMESPACE` exports, and the original Root `.onLoad` that the generated wrapper calls last.
+/// `NAMESPACE` exports and native libraries, and the original Root `.onLoad` that the generated
+/// wrapper calls last.
 #[derive(Clone, Debug, Default)]
 pub struct RootArtifactIr {
     pub description: Arc<str>,
     pub exports: ExportTable,
+    pub native_components: Vec<crate::package::NativeComponent>,
     pub on_load: Option<ClosureId>,
 }
 
@@ -328,12 +329,6 @@ pub struct S3RegistrationIr {
     pub generic: GenericId,
     pub class: String,
     pub method: BindingId,
-}
-
-#[derive(Clone, Debug)]
-pub struct NativeComponentIr {
-    pub namespace: NamespaceId,
-    pub native: crate::package::NativeComponent,
 }
 
 #[derive(Clone, Debug)]
@@ -364,7 +359,6 @@ pub struct ProgramIr {
     codes: Vec<CodeIr>,
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
-    native_components: Vec<NativeComponentIr>,
     resources: Vec<ResourceIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
@@ -424,10 +418,6 @@ impl ProgramIr {
 
     pub fn s3_registrations(&self) -> &[S3RegistrationIr] {
         &self.s3_registrations
-    }
-
-    pub fn native_components(&self) -> &[NativeComponentIr] {
-        &self.native_components
     }
 
     pub fn resources(&self) -> &[ResourceIr] {
@@ -495,10 +485,6 @@ impl ProgramIr {
         &self.s3_registrations[id.index()]
     }
 
-    pub fn native_component(&self, id: NativeComponentId) -> &NativeComponentIr {
-        &self.native_components[id.index()]
-    }
-
     pub fn resource(&self, id: ResourceId) -> &ResourceIr {
         &self.resources[id.index()]
     }
@@ -516,7 +502,6 @@ pub struct ProgramBuilder {
     codes: Vec<CodeIr>,
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
-    native_components: Vec<NativeComponentIr>,
     resources: Vec<ResourceIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
@@ -564,7 +549,6 @@ impl ProgramBuilder {
             codes: Vec::new(),
             activations: Vec::new(),
             s3_registrations: Vec::new(),
-            native_components: Vec::new(),
             resources: Vec::new(),
             relocations: Vec::new(),
             root_artifact: RootArtifactIr::default(),
@@ -651,7 +635,6 @@ impl ProgramBuilder {
                 MaterializedRole::Linked => LinkNamespaceState::Linked(state),
             },
             s3_registrations: Vec::new(),
-            native_components: Vec::new(),
         });
         assert_eq!(id, namespace);
         FinalizedNamespace {
@@ -683,7 +666,6 @@ impl ProgramBuilder {
             imports: Vec::new(),
             state: LinkNamespaceState::External { package },
             s3_registrations: Vec::new(),
-            native_components: Vec::new(),
         });
         assert_eq!(id, namespace);
         FinalizedNamespace {
@@ -769,24 +751,6 @@ impl ProgramBuilder {
             .push(ImportBindingIr { local, target });
     }
 
-    pub fn add_native_component(&mut self, component: NativeComponentIr) -> NativeComponentId {
-        let id = NativeComponentId::from_index(self.native_components.len());
-        self.native_components.push(component);
-        id
-    }
-
-    pub fn attach_native_component(
-        &mut self,
-        namespace: NamespaceId,
-        native: crate::package::NativeComponent,
-    ) -> NativeComponentId {
-        let component = self.add_native_component(NativeComponentIr { namespace, native });
-        self.namespaces[namespace.index()]
-            .native_components
-            .push(component);
-        component
-    }
-
     pub fn add_resource(&mut self, resource: ResourceIr) -> ResourceId {
         let id = ResourceId::from_index(self.resources.len());
         self.resources.push(resource);
@@ -854,7 +818,6 @@ impl ProgramBuilder {
             codes: self.codes,
             activations: self.activations,
             s3_registrations: self.s3_registrations,
-            native_components: self.native_components,
             resources: self.resources,
             relocations: self.relocations,
             root_artifact: self.root_artifact,
