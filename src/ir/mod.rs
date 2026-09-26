@@ -265,34 +265,69 @@ pub struct CodeSite {
 }
 
 #[derive(Clone, Debug)]
-pub enum Relocation {
+pub struct Relocation {
+    pub site: CodeSite,
+    pub target: RelocationTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RelocationTarget {
     Binding {
-        site: CodeSite,
         target: BindingId,
         access: ExternalBindingAccess,
     },
-    Namespace {
-        site: CodeSite,
-        target: NamespaceId,
+    RequireNamespace {
+        result: bool,
     },
-    Package {
-        site: CodeSite,
-        target: Option<PackageId>,
-        operation: PackageOperationIr,
+    Namespace {
+        package: PackageId,
+        operation: NamespaceOperation,
+    },
+    PackageVersion {
+        version: String,
     },
     Resource {
-        site: CodeSite,
         target: ResourceId,
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceOperation {
+    Load,
+    Get,
+    As,
+}
+
+impl NamespaceOperation {
+    fn callee(self) -> &'static str {
+        match self {
+            Self::Load => "loadNamespace(",
+            Self::Get => "getNamespace(",
+            Self::As => "asNamespace(",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PackageOperationIr {
-    RequireNamespace { result: bool },
-    LoadNamespace,
-    GetNamespace,
-    AsNamespace,
-    PackageVersion { version: String },
+pub enum InvalidRelocation {
+    OutsideCode,
+    Overlap,
+    Mismatch(String),
+}
+
+impl std::fmt::Display for InvalidRelocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutsideCode => f.write_str("relocation occurrence lies outside its code unit"),
+            Self::Overlap => f.write_str("relocation occurrences overlap in one code unit"),
+            Self::Mismatch(original) => {
+                write!(
+                    f,
+                    "relocation does not match the syntax it rewrites: `{original}`"
+                )
+            }
+        }
+    }
 }
 
 /// One Linked namespace activation, in the order the Root `.onLoad` wrapper performs them.
@@ -311,7 +346,7 @@ pub struct NamespaceActivationIr {
 /// wrapper calls last.
 #[derive(Clone, Debug, Default)]
 pub struct RootArtifactIr {
-    pub description: Arc<str>,
+    pub description: Option<Arc<str>>,
     pub exports: ExportTable,
     pub native_components: Vec<crate::package::NativeComponent>,
     pub on_load: Option<ClosureId>,
@@ -757,8 +792,55 @@ impl ProgramBuilder {
         id
     }
 
-    pub fn add_relocation(&mut self, relocation: Relocation) {
-        self.relocations.push(relocation);
+    pub fn relocate(
+        &mut self,
+        code: CodeId,
+        start: usize,
+        end: usize,
+        target: RelocationTarget,
+    ) -> Result<(), InvalidRelocation> {
+        let code_ir = &self.codes[code.index()];
+        let original = code_ir
+            .source
+            .get(start..end)
+            .ok_or(InvalidRelocation::OutsideCode)?;
+        if code_ir
+            .occurrences
+            .iter()
+            .any(|occurrence| start < occurrence.end && occurrence.start < end)
+        {
+            return Err(InvalidRelocation::Overlap);
+        }
+        if !self.relocation_matches(&target, original) {
+            return Err(InvalidRelocation::Mismatch(original.to_owned()));
+        }
+        let occurrence = CodeOccurrenceId::from_index(code_ir.occurrences.len());
+        self.codes[code.index()]
+            .occurrences
+            .push(CodeOccurrence { start, end });
+        self.relocations.push(Relocation {
+            site: CodeSite { code, occurrence },
+            target,
+        });
+        Ok(())
+    }
+
+    fn relocation_matches(&self, target: &RelocationTarget, original: &str) -> bool {
+        let callee = original.trim_start_matches("base::");
+        match target {
+            RelocationTarget::Binding { target, .. } => {
+                let unqualified = original
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or(original)
+                    .trim_matches('`');
+                unqualified == self.bindings[target.index()].name
+            }
+            RelocationTarget::RequireNamespace { .. } => callee.starts_with("requireNamespace("),
+            RelocationTarget::Namespace { operation, .. } => callee.starts_with(operation.callee()),
+            RelocationTarget::PackageVersion { .. } => callee.starts_with("packageVersion("),
+            RelocationTarget::Resource { .. } => callee.starts_with("system.file("),
+        }
     }
 
     pub fn binding_closure(&self, binding: BindingId) -> Option<ClosureId> {
@@ -789,14 +871,6 @@ impl ProgramBuilder {
             LinkBindingState::Materialized { namespace, .. }
             | LinkBindingState::External { namespace, .. } => *namespace,
         }
-    }
-
-    pub fn add_code_occurrence(&mut self, code: CodeId, start: usize, end: usize) -> CodeSite {
-        let occurrence = CodeOccurrenceId::from_index(self.codes[code.index()].occurrences.len());
-        self.codes[code.index()]
-            .occurrences
-            .push(CodeOccurrence { start, end });
-        CodeSite { code, occurrence }
     }
 
     pub fn set_root_artifact(&mut self, root_artifact: RootArtifactIr) {

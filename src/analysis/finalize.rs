@@ -3,9 +3,9 @@ use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::build::{PackageOperation, PendingRelocation};
 use crate::ir::{
-    ExportTable, ExternalBindingAccess, ExternalPackageContract, MaterializedRole,
-    MaterializedSlot, MaterializedSlotSource, PackageIr, PackageOperationIr,
-    PackageRole as LinkedPackageRole, ProgramIr, RootArtifactIr, TargetContract,
+    ExportTable, ExternalBindingAccess, ExternalPackageContract, InvalidRelocation,
+    MaterializedRole, MaterializedSlot, MaterializedSlotSource, NamespaceOperation, PackageIr,
+    PackageRole as LinkedPackageRole, ProgramIr, RelocationTarget, RootArtifactIr, TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{ImportSpec, PackageAvailability, PackageId, PackageProvider};
@@ -430,8 +430,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 continue;
             };
-            let site = builder.add_code_occurrence(code, source.start, source.end);
-            match relocation {
+            let target = match relocation {
                 PendingRelocation::NamespaceAccess {
                     package,
                     binding,
@@ -445,15 +444,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     let Some(&target) = target_namespace.bindings.get(binding) else {
                         continue;
                     };
-                    builder.add_relocation(crate::ir::Relocation::Binding {
-                        site,
+                    RelocationTarget::Binding {
                         target,
                         access: if *internal {
                             ExternalBindingAccess::Internal
                         } else {
                             ExternalBindingAccess::Exported
                         },
-                    });
+                    }
                 }
                 PendingRelocation::ResourceAccess {
                     package, resource, ..
@@ -462,30 +460,38 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         package: *package,
                         path: resource.clone(),
                     });
-                    builder.add_relocation(crate::ir::Relocation::Resource {
-                        site,
+                    RelocationTarget::Resource {
                         target: resource_id,
-                    });
+                    }
                 }
                 PendingRelocation::PackageOperation {
                     package, operation, ..
-                } => builder.add_relocation(crate::ir::Relocation::Package {
-                    site,
-                    target: *package,
-                    operation: match operation {
+                } => {
+                    let namespace = |operation| {
+                        package.map(|package| RelocationTarget::Namespace { package, operation })
+                    };
+                    let target = match operation {
                         PackageOperation::RequireNamespace { result } => {
-                            PackageOperationIr::RequireNamespace { result: *result }
+                            Some(RelocationTarget::RequireNamespace { result: *result })
                         }
-                        PackageOperation::LoadNamespace => PackageOperationIr::LoadNamespace,
-                        PackageOperation::GetNamespace => PackageOperationIr::GetNamespace,
-                        PackageOperation::AsNamespace => PackageOperationIr::AsNamespace,
+                        PackageOperation::LoadNamespace => namespace(NamespaceOperation::Load),
+                        PackageOperation::GetNamespace => namespace(NamespaceOperation::Get),
+                        PackageOperation::AsNamespace => namespace(NamespaceOperation::As),
                         PackageOperation::PackageVersion { version } => {
-                            PackageOperationIr::PackageVersion {
+                            Some(RelocationTarget::PackageVersion {
                                 version: version.clone(),
-                            }
+                            })
                         }
-                    },
-                }),
+                    };
+                    let Some(target) = target else {
+                        issues.push(FinalizationIssue::UnresolvedNamespaceOperation);
+                        continue;
+                    };
+                    target
+                }
+            };
+            if let Err(invalid) = builder.relocate(code, source.start, source.end, target) {
+                issues.push(FinalizationIssue::InvalidRelocation(invalid));
             }
         }
         let imports = contracts
@@ -493,7 +499,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .flat_map(|contract| contract.requirements.iter().cloned())
             .collect::<Vec<_>>();
         let description = match &self.root_description {
-            None => Arc::from(""),
+            None => None,
             Some(source) => generated_description(
                 source,
                 |name| {
@@ -510,9 +516,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .map_or_else(
                 |problems| {
                     issues.extend(problems.into_iter().map(FinalizationIssue::Description));
-                    Arc::from("")
+                    None
                 },
-                Arc::from,
+                |description| Some(Arc::from(description)),
             ),
         };
         builder.set_root_artifact(RootArtifactIr {
@@ -814,6 +820,8 @@ pub(super) enum FinalizationIssue {
         identity: crate::package::PackageIdentity,
         requirement: Relation,
     },
+    UnresolvedNamespaceOperation,
+    InvalidRelocation(InvalidRelocation),
     Description(String),
 }
 
@@ -851,6 +859,10 @@ impl std::fmt::Display for FinalizationIssue {
                 f,
                 "External package `{package}` has no declared DESCRIPTION requirement in the retained program"
             ),
+            Self::UnresolvedNamespaceOperation => {
+                f.write_str("a namespace-loading relocation has no resolved package")
+            }
+            Self::InvalidRelocation(invalid) => invalid.fmt(f),
             Self::UnsatisfiedRequirement {
                 identity,
                 requirement,

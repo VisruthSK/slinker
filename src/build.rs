@@ -1,8 +1,7 @@
 use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::ir::{
-    LinkBindingState, LinkNamespaceState, PackageOperationIr, ProgramIr, Relocation, ResourceId,
-    Value,
+    LinkBindingState, LinkNamespaceState, ProgramIr, RelocationTarget, ResourceId, Value,
 };
 use crate::package::{BindingName, PackageId};
 use crate::r_worker::client::WorkerClient;
@@ -229,6 +228,7 @@ pub enum PureRStatic {}
 /// Opaque capability proving full preflight succeeded for one profile.
 pub struct BuildableProgram<'a, Profile> {
     program: &'a ProgramIr,
+    description: &'a str,
     materialization: MaterializationContext<'a>,
     _profile: PhantomData<Profile>,
 }
@@ -258,10 +258,10 @@ impl PureRStatic {
                 ),
             })
             .collect::<BTreeSet<_>>();
-        if ir.program().root_artifact().description.is_empty() {
+        let description = ir.program().root_artifact().description.as_deref();
+        if description.is_none() {
             blockers.insert("Root source-package DESCRIPTION plan is missing".into());
         }
-        blockers.extend(relocation_site_issues(ir.program()));
         let program = ir.program();
         for import in &program.root_namespace().imports {
             let target = program.binding(import.target);
@@ -278,13 +278,14 @@ impl PureRStatic {
                 ));
             }
         }
-        if !blockers.is_empty() {
+        let Some(description) = description.filter(|_| blockers.is_empty()) else {
             return Err(BuildReport::new(blockers.into_iter().collect()).into());
-        }
+        };
         context.freeze(ir)?;
         let context: &'a BuildContext = context;
         Ok(BuildableProgram {
             program: ir.program(),
+            description,
             materialization: context.materialization(),
             _profile: PhantomData,
         })
@@ -359,7 +360,7 @@ pub fn materialize(
     fs::create_dir_all(package_root.join("inst/slinker"))?;
     fs::write(
         package_root.join("DESCRIPTION"),
-        buildable.program.root_artifact().description.as_bytes(),
+        buildable.description.as_bytes(),
     )?;
     fs::write(
         package_root.join("NAMESPACE"),
@@ -725,90 +726,6 @@ fn render_namespace(program: &ProgramIr) -> String {
     out
 }
 
-fn relocation_site(relocation: &Relocation) -> &crate::ir::CodeSite {
-    match relocation {
-        Relocation::Binding { site, .. }
-        | Relocation::Namespace { site, .. }
-        | Relocation::Package { site, .. }
-        | Relocation::Resource { site, .. } => site,
-    }
-}
-
-fn relocation_matches(program: &ProgramIr, relocation: &Relocation, original: &str) -> bool {
-    let unqualified = original
-        .rsplit(':')
-        .next()
-        .unwrap_or(original)
-        .trim_matches('`');
-    let callee = original.trim_start_matches("base::");
-    match relocation {
-        Relocation::Binding { target, .. } => unqualified == program.binding(*target).name,
-        Relocation::Namespace { target, .. } => original.contains(
-            program
-                .package(program.namespace(*target).package)
-                .identity()
-                .name
-                .as_str(),
-        ),
-        Relocation::Package { operation, .. } => {
-            let names: &[&str] = match operation {
-                PackageOperationIr::RequireNamespace { .. } => &["requireNamespace("],
-                PackageOperationIr::LoadNamespace => &["loadNamespace("],
-                PackageOperationIr::GetNamespace => &["getNamespace("],
-                PackageOperationIr::AsNamespace => &["asNamespace("],
-                PackageOperationIr::PackageVersion { .. } => &["packageVersion("],
-            };
-            names.iter().any(|name| callee.starts_with(name))
-        }
-        Relocation::Resource { .. } => callee.starts_with("system.file("),
-    }
-}
-
-fn relocation_site_issues(program: &ProgramIr) -> Vec<String> {
-    let mut sites = BTreeMap::<crate::ir::CodeId, Vec<crate::ir::CodeOccurrenceId>>::new();
-    let mut issues = Vec::new();
-    for relocation in program.relocations() {
-        let site = relocation_site(relocation);
-        sites.entry(site.code).or_default().push(site.occurrence);
-        let code_ir = program.code(site.code);
-        let occurrence = code_ir.occurrence(site.occurrence);
-        let original = code_ir
-            .source()
-            .get(occurrence.start..occurrence.end)
-            .unwrap_or_default();
-        if !relocation_matches(program, relocation, original) {
-            issues.push(format!(
-                "relocation does not match the syntax it rewrites: `{original}`"
-            ));
-        }
-    }
-    for (code, mut occurrences) in sites {
-        let code_ir = program.code(code);
-        let source = code_ir.source();
-        occurrences.sort_by_key(|occurrence| code_ir.occurrence(*occurrence).start);
-        for pair in occurrences.windows(2) {
-            if pair[0] == pair[1] {
-                issues.push("two relocations rewrite the same code occurrence".to_owned());
-            } else if code_ir.occurrence(pair[0]).end > code_ir.occurrence(pair[1]).start {
-                issues.push("relocation occurrences overlap in one code unit".to_owned());
-            }
-        }
-        for occurrence in occurrences
-            .iter()
-            .map(|occurrence| code_ir.occurrence(*occurrence))
-        {
-            if occurrence.start > occurrence.end
-                || occurrence.end > source.len()
-                || !source.is_char_boundary(occurrence.start)
-                || !source.is_char_boundary(occurrence.end)
-            {
-                issues.push("relocation occurrence lies outside its code unit".to_owned());
-            }
-        }
-    }
-    issues
-}
-
 fn relocated_source(
     program: &ProgramIr,
     code: crate::ir::CodeId,
@@ -818,17 +735,15 @@ fn relocated_source(
     let mut relocations = program
         .relocations()
         .iter()
-        .filter_map(|relocation| {
-            let site = relocation_site(relocation);
-            (site.code == code).then_some((site, relocation))
-        })
+        .filter(|relocation| relocation.site.code == code)
         .collect::<Vec<_>>();
-    relocations
-        .sort_by_key(|(site, _)| std::cmp::Reverse(code_ir.occurrence(site.occurrence).start));
-    for (site, relocation) in relocations {
-        let occurrence = code_ir.occurrence(site.occurrence);
-        let replacement = match relocation {
-            Relocation::Binding { target, access, .. } => match access {
+    relocations.sort_by_key(|relocation| {
+        std::cmp::Reverse(code_ir.occurrence(relocation.site.occurrence).start)
+    });
+    for relocation in relocations {
+        let occurrence = code_ir.occurrence(relocation.site.occurrence);
+        let replacement = match &relocation.target {
+            RelocationTarget::Binding { target, access } => match access {
                 crate::ir::ExternalBindingAccess::Exported => binding_reference(program, *target),
                 crate::ir::ExternalBindingAccess::Internal => {
                     let namespace = program.namespace(program.binding_namespace(*target));
@@ -838,31 +753,17 @@ fn relocated_source(
                     )
                 }
             },
-            Relocation::Namespace { target, .. } => {
-                let package = program
-                    .package(program.namespace(*target).package)
-                    .identity();
-                format!("base::asNamespace({})", r_string(&package.name))
+            RelocationTarget::RequireNamespace { result } => {
+                if *result { "TRUE" } else { "FALSE" }.into()
             }
-            Relocation::Package {
-                target, operation, ..
-            } => match operation {
-                PackageOperationIr::RequireNamespace { result } => {
-                    if *result { "TRUE" } else { "FALSE" }.into()
-                }
-                PackageOperationIr::LoadNamespace
-                | PackageOperationIr::GetNamespace
-                | PackageOperationIr::AsNamespace => {
-                    let package = program
-                        .package(target.expect("resolved package operation"))
-                        .identity();
-                    format!("base::asNamespace({})", r_string(&package.name))
-                }
-                PackageOperationIr::PackageVersion { version } => {
-                    format!("base::package_version({})", r_string(version))
-                }
-            },
-            Relocation::Resource { target, .. } => {
+            RelocationTarget::Namespace { package, .. } => format!(
+                "base::asNamespace({})",
+                r_string(&program.package(*package).identity().name)
+            ),
+            RelocationTarget::PackageVersion { version } => {
+                format!("base::package_version({})", r_string(version))
+            }
+            RelocationTarget::Resource { target } => {
                 let resource = program.resource(*target);
                 let package = program.package(resource.package).identity();
                 format!(
@@ -906,12 +807,7 @@ fn validate_program_code(
         let relocated = program
             .relocations()
             .iter()
-            .any(|relocation| match relocation {
-                Relocation::Binding { site, .. }
-                | Relocation::Namespace { site, .. }
-                | Relocation::Package { site, .. }
-                | Relocation::Resource { site, .. } => site.code == code_id,
-            });
+            .any(|relocation| relocation.site.code == code_id);
         if !relocated {
             let digest = crate::package::Digest::of(&normalized);
             if &digest != code.normalized_shape() {

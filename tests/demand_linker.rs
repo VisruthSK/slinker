@@ -3333,7 +3333,10 @@ fn direct_suggested_namespace_access_is_ignored_without_extra_pkgs() {
             .program()
             .relocations()
             .iter()
-            .any(|relocation| matches!(relocation, slinker::ir::Relocation::Binding { .. }))
+            .any(|relocation| matches!(
+                relocation.target,
+                slinker::ir::RelocationTarget::Binding { .. }
+            ))
     );
     assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
     assert_eq!(
@@ -3616,7 +3619,10 @@ fn unselected_suggested_resource_does_not_discover_package() {
             .program()
             .relocations()
             .iter()
-            .any(|relocation| matches!(relocation, slinker::ir::Relocation::Resource { .. }))
+            .any(|relocation| matches!(
+                relocation.target,
+                slinker::ir::RelocationTarget::Resource { .. }
+            ))
     );
     assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
 }
@@ -4068,13 +4074,8 @@ fn unselected_suggested_guard_prunes_optional_branch() {
         plan.program()
             .relocations()
             .iter()
-            .any(|relocation| matches!(
-                relocation,
-                slinker::ir::Relocation::Package {
-                    operation: slinker::ir::PackageOperationIr::RequireNamespace { result: false },
-                    ..
-                }
-            ))
+            .any(|relocation| relocation.target
+                == slinker::ir::RelocationTarget::RequireNamespace { result: false })
     );
 }
 
