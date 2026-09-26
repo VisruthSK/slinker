@@ -194,8 +194,6 @@ Invariants into types:
   generic names. Intern them at the worker boundary into typed symbols (`PackageName`,
   `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
 
-Structure:
-
 Minimal code:
 - Fix the `clippy::pedantic` findings that matter (redundant clones, pass-by-value, `map_or_else`,
   missing `#[must_use]`) and enable the lints that stay useful in CI.
