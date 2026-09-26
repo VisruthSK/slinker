@@ -1,9 +1,10 @@
+use super::arguments::declared_strings;
 use super::resolution::{BindingTarget, Resolution};
-use super::state::AnalyzerState;
+use super::state::{AnalyzerState, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::package::{BindingName, ClassName, GenericName, PackageId, PackageProvider};
-use crate::syntax::{CallSite, DeclaredValue, ParsedRFile, Span, StaticArg};
+use crate::syntax::{CallSite, ParsedRFile, Span, StaticArg};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -54,7 +55,7 @@ pub(super) enum DispatchChange {
 #[derive(Default)]
 pub(super) struct S3Model {
     generics: BTreeMap<S3GenericKey, S3Generic>,
-    callable_generics: HashMap<CallableId, S3GenericKey>,
+    callable_generics: HashMap<CallableId, BTreeSet<S3GenericKey>>,
     invocations: HashMap<CallableId, Vec<Option<Invocation>>>,
     closed_methods: HashSet<(PackageId, BindingName)>,
     next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
@@ -75,7 +76,9 @@ impl S3Model {
                 entry.selector = Some(definition.selector);
                 entry.formals = definition.formals;
                 self.callable_generics
-                    .insert(definition.callable, key.clone());
+                    .entry(definition.callable)
+                    .or_default()
+                    .insert(key.clone());
             }
             Some(_) => {}
             None => entry.callable = None,
@@ -86,13 +89,17 @@ impl S3Model {
         &mut self,
         callable: CallableId,
         invocation: Option<Invocation>,
-    ) -> Option<S3GenericKey> {
-        let generic = self.callable_generics.get(&callable).cloned();
+    ) -> BTreeSet<S3GenericKey> {
+        let generics = self
+            .callable_generics
+            .get(&callable)
+            .cloned()
+            .unwrap_or_default();
         self.invocations
             .entry(callable)
             .or_default()
             .push(invocation);
-        generic
+        generics
     }
 
     fn callable_to_check(&self, key: &S3GenericKey) -> Option<&CallableId> {
@@ -218,32 +225,53 @@ impl S3Dispatch {
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn s3_dispatch(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
-        lexical_environment: &str,
+        site: ParsedSite<'_>,
+        parsed: &ParsedRFile,
         parameters: Option<&[String]>,
         call: &CallSite,
     ) -> Result<()> {
+        let (from, current, binding) = (site.node, site.package, site.binding);
         if call.callee == "NextMethod" {
             self.s3
                 .next_method_calls
                 .push((from, current, binding.to_owned(), call.span.clone()));
             return Ok(());
         }
-        let Some(Some(StaticArg::String(generic))) = call.args.first() else {
+        let generics = match call.args.first() {
+            Some(Some(StaticArg::String(generic))) => BTreeSet::from([generic.clone()]),
+            Some(Some(StaticArg::Symbol(_))) => {
+                declared_strings(parsed, call, &["generic", "object"], "generic")
+                    .unwrap_or_default()
+            }
+            _ => BTreeSet::new(),
+        };
+        if generics.is_empty() {
             self.diagnostic(
                 from,
                 current,
                 Some(binding),
                 RejectCode::ObjectSystem,
-                "UseMethod generic is not a static string",
+                "UseMethod generic is not a static string or a declared strings() value",
                 Some(call.span.clone()),
             );
             return Ok(());
-        };
+        }
+        for generic in generics {
+            self.observe_generic(site, parameters, call, &generic)?;
+        }
+        Ok(())
+    }
+
+    fn observe_generic(
+        &mut self,
+        site: ParsedSite<'_>,
+        parameters: Option<&[String]>,
+        call: &CallSite,
+        generic: &str,
+    ) -> Result<()> {
+        let (from, current, binding) = (site.node, site.package, site.binding);
         let namespace_generic =
-            lexical_environment == format!("namespace:{}", self.packages.name(current));
+            site.lexical_environment == format!("namespace:{}", self.packages.name(current));
         let selector = match (parameters, call.args.get(1)) {
             (Some(parameters), None) => parameters.first().cloned(),
             (Some(parameters), Some(Some(StaticArg::Symbol(object))))
@@ -255,7 +283,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         let key = S3GenericKey {
             package: current,
-            name: generic.as_str().into(),
+            name: generic.into(),
         };
         let callable = CallableId {
             package: current,
@@ -288,34 +316,25 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .arg_bindings
                     .get(index)
                     .and_then(Option::as_ref)
-                    .and_then(|binding| parsed.domain_for(binding, call.scope))
-                    .map(|values| {
-                        values
-                            .into_iter()
-                            .map(|value| match value {
-                                DeclaredValue::S3Class(classes) => classes,
-                            })
-                            .collect()
-                    });
+                    .and_then(|binding| parsed.class_domain_for(binding, call.scope));
+
                 (name.clone(), domain)
             })
             .collect();
-        let generic = self
+        let generics = self
             .s3
             .record_invocation(callable, Some(Invocation { arguments }));
-        self.refresh_generic(generic)
+        self.refresh_generics(generics)
     }
 
     pub(super) fn record_escape(&mut self, callable: CallableId) -> Result<()> {
-        let generic = self.s3.record_invocation(callable, None);
-        self.refresh_generic(generic)
+        let generics = self.s3.record_invocation(callable, None);
+        self.refresh_generics(generics)
     }
 
-    fn refresh_generic(&mut self, key: Option<S3GenericKey>) -> Result<()> {
-        match key {
-            Some(key) => self.refresh_s3_generic(&key),
-            None => Ok(()),
-        }
+    fn refresh_generics(&mut self, keys: BTreeSet<S3GenericKey>) -> Result<()> {
+        keys.into_iter()
+            .try_for_each(|key| self.refresh_s3_generic(&key))
     }
 
     fn refresh_s3_generic(&mut self, key: &S3GenericKey) -> Result<()> {

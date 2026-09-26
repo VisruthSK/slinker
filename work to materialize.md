@@ -154,11 +154,8 @@ Minimal code:
 - Value provenance for reflection: `asNamespace(ns)$.__NAMESPACE__.$exports` reads the export table.
 - Default-argument specialization: a formal defaulting to a constant that no caller passes is
   static (voucher's `system.file(..., package = package)`).
-- Declarations, exact domains in both modes, each with parser and analysis tests:
-  - `strings("a", "b")` for a binding used as a name in `get`/`exists`/`match.fun`/`do.call`, as a
-    package in `asNamespace`/`requireNamespace`/`system.file`, or as a generic in `UseMethod`;
-  - `callables(pkg::f, g)` for a function-valued binding passed to `do.call`, `lapply`, or native
-    callbacks.
+- Declarations, exact domains, with parser and analysis tests: `callables(pkg::f, g)` for a
+  function-valued binding passed to `do.call`, `lapply`, or native callbacks.
 
 ## Track F: S3 completion
 

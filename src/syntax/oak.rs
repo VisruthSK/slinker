@@ -13,8 +13,8 @@
 use crate::syntax::facts::{
     ActiveBindingDef, BindingDeclaration, CallSite, CalleeKind, ConstructionArgument,
     ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredDomain,
-    DeclaredValue, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind, PackageGuard,
-    PackageRef, ParsedExpression, ParsedRFile, ResourceRef, SemanticIssue, SemanticIssueKind,
+    EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind, PackageGuard, PackageRef,
+    ParsedExpression, ParsedRFile, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind,
     StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
@@ -650,14 +650,23 @@ fn collect_slinker_declaration(
             .map(|name| ast_text(text, &name));
         let domain = argument
             .value()
-            .and_then(|value| declared_values(text, &value));
+            .and_then(|value| declared_domain(text, &value));
         let issue = match (name, domain) {
-            (Some(name), Some(values)) => match scopes.binding(index, &name, scope) {
+            (Some(name), Some(domain)) => match scopes.binding(index, &name, scope) {
+                Some(binding)
+                    if collected.declarations.iter().any(|declaration| {
+                        declaration.binding == binding
+                            && std::mem::discriminant(&declaration.domain)
+                                != std::mem::discriminant(&domain)
+                    }) =>
+                {
+                    format!("declarations for `{name}` mix s3() classes with strings()")
+                }
                 Some(binding) => {
                     collected.declarations.push(BindingDeclaration {
                         declaring_scope: lexical,
                         binding,
-                        domain: DeclaredDomain::Exact(values),
+                        domain,
                         span,
                     });
                     continue;
@@ -666,7 +675,7 @@ fn collect_slinker_declaration(
             },
             (None, _) => "slinker() declarations must name the binding they constrain".to_owned(),
             (Some(name), None) => format!(
-                "declaration for `{name}` must be s3(\"class\", ...) or one_of(s3(...), ...) with literal classes"
+                "declaration for `{name}` must be s3(\"class\", ...), one_of(s3(...), ...), or strings(\"value\", ...) with literal strings"
             ),
         };
         collected.issues.push(SemanticIssue {
@@ -677,7 +686,30 @@ fn collect_slinker_declaration(
     }
 }
 
-fn declared_values(text: &str, value: &AnyRExpression) -> Option<Vec<DeclaredValue>> {
+fn declared_domain(text: &str, value: &AnyRExpression) -> Option<DeclaredDomain> {
+    let (callee, arguments) = declaration_call(value)?;
+    match callee.as_str() {
+        "strings" => literal_strings(text, &arguments)
+            .map(|strings| DeclaredDomain::Strings(strings.into_iter().collect())),
+        "s3" | "one_of" => declared_classes(text, value).map(DeclaredDomain::Classes),
+        _ => None,
+    }
+}
+
+fn declared_classes(text: &str, value: &AnyRExpression) -> Option<Vec<Vec<String>>> {
+    let (callee, arguments) = declaration_call(value)?;
+    match callee.as_str() {
+        "s3" => literal_strings(text, &arguments).map(|classes| vec![classes]),
+        "one_of" if !arguments.is_empty() => arguments
+            .iter()
+            .map(|alternative| declared_classes(text, alternative))
+            .collect::<Option<Vec<_>>>()
+            .map(|alternatives| alternatives.into_iter().flatten().collect()),
+        _ => None,
+    }
+}
+
+fn declaration_call(value: &AnyRExpression) -> Option<(String, Vec<AnyRExpression>)> {
     let AnyRExpression::RCall(call) = value else {
         return None;
     };
@@ -693,22 +725,22 @@ fn declared_values(text: &str, value: &AnyRExpression) -> Option<Vec<DeclaredVal
             argument.value()
         })
         .collect::<Option<Vec<_>>>()?;
-    match callee.as_str() {
-        "s3" if !arguments.is_empty() => arguments
-            .iter()
-            .map(|class| match static_arg(ast_text(text, class).trim()) {
-                Some(StaticArg::String(class)) => Some(class),
-                Some(StaticArg::Symbol(_)) | None => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .map(|classes| vec![DeclaredValue::S3Class(classes)]),
-        "one_of" if !arguments.is_empty() => arguments
-            .iter()
-            .map(|alternative| declared_values(text, alternative))
-            .collect::<Option<Vec<_>>>()
-            .map(|alternatives| alternatives.into_iter().flatten().collect()),
-        _ => None,
+    Some((callee, arguments))
+}
+
+fn literal_strings(text: &str, arguments: &[AnyRExpression]) -> Option<Vec<String>> {
+    if arguments.is_empty() {
+        return None;
     }
+    arguments
+        .iter()
+        .map(
+            |argument| match static_arg(ast_text(text, argument).trim()) {
+                Some(StaticArg::String(value)) => Some(value),
+                Some(StaticArg::Symbol(_)) | None => None,
+            },
+        )
+        .collect()
 }
 
 fn sole_positional_argument(call: &RCall) -> Option<AnyRExpression> {
@@ -3307,7 +3339,18 @@ fn collect_resources(
         {
             continue;
         }
-        let package = named_static_string(&call.raw.args, "package");
+        let package = named_static_string(&call.raw.args, "package").map_or_else(
+            || {
+                ResourcePackage::Computed(
+                    call.site
+                        .arg_names
+                        .iter()
+                        .position(|name| name.as_deref() == Some("package"))
+                        .and_then(|index| call.site.arg_bindings.get(index)?.clone()),
+                )
+            },
+            ResourcePackage::Literal,
+        );
         let must_work = named_static_bool(&call.raw.args, "mustWork");
         let path_parts = call
             .raw
@@ -3331,6 +3374,7 @@ fn collect_resources(
             path,
             must_work,
             guards: call.site.guards.clone(),
+            scope: call.site.scope,
             span: Span::new(source, call.site.span.start, call.site.span.end),
         });
     }
@@ -4878,9 +4922,9 @@ mod tests {
         assert_eq!(declaration.binding.name, "x");
         assert_eq!(
             declaration.domain,
-            DeclaredDomain::Exact(vec![
-                DeclaredValue::S3Class(vec!["foo".into()]),
-                DeclaredValue::S3Class(vec!["bar".into(), "parent".into()]),
+            DeclaredDomain::Classes(vec![
+                vec!["foo".into()],
+                vec!["bar".into(), "parent".into()]
             ])
         );
         let print = parsed.expressions[0]
@@ -4889,12 +4933,66 @@ mod tests {
             .find(|call| call.callee == "print")
             .unwrap();
         assert_eq!(
-            parsed.domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+            parsed.class_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
             Some(vec![
-                DeclaredValue::S3Class(vec!["foo".into()]),
-                DeclaredValue::S3Class(vec!["bar".into(), "parent".into()]),
+                vec!["foo".into()],
+                vec!["bar".into(), "parent".into()]
             ])
         );
+    }
+
+    #[test]
+    fn string_declarations_narrow_and_never_mix_with_classes() {
+        let parsed = parse_source(
+            "f <- function(name) { declare(slinker(name = strings('alpha', 'beta'))); g <- function() { declare(slinker(name = strings('beta', 'gamma'))); print(name) } }",
+        );
+        assert!(parsed.issues.is_empty(), "{:?}", parsed.issues);
+        let print = parsed.expressions[0]
+            .calls
+            .iter()
+            .find(|call| call.callee == "print")
+            .unwrap();
+        let binding = print.arg_bindings[0].as_ref().unwrap();
+        assert_eq!(
+            parsed.string_domain_for(binding, print.scope),
+            Some(["beta".to_owned()].into_iter().collect())
+        );
+        assert_eq!(parsed.class_domain_for(binding, print.scope), None);
+        assert!(names_inert(&parsed, "strings"));
+
+        let mixed = parse_source(
+            "f <- function(x) { declare(slinker(x = strings('a'))); declare(slinker(x = s3('foo'))) }",
+        );
+        assert_eq!(mixed.declarations.len(), 1);
+        assert!(
+            mixed
+                .issues
+                .iter()
+                .any(|issue| issue.kind == SemanticIssueKind::InvalidDeclaration)
+        );
+        for malformed in [
+            "f <- function(x) declare(slinker(x = strings()))",
+            "f <- function(x) declare(slinker(x = strings(y)))",
+            "f <- function(x) declare(slinker(x = one_of(strings('a'))))",
+        ] {
+            let parsed = parse_source(malformed);
+            assert!(parsed.declarations.is_empty(), "{malformed}");
+            assert!(
+                parsed
+                    .issues
+                    .iter()
+                    .any(|issue| issue.kind == SemanticIssueKind::InvalidDeclaration),
+                "{malformed}"
+            );
+        }
+    }
+
+    fn names_inert(parsed: &ParsedRFile, name: &str) -> bool {
+        !reference_names(parsed).contains(&name)
+            && parsed.expressions[0]
+                .calls
+                .iter()
+                .all(|call| call.callee != name)
     }
 
     #[test]
@@ -4908,8 +5006,8 @@ mod tests {
             .find(|call| call.callee == "print")
             .unwrap();
         assert_eq!(
-            parsed.domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
-            Some(vec![DeclaredValue::S3Class(vec!["foo".into()])])
+            parsed.class_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+            Some(vec![vec!["foo".into()]])
         );
     }
 

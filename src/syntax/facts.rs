@@ -7,6 +7,7 @@
 
 use crate::syntax::source::Span;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindingDef {
@@ -112,11 +113,20 @@ pub struct CallSite {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRef {
-    pub package: Option<String>,
+    pub package: ResourcePackage,
     pub path: Option<String>,
     pub must_work: Option<bool>,
     pub guards: Vec<PackageGuard>,
+    pub scope: LexicalScopeId,
     pub span: Span,
+}
+
+/// The `package` argument of a `system.file()` call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourcePackage {
+    Literal(String),
+    /// A computed value, with the lexical binding it names when it is a bare symbol.
+    Computed(Option<LexicalBindingId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,14 +329,11 @@ pub struct BindingDeclaration {
     pub span: Span,
 }
 
+/// The exact values a declared binding can hold: alternative S3 class vectors, or strings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeclaredDomain {
-    Exact(Vec<DeclaredValue>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DeclaredValue {
-    S3Class(Vec<String>),
+    Classes(Vec<Vec<String>>),
+    Strings(BTreeSet<String>),
 }
 
 impl ParsedRFile {
@@ -345,25 +352,51 @@ impl ParsedRFile {
         false
     }
 
-    pub fn domain_for(
-        &self,
-        binding: &LexicalBindingId,
+    fn visible_domains<'a>(
+        &'a self,
+        binding: &'a LexicalBindingId,
         use_scope: LexicalScopeId,
-    ) -> Option<Vec<DeclaredValue>> {
+    ) -> impl Iterator<Item = &'a DeclaredDomain> {
         self.declarations
             .iter()
-            .filter(|declaration| {
+            .filter(move |declaration| {
                 &declaration.binding == binding
                     && self.scope_is_within(use_scope, declaration.declaring_scope)
             })
-            .map(|declaration| match &declaration.domain {
-                DeclaredDomain::Exact(values) => values.clone(),
+            .map(|declaration| &declaration.domain)
+    }
+
+    /// The S3 class vectors `binding` can have at `use_scope`, narrowed by every visible
+    /// declaration.
+    pub fn class_domain_for(
+        &self,
+        binding: &LexicalBindingId,
+        use_scope: LexicalScopeId,
+    ) -> Option<Vec<Vec<String>>> {
+        self.visible_domains(binding, use_scope)
+            .filter_map(|domain| match domain {
+                DeclaredDomain::Classes(classes) => Some(classes.clone()),
+                DeclaredDomain::Strings(_) => None,
             })
-            .reduce(|domain, values| {
+            .reduce(|domain, classes| {
                 domain
                     .into_iter()
-                    .filter(|value| values.contains(value))
+                    .filter(|class| classes.contains(class))
                     .collect()
             })
+    }
+
+    /// The strings `binding` can hold at `use_scope`, narrowed by every visible declaration.
+    pub fn string_domain_for(
+        &self,
+        binding: &LexicalBindingId,
+        use_scope: LexicalScopeId,
+    ) -> Option<BTreeSet<String>> {
+        self.visible_domains(binding, use_scope)
+            .filter_map(|domain| match domain {
+                DeclaredDomain::Strings(strings) => Some(strings.clone()),
+                DeclaredDomain::Classes(_) => None,
+            })
+            .reduce(|domain, strings| domain.intersection(&strings).cloned().collect())
     }
 }

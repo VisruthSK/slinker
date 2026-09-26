@@ -1,6 +1,7 @@
 use super::arguments::{
-    matched_call_arg_index, matched_static_arg, native_selector_span, only_package_argument,
-    reflective_name_formals, static_package_arg, static_string_arg,
+    declared_strings, matched_call_arg_index, matched_static_arg, namespace_formals,
+    namespace_target, native_selector_span, only_package_argument, reflective_name_formals,
+    static_package_arg, static_string_arg,
 };
 use super::diagnostic::DiagnosticSink;
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
@@ -25,8 +26,8 @@ use crate::package::{
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, OakParseContext,
-    OakParser, PackageGuard, ParsedExpression, ParsedRFile, SemanticIssueKind, SourceId, SourceKey,
-    Span, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    OakParser, PackageGuard, ParsedExpression, ParsedRFile, ResourcePackage, SemanticIssueKind,
+    SourceId, SourceKey, Span, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::{Error, Result};
 use rayon::prelude::*;
@@ -36,11 +37,11 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub(super) struct ParsedSite<'a> {
-    node: NodeId,
-    package: PackageId,
-    image: &'a PackageImage,
-    binding: &'a str,
-    lexical_environment: &'a str,
+    pub(super) node: NodeId,
+    pub(super) package: PackageId,
+    pub(super) image: &'a PackageImage,
+    pub(super) binding: &'a str,
+    pub(super) lexical_environment: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -1102,7 +1103,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 if !self.guards_active(package, image, &resource.guards)? {
                     continue;
                 }
-                self.resource_access(node, package, resource)?;
+                self.resource_access(node, package, parsed, resource)?;
             }
             self.record_non_reflective_namespace_uses(expression);
             self.process_calls(site, parsed, expression)?;
@@ -1314,24 +1315,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Resolution::Static(BindingTarget::Base)
                 )
             {
-                self.s3_dispatch(
-                    site.node,
-                    site.package,
-                    site.binding,
-                    site.lexical_environment,
-                    Some(&expression.parameters),
-                    call,
-                )?;
+                self.s3_dispatch(site, parsed, Some(&expression.parameters), call)?;
                 continue;
             }
-            self.semantic_call(
-                site.node,
-                site.package,
-                site.image,
-                site.binding,
-                site.lexical_environment,
-                call,
-            )?;
+            self.semantic_call(site, parsed, call)?;
         }
         Ok(())
     }
@@ -2035,42 +2022,48 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         from: NodeId,
         current: PackageId,
+        parsed: &ParsedRFile,
         resource: &crate::syntax::ResourceRef,
     ) -> Result<()> {
-        let Some(package_name) = &resource.package else {
-            self.relocations
-                .defer_dynamic_resource_lookup(from, current, resource.span.clone());
+        let package_name = match &resource.package {
+            ResourcePackage::Literal(name) => name,
+            ResourcePackage::Computed(binding) => {
+                let declared = binding
+                    .as_ref()
+                    .and_then(|binding| parsed.string_domain_for(binding, resource.scope));
+                let Some(names) = declared else {
+                    self.relocations.defer_dynamic_resource_lookup(
+                        from,
+                        current,
+                        resource.span.clone(),
+                    );
+                    return Ok(());
+                };
+                for name in names {
+                    let linked = self
+                        .resource_package(from, current, resource, &name)?
+                        .is_some_and(|package| {
+                            self.packages.role(package) == crate::package::PackageRole::Linked
+                        });
+                    if linked {
+                        self.diagnostic(
+                            from,
+                            current,
+                            None,
+                            RejectCode::DynamicLookup,
+                            format!(
+                                "system.file() can name Linked `{name}` through a declared computed package, whose installation slinker removes"
+                            ),
+                            Some(resource.span.clone()),
+                        );
+                    }
+                }
+                return Ok(());
+            }
+        };
+        let Some(foreign) = self.resource_package(from, current, resource, package_name)? else {
             return Ok(());
         };
-
-        // The root remains a real installed package. Preserve its own package
-        // path/help/Meta semantics exactly; no synthetic resource rewrite is
-        // required for system.file(..., package = <root>).
-        if self.is_root(current) && package_name == self.packages.name(current) {
-            return Ok(());
-        }
-
-        if self.package_is_suggested_only(current, package_name)?
-            && !self.optional_package_selected(package_name)
-        {
-            return Ok(());
-        }
-
-        let Some(foreign) = self.packages.resolve(package_name)? else {
-            self.record_missing_package(
-                from,
-                current,
-                package_name,
-                EdgeKind::Resource,
-                format!("system.file references package {package_name}"),
-                Some(resource.span.clone()),
-            );
-            return Ok(());
-        };
-        if self.packages.is_external(foreign) {
-            self.external.insert(foreign);
-            return Ok(());
-        }
         let Some(path) = &resource.path else {
             self.diagnostic(
                 from,
@@ -2125,6 +2118,42 @@ impl<P: PackageProvider> AnalyzerState<P> {
             resource: path.clone(),
         });
         Ok(())
+    }
+
+    /// The installed package whose files `system.file(package = name)` must reach through the
+    /// generated package, or `None` when the call already behaves as written.
+    fn resource_package(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        resource: &crate::syntax::ResourceRef,
+        name: &str,
+    ) -> Result<Option<PackageId>> {
+        // The root remains a real installed package. Preserve its own package
+        // path/help/Meta semantics exactly; no synthetic resource rewrite is
+        // required for system.file(..., package = <root>).
+        if self.is_root(current) && name == self.packages.name(current) {
+            return Ok(None);
+        }
+        if self.package_is_suggested_only(current, name)? && !self.optional_package_selected(name) {
+            return Ok(None);
+        }
+        let Some(foreign) = self.packages.resolve(name)? else {
+            self.record_missing_package(
+                from,
+                current,
+                name,
+                EdgeKind::Resource,
+                format!("system.file references package {name}"),
+                Some(resource.span.clone()),
+            );
+            return Ok(None);
+        };
+        if self.packages.is_external(foreign) {
+            self.external.insert(foreign);
+            return Ok(None);
+        }
+        Ok(Some(foreign))
     }
 
     pub(super) fn optional_package_selected(&self, name: &str) -> bool {
@@ -2695,13 +2724,17 @@ OpenReason::Unresolved(_)) => self.diagnostic(
 
     fn reflective_lookup(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        image: &PackageImage,
-        binding: &str,
-        lexical_environment: &str,
+        site: ParsedSite<'_>,
+        parsed: &ParsedRFile,
         call: &CallSite,
     ) -> Result<()> {
+        let ParsedSite {
+            node: from,
+            package: current,
+            image,
+            binding,
+            lexical_environment,
+        } = site;
         if call.callee == "exists"
             && self.argument_text(call, "inherits") == Some("FALSE")
             && self.argument_span(call, "envir").is_some_and(|span| {
@@ -2723,8 +2756,11 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             .any(|name| matches!(name.as_str(), "envir" | "pos" | "where" | "frame"))
             || call.arg_names.iter().filter(|name| name.is_none()).count() > 1
                 && call.callee != "do.call";
-        match matched_static_arg(call, formals, target) {
-            Some(StaticArg::String(name)) if !computed_environment => {
+        match (
+            matched_static_arg(call, formals, target),
+            declared_strings(parsed, call, formals, target),
+        ) {
+            (Some(StaticArg::String(name)), _) if !computed_environment => {
                 let name = name.clone();
                 self.retain_reflective_name(
                     from,
@@ -2735,7 +2771,20 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     &call.span,
                 )
             }
-            Some(StaticArg::Symbol(_)) | None
+            (Some(StaticArg::Symbol(_)), Some(names)) if !computed_environment => {
+                for name in names {
+                    self.retain_reflective_name(
+                        from,
+                        current,
+                        image,
+                        lexical_environment,
+                        &name,
+                        &call.span,
+                    )?;
+                }
+                Ok(())
+            }
+            (Some(StaticArg::Symbol(_)) | None, _)
                 if matches!(call.callee.as_str(), "match.fun" | "do.call")
                     && !self.builds_function_name(call, formals, target) =>
             {
@@ -2842,13 +2891,17 @@ OpenReason::Unresolved(_)) => self.diagnostic(
 
     pub(super) fn semantic_call(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        image: &PackageImage,
-        binding: &str,
-        lexical_environment: &str,
+        site: ParsedSite<'_>,
+        parsed: &ParsedRFile,
         call: &CallSite,
     ) -> Result<()> {
+        let ParsedSite {
+            node: from,
+            package: current,
+            image,
+            binding,
+            lexical_environment,
+        } = site;
         if !self.semantic_callee_is_base(
             from,
             current,
@@ -2869,27 +2922,28 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             return Ok(());
         }
         if reflective_name_formals(&call.callee).is_some() {
-            return self.reflective_lookup(
-                from,
-                current,
-                image,
-                binding,
-                lexical_environment,
-                call,
-            );
+            return self.reflective_lookup(site, parsed, call);
         }
         match call.callee.as_str() {
             "library" | "require" => {
                 self.attachment_call(from, current, call)?;
             }
             "requireNamespace" => {
-                self.namespace_operation(from, current, binding, call, NamespaceCall::Require)?;
+                self.namespace_operation(
+                    from,
+                    current,
+                    binding,
+                    parsed,
+                    call,
+                    NamespaceCall::Require,
+                )?;
             }
             "loadNamespace" => {
                 self.namespace_operation(
                     from,
                     current,
                     binding,
+                    parsed,
                     call,
                     NamespaceCall::Operation(NamespaceOperation::Load),
                 )?;
@@ -2899,6 +2953,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     from,
                     current,
                     binding,
+                    parsed,
                     call,
                     NamespaceCall::Operation(NamespaceOperation::Get),
                 )?;
@@ -2908,6 +2963,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     from,
                     current,
                     binding,
+                    parsed,
                     call,
                     NamespaceCall::Operation(NamespaceOperation::As),
                 )?;
@@ -2960,7 +3016,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             }
             "find.package" => self.identity_query(from, current, call, false)?,
             "UseMethod" | "NextMethod" => {
-                self.s3_dispatch(from, current, binding, lexical_environment, None, call)?;
+                self.s3_dispatch(site, parsed, None, call)?;
             }
             ".Call" | ".External" | ".C" | ".Fortran" => {
                 self.native_call(from, current, image, binding, lexical_environment, call)?;
@@ -3127,6 +3183,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         from: NodeId,
         current: PackageId,
         binding: &str,
+        parsed: &ParsedRFile,
         call: &CallSite,
         operation: NamespaceCall,
     ) -> Result<()> {
@@ -3138,6 +3195,15 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         });
         let Some(name) = name else {
             if self.reflection.is_non_reflective_namespace_use(&call.span) {
+                return Ok(());
+            }
+            let formals = namespace_formals(&call.callee);
+            if let Some(names) =
+                declared_strings(parsed, call, formals, namespace_target(&call.callee))
+            {
+                for name in names {
+                    self.declared_namespace_name(from, current, binding, call, operation, &name)?;
+                }
                 return Ok(());
             }
             self.diagnostic(
@@ -3220,6 +3286,51 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             target,
             operation,
         ));
+        Ok(())
+    }
+
+    /// A declared value of a computed namespace name reaches the real package at run time, so
+    /// only a name that stays unrewritten as written is accepted.
+    fn declared_namespace_name(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+        operation: NamespaceCall,
+        name: &str,
+    ) -> Result<()> {
+        let problem = match self.discovered_package(from, current, call, name)? {
+            Discovered::Settled => return Ok(()),
+            Discovered::Optional if operation != NamespaceCall::Require => return Ok(()),
+            Discovered::Missing if operation != NamespaceCall::Require => {
+                self.record_missing_package(
+                    from,
+                    current,
+                    name,
+                    EdgeKind::Discovery,
+                    format!("{} requires unavailable namespace {name}", call.callee),
+                    Some(call.span.clone()),
+                );
+                return Ok(());
+            }
+            Discovered::Linked(_) => format!(
+                "{}() can name Linked `{name}` through a declared computed value, which cannot be rewritten to its private namespace",
+                call.callee
+            ),
+            Discovered::Optional | Discovered::Missing => format!(
+                "{}() can name `{name}` through a declared computed value, whose installation slinker does not fix",
+                call.callee
+            ),
+        };
+        self.diagnostic(
+            from,
+            current,
+            Some(binding),
+            RejectCode::DynamicPackageDiscovery,
+            problem,
+            Some(call.span.clone()),
+        );
         Ok(())
     }
 

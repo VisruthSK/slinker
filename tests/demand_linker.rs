@@ -2708,6 +2708,100 @@ fn reflective_lookups_retain_static_names_and_block_dynamic_ones() {
 }
 
 #[test]
+fn declared_strings_make_computed_names_exact() {
+    let analyze = |source: &str| {
+        Linker::new(
+            FakeProvider::new(vec![
+                root_calling("dep", "f"),
+                package_with!(
+                    "dep",
+                    &[
+                        ("f", Some(source)),
+                        ("helper", Some("helper <- function() 1")),
+                        ("other", Some("other <- function() 2")),
+                        ("unused", Some("unused <- function() 3")),
+                    ],
+                    Vec::new(),
+                    export("f"),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    "Imports: ext
+",
+                ),
+                package("ext", &[("x", Some("x <- function() 1"))]),
+            ]),
+            1,
+        )
+        .with_external_packages(source.contains("'ext'").then(|| "ext".to_owned()))
+        .analyze("root")
+        .unwrap()
+    };
+
+    let lookup = analyze(
+        "f <- function(name) { declare(slinker(name = strings('helper', 'other'))); get(name)() }",
+    );
+    assert!(lookup.blockers().is_empty(), "{:?}", lookup.blockers());
+    assert!(retained_binding(&lookup, "dep", "helper"));
+    assert!(retained_binding(&lookup, "dep", "other"));
+    assert!(!retained_binding(&lookup, "dep", "unused"));
+
+    let narrowed = analyze(
+        "f <- function(name) { declare(slinker(name = strings('helper', 'other'))); g <- function() { declare(slinker(name = strings('other'))); match.fun(name)() }; g() }",
+    );
+    assert!(narrowed.blockers().is_empty(), "{:?}", narrowed.blockers());
+    assert!(retained_binding(&narrowed, "dep", "other"));
+    assert!(!retained_binding(&narrowed, "dep", "helper"));
+
+    let external =
+        analyze("f <- function(pkg) { declare(slinker(pkg = strings('ext'))); asNamespace(pkg) }");
+    assert!(external.blockers().is_empty(), "{:?}", external.blockers());
+
+    let linked = analyze(
+        "f <- function(pkg) { declare(slinker(pkg = strings('ext', 'dep'))); asNamespace(pkg) }",
+    );
+    assert!(
+        linked.blockers().iter().any(|diagnostic| {
+            diagnostic.code == RejectCode::DynamicPackageDiscovery
+                && diagnostic.message.contains("can name Linked `dep`")
+        }),
+        "{:?}",
+        linked.blockers()
+    );
+
+    let resource_external = analyze(
+        "f <- function(pkg) { declare(slinker(pkg = strings('ext'))); system.file('x', package = pkg) }",
+    );
+    assert!(
+        resource_external.blockers().is_empty(),
+        "{:?}",
+        resource_external.blockers()
+    );
+
+    let resource_linked = analyze(
+        "f <- function(pkg) { declare(slinker(pkg = strings('dep'))); system.file('x', package = pkg) }",
+    );
+    assert!(
+        resource_linked.blockers().iter().any(|diagnostic| {
+            diagnostic.code == RejectCode::DynamicLookup
+                && diagnostic.message.contains("can name Linked `dep`")
+        }),
+        "{:?}",
+        resource_linked.blockers()
+    );
+
+    let computed_environment = analyze(
+        "f <- function(name, env) { declare(slinker(name = strings('helper'))); get(name, envir = env) }",
+    );
+    assert!(
+        computed_environment
+            .blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicLookup)
+    );
+}
+
+#[test]
 fn dynamic_namespace_is_allowed_only_without_reflection() {
     let blocked = |source: &str| {
         let plan = Linker::new(
@@ -3676,6 +3770,86 @@ fn closed_generic_retains_every_registered_and_lexical_method() {
         assert!(retained_binding(&plan, "foo", method), "{method}");
     }
     assert!(!retained_binding(&plan, "foo", "unrelated"));
+}
+
+#[test]
+fn declared_generic_names_dispatch_each_generic() {
+    let analyze = |dispatch: &str| {
+        let root = package(
+            "root",
+            &[("f", Some("f <- function() foo::dispatch(1, 'alpha')"))],
+        );
+        let foo = package(
+            "foo",
+            &[
+                ("dispatch", Some(dispatch)),
+                (
+                    "alpha.default",
+                    Some("alpha.default <- function(x, kind) 1"),
+                ),
+                ("beta.default", Some("beta.default <- function(x, kind) 2")),
+                (
+                    "gamma.default",
+                    Some("gamma.default <- function(x, kind) 3"),
+                ),
+            ],
+        );
+        Linker::new(FakeProvider::new(vec![root, foo]), 1)
+            .analyze("root")
+            .unwrap()
+    };
+
+    let declared = analyze(
+        "dispatch <- function(x, kind) { declare(slinker(kind = strings('alpha', 'beta'))); UseMethod(kind) }",
+    );
+    assert!(declared.blockers().is_empty(), "{:?}", declared.blockers());
+    assert!(retained_binding(&declared, "foo", "alpha.default"));
+    assert!(retained_binding(&declared, "foo", "beta.default"));
+    assert!(!retained_binding(&declared, "foo", "gamma.default"));
+
+    let root = package(
+        "root",
+        &[(
+            "first",
+            Some(
+                "first <- function(x) { declare(slinker(x = s3('c1'))); foo::dispatch(x, 'alpha'); foo::chain1() }",
+            ),
+        )],
+    );
+    let methods = ["alpha.c1", "alpha.c2", "beta.c1", "beta.c2", "alpha.c3"];
+    let mut sources = vec![
+        "dispatch <- function(x, kind) { declare(slinker(kind = strings('alpha', 'beta'))); UseMethod(kind) }".to_owned(),
+        "chain1 <- function() chain2()".to_owned(),
+        "chain2 <- function() chain3()".to_owned(),
+        "chain3 <- function() late(NULL)".to_owned(),
+        "late <- function(y) { declare(slinker(y = s3('c2'))); dispatch(y, 'beta') }".to_owned(),
+    ];
+    sources.extend(methods.map(|method| format!("{method} <- function(x, kind) 1")));
+    let bindings = sources
+        .iter()
+        .map(|source| {
+            (
+                source.split(' ').next().expect("binding name"),
+                Some(source.as_str()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let closed = Linker::new(FakeProvider::new(vec![root, package("foo", &bindings)]), 1)
+        .analyze("root")
+        .unwrap();
+    assert!(closed.blockers().is_empty(), "{:?}", closed.blockers());
+    for method in ["alpha.c1", "alpha.c2", "beta.c1", "beta.c2"] {
+        assert!(retained_binding(&closed, "foo", method), "{method}");
+    }
+    assert!(!retained_binding(&closed, "foo", "alpha.c3"));
+
+    let undeclared = analyze("dispatch <- function(x, kind) UseMethod(kind)");
+    assert!(
+        undeclared
+            .blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::ObjectSystem)
+    );
 }
 
 #[test]
