@@ -202,8 +202,8 @@ Invariants into types:
 - Removed bindings and unretained exports become typed slot state instead of parallel string lists.
 
 Structure:
-- Split `AnalyzerState` (about 40 fields) into owners with narrow APIs: need queue, diagnostic sink,
-  S3 model, relocation plan, reflection facts, parse cache.
+- Split the rest of `AnalyzerState` into owners with narrow APIs: S3 model, relocation plan,
+  reflection facts, parse cache.
 - Break up the long functions: `finalize_program` (424 lines), `syntax/oak.rs` `translate_index`
   (334) and the 208-line function after it, `AnalyzerState` `semantic_call` (259),
   `process_binding` (241), `process_parsed` (217), and the 230-line interpreter call evaluation.

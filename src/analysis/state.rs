@@ -2,8 +2,10 @@ use super::arguments::{
     matched_call_arg_index, matched_static_arg, native_selector_span, reflective_name_formals,
     static_package_arg, static_string_arg,
 };
+use super::diagnostic::DiagnosticSink;
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
 use super::namespace::NamespaceBuilder;
+use super::need::{NeedQueue, Popped};
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
 use super::relocation::{NamespaceCall, PendingRelocation};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
@@ -28,7 +30,7 @@ use crate::syntax::{
 use crate::{Error, Result};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -62,16 +64,13 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) parse_pool: Option<Arc<rayon::ThreadPool>>,
     pub(super) graph: Graph,
     pub(super) roots: Vec<NodeId>,
-    pub(super) pending: VecDeque<Need>,
-    pub(super) queued: HashSet<Need>,
-    pub(super) processed: HashSet<Need>,
+    pub(super) needs: NeedQueue,
     pub(super) encountered: HashSet<PackageId>,
     pub(super) external: HashSet<PackageId>,
     pub(super) parsed_bindings: HashMap<(PackageId, String), ParseState>,
     pub(super) images: HashMap<PackageId, Arc<PackageImage>>,
     pub(super) objects: ObjectWorld,
-    pub(super) diagnostics: Vec<Diagnostic>,
-    pub(super) assumptions: Vec<Diagnostic>,
+    pub(super) diagnostics: DiagnosticSink,
     pub(super) pending_relocations: Vec<PendingRelocation>,
     pub(super) dynamic_resource_lookups: Vec<(NodeId, PackageId, Span)>,
     pub(super) s3_generics: BTreeMap<S3GenericKey, S3Generic>,
@@ -95,7 +94,6 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) non_returning_bindings: HashMap<PackageId, BTreeSet<String>>,
     pub(super) namespace_builders: HashMap<PackageId, NamespaceBuilder>,
     pub(super) observations: Vec<SyntaxObservation>,
-    pub(super) diagnostic_keys: HashSet<(NodeId, RejectCode, String)>,
     pub(super) contextual_namespace_calls: HashMap<Span, Option<String>>,
     pub(super) root_description: Option<Arc<str>>,
 }
@@ -124,16 +122,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             parse_pool: None,
             graph: Graph::default(),
             roots: Vec::new(),
-            pending: VecDeque::new(),
-            queued: HashSet::new(),
-            processed: HashSet::new(),
+            needs: NeedQueue::default(),
             encountered: HashSet::new(),
             external: HashSet::new(),
             parsed_bindings: HashMap::new(),
             images: HashMap::new(),
             objects: ObjectWorld::default(),
-            diagnostics: Vec::new(),
-            assumptions: Vec::new(),
+            diagnostics: DiagnosticSink::default(),
             pending_relocations: Vec::new(),
             dynamic_resource_lookups: Vec::new(),
             s3_generics: BTreeMap::new(),
@@ -157,7 +152,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             non_returning_bindings: HashMap::new(),
             namespace_builders: HashMap::new(),
             observations: Vec::new(),
-            diagnostic_keys: HashSet::new(),
             contextual_namespace_calls: HashMap::new(),
             root_description: None,
         }
@@ -176,7 +170,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let root_image = self.image(root)?;
 
         self.require_root(Need::Activation { package: root });
-        while !self.pending.is_empty() {
+        while !self.needs.is_empty() {
             self.process_frontier()?;
         }
 
@@ -196,14 +190,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             });
         }
 
-        while !self.pending.is_empty() {
+        while !self.needs.is_empty() {
             self.process_frontier()?;
         }
         Ok(self)
     }
 
     pub(super) fn process_frontier(&mut self) -> Result<()> {
-        let frontier = self.pending.len();
+        let frontier = self.needs.len();
         if frontier == 0 {
             return Ok(());
         }
@@ -214,14 +208,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.preparse_frontier_bindings(frontier)?;
 
         for _ in 0..frontier {
-            let Some(need) = self.pending.pop_front() else {
-                break;
-            };
-            self.queued.remove(&need);
-            if !self.processed.insert(need.clone()) {
-                continue;
+            match self.needs.pop() {
+                Some(Popped::Started(need)) => self.process_need(need)?,
+                Some(Popped::AlreadyStarted) => {}
+                None => break,
             }
-            self.process_need(need)?;
         }
         Ok(())
     }
@@ -315,12 +306,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             context: OakParseContext,
         }
 
-        let needs = self
-            .pending
-            .iter()
-            .take(frontier)
-            .cloned()
-            .collect::<Vec<_>>();
+        let needs = self.needs.upcoming(frontier).cloned().collect::<Vec<_>>();
         let mut work = Vec::<Work>::new();
         let mut scheduled = HashSet::<(PackageId, String)>::new();
 
@@ -1459,8 +1445,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             package: id,
             hook: ".onLoad".into(),
         };
-        if self.processed.insert(lifecycle.clone()) {
-            self.queued.remove(&lifecycle);
+        if self.needs.start(&lifecycle) {
             self.process_lifecycle(id, ".onLoad".into())?;
         }
 
@@ -1468,8 +1453,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             package: id,
             binding: ".onLoad".into(),
         };
-        if self.processed.insert(hook.clone()) {
-            self.queued.remove(&hook);
+        if self.needs.start(&hook) {
             self.process_binding(id, ".onLoad".into())?;
         }
         Ok(())
@@ -2769,9 +2753,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if !self.roots.contains(&node) {
             self.roots.push(node);
         }
-        if !self.processed.contains(&need) && self.queued.insert(need.clone()) {
-            self.pending.push_back(need);
-        }
+        self.needs.schedule(need);
     }
 
     pub(super) fn require(
@@ -2795,9 +2777,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.encountered.insert(need.package());
         let to = self.need_node(&need);
         self.depend(from, to, kind, reason, span);
-        if !self.processed.contains(&need) && self.queued.insert(need.clone()) {
-            self.pending.push_back(need);
-        }
+        self.needs.schedule(need);
     }
 
     pub(super) fn depend(
@@ -2891,7 +2871,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         span: Option<Span>,
     ) {
         let diagnostic = self.new_diagnostic(node, package, binding, code, message.into(), span);
-        self.record(true, diagnostic);
+        self.diagnostics.record(node, true, diagnostic);
     }
 
     pub(super) fn assume(
@@ -2904,7 +2884,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         span: Option<Span>,
     ) {
         let diagnostic = self.new_diagnostic(node, package, binding, code, message.into(), span);
-        self.record(self.policy.strict, diagnostic);
+        self.diagnostics
+            .record(node, self.policy.strict, diagnostic);
     }
 
     fn new_diagnostic(
@@ -2923,23 +2904,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             message,
             span,
             node: Some(node),
-        }
-    }
-
-    fn record(&mut self, blocking: bool, diagnostic: Diagnostic) {
-        let node = diagnostic
-            .node
-            .expect("analysis diagnostics carry their node");
-        if !self
-            .diagnostic_keys
-            .insert((node, diagnostic.code, diagnostic.message.clone()))
-        {
-            return;
-        }
-        if blocking {
-            self.diagnostics.push(diagnostic);
-        } else {
-            self.assumptions.push(diagnostic);
         }
     }
 

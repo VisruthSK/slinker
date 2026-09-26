@@ -1,5 +1,6 @@
 use crate::analysis::object_world::ClosureId;
 use crate::package::PackageId;
+use std::collections::{HashSet, VecDeque};
 
 pub type BindingName = String;
 pub type ResourceId = String;
@@ -72,5 +73,56 @@ impl Need {
             | Self::Native { package, .. }
             | Self::Lifecycle { package, .. } => *package,
         }
+    }
+}
+
+pub(super) enum Popped {
+    Started(Need),
+    AlreadyStarted,
+}
+
+#[derive(Default)]
+pub(super) struct NeedQueue {
+    pending: VecDeque<Need>,
+    queued: HashSet<Need>,
+    started: HashSet<Need>,
+}
+
+impl NeedQueue {
+    pub(super) fn schedule(&mut self, need: Need) {
+        if !self.started.contains(&need) && self.queued.insert(need.clone()) {
+            self.pending.push_back(need);
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub(super) fn upcoming(&self, count: usize) -> impl Iterator<Item = &Need> {
+        self.pending.iter().take(count)
+    }
+
+    pub(super) fn pop(&mut self) -> Option<Popped> {
+        let need = self.pending.pop_front()?;
+        self.queued.remove(&need);
+        Some(if self.started.insert(need.clone()) {
+            Popped::Started(need)
+        } else {
+            Popped::AlreadyStarted
+        })
+    }
+
+    pub(super) fn start(&mut self, need: &Need) -> bool {
+        self.queued.remove(need);
+        self.started.insert(need.clone())
+    }
+
+    pub(super) fn started(&self) -> impl Iterator<Item = &Need> {
+        self.started.iter()
     }
 }

@@ -55,10 +55,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         self.finalize_s3_dispatch(&retained);
-        let mut blockers = self.diagnostics;
-        blockers.sort_by(diagnostic_order);
-        let mut assumptions = self.assumptions;
-        assumptions.sort_by(diagnostic_order);
+        let (blockers, assumptions) = self.diagnostics.into_sorted();
         LinkIr {
             program,
             provenance: crate::ir::ProvenanceIr::from_analysis(self.graph, self.roots),
@@ -85,7 +82,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .map(|package| (*package, self.packages.role(*package)))
             .collect::<Vec<_>>();
         let mut retained_bindings = HashMap::<PackageId, BTreeSet<String>>::new();
-        for need in &self.processed {
+        for need in self.needs.started() {
             if let Need::Binding { package, binding } = need {
                 retained_bindings
                     .entry(*package)
@@ -764,15 +761,6 @@ impl LinkIr {
 
 pub(super) fn spans_overlap(left: &Span, right: &Span) -> bool {
     left.source == right.source && left.start < right.end && right.start < left.end
-}
-
-fn diagnostic_order(left: &Diagnostic, right: &Diagnostic) -> std::cmp::Ordering {
-    (&left.package, left.code, &left.binding, &left.message).cmp(&(
-        &right.package,
-        right.code,
-        &right.binding,
-        &right.message,
-    ))
 }
 
 #[derive(Debug)]
