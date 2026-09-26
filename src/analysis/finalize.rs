@@ -619,7 +619,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn finalize_s3_dispatch(&mut self, retained: &BTreeSet<PackageId>) {
         let mut open_registrations = Vec::new();
         for &package in retained {
-            if self.s3_generics.is_empty()
+            if !self.s3.has_generics()
                 || self.packages.role(package) != LinkedPackageRole::External
                 || self.packages.is_platform(package)
             {
@@ -628,16 +628,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
             match self.packages.index(package) {
                 Ok(index) => {
                     open_registrations.extend(index.s3.iter().flat_map(|registration| {
-                        self.s3_generics
-                            .iter()
-                            .filter(|(key, generic)| {
+                        self.s3
+                            .generics_reaching(&registration.class)
+                            .filter(|key| {
                                 key.name == registration.generic.name
                                     && registration.generic.package.as_deref().is_none_or(|owner| {
                                         owner == self.packages.name(key.package)
                                     })
-                                    && generic.dispatch.reaches(&registration.class)
                             })
-                            .map(move |(key, _)| (package, key.clone()))
+                            .map(move |key| (package, key.clone()))
                     }))
                 }
                 Err(error) => {
@@ -659,7 +658,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 self.packages.name(external),
                 generic.name
             );
-            for (node, package, span) in self.s3_generics[&generic].sites.clone() {
+            for (node, package, span) in self.s3.sites(&generic).to_vec() {
                 self.diagnostic(
                     node,
                     package,
@@ -670,7 +669,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
         }
-        for (node, package, binding, span) in std::mem::take(&mut self.next_method_calls) {
+        for (node, package, binding, span) in self.s3.take_next_method_calls() {
             let registered = self
                 .namespace_builders
                 .get(&package)
@@ -680,7 +679,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         .iter()
                         .any(|registration| registration.method == binding)
                 });
-            if !registered && !self.closed_methods.contains(&(package, binding.clone())) {
+            if !registered && !self.s3.is_closed_method(package, &binding) {
                 self.assume(
                     node,
                     package,

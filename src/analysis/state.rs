@@ -9,7 +9,7 @@ use super::need::{NeedQueue, Popped};
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
 use super::relocation::{NamespaceCall, PendingRelocation};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
-use super::s3::{CallableId, Invocation, S3Generic, S3GenericKey, callable_target};
+use super::s3::{CallableId, S3Model, callable_target};
 use crate::analysis::policy::{DiscoveryPolicy, LinkPolicy};
 use crate::analysis::{
     Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode, S3Id,
@@ -73,11 +73,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) diagnostics: DiagnosticSink,
     pub(super) pending_relocations: Vec<PendingRelocation>,
     pub(super) dynamic_resource_lookups: Vec<(NodeId, PackageId, Span)>,
-    pub(super) s3_generics: BTreeMap<S3GenericKey, S3Generic>,
-    pub(super) callable_generics: HashMap<CallableId, S3GenericKey>,
-    pub(super) invocations: HashMap<CallableId, Vec<Option<Invocation>>>,
-    pub(super) closed_methods: HashSet<(PackageId, String)>,
-    pub(super) next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
+    pub(super) s3: S3Model,
     pub(super) value_closures: HashSet<NodeId>,
     pub(super) construction_calls: HashMap<ConstructionCallKey, AbstractValue>,
     pub(super) construction_evaluations: usize,
@@ -131,11 +127,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             diagnostics: DiagnosticSink::default(),
             pending_relocations: Vec::new(),
             dynamic_resource_lookups: Vec::new(),
-            s3_generics: BTreeMap::new(),
-            callable_generics: HashMap::new(),
-            invocations: HashMap::new(),
-            closed_methods: HashSet::new(),
-            next_method_calls: Vec::new(),
+            s3: S3Model::default(),
             value_closures: HashSet::new(),
             construction_calls: HashMap::new(),
             construction_evaluations: 0,
