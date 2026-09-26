@@ -10,7 +10,7 @@ use crate::ir::{
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{ImportSpec, PackageAvailability, PackageId, PackageProvider};
 use crate::source::generated_description;
-use crate::syntax::{SourceOrigin, Sources, Span};
+use crate::syntax::{SourceOrigin, Sources};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -476,7 +476,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }
                 }
             };
-            if let Err(invalid) = builder.relocate(code, source.start, source.end, target) {
+            if let Err(invalid) = builder.relocate(code, source.range(), target) {
                 issues.push(FinalizationIssue::InvalidRelocation(invalid));
             }
         }
@@ -705,7 +705,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for observation in self.observations.clone() {
             if pending_relocations
                 .iter()
-                .any(|rewrite| spans_overlap(&observation.span, rewrite))
+                .any(|rewrite| observation.span.overlaps(rewrite))
             {
                 self.diagnostic(
                     observation.node,
@@ -756,10 +756,6 @@ impl LinkIr {
     pub fn construction_evaluations(&self) -> usize {
         self.construction_evaluations
     }
-}
-
-pub(super) fn spans_overlap(left: &Span, right: &Span) -> bool {
-    left.source == right.source && left.start < right.end && right.start < left.end
 }
 
 #[derive(Debug)]

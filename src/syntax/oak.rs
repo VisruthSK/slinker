@@ -17,7 +17,7 @@ use crate::syntax::facts::{
     PackageRef, ParsedExpression, ParsedRFile, ResourceRef, SemanticIssue, SemanticIssueKind,
     StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
-use crate::syntax::source::{SourceId, Span};
+use crate::syntax::source::{SourceId, Span, TextRange};
 use crate::{Error, Result};
 use air_r_parser::{RParserOptions, parse};
 use air_r_syntax::{AnyRExpression, RBinaryExpression, RCall, RRoot};
@@ -274,8 +274,7 @@ struct LiveUse {
 #[derive(Debug, Clone)]
 struct RawArgument {
     name: Option<String>,
-    value_start: usize,
-    value_end: usize,
+    value: TextRange,
     static_arg: Option<StaticArg>,
 }
 
@@ -295,10 +294,8 @@ struct LiveCall {
 #[derive(Debug, Clone)]
 struct FunctionRegion {
     function_start: usize,
-    formals_start: usize,
-    formals_end: usize,
-    body_start: usize,
-    body_end: usize,
+    formals: TextRange,
+    body: TextRange,
     parameters: BTreeSet<String>,
 }
 
@@ -306,19 +303,15 @@ struct FunctionRegion {
 struct ForRegion {
     variable: String,
     variable_start: usize,
-    body_start: usize,
-    body_end: usize,
+    body: TextRange,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct IfRegion {
     if_start: usize,
-    condition_start: usize,
-    condition_end: usize,
-    then_start: usize,
-    then_end: usize,
-    else_start: Option<usize>,
-    else_end: Option<usize>,
+    condition: TextRange,
+    then_branch: TextRange,
+    else_branch: Option<TextRange>,
 }
 
 #[derive(Clone, Copy)]
@@ -337,8 +330,7 @@ struct BindingProofContext<'a> {
 
 #[derive(Debug, Clone)]
 struct SuperAssignmentParts {
-    span_start: usize,
-    span_end: usize,
+    span: TextRange,
     value_symbol: Option<(String, usize, usize)>,
 }
 
@@ -1538,10 +1530,12 @@ fn formal_default_use_is_bound(regions: &[FunctionRegion], live_use: &LiveUse) -
     let mut containing = regions
         .iter()
         .filter(|region| {
-            live_use.start >= region.formals_start && live_use.end <= region.formals_end
+            region
+                .formals
+                .contains_range(TextRange::new(live_use.start, live_use.end))
         })
         .collect::<Vec<_>>();
-    containing.sort_by_key(|region| region.formals_end.saturating_sub(region.formals_start));
+    containing.sort_by_key(|region| region.formals.end.saturating_sub(region.formals.start));
     containing
         .into_iter()
         .any(|region| region.parameters.contains(&live_use.name))
@@ -1550,8 +1544,9 @@ fn formal_default_use_is_bound(regions: &[FunctionRegion], live_use: &LiveUse) -
 fn for_body_use_is_bound(index: &SemanticIndex, regions: &[ForRegion], live_use: &LiveUse) -> bool {
     if !regions.iter().any(|region| {
         region.variable == live_use.name
-            && live_use.start >= region.body_start
-            && live_use.end <= region.body_end
+            && region
+                .body
+                .contains_range(TextRange::new(live_use.start, live_use.end))
     }) {
         return false;
     }
@@ -1605,7 +1600,7 @@ fn post_for_use_may_fall_through(
     live_use: &LiveUse,
 ) -> bool {
     for region in regions.iter().rev() {
-        if region.variable != live_use.name || region.body_end > live_use.start {
+        if region.variable != live_use.name || region.body.end > live_use.start {
             continue;
         }
 
@@ -1702,20 +1697,25 @@ fn definition_must_execute_before_position(
     }
 
     for region in for_regions {
-        if definition_start >= region.body_start
-            && definition_start < region.body_end
-            && !(position >= region.body_start && position < region.body_end)
+        if definition_start >= region.body.start
+            && definition_start < region.body.end
+            && !(position >= region.body.start && position < region.body.end)
         {
             return false;
         }
     }
 
     for region in if_regions {
-        let in_then = definition_start >= region.then_start && definition_start < region.then_end;
-        if in_then && !(position >= region.then_start && position < region.then_end) {
+        let in_then = definition_start >= region.then_branch.start
+            && definition_start < region.then_branch.end;
+        if in_then && !(position >= region.then_branch.start && position < region.then_branch.end) {
             return false;
         }
-        if let (Some(else_start), Some(else_end)) = (region.else_start, region.else_end) {
+        if let Some(TextRange {
+            start: else_start,
+            end: else_end,
+        }) = region.else_branch
+        {
             let in_else = definition_start >= else_start && definition_start < else_end;
             if in_else && !(position >= else_start && position < else_end) {
                 return false;
@@ -1863,7 +1863,7 @@ fn conditional_fallthrough_proven_bound(
     // this name; a path may omit the assignment only if it exits the function
     // or invokes a callee already proved non-returning.
     for region in regions {
-        let Some(chain_end) = region.else_end else {
+        let Some(TextRange { end: chain_end, .. }) = region.else_branch else {
             continue;
         };
         if chain_end > live_use.start || region.if_start >= live_use.start {
@@ -1906,7 +1906,7 @@ fn conditional_fallthrough_proven_bound(
     // state. This is the ISCAM shape where a later branch re-tests the same
     // unchanged selector and therefore rules out earlier arms.
     for region in regions {
-        let Some(chain_end) = region.else_end else {
+        let Some(TextRange { end: chain_end, .. }) = region.else_branch else {
             continue;
         };
         if chain_end > live_use.start || region.if_start >= live_use.start {
@@ -1939,9 +1939,9 @@ fn branch_assumptions_at(
 ) -> Vec<BranchAssumption> {
     let mut assumptions = Vec::new();
     for region in regions {
-        let truth = if position >= region.then_start && position < region.then_end {
+        let truth = if position >= region.then_branch.start && position < region.then_branch.end {
             Some(true)
-        } else if let (Some(start), Some(end)) = (region.else_start, region.else_end) {
+        } else if let Some(TextRange { start, end }) = region.else_branch {
             (position >= start && position < end).then_some(false)
         } else {
             None
@@ -1950,9 +1950,9 @@ fn branch_assumptions_at(
             continue;
         };
         assumptions.push(BranchAssumption {
-            condition: canonical_condition(text, region.condition_start, region.condition_end),
+            condition: canonical_condition(text, region.condition.start, region.condition.end),
             truth,
-            symbols: condition_symbols(text, region.condition_start, region.condition_end),
+            symbols: condition_symbols(text, region.condition.start, region.condition.end),
         });
     }
     assumptions
@@ -2219,7 +2219,7 @@ fn exhaustive_equality_dispatch_proves_binding(
     let mut selector = None::<String>;
     let mut cases = Vec::<(PredicateValue, usize, usize)>::new();
     let final_else = loop {
-        let condition = canonical_condition(text, current.condition_start, current.condition_end);
+        let condition = canonical_condition(text, current.condition.start, current.condition.end);
         let Some(SimplePredicate::Eq { symbol, value }) = parse_simple_predicate(&condition) else {
             return false;
         };
@@ -2233,9 +2233,13 @@ fn exhaustive_equality_dispatch_proves_binding(
         if cases.iter().any(|(existing, _, _)| existing == &value) {
             return false;
         }
-        cases.push((value, current.then_start, current.then_end));
+        cases.push((value, current.then_branch.start, current.then_branch.end));
 
-        let (Some(else_start), Some(else_end)) = (current.else_start, current.else_end) else {
+        let Some(TextRange {
+            start: else_start,
+            end: else_end,
+        }) = current.else_branch
+        else {
             break None;
         };
         if let Some(nested) = regions
@@ -2354,7 +2358,7 @@ fn prior_membership_guard_values(
 ) -> Option<BTreeSet<String>> {
     regions
         .iter()
-        .filter(|region| region.if_start < before && region.then_end <= before)
+        .filter(|region| region.if_start < before && region.then_branch.end <= before)
         .rev()
         .find_map(|region| {
             if !branch_exits_current_function(
@@ -2362,12 +2366,12 @@ fn prior_membership_guard_values(
                 context,
                 index,
                 regions,
-                region.then_start,
-                region.then_end,
+                region.then_branch.start,
+                region.then_branch.end,
             ) {
                 return None;
             }
-            let condition = canonical_condition(text, region.condition_start, region.condition_end);
+            let condition = canonical_condition(text, region.condition.start, region.condition.end);
             let marker = format!("!({selector}%in%c(");
             let marker_start = condition.find(&marker)?;
             let open = marker_start + marker.len() - 1;
@@ -2639,9 +2643,11 @@ fn definition_is_direct_in_branch(
     regions
         .iter()
         .filter_map(|region| {
-            if definition_start >= region.then_start && definition_start < region.then_end {
-                Some((region.then_start, region.then_end))
-            } else if let (Some(start), Some(end)) = (region.else_start, region.else_end) {
+            if definition_start >= region.then_branch.start
+                && definition_start < region.then_branch.end
+            {
+                Some((region.then_branch.start, region.then_branch.end))
+            } else if let Some(TextRange { start, end }) = region.else_branch {
                 (definition_start >= start && definition_start < end).then_some((start, end))
             } else {
                 None
@@ -2664,21 +2670,25 @@ fn if_chain_all_returning_paths_bind(
     if !branch_binds_reaching_definition(
         text,
         regions,
-        region.then_start,
-        region.then_end,
+        region.then_branch.start,
+        region.then_branch.end,
         definition_starts,
     ) && !branch_exits_current_function(
         text,
         context,
         index,
         regions,
-        region.then_start,
-        region.then_end,
+        region.then_branch.start,
+        region.then_branch.end,
     ) {
         return false;
     }
 
-    let (Some(else_start), Some(else_end)) = (region.else_start, region.else_end) else {
+    let Some(TextRange {
+        start: else_start,
+        end: else_end,
+    }) = region.else_branch
+    else {
         return false;
     };
 
@@ -2715,8 +2725,8 @@ fn branch_binds_reaching_definition(
                 nested.if_start >= branch_start
                     && nested.if_start < branch_end
                     && nested.if_start != branch_start
-                    && ((definition_start >= nested.then_start && definition_start < nested.then_end)
-                        || matches!((nested.else_start, nested.else_end), (Some(start), Some(end)) if definition_start >= start && definition_start < end))
+                    && ((definition_start >= nested.then_branch.start && definition_start < nested.then_branch.end)
+                        || matches!(nested.else_branch, Some(TextRange { start, end }) if definition_start >= start && definition_start < end))
             })
     })
 }
@@ -2800,8 +2810,8 @@ fn branch_exits_current_function(
     if let Some(region) = regions.iter().find(|region| {
         region.if_start == expression_start
             && region
-                .else_end
-                .is_some_and(|else_end| else_end <= expression_end)
+                .else_branch
+                .is_some_and(|branch| branch.end <= expression_end)
     }) {
         return if_chain_all_paths_exit(text, context, index, regions, region);
     }
@@ -2829,12 +2839,16 @@ fn if_chain_all_paths_exit(
         context,
         index,
         regions,
-        region.then_start,
-        region.then_end,
+        region.then_branch.start,
+        region.then_branch.end,
     ) {
         return false;
     }
-    let (Some(else_start), Some(else_end)) = (region.else_start, region.else_end) else {
+    let Some(TextRange {
+        start: else_start,
+        end: else_end,
+    }) = region.else_branch
+    else {
         return false;
     };
     if let Some(nested) = regions
@@ -2989,17 +3003,21 @@ fn expression_definitely_non_returning(
     if let Some(region) = regions.iter().find(|region| {
         region.if_start == expression_start
             && region
-                .else_end
-                .is_some_and(|else_end| else_end <= expression_end)
+                .else_branch
+                .is_some_and(|branch| branch.end <= expression_end)
     }) {
-        let (Some(else_start), Some(else_end)) = (region.else_start, region.else_end) else {
+        let Some(TextRange {
+            start: else_start,
+            end: else_end,
+        }) = region.else_branch
+        else {
             return false;
         };
         return expression_definitely_non_returning(
             text,
             context,
-            region.then_start,
-            region.then_end,
+            region.then_branch.start,
+            region.then_branch.end,
         ) && expression_definitely_non_returning(text, context, else_start, else_end);
     }
 
@@ -3222,17 +3240,10 @@ fn collect_active_bindings(
             continue;
         };
         let certain = !if_regions.iter().any(|region| {
-            range_contains(
-                region.then_start,
-                region.then_end,
-                call.site.span.start,
-                call.site.span.end,
-            ) || region
-                .else_start
-                .zip(region.else_end)
-                .is_some_and(|(start, end)| {
-                    range_contains(start, end, call.site.span.start, call.site.span.end)
-                })
+            region.then_branch.contains_range(call.site.span.range())
+                || region
+                    .else_branch
+                    .is_some_and(|branch| branch.contains_range(call.site.span.range()))
         });
         bindings.push(ActiveBindingDef {
             name: name.clone(),
@@ -3267,12 +3278,7 @@ fn collect_environment_aliases(
             let Some(environment_call) = calls.iter().find(|call| {
                 call.site.callee == "environment"
                     && is_base_call(context, &call.site)
-                    && range_contains(
-                        value_start,
-                        value_end,
-                        call.site.span.start,
-                        call.site.span.end,
-                    )
+                    && TextRange::new(value_start, value_end).contains_range(call.site.span.range())
             }) else {
                 continue;
             };
@@ -3305,14 +3311,9 @@ fn environment_target(
         return Some(target.clone());
     }
 
-    let nested = calls.iter().find(|call| {
-        range_contains(
-            argument.value_start,
-            argument.value_end,
-            call.site.span.start,
-            call.site.span.end,
-        )
-    })?;
+    let nested = calls
+        .iter()
+        .find(|call| argument.value.contains_range(call.site.span.range()))?;
     if nested.site.callee == "asNamespace" && is_base_call(context, &nested.site) {
         return nested
             .raw
@@ -3372,8 +3373,8 @@ fn collect_superassignments(
                         suppressed.push((name.clone(), *start, *end));
                     }
                     (
-                        parts.span_start,
-                        parts.span_end,
+                        parts.span.start,
+                        parts.span.end,
                         parts.value_symbol.map(|(name, _, _)| name),
                     )
                 }
@@ -3432,11 +3433,11 @@ fn superassignment_targets_captured_activation(
         .iter()
         .filter(|region| {
             region.function_start != current_function.function_start
-                && region.body_start <= current_function.function_start
-                && current_function.function_start < region.body_end
+                && region.body.start <= current_function.function_start
+                && current_function.function_start < region.body.end
         })
         .collect::<Vec<_>>();
-    ancestors.sort_by_key(|region| region.body_end.saturating_sub(region.body_start));
+    ancestors.sort_by_key(|region| region.body.end.saturating_sub(region.body.start));
 
     for ancestor in ancestors {
         // Formal bindings exist in the activation frame from function entry.
@@ -3463,7 +3464,7 @@ fn superassignment_targets_captured_activation(
                 }
 
                 let definition_start = text_offset(definition.range().start());
-                if definition_start < ancestor.body_start || definition_start >= ancestor.body_end {
+                if definition_start < ancestor.body.start || definition_start >= ancestor.body.end {
                     continue;
                 }
                 if innermost_function_region(function_regions, definition_start)
@@ -3488,10 +3489,10 @@ fn superassignment_targets_captured_activation(
                     DefinitionKind::ForVariable(_) => {
                         if regions.for_regions.iter().any(|region| {
                             region.variable == target
-                                && region.variable_start >= ancestor.body_start
-                                && region.variable_start < ancestor.body_end
-                                && child_start >= region.body_start
-                                && child_start < region.body_end
+                                && region.variable_start >= ancestor.body.start
+                                && region.variable_start < ancestor.body.end
+                                && child_start >= region.body.start
+                                && child_start < region.body.end
                         }) {
                             return true;
                         }
@@ -3511,8 +3512,8 @@ fn innermost_function_region(
 ) -> Option<&FunctionRegion> {
     regions
         .iter()
-        .filter(|region| position >= region.body_start && position < region.body_end)
-        .min_by_key(|region| region.body_end.saturating_sub(region.body_start))
+        .filter(|region| position >= region.body.start && position < region.body.end)
+        .min_by_key(|region| region.body.end.saturating_sub(region.body.start))
 }
 
 fn direct_child_function_start(
@@ -3524,12 +3525,12 @@ fn direct_child_function_start(
         .iter()
         .filter(|candidate| {
             candidate.function_start != ancestor.function_start
-                && candidate.function_start >= ancestor.body_start
-                && candidate.body_end <= ancestor.body_end
-                && candidate.body_start <= descendant.function_start
-                && descendant.function_start < candidate.body_end
+                && candidate.function_start >= ancestor.body.start
+                && candidate.body.end <= ancestor.body.end
+                && candidate.body.start <= descendant.function_start
+                && descendant.function_start < candidate.body.end
         })
-        .max_by_key(|candidate| candidate.body_end.saturating_sub(candidate.body_start))
+        .max_by_key(|candidate| candidate.body.end.saturating_sub(candidate.body.start))
         .map(|candidate| candidate.function_start)
 }
 
@@ -3584,12 +3585,12 @@ fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<Semanti
 }
 
 fn apply_guard_regions_to_references(
-    regions: &[(usize, usize, PackageGuard)],
+    regions: &[(TextRange, PackageGuard)],
     references: &mut [NameRef],
 ) {
-    for (start, end, guard) in regions {
+    for (range, guard) in regions {
         for reference in references.iter_mut() {
-            if range_contains(*start, *end, reference.span.start, reference.span.end) {
+            if range.contains_range(reference.span.range()) {
                 push_guard(&mut reference.guards, guard.clone());
             }
         }
@@ -3597,22 +3598,22 @@ fn apply_guard_regions_to_references(
 }
 
 fn apply_guard_regions_to_package_refs(
-    regions: &[(usize, usize, PackageGuard)],
+    regions: &[(TextRange, PackageGuard)],
     references: &mut [PackageRef],
 ) {
-    for (start, end, guard) in regions {
+    for (range, guard) in regions {
         for reference in references.iter_mut() {
-            if range_contains(*start, *end, reference.span.start, reference.span.end) {
+            if range.contains_range(reference.span.range()) {
                 push_guard(&mut reference.guards, guard.clone());
             }
         }
     }
 }
 
-fn apply_guard_regions_to_calls(regions: &[(usize, usize, PackageGuard)], calls: &mut [LiveCall]) {
-    for (start, end, guard) in regions {
+fn apply_guard_regions_to_calls(regions: &[(TextRange, PackageGuard)], calls: &mut [LiveCall]) {
+    for (range, guard) in regions {
         for call in calls.iter_mut() {
-            if range_contains(*start, *end, call.site.span.start, call.site.span.end) {
+            if range.contains_range(call.site.span.range()) {
                 push_guard(&mut call.site.guards, guard.clone());
             }
         }
@@ -3620,12 +3621,12 @@ fn apply_guard_regions_to_calls(regions: &[(usize, usize, PackageGuard)], calls:
 }
 
 fn apply_guard_regions_to_effects(
-    regions: &[(usize, usize, PackageGuard)],
+    regions: &[(TextRange, PackageGuard)],
     effects: &mut [SyntaxEffect],
 ) {
-    for (start, end, guard) in regions {
+    for (range, guard) in regions {
         for effect in effects.iter_mut() {
-            if range_contains(*start, *end, effect.span.start, effect.span.end) {
+            if range.contains_range(effect.span.range()) {
                 push_guard(&mut effect.guards, guard.clone());
             }
         }
@@ -3637,20 +3638,16 @@ fn if_guard_regions(
     context: &OakParseContext,
     regions: &[IfRegion],
     calls: &[LiveCall],
-) -> Vec<(usize, usize, PackageGuard)> {
+) -> Vec<(TextRange, PackageGuard)> {
     let mut guards = Vec::new();
     for region in regions {
-        if condition_contains_or(text, region.condition_start, region.condition_end) {
+        if condition_contains_or(text, region.condition.start, region.condition.end) {
             continue;
         }
         for call in calls {
-            if !range_contains(
-                region.condition_start,
-                region.condition_end,
-                call.site.span.start,
-                call.site.span.end,
-            ) || !is_base_call(context, &call.site)
-                || directly_negated(text, region.condition_start, call.site.span.start)
+            if !region.condition.contains_range(call.site.span.range())
+                || !is_base_call(context, &call.site)
+                || directly_negated(text, region.condition.start, call.site.span.start)
             {
                 continue;
             }
@@ -3662,7 +3659,7 @@ fn if_guard_regions(
                 _ => None,
             };
             if let Some(guard) = guard {
-                guards.push((region.then_start, region.then_end, guard));
+                guards.push((region.then_branch, guard));
             }
         }
     }
@@ -3672,7 +3669,7 @@ fn if_guard_regions(
 fn hook_guard_regions(
     context: &OakParseContext,
     calls: &[LiveCall],
-) -> Vec<(usize, usize, PackageGuard)> {
+) -> Vec<(TextRange, PackageGuard)> {
     let mut guards = Vec::new();
     for call in calls {
         if call.site.callee != "setHook" || !is_base_call(context, &call.site) {
@@ -3687,12 +3684,9 @@ fn hook_guard_regions(
         let Some(event_call) = calls.iter().find(|nested| {
             nested.site.callee == "packageEvent"
                 && is_base_call(context, &nested.site)
-                && range_contains(
-                    event_argument.value_start,
-                    event_argument.value_end,
-                    nested.site.span.start,
-                    nested.site.span.end,
-                )
+                && event_argument
+                    .value
+                    .contains_range(nested.site.span.range())
         }) else {
             continue;
         };
@@ -3710,8 +3704,7 @@ fn hook_guard_regions(
             });
         if event == Some("onLoad") {
             guards.push((
-                callback_argument.value_start,
-                callback_argument.value_end,
+                callback_argument.value,
                 PackageGuard::Selected(package.to_owned()),
             ));
         }
@@ -3796,10 +3789,6 @@ fn named_static_bool(arguments: &[RawArgument], name: &str) -> Option<bool> {
     })
 }
 
-fn range_contains(start: usize, end: usize, inner_start: usize, inner_end: usize) -> bool {
-    start <= inner_start && inner_end <= end
-}
-
 fn assignment_rhs_after(text: &str, target_end: usize, operator: &str) -> Option<(usize, usize)> {
     let mut cursor = skip_trivia(text, target_end);
     if !text.get(cursor..)?.starts_with(operator) {
@@ -3822,8 +3811,7 @@ fn superassignment_parts(
         let value_start = skip_trivia(text, cursor);
         let value_end = expression_end(text, value_start);
         return Some(SuperAssignmentParts {
-            span_start: target_start,
-            span_end: value_end,
+            span: TextRange::new(target_start, value_end),
             value_symbol: static_symbol_range(text, value_start, value_end),
         });
     }
@@ -3834,8 +3822,7 @@ fn superassignment_parts(
     let value_start = skip_trivia(text, statement_start);
     let value_end = trim_end_offset(text, statement_start + operator);
     Some(SuperAssignmentParts {
-        span_start: value_start,
-        span_end: target_end,
+        span: TextRange::new(value_start, target_end),
         value_symbol: static_symbol_range(text, value_start, value_end),
     })
 }
@@ -3913,8 +3900,7 @@ fn split_arguments(text: &str, start: usize, end: usize) -> Vec<RawArgument> {
                 } else {
                     arguments.push(RawArgument {
                         name: None,
-                        value_start: cursor,
-                        value_end: cursor,
+                        value: TextRange::new(cursor, cursor),
                         static_arg: None,
                     });
                 }
@@ -3931,8 +3917,7 @@ fn split_arguments(text: &str, start: usize, end: usize) -> Vec<RawArgument> {
         } else if segment_start < end {
             arguments.push(RawArgument {
                 name: None,
-                value_start: end,
-                value_end: end,
+                value: TextRange::new(end, end),
                 static_arg: None,
             });
         }
@@ -3954,8 +3939,7 @@ fn raw_argument(text: &str, start: usize, end: usize) -> Option<RawArgument> {
     let static_arg = text.get(value_start..value_end).and_then(static_arg);
     Some(RawArgument {
         name,
-        value_start,
-        value_end,
+        value: TextRange::new(value_start, value_end),
         static_arg,
     })
 }
@@ -3964,8 +3948,8 @@ fn argument_spans(source: &SourceId, arguments: &[RawArgument]) -> Vec<Option<Sp
     arguments
         .iter()
         .map(|argument| {
-            (argument.value_start < argument.value_end)
-                .then(|| Span::new(source.clone(), argument.value_start, argument.value_end))
+            (argument.value.start < argument.value.end)
+                .then(|| Span::new(source.clone(), argument.value.start, argument.value.end))
         })
         .collect()
 }
@@ -3984,8 +3968,8 @@ fn local_closure_arguments(
             };
             let Some(use_site) = live_uses.iter().find(|live_use| {
                 live_use.name == *name
-                    && live_use.start == argument.value_start
-                    && live_use.end == argument.value_end
+                    && live_use.start == argument.value.start
+                    && live_use.end == argument.value.end
                     && live_use.callee_kind == CalleeKind::DefinitelyLexical
             }) else {
                 return false;
@@ -4339,22 +4323,15 @@ fn function_region_after_open(
     let parameters = split_arguments(text, open + 1, close)
         .into_iter()
         .filter_map(|argument| {
-            let RawArgument {
-                name,
-                value_start,
-                value_end,
-                ..
-            } = argument;
-            name.or_else(|| text.get(value_start..value_end).and_then(static_symbol))
+            let RawArgument { name, value, .. } = argument;
+            name.or_else(|| text.get(value.start..value.end).and_then(static_symbol))
         })
         .collect();
 
     Some(FunctionRegion {
         function_start,
-        formals_start: open + 1,
-        formals_end: close,
-        body_start,
-        body_end,
+        formals: TextRange::new(open + 1, close),
+        body: TextRange::new(body_start, body_end),
         parameters,
     })
 }
@@ -4426,8 +4403,7 @@ fn find_for_regions(text: &str) -> Vec<ForRegion> {
                 regions.push(ForRegion {
                     variable,
                     variable_start,
-                    body_start,
-                    body_end,
+                    body: TextRange::new(body_start, body_end),
                 });
                 cursor += 3;
             }
@@ -4480,25 +4456,22 @@ fn find_if_regions(text: &str) -> Vec<IfRegion> {
                 let then_start = skip_trivia(text, close + 1);
                 let then_end = expression_end(text, then_start);
                 let after_then = skip_trivia(text, then_end);
-                let (else_start, else_end) = if text
+                let else_branch = if text
                     .get(after_then..)
                     .is_some_and(|rest| rest.starts_with("else"))
                     && word_boundary_after(text, after_then + 4)
                 {
                     let start = skip_trivia(text, after_then + 4);
                     let end = expression_end(text, start);
-                    (Some(start), Some(end))
+                    Some(TextRange::new(start, end))
                 } else {
-                    (None, None)
+                    None
                 };
                 regions.push(IfRegion {
                     if_start: cursor,
-                    condition_start: open + 1,
-                    condition_end: close,
-                    then_start,
-                    then_end,
-                    else_start,
-                    else_end,
+                    condition: TextRange::new(open + 1, close),
+                    then_branch: TextRange::new(then_start, then_end),
+                    else_branch,
                 });
                 cursor += 2;
             }
@@ -4522,7 +4495,10 @@ fn expression_end(text: &str, start: usize) -> usize {
     {
         let regions = find_if_regions(&text[start..]);
         if let Some(region) = regions.first() {
-            return start + region.else_end.unwrap_or(region.then_end);
+            return start
+                + region
+                    .else_branch
+                    .map_or(region.then_branch.end, |branch| branch.end);
         }
     }
 

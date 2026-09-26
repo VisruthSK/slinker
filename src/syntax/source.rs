@@ -16,6 +16,34 @@ impl Span {
     pub fn new(source: SourceId, start: usize, end: usize) -> Self {
         Self { source, start, end }
     }
+
+    pub fn range(&self) -> TextRange {
+        TextRange::new(self.start, self.end)
+    }
+
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.source == other.source && self.range().overlaps(other.range())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TextRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl TextRange {
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    pub fn contains_range(self, inner: Self) -> bool {
+        self.start <= inner.start && inner.end <= self.end
+    }
+
+    pub fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

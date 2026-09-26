@@ -4,6 +4,7 @@ use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{PackageId, PackageIdentity, PackageRole};
 
 use crate::package::Digest;
+use crate::syntax::TextRange;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -206,20 +207,16 @@ pub struct PayloadRef {
 pub struct CodeIr {
     source: Arc<str>,
     value_start: Option<usize>,
-    occurrences: Vec<CodeOccurrence>,
+    occurrences: Vec<TextRange>,
     normalized_shape: Digest,
 }
 
 impl CodeIr {
-    pub fn new(
-        source: Arc<str>,
-        occurrences: Vec<CodeOccurrence>,
-        normalized_shape: Digest,
-    ) -> Self {
+    pub fn new(source: Arc<str>, normalized_shape: Digest) -> Self {
         Self {
             value_start: crate::syntax::assigned_value_start(&source),
             source,
-            occurrences,
+            occurrences: Vec::new(),
             normalized_shape,
         }
     }
@@ -232,30 +229,13 @@ impl CodeIr {
         self.value_start
     }
 
-    pub fn occurrences(&self) -> &[CodeOccurrence] {
-        &self.occurrences
-    }
-
-    pub fn indexed_occurrences(&self) -> impl Iterator<Item = (CodeOccurrenceId, &CodeOccurrence)> {
-        self.occurrences
-            .iter()
-            .enumerate()
-            .map(|(index, occurrence)| (CodeOccurrenceId::from_index(index), occurrence))
-    }
-
-    pub fn occurrence(&self, id: CodeOccurrenceId) -> &CodeOccurrence {
-        &self.occurrences[id.index()]
+    pub fn occurrence(&self, id: CodeOccurrenceId) -> TextRange {
+        self.occurrences[id.index()]
     }
 
     pub fn normalized_shape(&self) -> &Digest {
         &self.normalized_shape
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct CodeOccurrence {
-    pub start: usize,
-    pub end: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -638,7 +618,7 @@ impl ProgramBuilder {
                     normalized_shape,
                     binding,
                 } => {
-                    let code = self.add_code(CodeIr::new(source, Vec::new(), normalized_shape));
+                    let code = self.add_code(CodeIr::new(source, normalized_shape));
                     let closure = self.add_closure(Closure {
                         code,
                         enclosure: namespace_environment,
@@ -795,19 +775,18 @@ impl ProgramBuilder {
     pub fn relocate(
         &mut self,
         code: CodeId,
-        start: usize,
-        end: usize,
+        range: TextRange,
         target: RelocationTarget,
     ) -> Result<(), InvalidRelocation> {
         let code_ir = &self.codes[code.index()];
         let original = code_ir
             .source
-            .get(start..end)
+            .get(range.start..range.end)
             .ok_or(InvalidRelocation::OutsideCode)?;
         if code_ir
             .occurrences
             .iter()
-            .any(|occurrence| start < occurrence.end && occurrence.start < end)
+            .any(|occurrence| occurrence.overlaps(range))
         {
             return Err(InvalidRelocation::Overlap);
         }
@@ -815,9 +794,7 @@ impl ProgramBuilder {
             return Err(InvalidRelocation::Mismatch(original.to_owned()));
         }
         let occurrence = CodeOccurrenceId::from_index(code_ir.occurrences.len());
-        self.codes[code.index()]
-            .occurrences
-            .push(CodeOccurrence { start, end });
+        self.codes[code.index()].occurrences.push(range);
         self.relocations.push(Relocation {
             site: CodeSite { code, occurrence },
             target,
