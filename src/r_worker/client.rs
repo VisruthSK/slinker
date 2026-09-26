@@ -4,17 +4,16 @@ use crate::r_worker::protocol::{
 };
 use crate::{Error, Result, Target, TargetEnvironment};
 use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use tempfile::TempPath;
 
 pub(crate) struct WorkerClient {
     child: Child,
     input: BufWriter<ChildStdin>,
     output: BufReader<File>,
-    protocol_path: PathBuf,
+    protocol_path: TempPath,
     next_request: u64,
 }
 
@@ -45,16 +44,7 @@ impl WorkerClient {
             path: "<current-executable>".into(),
             source,
         })?;
-        let protocol_path = protocol_path();
-        let protocol_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&protocol_path)
-            .map_err(|source| Error::Io {
-                path: protocol_path.clone(),
-                source,
-            })?;
+        let (protocol_file, protocol_path) = protocol_file()?;
         let mut command = Command::new(&executable);
         command
             .arg("__r-worker")
@@ -237,7 +227,7 @@ impl WorkerClient {
                 .output
                 .read_line(&mut line)
                 .map_err(|source| Error::Io {
-                    path: self.protocol_path.clone(),
+                    path: self.protocol_path.to_path_buf(),
                     source,
                 })?;
             if bytes != 0 && line.ends_with('\n') {
@@ -310,17 +300,19 @@ impl Drop for WorkerClient {
         let _ = self.input.write_all(b"\n");
         let _ = self.input.flush();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.protocol_path);
     }
 }
 
-fn protocol_path() -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "slinker-r-worker-{}-{}.jsonl",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+fn protocol_file() -> Result<(File, TempPath)> {
+    let file = tempfile::Builder::new()
+        .prefix("slinker-r-worker-")
+        .suffix(".jsonl")
+        .tempfile()
+        .map_err(|source| Error::Io {
+            path: std::env::temp_dir(),
+            source,
+        })?;
+    Ok(file.into_parts())
 }
 
 fn package_spec(package: &InstalledPackage) -> PackageSpec {
@@ -364,6 +356,26 @@ fn worker_error(operation: &str, response: WorkerResponse) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_protocol_files_do_not_block_worker_startup() {
+        let stale = (0..64)
+            .map(|index| {
+                std::env::temp_dir().join(format!(
+                    "slinker-r-worker-{}-{index}.jsonl",
+                    std::process::id()
+                ))
+            })
+            .filter(|path| std::fs::File::create_new(path).is_ok())
+            .collect::<Vec<_>>();
+        let created = (0..3).map(|_| protocol_file()).collect::<Vec<_>>();
+        for path in stale {
+            let _ = std::fs::remove_file(path);
+        }
+        for result in created {
+            result.expect("a fresh protocol file");
+        }
+    }
 
     #[test]
     fn worker_crash_context_identifies_exact_binding_request() {
