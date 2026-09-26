@@ -2,7 +2,8 @@ use super::arguments::{matched_call_arg_index, native_call_argument_index};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
 use super::state::{AnalyzerState, NativeCallTarget, NativeCallbackContext};
 use crate::Result;
-use crate::analysis::{EdgeKind, Need, NodeKind, RejectCode};
+use crate::analysis::{EdgeKind, Need, RejectCode};
+use crate::ir::ExternalBindingAccess;
 use crate::package::{
     NativeRoutineSummary, NativeSafety, PackageId, PackageImage, PackageIndex, PackageProvider,
 };
@@ -104,7 +105,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .copied()
                 .unwrap_or(false)
             {
-                self.graph.add_edge_at(
+                self.depend(
                     native_node,
                     callback_owner,
                     EdgeKind::Callback,
@@ -153,12 +154,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     );
                 }
                 Resolution::Static(BindingTarget::External { package, binding: callback }) => {
-                    let target = self.graph.add_node(
-                        self.packages.name(package).to_owned(),
-                        NodeKind::ExternalBinding { name: callback.clone() },
+                    let target = self.external_binding(
+                        package,
+                        &callback,
+                        ExternalBindingAccess::Exported,
                         Some(call.span.clone()),
                     );
-                    self.graph.add_edge_at(
+                    self.depend(
                         native_node,
                         target,
                         EdgeKind::Callback,

@@ -2,6 +2,7 @@ use super::object_world::{ClosureId, ClosureObject};
 use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, NodeKind, RejectCode};
+use crate::ir::ExternalBindingAccess;
 use crate::package::{ImportSpec, PackageId, PackageImage, PackageProvider};
 use crate::syntax::{
     NamespaceImportResolution, NamespaceImports, OakParseContext, Span,
@@ -538,14 +539,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
             Resolution::Static(BindingTarget::External { package, binding }) => {
-                let node = self.graph.add_node(
-                    self.packages.name(package).to_owned(),
-                    NodeKind::ExternalBinding {
-                        name: binding.clone(),
-                    },
+                let node = self.external_binding(
+                    package,
+                    &binding,
+                    ExternalBindingAccess::Exported,
                     Some(span.clone()),
                 );
-                self.graph.add_edge_at(
+                self.depend(
                     from,
                     node,
                     EdgeKind::Import,
@@ -559,7 +559,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     NodeKind::PackageMetadata { name: name.clone() },
                     Some(span.clone()),
                 );
-                self.graph.add_edge_at(
+                self.depend(
                     from,
                     node,
                     EdgeKind::Lexical,

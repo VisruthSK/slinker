@@ -80,6 +80,8 @@ slinker path touchstone otelsdk
 
 `why` prints a shortest typed provenance chain. `path` prints distinct cross-package entry/use sites. Missing dependencies remain graph nodes, so one analysis can collate the first-order missing packages and show which retained binding requested each one.
 
+Provenance explains a result and never decides one: finalization reads typed requirements and External binding uses, not the explanation graph, and `build` does not record provenance edges.
+
 ## Installed-image model
 
 For an encountered package, slinker first reads cheap installed metadata such as `DESCRIPTION`, `Meta/package.rds`, `Meta/nsInfo.rds`, and lazy-load binding names. Full lazy-load object inspection happens only when a binding, dataset, or other semantic need requires it.

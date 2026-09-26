@@ -226,6 +226,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
     let target = target_request.capture()?;
     let store = PackageStore::new(r_home.clone(), target.clone(), cache_location())?;
     let ir = Linker::new(store, args.universe.jobs.get())
+        .without_provenance()
         .with_external_packages(args.universe.external.iter().cloned())
         .with_policy(args.universe.policy())
         .with_root_source(source.description_source())

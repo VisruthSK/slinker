@@ -51,6 +51,11 @@ impl<P: PackageProvider> Linker<P> {
         self
     }
 
+    pub fn without_provenance(mut self) -> Self {
+        self.0.provenance = false;
+        self
+    }
+
     pub fn with_extra_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
         self.0.extra_packages.extend(packages);
         self

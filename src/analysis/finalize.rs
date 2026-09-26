@@ -37,14 +37,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let (program, issues) = self.finalize_program(&retained);
         let node = self.need_node(&Need::Activation { package: root });
         for issue in issues {
-            self.diagnostic(
-                node,
-                root,
-                None,
-                RejectCode::UnsupportedRootTransformation,
-                issue,
-                None,
-            );
+            self.diagnostic(node, root, None, issue.code(), issue.to_string(), None);
         }
         if retained
             .iter()
@@ -80,7 +73,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn finalize_program(
         &self,
         retained: &BTreeSet<PackageId>,
-    ) -> (ProgramIr, Vec<String>) {
+    ) -> (ProgramIr, Vec<FinalizationIssue>) {
         let target = &self.packages.target_environment().target;
         let mut builder = ProgramIr::builder(TargetContract {
             r_version: target.r_version.clone(),
@@ -140,9 +133,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             })
             .collect::<Vec<_>>();
         unreached.sort();
-        issues.extend(unreached.into_iter().map(|name| {
-            format!("`--external {name}` names a package the retained program never reaches")
-        }));
+        issues.extend(
+            unreached
+                .into_iter()
+                .map(|name| FinalizationIssue::UnreachedExternal(name.clone())),
+        );
 
         let mut linked_namespaces = Vec::new();
         let mut root_native_components = Vec::new();
@@ -154,20 +149,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 LinkedPackageRole::Root => MaterializedRole::Root,
                 LinkedPackageRole::Linked => MaterializedRole::Linked,
                 LinkedPackageRole::External => {
-                    let bindings = self.graph.nodes.iter().filter_map(|node| match &node.kind {
-                        NodeKind::ExternalBinding { name } if node.package == package_name => {
-                            let access = if self
-                                .internal_external_bindings
-                                .contains(&(package, name.clone()))
-                            {
-                                ExternalBindingAccess::Internal
-                            } else {
-                                ExternalBindingAccess::Exported
-                            };
-                            Some((name.clone(), access))
-                        }
-                        _ => None,
-                    });
+                    let bindings = self
+                        .external_bindings
+                        .iter()
+                        .filter(|((owner, _), _)| *owner == package)
+                        .map(|((_, name), access)| (name.clone(), *access));
                     let namespace = builder.finish_external_namespace(package, bindings);
                     namespace_ids.insert(package_name.to_owned(), namespace);
                     continue;
@@ -223,8 +209,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(&binding) => {
                         on_load_bindings.insert(namespace.namespace, binding);
                     }
-                    None => issues.push(format!(
-                        "`{package_name}::.onLoad` runs when the namespace loads but is not retained"
+                    None => issues.push(FinalizationIssue::OnLoadNotRetained(
+                        package_name.to_owned(),
                     )),
                 }
             }
@@ -299,17 +285,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             .and_then(|package| self.images.get(&package))
                             .map(|image| image.index.exports.values().cloned().collect::<Vec<_>>())
                             .unwrap_or_else(|| {
-                                self.graph
-                                    .nodes
-                                    .iter()
-                                    .filter_map(|node| match &node.kind {
-                                        NodeKind::ExternalBinding { name }
-                                            if node.package == *target =>
-                                        {
-                                            Some(name.clone())
-                                        }
-                                        _ => None,
-                                    })
+                                self.external_bindings
+                                    .keys()
+                                    .filter(|(owner, _)| self.packages.name(*owner) == target)
+                                    .map(|(_, name)| name.clone())
                                     .collect()
                             });
                         (
@@ -400,10 +379,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         })
                 })
                 .unwrap_or_else(|| {
-                    issues.push(
-                        "Linked namespaces import each other cyclically, which R cannot load"
-                            .into(),
-                    );
+                    issues.push(FinalizationIssue::CyclicLinkedImports);
                     *remaining.iter().next().expect("remaining namespace")
                 });
             remaining.remove(&next);
@@ -424,7 +400,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let root_on_load = on_load_bindings.get(&root_namespace).and_then(|&binding| {
             let closure = builder.binding_closure(binding);
             if closure.is_none() {
-                issues.push("the Root `.onLoad` is not relocatable source, so the generated wrapper cannot call it".into());
+                issues.push(FinalizationIssue::RootOnLoadNotRelocatable);
             }
             closure
         });
@@ -447,9 +423,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .and_then(|binding| builder.binding_code(*binding))
             else {
                 if reaches_removed_installation(relocation) {
-                    issues.push(format!(
-                        "`{owner_package}::{owner_binding}` needs a code relocation but is not emitted as relocatable source"
-                    ));
+                    issues.push(FinalizationIssue::NonRelocatableCode {
+                        package: owner_package.clone(),
+                        binding: owner_binding.clone(),
+                    });
                 }
                 continue;
             };
@@ -532,7 +509,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             )
             .map_or_else(
                 |problems| {
-                    issues.extend(problems);
+                    issues.extend(problems.into_iter().map(FinalizationIssue::Description));
                     Arc::from("")
                 },
                 Arc::from,
@@ -583,7 +560,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &self,
         package: PackageId,
         declared: Vec<Relation>,
-        issues: &mut Vec<String>,
+        issues: &mut Vec<FinalizationIssue>,
     ) -> ExternalPackageContract {
         let identity = self.packages.identity(package);
         let platform = self.packages.is_platform(package);
@@ -591,21 +568,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Vec::new()
         } else {
             intersect_requirements(&identity.name, &declared).unwrap_or_else(|problem| {
-                issues.push(problem);
+                issues.push(FinalizationIssue::IncompatibleRequirements(problem));
                 Vec::new()
             })
         };
         if !platform && declared.is_empty() {
-            issues.push(format!(
-                "External package `{}` has no declared DESCRIPTION requirement in the retained program",
-                identity.name
-            ));
+            issues.push(FinalizationIssue::UndeclaredExternal(identity.name.clone()));
         }
         if let Some(unmet) = requirements
             .iter()
             .find(|relation| !relation.requirement().matches(&identity.version))
         {
-            issues.push(format!("analyzed {identity} does not satisfy `{unmet}`"));
+            issues.push(FinalizationIssue::UnsatisfiedRequirement {
+                identity: identity.clone(),
+                requirement: unmet.clone(),
+            });
         }
         ExternalPackageContract {
             package: identity.name.clone(),
@@ -618,11 +595,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &self,
         namespace_ids: &HashMap<String, crate::ir::FinalizedNamespace>,
     ) -> Vec<(crate::ir::NamespaceId, crate::ir::NamespaceId)> {
-        let mut successors =
-            HashMap::<crate::analysis::NodeId, Vec<crate::analysis::NodeId>>::new();
-        for edge in &self.graph.edges {
-            successors.entry(edge.from).or_default().push(edge.to);
-        }
         let mut dependencies = Vec::new();
         for start in self.graph.nodes.iter().filter(|node| {
             matches!(
@@ -639,7 +611,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 if !seen.insert(node) {
                     continue;
                 }
-                for &next in successors.get(&node).into_iter().flatten() {
+                for &next in self.dependencies.get(&node).into_iter().flatten() {
                     let target = &self.graph.nodes[next.0];
                     if target.package == start.package {
                         stack.push(next);
@@ -824,4 +796,65 @@ fn diagnostic_order(left: &Diagnostic, right: &Diagnostic) -> std::cmp::Ordering
         &right.binding,
         &right.message,
     ))
+}
+
+#[derive(Debug)]
+pub(super) enum FinalizationIssue {
+    UnreachedExternal(String),
+    OnLoadNotRetained(String),
+    CyclicLinkedImports,
+    RootOnLoadNotRelocatable,
+    NonRelocatableCode {
+        package: String,
+        binding: String,
+    },
+    IncompatibleRequirements(String),
+    UndeclaredExternal(String),
+    UnsatisfiedRequirement {
+        identity: crate::package::PackageIdentity,
+        requirement: Relation,
+    },
+    Description(String),
+}
+
+impl FinalizationIssue {
+    fn code(&self) -> RejectCode {
+        RejectCode::UnsupportedRootTransformation
+    }
+}
+
+impl std::fmt::Display for FinalizationIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnreachedExternal(name) => write!(
+                f,
+                "`--external {name}` names a package the retained program never reaches"
+            ),
+            Self::OnLoadNotRetained(package) => write!(
+                f,
+                "`{package}::.onLoad` runs when the namespace loads but is not retained"
+            ),
+            Self::CyclicLinkedImports => f.write_str(
+                "Linked namespaces import each other cyclically, which R cannot load",
+            ),
+            Self::RootOnLoadNotRelocatable => f.write_str(
+                "the Root `.onLoad` is not relocatable source, so the generated wrapper cannot call it",
+            ),
+            Self::NonRelocatableCode { package, binding } => write!(
+                f,
+                "`{package}::{binding}` needs a code relocation but is not emitted as relocatable source"
+            ),
+            Self::IncompatibleRequirements(problem) | Self::Description(problem) => {
+                f.write_str(problem)
+            }
+            Self::UndeclaredExternal(package) => write!(
+                f,
+                "External package `{package}` has no declared DESCRIPTION requirement in the retained program"
+            ),
+            Self::UnsatisfiedRequirement {
+                identity,
+                requirement,
+            } => write!(f, "analyzed {identity} does not satisfy `{requirement}`"),
+        }
+    }
 }

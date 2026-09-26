@@ -205,11 +205,6 @@ Invariants into types:
   `contains` and `overlaps`.
 - Removed bindings and unretained exports become typed slot state instead of parallel string lists.
 
-IR cleanup (breaking):
-- Finalization stops reading the graph: External binding uses, activation-time dependencies, and
-  `import(pkg)` expansion come from typed analysis state. String issues become typed diagnostics.
-  Done when finalization output is unchanged with provenance recording disabled (test).
-
 Structure:
 - Split `AnalyzerState` (about 40 fields) into owners with narrow APIs: need queue, diagnostic sink,
   S3 model, relocation plan, reflection facts, parse cache.

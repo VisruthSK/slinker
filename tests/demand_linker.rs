@@ -2524,6 +2524,77 @@ fn activation_order_follows_lifecycle_dependencies_not_only_imports() {
 }
 
 #[test]
+fn finalization_does_not_depend_on_provenance() {
+    let fixture = || {
+        let root = package_with!(
+            "root",
+            &[
+                ("f", Some("f <- function() alpha::run()")),
+                ("g", Some("g <- function() ext:::secret(opened())")),
+            ],
+            vec![ImportSpec::All {
+                package: "ext".into(),
+                except: Vec::new(),
+            }],
+            ExportMap::from([("f".into(), "f".into()), ("g".into(), "g".into())]),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "",
+        );
+        let mut alpha = package(
+            "alpha",
+            &[
+                ("run", Some("run <- function() 1")),
+                (
+                    ".onLoad",
+                    Some(".onLoad <- function(libname, pkgname) beta::setup()"),
+                ),
+            ],
+        );
+        Arc::make_mut(&mut alpha.index).lifecycle.on_load = true;
+        let beta = package("beta", &[("setup", Some("setup <- function() 2"))]);
+        let ext = package_with!(
+            "ext",
+            &[
+                ("opened", Some("opened <- function() 3")),
+                ("secret", Some("secret <- function(x) x")),
+            ],
+            Vec::new(),
+            export("opened"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "",
+        );
+        vec![root, alpha, beta, ext]
+    };
+    let analyze = |provenance: bool| {
+        let linker =
+            Linker::new(FakeProvider::new(fixture()), 1).with_external_packages(["ext".to_owned()]);
+        let linker = if provenance {
+            linker
+        } else {
+            linker.without_provenance()
+        };
+        linker.analyze("root").unwrap()
+    };
+    let recorded = analyze(true);
+    let unrecorded = analyze(false);
+
+    assert!(!recorded.provenance().edges().is_empty());
+    assert!(unrecorded.provenance().edges().is_empty());
+    assert_eq!(
+        format!("{:?}", recorded.program()),
+        format!("{:?}", unrecorded.program())
+    );
+    assert_eq!(
+        format!("{:?}{:?}", recorded.blockers(), recorded.assumptions()),
+        format!("{:?}{:?}", unrecorded.blockers(), unrecorded.assumptions())
+    );
+}
+
+#[test]
 fn external_internal_access_is_preserved_in_the_program() {
     let root = package(
         "root",

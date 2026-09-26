@@ -12,6 +12,7 @@ use crate::analysis::{
     Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode, S3Id,
 };
 use crate::build::{PackageOperation, PendingRelocation};
+use crate::ir::ExternalBindingAccess;
 use crate::metadata::{RelationField, relations};
 use crate::package::{
     BindingImage, BindingRepresentation, ClosureSource, Digest, ImportSpec, NativeSafety,
@@ -81,7 +82,9 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) construction_calls: HashMap<ConstructionCallKey, AbstractValue>,
     pub(super) construction_evaluations: usize,
     pub(super) non_reflective_namespace_uses: HashSet<Span>,
-    pub(super) internal_external_bindings: HashSet<(PackageId, String)>,
+    pub(super) external_bindings: BTreeMap<(PackageId, String), ExternalBindingAccess>,
+    pub(super) dependencies: HashMap<NodeId, HashSet<NodeId>>,
+    pub(super) provenance: bool,
     pub(super) sources: Sources,
     pub(super) source_ids: HashMap<(PackageId, String), SourceId>,
     pub(super) normalized_shapes: HashMap<(PackageId, String), Digest>,
@@ -141,7 +144,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             construction_calls: HashMap::new(),
             construction_evaluations: 0,
             non_reflective_namespace_uses: HashSet::new(),
-            internal_external_bindings: HashSet::new(),
+            external_bindings: BTreeMap::new(),
+            dependencies: HashMap::new(),
+            provenance: true,
             sources: Sources::default(),
             source_ids: HashMap::new(),
             normalized_shapes: HashMap::new(),
@@ -614,11 +619,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     package: id,
                     hook: ".onLoad".into(),
                 });
-                self.graph.add_edge(
+                self.depend(
                     node,
                     lifecycle,
                     EdgeKind::Lifecycle,
                     format!("activation creates active binding `{binding}`"),
+                    None,
                 );
                 return Ok(());
             }
@@ -653,18 +659,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         package,
                         binding: foreign_binding,
                     }) => {
-                        let external = self.graph.add_node(
-                            self.packages.name(package).to_owned(),
-                            NodeKind::ExternalBinding {
-                                name: foreign_binding.clone(),
-                            },
+                        let external = self.external_binding(
+                            package,
+                            &foreign_binding,
+                            ExternalBindingAccess::Exported,
                             None,
                         );
-                        self.graph.add_edge(
+                        self.depend(
                             node,
                             external,
                             EdgeKind::Export,
                             format!("root re-export `{binding}` resolves to External `{foreign_binding}`"),
+                            None,
                         );
                         return Ok(());
                     }
@@ -1844,18 +1850,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         if self.packages.is_external(foreign) {
             self.external.insert(foreign);
-            if reference.internal {
-                self.internal_external_bindings
-                    .insert((foreign, reference.symbol.clone()));
-            }
-            let external = self.graph.add_node(
-                self.packages.name(foreign),
-                NodeKind::ExternalBinding {
-                    name: reference.symbol.clone(),
+            let external = self.external_binding(
+                foreign,
+                &reference.symbol,
+                if reference.internal {
+                    ExternalBindingAccess::Internal
+                } else {
+                    ExternalBindingAccess::Exported
                 },
                 Some(reference.span.clone()),
             );
-            self.graph.add_edge_at(
+            self.depend(
                 from,
                 external,
                 EdgeKind::PackageQualified,
@@ -2757,10 +2762,47 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) {
         self.encountered.insert(need.package());
         let to = self.need_node(&need);
-        self.graph.add_edge_at(from, to, kind, reason, span);
+        self.depend(from, to, kind, reason, span);
         if !self.processed.contains(&need) && self.queued.insert(need.clone()) {
             self.pending.push_back(need);
         }
+    }
+
+    pub(super) fn depend(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        kind: EdgeKind,
+        reason: impl Into<String>,
+        span: Option<Span>,
+    ) {
+        self.dependencies.entry(from).or_default().insert(to);
+        if self.provenance {
+            self.graph.add_edge_at(from, to, kind, reason, span);
+        }
+    }
+
+    pub(super) fn external_binding(
+        &mut self,
+        package: PackageId,
+        name: &str,
+        access: ExternalBindingAccess,
+        span: Option<Span>,
+    ) -> NodeId {
+        let recorded = self
+            .external_bindings
+            .entry((package, name.to_owned()))
+            .or_insert(access);
+        if access == ExternalBindingAccess::Internal {
+            *recorded = access;
+        }
+        self.graph.add_node(
+            self.packages.name(package).to_owned(),
+            NodeKind::ExternalBinding {
+                name: name.to_owned(),
+            },
+            span,
+        )
     }
 
     pub(super) fn need_node(&mut self, need: &Need) -> NodeId {
