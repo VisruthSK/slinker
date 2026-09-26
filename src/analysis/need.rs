@@ -5,7 +5,24 @@ use std::collections::{HashSet, VecDeque};
 pub use crate::package::BindingName;
 pub type ResourceId = String;
 pub type NativeId = String;
-pub type LifecycleId = String;
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LifecycleHook {
+    OnLoad,
+}
+
+impl LifecycleHook {
+    pub fn binding(self) -> BindingName {
+        BindingName::from(self.to_string())
+    }
+}
+
+impl std::fmt::Display for LifecycleHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OnLoad => f.write_str(".onLoad"),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct S3Id {
@@ -56,7 +73,7 @@ pub enum Need {
     },
     Lifecycle {
         package: PackageId,
-        hook: LifecycleId,
+        hook: LifecycleHook,
     },
 }
 

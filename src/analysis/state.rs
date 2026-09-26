@@ -14,7 +14,7 @@ use super::resolution::{BindingTarget, OpenReason, Resolution};
 use super::s3::{CallableId, S3Model, callable_target};
 use crate::analysis::policy::{DiscoveryPolicy, LinkPolicy};
 use crate::analysis::{
-    Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode, S3Id,
+    Diagnostic, EdgeKind, GenericId, Graph, LifecycleHook, Need, NodeId, NodeKind, RejectCode, S3Id,
 };
 use crate::ir::ExternalBindingAccess;
 use crate::ir::NamespaceOperation;
@@ -580,7 +580,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         {
             let lifecycle = self.need_node(&Need::Lifecycle {
                 package: id,
-                hook: ".onLoad".into(),
+                hook: LifecycleHook::OnLoad,
             });
             self.depend(
                 node,
@@ -1526,10 +1526,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
         let lifecycle = Need::Lifecycle {
             package: id,
-            hook: ".onLoad".into(),
+            hook: LifecycleHook::OnLoad,
         };
         if self.needs.start(&lifecycle) {
-            self.process_lifecycle(id, ".onLoad".into())?;
+            self.process_lifecycle(id, LifecycleHook::OnLoad)?;
         }
 
         let hook = Need::Binding {
@@ -1659,7 +1659,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 node,
                 Need::Lifecycle {
                     package: id,
-                    hook: ".onLoad".into(),
+                    hook: LifecycleHook::OnLoad,
                 },
                 EdgeKind::Lifecycle,
                 "namespace activation requires .onLoad",
@@ -1838,16 +1838,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_lifecycle(&mut self, id: PackageId, hook: String) -> Result<()> {
-        let node = self.need_node(&Need::Lifecycle {
-            package: id,
-            hook: hook.clone(),
-        });
+    pub(super) fn process_lifecycle(&mut self, id: PackageId, hook: LifecycleHook) -> Result<()> {
+        let node = self.need_node(&Need::Lifecycle { package: id, hook });
         self.require(
             node,
             Need::Binding {
                 package: id,
-                binding: hook.clone().into(),
+                binding: hook.binding(),
             },
             EdgeKind::Lifecycle,
             format!("lifecycle hook `{hook}` must be retained"),
@@ -2980,7 +2977,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Need::Native { component, .. } => NodeKind::NativeComponent {
                 name: component.clone(),
             },
-            Need::Lifecycle { hook, .. } => NodeKind::Lifecycle { hook: hook.clone() },
+            Need::Lifecycle { hook, .. } => NodeKind::Lifecycle {
+                hook: hook.to_string(),
+            },
         };
         self.graph.add_node(package, kind, None)
     }
