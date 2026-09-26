@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Target-specific linker for installed R package images"
-license = "BSD-3-Clause"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [[bin]]
@@ -15,11 +15,11 @@ required-features = ["air"]
 [features]
 default = ["air"]
 air = [
-    "dep:air_r_parser",
-    "dep:air_r_syntax",
-    "dep:biome_rowan",
-    "dep:oak_semantic",
-    "dep:rayon",
+  "dep:air_r_parser",
+  "dep:air_r_syntax",
+  "dep:biome_rowan",
+  "dep:oak_semantic",
+  "dep:rayon",
 ]
 
 [dependencies]
@@ -49,7 +49,9 @@ clap = { version = "4.6.7", features = ["derive"] }
 which = "8.0.6"
 
 [dev-dependencies]
-criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8.2", default-features = false, features = [
+  "cargo_bench_support",
+] }
 
 [[bench]]
 name = "micro"
