@@ -2535,26 +2535,99 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         );
     }
 
-    fn callee_is_utils(
+    fn external_callee(
         &mut self,
         current: PackageId,
         image: &PackageImage,
         lexical_environment: &str,
         call: &CallSite,
-    ) -> Result<bool> {
+    ) -> Result<Option<PackageId>> {
         if call.callee_kind != CalleeKind::DefinitelyExternal {
-            return Ok(false);
+            return Ok(None);
         }
         Ok(match call.qualified_package.as_deref() {
-            Some(package) => package == "utils",
-            None => matches!(
-                self.resolve_lexical_name(current, image, lexical_environment, &call.callee)?,
+            Some(package) => self
+                .known_package(package)
+                .filter(|package| self.packages.is_external(*package)),
+            None => match self.resolve_lexical_name(
+                current,
+                image,
+                lexical_environment,
+                &call.callee,
+            )? {
                 Resolution::Static(BindingTarget::External { package, binding })
-                    if self.packages.name(package) == "utils" && binding == call.callee.as_str()
-            ),
+                    if binding == call.callee.as_str() =>
+                {
+                    Some(package)
+                }
+                _ => None,
+            },
         })
     }
 
+    fn rlang_call(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+    ) -> Result<()> {
+        let (rewritable, formals, target) = match call.callee.as_str() {
+            "ns_env" | "ns_imports_env" => {
+                return self.namespace_argument(from, current, binding, call, &["x"], "x");
+            }
+            "ns_exports" => {
+                return self.namespace_argument(from, current, binding, call, &["ns"], "ns");
+            }
+            "is_installed" => (&[][..], &["pkg", "...", "version", "compare"][..], "pkg"),
+            "check_installed" => (
+                &["reason", "call"][..],
+                &[
+                    "pkg", "reason", "...", "version", "compare", "action", "call",
+                ][..],
+                "pkg",
+            ),
+            _ => return Ok(()),
+        };
+        let Some(index) = matched_call_arg_index(call, formals, target) else {
+            return Ok(());
+        };
+        let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
+            self.dynamic_package_name(from, current, binding, call);
+            return Ok(());
+        };
+        let name = name.clone();
+        let Some(package) = self.declared_linked_package(current, &name)? else {
+            return Ok(());
+        };
+        if !only_package_argument(call, rewritable) {
+            self.unrewritable_package_call(from, current, call, &name);
+            return Ok(());
+        }
+        self.relocations.push(PendingRelocation::InstalledQuery {
+            source: call.span.clone(),
+            package,
+            check: call.callee == "check_installed",
+        });
+        Ok(())
+    }
+
+    fn declared_linked_package(
+        &mut self,
+        current: PackageId,
+        name: &str,
+    ) -> Result<Option<PackageId>> {
+        if name == self.packages.name(current) {
+            return Ok((!self.is_root(current)).then_some(current));
+        }
+        if !self.optional_package_selected(name) && !self.package_is_required(current, name)? {
+            return Ok(None);
+        }
+        Ok(self
+            .packages
+            .resolve(name)?
+            .filter(|package| self.packages.role(*package) == crate::package::PackageRole::Linked))
+    }
     fn utils_call(
         &mut self,
         from: NodeId,
@@ -2769,8 +2842,14 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             lexical_environment,
             call,
         )? {
-            if self.callee_is_utils(current, image, lexical_environment, call)? {
-                self.utils_call(from, current, binding, call)?;
+            if let Some(package) =
+                self.external_callee(current, image, lexical_environment, call)?
+            {
+                match self.packages.name(package) {
+                    "utils" => self.utils_call(from, current, binding, call)?,
+                    "rlang" => self.rlang_call(from, current, binding, call)?,
+                    _ => {}
+                }
             }
             return Ok(());
         }

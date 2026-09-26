@@ -825,7 +825,10 @@ fn relocated_source(program: &ProgramIr, code: crate::ir::CodeId) -> String {
             | RelocationTarget::NamespaceArgument { package } => {
                 namespace_expression(program, *package)
             }
-            RelocationTarget::LoadedQuery => "TRUE".into(),
+            RelocationTarget::LoadedQuery | RelocationTarget::InstalledQuery { check: false } => {
+                "TRUE".into()
+            }
+            RelocationTarget::InstalledQuery { check: true } => "base::invisible(NULL)".into(),
             RelocationTarget::NativeSymbol {
                 package,
                 component,

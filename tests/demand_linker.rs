@@ -4850,3 +4850,70 @@ fn linked_discovery_with_unhonored_arguments_blocks() {
         "f <- function() asNamespace('foo', base.OK = FALSE)"
     ));
 }
+
+#[test]
+fn rlang_package_queries_on_a_linked_package_are_rewritten() {
+    let analyze = |source: &str| {
+        let root = package_importing("root", &[("f", Some(source))], "foo, rlang");
+        let foo = package("foo", &[("x", Some("x <- function() 1"))]);
+        let rlang = package(
+            "rlang",
+            &[
+                ("check_installed", None),
+                ("is_installed", None),
+                ("ns_env", None),
+            ],
+        );
+        Linker::new(FakeProvider::new(vec![root, foo, rlang]), 1)
+            .with_external_packages(["rlang".into()])
+            .analyze("root")
+            .unwrap()
+    };
+    let rewritten = |source: &str, target: slinker::ir::RelocationTarget| {
+        let plan = analyze(source);
+        assert!(
+            plan.blockers().is_empty(),
+            "{source}: {:?}",
+            plan.blockers()
+        );
+        plan.program()
+            .relocations()
+            .iter()
+            .any(|relocation| relocation.target == target)
+    };
+
+    assert!(rewritten(
+        "f <- function() rlang::check_installed('foo', reason = 'to work')",
+        slinker::ir::RelocationTarget::InstalledQuery { check: true }
+    ));
+    assert!(rewritten(
+        "f <- function() rlang::is_installed(pkg = 'foo')",
+        slinker::ir::RelocationTarget::InstalledQuery { check: false }
+    ));
+    assert!(
+        analyze("f <- function() rlang::ns_env('foo')")
+            .program()
+            .relocations()
+            .iter()
+            .any(|relocation| matches!(
+                relocation.target,
+                slinker::ir::RelocationTarget::NamespaceArgument { .. }
+            ))
+    );
+    assert!(!rewritten(
+        "f <- function() rlang::is_installed('unrelated')",
+        slinker::ir::RelocationTarget::InstalledQuery { check: false }
+    ));
+    assert!(
+        analyze("f <- function() rlang::is_installed('foo', version = '2.0')")
+            .blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::UnsupportedRootTransformation)
+    );
+    assert!(
+        analyze("f <- function(p) rlang::ns_env(p)")
+            .blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+    );
+}

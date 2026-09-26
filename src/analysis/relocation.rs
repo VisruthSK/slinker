@@ -58,6 +58,11 @@ pub(super) enum PendingRelocation {
         package: PackageId,
         component: ComponentName,
     },
+    InstalledQuery {
+        source: Span,
+        package: PackageId,
+        check: bool,
+    },
 }
 
 impl PendingRelocation {
@@ -86,7 +91,8 @@ impl PendingRelocation {
             | Self::NamespaceArgument { source, .. }
             | Self::DescriptionArgument { source, .. }
             | Self::NativeSymbol { source, .. }
-            | Self::NativeLibrary { source, .. } => source,
+            | Self::NativeLibrary { source, .. }
+            | Self::InstalledQuery { source, .. } => source,
         }
     }
 
@@ -106,7 +112,8 @@ impl PendingRelocation {
             | Self::LoadedQuery { package, .. }
             | Self::NamespaceArgument { package, .. }
             | Self::NativeSymbol { package, .. }
-            | Self::NativeLibrary { package, .. } => Some(*package),
+            | Self::NativeLibrary { package, .. }
+            | Self::InstalledQuery { package, .. } => Some(*package),
             Self::RequireNamespace { loaded, .. } => *loaded,
             Self::ResourceAccess { .. }
             | Self::PackageVersion { .. }

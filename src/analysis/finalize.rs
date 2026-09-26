@@ -554,6 +554,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }
                 }
                 PendingRelocation::LoadedQuery { .. } => RelocationTarget::LoadedQuery,
+                PendingRelocation::InstalledQuery { check, .. } => {
+                    RelocationTarget::InstalledQuery { check: *check }
+                }
                 PendingRelocation::NamespaceArgument { package, .. } => {
                     RelocationTarget::NamespaceArgument { package: *package }
                 }
