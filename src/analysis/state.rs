@@ -2406,56 +2406,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &str,
         call: &CallSite,
     ) -> Result<()> {
-        if lexical_environment.starts_with("unsupported:") && call.qualified_package.is_none() {
+        if !self.semantic_callee_is_base(
+            from,
+            current,
+            image,
+            binding,
+            lexical_environment,
+            call,
+        )? {
             return Ok(());
-        }
-        match call.callee_kind {
-            CalleeKind::DefinitelyLexical => return Ok(()),
-            CalleeKind::ConditionalFallthrough => {
-                // Oak found at least one reaching lexical definition, but also
-                // a path that falls through to the installed namespace. Slinker
-                // must not apply linker-specific effects unless the callee
-                // identity is path-invariant. If the fallthrough target is the
-                // base primitive/function that slinker specializes, block the
-                // rewrite instead of pretending either branch is definitive.
-                if call.qualified_package.is_none()
-                    && Self::is_slinker_semantic_callee(&call.callee)
-                    && matches!(
-                        self.resolve_lexical_name(
-                            current,
-                            image,
-                            lexical_environment,
-                            &call.callee
-                        )?,
-                        Resolution::Static(BindingTarget::Base)
-                    )
-                {
-                    self.diagnostic(
-                        from,
-                        current,
-                        Some(binding),
-                        RejectCode::SemanticAmbiguity,
-                        format!(
-                            "conditionally local callee `{}` can fall through to base; linker-specific effects are path-dependent",
-                            call.callee
-                        ),
-                        Some(call.span.clone()),
-                    );
-                }
-                return Ok(());
-            }
-            CalleeKind::DefinitelyExternal => {}
-        }
-        match call.qualified_package.as_deref() {
-            Some("base") => {}
-            Some(_) => return Ok(()),
-            None => {
-                let resolved =
-                    self.resolve_lexical_name(current, image, lexical_environment, &call.callee)?;
-                if !matches!(resolved, Resolution::Static(BindingTarget::Base)) {
-                    return Ok(());
-                }
-            }
         }
         if reflective_name_formals(&call.callee).is_some() {
             return self.reflective_lookup(
@@ -2469,26 +2428,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         match call.callee.as_str() {
             "library" | "require" => {
-                let package = static_package_arg(call);
-                if let Some(name) = package
-                    && self.package_is_suggested_only(current, name)?
-                    && !self.optional_package_selected(name)
-                {
-                    return Ok(());
-                }
-                self.diagnostic(
-                    from,
-                    current,
-                    None,
-                    RejectCode::PackageAttachmentUnsupported,
-                    match package {
-                        Some(name) => format!(
-                            "search-path attachment of `{name}` is outside the current contract"
-                        ),
-                        None => "dynamic package attachment is outside the current contract".into(),
-                    },
-                    Some(call.span.clone()),
-                );
+                self.attachment_call(from, current, call)?;
             }
             "requireNamespace" => {
                 self.namespace_operation(from, current, binding, call, NamespaceCall::Require)?
@@ -2529,39 +2469,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 self.s3_dispatch(from, current, binding, lexical_environment, None, call)?;
             }
             ".Call" | ".External" | ".C" | ".Fortran" => {
-                if let Some(target) =
-                    self.native_component_for_call(current, image, lexical_environment, call)?
-                {
-                    let component = target.component;
-                    self.require_at(
-                        from,
-                        Need::Native { package: current, component: component.clone() },
-                        EdgeKind::Native,
-                        format!("reachable {} resolves its static native selector through `{component}`", call.callee),
-                        Some(call.span.clone()),
-                    );
-                    self.process_native_routine_callbacks(NativeCallbackContext {
-                        owner: from,
-                        package: current,
-                        image,
-                        binding,
-                        lexical_environment,
-                        component: &component,
-                        call,
-                    })?;
-                } else {
-                    self.diagnostic(
-                        from,
-                        current,
-                        None,
-                        RejectCode::UnknownNativeLookup,
-                        format!(
-                            "{} native selector cannot be resolved to one registered package DLL",
-                            call.callee
-                        ),
-                        Some(call.span.clone()),
-                    );
-                }
+                self.native_call(from, current, image, binding, lexical_environment, call)?;
             }
             "deparse" | "substitute" | "match.call" => {
                 self.relocations.observe(SyntaxObservation {
@@ -2572,6 +2480,144 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 })
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn semantic_callee_is_base(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        image: &PackageImage,
+        binding: &str,
+        lexical_environment: &str,
+        call: &CallSite,
+    ) -> Result<bool> {
+        if lexical_environment.starts_with("unsupported:") && call.qualified_package.is_none() {
+            return Ok(false);
+        }
+        match call.callee_kind {
+            CalleeKind::DefinitelyLexical => return Ok(false),
+            CalleeKind::ConditionalFallthrough => {
+                // Oak found at least one reaching lexical definition, but also
+                // a path that falls through to the installed namespace. Slinker
+                // must not apply linker-specific effects unless the callee
+                // identity is path-invariant. If the fallthrough target is the
+                // base primitive/function that slinker specializes, block the
+                // rewrite instead of pretending either branch is definitive.
+                if call.qualified_package.is_none()
+                    && Self::is_slinker_semantic_callee(&call.callee)
+                    && matches!(
+                        self.resolve_lexical_name(
+                            current,
+                            image,
+                            lexical_environment,
+                            &call.callee
+                        )?,
+                        Resolution::Static(BindingTarget::Base)
+                    )
+                {
+                    self.diagnostic(
+                        from,
+                        current,
+                        Some(binding),
+                        RejectCode::SemanticAmbiguity,
+                        format!(
+                            "conditionally local callee `{}` can fall through to base; linker-specific effects are path-dependent",
+                            call.callee
+                        ),
+                        Some(call.span.clone()),
+                    );
+                }
+                return Ok(false);
+            }
+            CalleeKind::DefinitelyExternal => {}
+        }
+        match call.qualified_package.as_deref() {
+            Some("base") => {}
+            Some(_) => return Ok(false),
+            None => {
+                let resolved =
+                    self.resolve_lexical_name(current, image, lexical_environment, &call.callee)?;
+                if !matches!(resolved, Resolution::Static(BindingTarget::Base)) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn attachment_call(&mut self, from: NodeId, current: PackageId, call: &CallSite) -> Result<()> {
+        let package = static_package_arg(call);
+        if let Some(name) = package
+            && self.package_is_suggested_only(current, name)?
+            && !self.optional_package_selected(name)
+        {
+            return Ok(());
+        }
+        self.diagnostic(
+            from,
+            current,
+            None,
+            RejectCode::PackageAttachmentUnsupported,
+            match package {
+                Some(name) => {
+                    format!("search-path attachment of `{name}` is outside the current contract")
+                }
+                None => "dynamic package attachment is outside the current contract".into(),
+            },
+            Some(call.span.clone()),
+        );
+        Ok(())
+    }
+
+    fn native_call(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        image: &PackageImage,
+        binding: &str,
+        lexical_environment: &str,
+        call: &CallSite,
+    ) -> Result<()> {
+        if let Some(target) =
+            self.native_component_for_call(current, image, lexical_environment, call)?
+        {
+            let component = target.component;
+            self.require_at(
+                from,
+                Need::Native {
+                    package: current,
+                    component: component.clone(),
+                },
+                EdgeKind::Native,
+                format!(
+                    "reachable {} resolves its static native selector through `{component}`",
+                    call.callee
+                ),
+                Some(call.span.clone()),
+            );
+            self.process_native_routine_callbacks(NativeCallbackContext {
+                owner: from,
+                package: current,
+                image,
+                binding,
+                lexical_environment,
+                component: &component,
+                call,
+            })?;
+        } else {
+            self.diagnostic(
+                from,
+                current,
+                None,
+                RejectCode::UnknownNativeLookup,
+                format!(
+                    "{} native selector cannot be resolved to one registered package DLL",
+                    call.callee
+                ),
+                Some(call.span.clone()),
+            );
         }
         Ok(())
     }
