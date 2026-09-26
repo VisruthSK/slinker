@@ -1,6 +1,6 @@
 # slinker plan
 
-Updated: 2026-09-25 (America/Los_Angeles)
+Updated: 2026-09-26 (America/Los_Angeles)
 
 This file is the forward plan: what remains and how to know each piece is done. It does not
 describe what the code already does (`README.md` documents behavior). Delete finished items instead
@@ -18,7 +18,6 @@ assumption (`--strict false`); `declare(slinker(...))` lets an author state a mi
 ## Decided
 
 - Soundness first. Coverage work waits until known ways a successful build can diverge are closed.
-  The Rust track goes before Track A so isolation lands on a smaller, typed codebase.
 - Work is organized as tracks, not a global stage order. "Next up" below is the current pick. Every
   change in any track also leaves the code it touches cleaner.
 - Retained non-source objects stay R-serialized payload bundles; the IR describes and bounds them
@@ -29,7 +28,7 @@ assumption (`--strict false`); `declare(slinker(...))` lets an author state a mi
   `.packageName`, function printing). Code that turns that name back into a namespace or package
   query is rewritten to the private namespace or blocked.
 - Everything linked code addresses by package name is rewired to the private namespace. Registries
-  keyed by something else stay shared and the residual divergence is documented (Track A).
+  keyed by something else stay shared and the residual divergence is documented in the README.
 - In-session serialization of Linked-namespace references is documented, not detected.
 - Linked lazy-loaded datasets are carried into the generated package.
 - Root code stays regenerated from installed closures; original comments and layout are not kept.
@@ -65,87 +64,24 @@ assumption (`--strict false`); `declare(slinker(...))` lets an author state a mi
 - Linked namespaces reproduce the original name universe and export table; removed bindings are
   stubs that fail loudly.
 - Installation independence: a slinked package behaves identically whether its Linked packages are
-  absent, installed, or loaded. The only allowed exception is the Track A residual.
+  absent, installed, or loaded. The only allowed exceptions are the residual divergences the README
+  documents.
 - A failed build publishes nothing that looks complete.
 
 ## Regression corpus
 
 Keep passing: `tests/build_materializer.rs` (synthetic fixtures, vendored `praise`/`pkgconfig`);
 `tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, `qrcode`, `pkgcond`, `doubt`,
-`config`, `here`); `voucher` built with `--strict false`, cli and fs Linked. Each item adds its own
-acceptance cases here.
+`config`, `here`, and `voucher` with cli and fs Linked under `--strict false`), each run against one
+build with its Linked dependencies absent, installed, and loaded. Each item adds its own acceptance
+cases here.
 
 ## Next up
 
 1. Track C: the type and cleanup items.
-2. Track A.
-3. Track B.
+2. Track B.
 
 ---
-
-## Track A: Isolation with private namespace names
-
-Why: today a Linked namespace is registered under the real name. Loading a slinked package makes
-every later `loadNamespace("cli")` in the session return the partial copy: after
-`library(voucher)`, `cli::cli_progress_bar()` and `library(pillar)` fail with "removed by slinker"
-even though real cli is installed. In the other order the package refuses to load
-(`LinkedNamespaceCollision`). Both break installation independence and make a package's own test
-suite unrunnable next to testthat.
-
-Registration:
-- Register each Linked namespace under a private key derived from the Root and Linked package names
-  that is not a valid package name, so it can never collide. The namespace spec keeps the original
-  name and version.
-- `NamespaceActivationIr` carries the private key; the materializer takes it from there.
-- Delete `LinkedNamespaceCollision`, its runtime check, and its tests.
-
-Payload references:
-- R serializes a namespace reference as its spec name and resolves it through the registry on load;
-  the serialization refhook is never called for namespaces. While `.slinker_bundle` serializes, set
-  every Linked image environment's spec name to its private key (all Linked images of the build in
-  one worker), and restore it afterwards. External namespaces keep their real names.
-
-Rewiring everything linked code addresses by package name (relocations in both relocatable code and
-payload closures; payload language that cannot be rewritten exactly blocks):
-- `pkg::f`, `pkg:::f`, `asNamespace`, `getNamespace`, `loadNamespace`, `requireNamespace`,
-  `isNamespaceLoaded`, `find.package`, `system.file(package = )` (already resources),
-  `packageVersion`, `packageDescription`, and `loadedNamespaces()` membership tests on a Linked
-  package;
-- wrappers such as `rlang::is_installed`/`check_installed` are covered once static discovery is
-  relocated; dynamic forms stay blockers or assumptions;
-- name round trips from the namespace itself: `asNamespace(.packageName)`,
-  `asNamespace(getNamespaceName(topenv()))`, `utils::packageName()` or `environmentName` feeding a
-  namespace or package query;
-- native lookups by name: `.Call(..., PACKAGE = "pkg")`, `getNativeSymbolInfo(, "pkg")`,
-  `is.loaded`. Two copies of one DLL load side by side; resolve through the copy's `DllInfo`, never
-  by name;
-- `registerS3method(..., envir = asNamespace("pkg"))` and `S3method(pkg::generic, cls)`;
-- delete `DiscoveryPolicy`: static discovery of a known package becomes a sound relocation (today
-  `Reject` blocks every static discovery of a hard dependency).
-
-Residual, documented in the README instead of fixed:
-- S3 methods a Linked package registers on another package's generic (`format.cli_ansi_string`
-  on base `format`) share one table keyed by class. Dispatch from linked code finds its own method
-  lexically first; dispatch started outside it (console printing, another package) can reach the
-  real package's method when a different real version is also loaded.
-- C callables (`R_RegisterCCallable("cli", ...)`) are a string literal in compiled code; a loaded C
-  consumer can receive either copy's function.
-- S4 class registries (S4 is blocked today).
-- Serializing an object that references a Linked namespace writes the original name, as the
-  original would; reading it back (`readRDS`, callr or future workers) fails without the real
-  package.
-
-Tests:
-- The CRAN harness runs each suite three ways against one build: dependencies uninstalled,
-  installed, and installed and loaded before the slinked package. Results must be identical.
-- `library(voucher); library(pillar)` works with real cli installed, in both orders.
-- A payload closure from a Linked package unserializes into the private namespace with real cli
-  loaded.
-- Each rewired form has a relocation test, and a linked `.Call(PACKAGE = )` reaches its own DLL
-  copy while the real package is loaded.
-
-Done when the three-way harness passes for every corpus package and voucher, and here's own
-testthat suite runs against the slinked here with rprojroot Linked (replacing its script check).
 
 ## Track B: Soundness gaps in the current profile
 
@@ -247,7 +183,7 @@ Minimal code:
   factories, private `.state` environment, `.onLoad`/`.onAttach`, `system.file` resources, a
   lazy-loaded dataset, `match.arg`/`tryCatch`/`do.call`/`switch`/`eval(bquote())`,
   `requireNamespace`-guarded Suggests code) with a testthat suite. Done when it builds strictly
-  with no assumptions and passes the Track A three-way harness.
+  with no assumptions and passes the three-way installation harness.
 - Lower Linked `.onLoad` `libname` uses to explicit resources instead of blocking them.
 - rlang, cli, glue, vctrs, R6 each link in a CRAN harness case, strictly where their code allows;
   R6 generators and re-enclosed methods are modeled or blocked precisely.

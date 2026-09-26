@@ -22,6 +22,15 @@ Static `asNamespace`, `getNamespace`, `loadNamespace`, `requireNamespace`, and `
 
 The Root's `S3method()` registrations on a generic that lives in a Linked namespace, whether imported (`S3method(gen, cls)`) or qualified (`S3method(pkg::gen, cls)`), are performed by the generated `.onLoad` after the Linked namespaces activate rather than by the generated `NAMESPACE`, so they reach the private generic. Registrations a Linked `NAMESPACE` qualifies with a Linked package, and `registerS3method(..., envir = asNamespace("pkg"))`, target the private namespace too.
 
+The private copies still share session-wide registries that are not keyed by package name, so these divergences remain and are not detected:
+
+- S3 methods live in one table per generic, keyed by class. A method a Linked package registers on another package's generic (`format.cli_ansi_string` on base `format`) is found first by dispatch from Linked code, but dispatch started elsewhere (console printing, another package) can reach the real package's method when a different real version is also loaded. Methods registered on a Linked generic are seen only through the private copy of that generic.
+- C callables (`R_RegisterCCallable("cli", ...)`) are keyed by a string in compiled code; a loaded C consumer can receive either copy's function.
+- S4 class registries (S4 is blocked today).
+- Serializing an object that references a Linked namespace writes the original name, as the original does; reading it back (`readRDS`, callr or future workers) resolves the real package and fails without it.
+- `loadedNamespaces()` lists the private keys, so code that treats every entry as a package name (`sessionInfo()`) warns about them.
+- A package name handed to External code (`rlang::is_installed("pkg")`) is resolved by that code against the real installation.
+
 The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then calls the Root's original `.onLoad`. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
 
 ### Strict mode
