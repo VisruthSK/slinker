@@ -759,6 +759,94 @@ fn translate_index(
 ) -> ParsedRFile {
     let scopes = LexicalScopes::new(index);
     let declarations = collect_declarations(&source, text, root, context, index, &scopes);
+    let mut live_uses = collect_live_uses(index, &declarations);
+
+    let function_regions = find_function_regions(text);
+    let for_regions = find_for_regions(text);
+    let if_regions = find_if_regions(text);
+    refine_callee_kinds(
+        text,
+        context,
+        index,
+        &function_regions,
+        &for_regions,
+        &if_regions,
+        &mut live_uses,
+    );
+
+    let mut references = name_references(&source, text, context, root, index, &live_uses);
+    let mut live_calls = lexical_calls(&source, text, index, &scopes, &live_uses);
+    let translation = Translation {
+        source: &source,
+        text,
+        root,
+        index,
+        scopes: &scopes,
+        declarations: &declarations,
+    };
+    let mut package_refs = namespace_access_facts(translation, &live_uses, &mut live_calls);
+    binary_operator_facts(translation, &mut references, &mut live_calls);
+
+    deduplicate_calls(&mut live_calls);
+
+    let mut guard_regions = if_guard_regions(text, context, &if_regions, &live_calls);
+    apply_guard_regions_to_references(&guard_regions, &mut references);
+    apply_guard_regions_to_package_refs(&guard_regions, &mut package_refs);
+    apply_guard_regions_to_calls(&guard_regions, &mut live_calls);
+
+    let hook_regions = hook_guard_regions(context, &live_calls);
+    apply_guard_regions_to_references(&hook_regions, &mut references);
+    apply_guard_regions_to_package_refs(&hook_regions, &mut package_refs);
+    apply_guard_regions_to_calls(&hook_regions, &mut live_calls);
+    guard_regions.extend(hook_regions);
+
+    let resource_refs = collect_resources(source.clone(), context, &live_calls);
+    let active_bindings = collect_active_bindings(
+        source.clone(),
+        text,
+        context,
+        index,
+        &live_calls,
+        &if_regions,
+    );
+    let (mut effects, suppressed_reference_spans) = collect_superassignments(
+        source.clone(),
+        text,
+        index,
+        &function_regions,
+        &for_regions,
+        &if_regions,
+    );
+    suppress_superassignment_references(&mut effects, &mut references, &suppressed_reference_spans);
+    apply_guard_regions_to_effects(&guard_regions, &mut effects);
+
+    let (parameters, construction) = collect_construction(source.clone(), text, root, &live_calls);
+    let calls = live_calls.into_iter().map(|call| call.site).collect();
+    let mut issues = translate_diagnostics(source.clone(), index);
+    issues.extend(declarations.issues);
+
+    let used_parameters = used_parameters(index);
+    ParsedRFile {
+        expressions: vec![ParsedExpression {
+            span: Span::new(source, 0, text.len()),
+            parameters,
+            used_parameters,
+            definitions: Vec::new(),
+            references,
+            package_refs,
+            resource_refs,
+            calls,
+            active_bindings,
+            effects,
+            construction,
+        }],
+        issues,
+        scope_parents: scopes.parents,
+        declarations: declarations.declarations,
+    }
+}
+
+fn collect_live_uses(index: &SemanticIndex, declarations: &Declarations) -> Vec<LiveUse> {
     let mut live_uses = Vec::new();
 
     for scope in index.scope_ids() {
@@ -797,29 +885,37 @@ fn translate_index(
             });
         }
     }
+    live_uses
+}
 
-    let function_regions = find_function_regions(text);
-    let for_regions = find_for_regions(text);
-    let if_regions = find_if_regions(text);
-    for live_use in &mut live_uses {
+fn refine_callee_kinds(
+    text: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    function_regions: &[FunctionRegion],
+    for_regions: &[ForRegion],
+    if_regions: &[IfRegion],
+    live_uses: &mut [LiveUse],
+) {
+    for live_use in live_uses.iter_mut() {
         // Oak currently treats a `for` induction definition as sufficient to
         // bind a later use. R has a zero-iteration path where that assignment
         // never happens. Put that path back before applying positive slinker
         // refinements. A pre-existing definitely executed binding still makes
         // the post-loop use safe.
         if live_use.callee_kind == CalleeKind::DefinitelyLexical
-            && post_for_use_may_fall_through(text, index, &for_regions, &if_regions, live_use)
+            && post_for_use_may_fall_through(text, index, for_regions, if_regions, live_use)
         {
             live_use.callee_kind = CalleeKind::ConditionalFallthrough;
         }
 
         if live_use.callee_kind != CalleeKind::DefinitelyLexical
-            && (formal_default_use_is_bound(&function_regions, live_use)
-                || for_body_use_is_bound(index, &for_regions, live_use)
+            && (formal_default_use_is_bound(function_regions, live_use)
+                || for_body_use_is_bound(index, for_regions, live_use)
                 || recursive_closure_binding_is_initialized(
                     text,
                     index,
-                    &function_regions,
+                    function_regions,
                     live_use,
                 ))
         {
@@ -831,17 +927,26 @@ fn translate_index(
                 text,
                 context,
                 index,
-                &for_regions,
-                &if_regions,
+                for_regions,
+                if_regions,
                 live_use,
             )
         {
             live_use.callee_kind = CalleeKind::DefinitelyLexical;
         }
     }
+}
 
+fn name_references(
+    source: &SourceId,
+    text: &str,
+    context: &OakParseContext,
+    root: &RRoot,
+    index: &SemanticIndex,
+    live_uses: &[LiveUse],
+) -> Vec<NameRef> {
     let data_masks = data_mask_ranges(root, context);
-    let mut references = live_uses
+    live_uses
         .iter()
         .filter_map(|live_use| {
             if is_r_language_constant(&live_use.name) {
@@ -879,12 +984,19 @@ fn translate_index(
                 span: Span::new(source.clone(), live_use.start, live_use.end),
             })
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    let mut package_refs = Vec::new();
+fn lexical_calls(
+    source: &SourceId,
+    text: &str,
+    index: &SemanticIndex,
+    scopes: &LexicalScopes,
+    live_uses: &[LiveUse],
+) -> Vec<LiveCall> {
     let mut live_calls = Vec::new();
 
-    for live_use in &live_uses {
+    for live_use in live_uses {
         let Some(raw) = call_after_name(text, live_use.start, live_use.end) else {
             continue;
         };
@@ -901,8 +1013,8 @@ fn translate_index(
                     .iter()
                     .map(|argument| argument.name.clone())
                     .collect(),
-                arg_spans: argument_spans(&source, &raw.args),
-                local_closure_args: local_closure_arguments(text, index, &live_uses, &raw.args),
+                arg_spans: argument_spans(source, &raw.args),
+                local_closure_args: local_closure_arguments(text, index, live_uses, &raw.args),
                 scope,
                 arg_bindings,
                 phase: live_use.phase,
@@ -912,7 +1024,33 @@ fn translate_index(
             raw,
         });
     }
+    live_calls
+}
 
+#[derive(Clone, Copy)]
+struct Translation<'a> {
+    source: &'a SourceId,
+    text: &'a str,
+    root: &'a RRoot,
+    index: &'a SemanticIndex,
+    scopes: &'a LexicalScopes,
+    declarations: &'a Declarations,
+}
+
+fn namespace_access_facts(
+    translation: Translation<'_>,
+    live_uses: &[LiveUse],
+    live_calls: &mut Vec<LiveCall>,
+) -> Vec<PackageRef> {
+    let Translation {
+        source,
+        text,
+        index,
+        scopes,
+        declarations,
+        ..
+    } = translation;
+    let mut package_refs = Vec::new();
     for access in index.namespace_accesses() {
         let start = text_offset(access.offset());
         if declarations.is_inert(start) {
@@ -951,8 +1089,8 @@ fn translate_index(
                         .iter()
                         .map(|argument| argument.name.clone())
                         .collect(),
-                    arg_spans: argument_spans(&source, &raw.args),
-                    local_closure_args: local_closure_arguments(text, index, &live_uses, &raw.args),
+                    arg_spans: argument_spans(source, &raw.args),
+                    local_closure_args: local_closure_arguments(text, index, live_uses, &raw.args),
                     scope: lexical_scope,
                     arg_bindings,
                     phase: phase_for_scope(index, scope),
@@ -963,7 +1101,22 @@ fn translate_index(
             });
         }
     }
+    package_refs
+}
 
+fn binary_operator_facts(
+    translation: Translation<'_>,
+    references: &mut Vec<NameRef>,
+    live_calls: &mut Vec<LiveCall>,
+) {
+    let Translation {
+        source,
+        text,
+        root,
+        index,
+        scopes,
+        declarations,
+    } = translation;
     for binary in root
         .syntax()
         .descendants()
@@ -979,7 +1132,7 @@ fn translate_index(
         let (Ok(left), Ok(right)) = (binary.left(), binary.right()) else {
             continue;
         };
-        let span = ast_span(&source, &binary);
+        let span = ast_span(source, &binary);
         if declarations.is_inert(span.start) {
             continue;
         }
@@ -999,7 +1152,7 @@ fn translate_index(
             });
         }
         let argument = |expression: &AnyRExpression| {
-            let span = ast_span(&source, expression);
+            let span = ast_span(source, expression);
             (
                 static_arg(text.get(span.start..span.end).unwrap_or_default().trim()),
                 Some(span),
@@ -1031,41 +1184,17 @@ fn translate_index(
             },
         });
     }
+}
 
-    deduplicate_calls(&mut live_calls);
-
-    let mut guard_regions = if_guard_regions(text, context, &if_regions, &live_calls);
-    apply_guard_regions_to_references(&guard_regions, &mut references);
-    apply_guard_regions_to_package_refs(&guard_regions, &mut package_refs);
-    apply_guard_regions_to_calls(&guard_regions, &mut live_calls);
-
-    let hook_regions = hook_guard_regions(context, &live_calls);
-    apply_guard_regions_to_references(&hook_regions, &mut references);
-    apply_guard_regions_to_package_refs(&hook_regions, &mut package_refs);
-    apply_guard_regions_to_calls(&hook_regions, &mut live_calls);
-    guard_regions.extend(hook_regions);
-
-    let resource_refs = collect_resources(source.clone(), context, &live_calls);
-    let active_bindings = collect_active_bindings(
-        source.clone(),
-        text,
-        context,
-        index,
-        &live_calls,
-        &if_regions,
-    );
-    let (mut effects, suppressed_reference_spans) = collect_superassignments(
-        source.clone(),
-        text,
-        index,
-        &function_regions,
-        &for_regions,
-        &if_regions,
-    );
+fn suppress_superassignment_references(
+    effects: &mut [SyntaxEffect],
+    references: &mut Vec<NameRef>,
+    suppressed_reference_spans: &[(String, usize, usize)],
+) {
     let is_suppressed = |reference: &NameRef, (name, start, end): &(String, usize, usize)| {
         reference.name == *name && reference.span.start == *start && reference.span.end == *end
     };
-    for effect in &mut effects {
+    for effect in effects.iter_mut() {
         let span = &effect.span;
         let free = |symbol: &String| {
             suppressed_reference_spans.iter().any(|value| {
@@ -1086,32 +1215,6 @@ fn translate_index(
             .iter()
             .any(|value| is_suppressed(reference, value))
     });
-    apply_guard_regions_to_effects(&guard_regions, &mut effects);
-
-    let (parameters, construction) = collect_construction(source.clone(), text, root, &live_calls);
-    let calls = live_calls.into_iter().map(|call| call.site).collect();
-    let mut issues = translate_diagnostics(source.clone(), index);
-    issues.extend(declarations.issues);
-
-    let used_parameters = used_parameters(index);
-    ParsedRFile {
-        expressions: vec![ParsedExpression {
-            span: Span::new(source, 0, text.len()),
-            parameters,
-            used_parameters,
-            definitions: Vec::new(),
-            references,
-            package_refs,
-            resource_refs,
-            calls,
-            active_bindings,
-            effects,
-            construction,
-        }],
-        issues,
-        scope_parents: scopes.parents,
-        declarations: declarations.declarations,
-    }
 }
 
 fn collect_construction(
