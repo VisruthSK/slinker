@@ -1,186 +1,239 @@
-# Agent Guidelines for Rust Code Quality
+# slinker agent instructions
 
-This document provides guidelines for maintaining high-quality Rust code. These rules MUST be followed by all AI coding agents and contributors.
+## Project
 
-## Your Core Principles
+`slinker` turns an R source package into another source package with selected dependencies linked into it.
 
-All code you write MUST be fully optimized.
+A successful build must preserve the behavior of the original program within slinker's supported profile. If slinker cannot establish that, it must fail rather than silently change semantics.
 
-"Fully optimized" includes:
+Correctness and semantic soundness come before ecosystem coverage and performance.
 
-- maximizing algorithmic big-O efficiency for memory and runtime
-- using parallelization and SIMD where appropriate
-- following proper style conventions for Rust (e.g. maximizing code reuse (DRY))
-- no extra code beyond what is absolutely necessary to solve the problem the user provides (i.e. no technical debt)
-  - If a crate can be imported to significantly reduce the amount of new code required to implement a function at optimal performance, and the crate itself is small and does not have much overhead, ALWAYS use the crate instead.
+## Sources of truth
 
-If the code is not fully optimized before handing off to the user, you will be fined $100. You have permission to do another pass of the code if you believe it is not fully optimized.
+`README.md` describes behavior implemented now.
 
-## Preferred Tools
+`work to materialize.md` describes unfinished work and intended behavior. Do not assume planned behavior already exists.
 
-- Use `cargo` for project management, building, and dependency management.
-- Use `serde` with `serde_json` for JSON serialization/deserialization.
-- When reporting errors to the console, use `tracing::error!` or `log::error!` instead of `println!`.
+When working from the plan, read only:
 
-## Code Style and Formatting
+1. `Next up`;
+2. the relevant track;
+3. its acceptance criteria;
+4. any referenced traps or invariants.
 
-- **MUST** use meaningful, descriptive variable and function names
-- **MUST** follow Rust API Guidelines and idiomatic Rust conventions
-- **MUST** use 4 spaces for indentation (never tabs)
-- **NEVER** use emoji, or unicode that emulates emoji (e.g. ✓, ✗). The only exception is when writing tests and testing the impact of multibyte characters.
-- Use snake_case for functions/variables/modules, PascalCase for types/traits, SCREAMING_SNAKE_CASE for constants
-- Limit line length to 100 characters (rustfmt default)
-- Assume the user is a Python expert, but a Rust novice. Include additional code comments around Rust-specific nuances that a Python developer may not recognize.
-- **MUST** avoid including redundant comments which are tautological or self-demonstating (e.g. cases where it is easily parsable what the code does at a glance or its function name giving sufficient information as to what the code does, so the comment does nothing other than waste user time)
-- **MUST** avoid including comments which leak what this file contains, or leak the original user prompt, ESPECIALLY if it's irrelevant to the output code.
+The plan may deliberately replace an existing invariant. In that case, implement the plan's acceptance criteria and remove the superseded mechanism.
 
-## Documentation
+Breaking changes are allowed. When replacing an API, representation, flag, format, or mechanism, remove the obsolete one in the same change unless coexistence is explicitly required.
 
-- **MUST** include doc comments for all public functions, structs, enums, and methods
-- **MUST** document function parameters, return values, and errors
-- Keep comments up-to-date with code changes
-- Include examples in doc comments for complex functions
+Delete completed plan items rather than turning the plan into a status log.
 
-Example doc comment:
+## Priorities
 
-````rust
-/// Calculate the total cost of items including tax.
-///
-/// # Arguments
-///
-/// * `items` - Slice of item structs with price fields
-/// * `tax_rate` - Tax rate as decimal (e.g., 0.08 for 8%)
-///
-/// # Returns
-///
-/// Total cost including tax
-///
-/// # Errors
-///
-/// Returns `CalculationError::EmptyItems` if items is empty
-/// Returns `CalculationError::InvalidTaxRate` if tax_rate is negative
-///
-/// # Examples
-///
-/// ```
-/// let items = vec![Item { price: 10.0 }, Item { price: 20.0 }];
-/// let total = calculate_total(&items, 0.08)?;
-/// assert_eq!(total, 32.40);
-/// ```
-pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, CalculationError> {
-````
+When requirements conflict:
 
-## Type System
+1. Semantic correctness and soundness.
+2. Clear and mechanically enforced ownership of invariants.
+3. Simpler representations that make invalid states impossible or difficult to construct.
+4. Measured runtime and memory performance.
+5. Broader package and language coverage.
 
-- **MUST** leverage Rust's type system to prevent bugs at compile time
-- **NEVER** use `.unwrap()` in library code; use `.expect()` only for invariant violations with a descriptive message
-- **MUST** use meaningful custom error types with `thiserror`
-- Use newtypes to distinguish semantically different values of the same underlying type
-- Prefer `Option<T>` over sentinel values
+Do not trade soundness for convenience, compatibility, coverage, or benchmark results.
 
-## Error Handling
+## Make invariants mechanical
 
-- **NEVER** use `.unwrap()` in production code paths
-- **MUST** use `Result<T, E>` for fallible operations
-- **MUST** use `thiserror` for defining error types and `anyhow` for application-level errors
-- **MUST** propagate errors with `?` operator where appropriate
-- Provide meaningful error messages with context using `.context()` from `anyhow`
+Prefer enforcing invariants in Rust over documenting them in prose.
 
-## Function Design
+When practical, encode an invariant using:
 
-- **MUST** keep functions focused on a single responsibility
-- **MUST** prefer borrowing (`&T`, `&mut T`) over ownership when possible
-- Limit function parameters to 5 or fewer; use a config struct for more
-- Return early to reduce nesting
-- Use iterators and combinators over explicit loops where clearer
+- type distinctions;
+- private fields or constructors;
+- enums that exclude invalid states;
+- newtypes for semantically different values;
+- module visibility;
+- ownership or lifetime structure;
+- APIs that expose only valid operations;
+- construction paths that require validation before producing a usable value.
 
-## Struct and Enum Design
+Do not rely on comments, naming conventions, `debug_assert!`, `unreachable!`, or agent instructions when the type system or API can make the invalid state unrepresentable.
 
-- **MUST** keep types focused on a single responsibility
-- **MUST** derive common traits: `Debug`, `Clone`, `PartialEq` where appropriate
-- Use `#[derive(Default)]` when a sensible default exists
-- Prefer composition over inheritance-like patterns
-- Use builder pattern for complex struct construction
-- Make fields private by default; provide accessor methods when needed
+Do not add runtime checks for internal states that can instead be made impossible to construct.
 
-## Testing
+External, serialized, R, filesystem, process, and protocol inputs remain untrusted. Validate them at their boundary before converting them into trusted internal types.
 
-- **MUST** write unit tests for all new functions and types
-- **MUST** mock external dependencies (APIs, databases, file systems)
-- **MUST** use the built-in `#[test]` attribute and `cargo test`
-- Follow the Arrange-Act-Assert pattern
-- Do not commit commented-out tests
-- Use `#[cfg(test)]` modules for test code
+When changing code that relies on a prose invariant, consider whether the change can make that invariant structural instead. Prefer removing the possibility of misuse over adding another warning about it.
 
-## Imports and Dependencies
+## Semantic ownership
 
-- **MUST** avoid wildcard imports (`use module::*`) except for preludes, test modules (`use super::*`), and prelude re-exports
-- **MUST** document dependencies in `Cargo.toml` with version constraints
-- Use `cargo` for dependency management
-- Organize imports: standard library, external crates, local modules
-- Use `rustfmt` to automate import formatting
+`ProgramIr` is the sole authority for semantic construction.
 
-## Rust Best Practices
+The materializer executes `ProgramIr`. Its API should receive the information required to execute the IR and no additional semantic authority from which it could reconstruct decisions.
 
-- **NEVER** use `unsafe` unless absolutely necessary; document safety invariants when used
-- **MUST** call `.clone()` explicitly on non-`Copy` types; avoid hidden clones in closures and iterators
-- **MUST** use pattern matching exhaustively; avoid catch-all `_` patterns when possible
-- **MUST** use `format!` macro for string formatting
-- Use iterators and iterator adapters over manual loops
-- Use `enumerate()` instead of manual counter variables
-- Prefer `if let` and `while let` for single-pattern matching
+The materializer must not rediscover semantic facts, infer missing semantics, inspect provenance to make semantic decisions, or consult installed-package state to reconstruct facts that analysis should already have decided.
 
-## Memory and Performance
+Prefer narrowing interfaces so such behavior is impossible over relying only on this rule.
 
-- **MUST** avoid unnecessary allocations; prefer `&str` over `String` when possible
-- **MUST** use `Cow<'_, str>` when ownership is conditionally needed
-- Use `Vec::with_capacity()` when the size is known
-- Prefer stack allocation over heap when appropriate
-- Use `Arc` and `Rc` judiciously; prefer borrowing
+Only `PureRStatic::check` may convert analysis output into a `BuildableProgram`.
 
-## Benchmarking and Optimization
+Enforce that construction boundary through Rust visibility and constructors wherever possible.
 
-- **NEVER** run benchmarks in parallel, as the benchmarks will compete for resources and the results will be invalid
-- **NEVER** game the benchmarks. Do not manipulate the benchmarks themselves to satisfy any required performance constraints
-- **NEVER** run benchmarks with `target-cpu=native` or any other `RUSTFLAGS`
-- If benchmarking against another crate or library, ensure the benchmarks are apples-to-apples comparisons
-- Ensure benchmark tests are independent. If the tests are dependent due to a feature (e.g. caching), ensure the feature is disabled
+Known unsupported behavior must fail during analysis or preflight. Do not postpone a known semantic failure until materialization.
 
-## Concurrency
+Every heuristic must go through `AnalyzerState::assume`. Sound rules and explicit declarations apply in both strict modes.
 
-- **MUST** use `Send` and `Sync` bounds appropriately
-- **MUST** prefer `tokio` for async runtime in async applications
-- **MUST** use `rayon` for CPU-bound parallelism
-- Avoid `Mutex` when `RwLock` or lock-free alternatives are appropriate
-- Use channels (`mpsc`, `crossbeam`) for message passing
+Prefer removing a heuristic to introducing another one.
 
-## Version Control
+Do not duplicate semantic knowledge between analysis, IR, finalization, workers, and materialization. A semantic fact should have one owner and explicit typed representations when it crosses subsystem boundaries.
 
-- **MUST** write clear, descriptive commit messages
-- **NEVER** commit commented-out code; delete it
-- **NEVER** commit debug `println!` statements or `dbg!` macros
-- **NEVER** commit credentials or sensitive data
+Keep these concepts distinct:
 
-## Tools
+- `PackageIdentity`
+- `PackageLocation`
+- `PackageId`
 
-- **MUST** use `rustfmt` for code formatting
-- **MUST** use `clippy` for linting and follow its suggestions
-- **MUST** ensure code compiles with no warnings (use `-D warnings` flag in CI, not `#![deny(warnings)]` in source)
-- Use `cargo` for building, testing, and dependency management
-- Use `cargo test` for running tests
-- Use `cargo doc` for generating documentation
-- **NEVER** uses the `Explore` tool for `Cargo.lock`: it is large and irrelevant. Read `Cargo.lock` **ONLY** if it's extremely relevant.
+A package location is never package identity. Preserve this distinction in types and APIs rather than relying on variable names.
 
-## Before Committing
+Worker-local object labels belong to one inspection epoch and must never escape it.
 
-- [ ] All tests pass (`cargo test`)
-- [ ] No compiler warnings (`cargo build`)
-- [ ] Clippy passes (`cargo clippy -- -D warnings`)
-- [ ] Code is formatted (`cargo fmt --check`)
-- [ ] All public items have doc comments
-- [ ] No commented-out code or debug statements
-- [ ] No hardcoded credentials
+Lifecycle behavior remains executable. `.onLoad` is not precomputed and an effect must not run twice.
 
----
+A failed build must publish nothing that appears complete.
 
-**Remember:** Prioritize clarity and maintainability over cleverness. This is your core directive.
+Generated `NAMESPACE` must not import a Linked package.
+
+Generated `DESCRIPTION` must describe every retained External requirement using the checked intersection of requirements.
+
+When a change affects installation independence, test the same generated package with the relevant Linked dependency absent, installed, and already loaded.
+
+## Working method
+
+Before editing, identify:
+
+- the observable behavior or invariant being changed;
+- the component that owns it;
+- how the invariant is currently enforced;
+- how the result will be falsified or validated.
+
+For a bug or regression:
+
+1. Reproduce the failure when practical.
+2. Form a concrete hypothesis about the responsible mechanism.
+3. Run the smallest experiment that could falsify that hypothesis.
+4. Treat the mechanism as the root cause only when evidence supports it.
+5. Make the smallest coherent fix to that mechanism.
+6. Preserve the reproducer as a regression test when appropriate.
+7. Remove temporary instrumentation and abandoned approaches.
+
+Do not claim a root cause from code inspection alone when it can reasonably be tested.
+
+If evidence disproves a hypothesis, discard changes based on it before trying another one.
+
+Do not stack speculative fixes.
+
+Fix the semantic owner rather than adding a downstream special case.
+
+When a representation becomes unnecessary, remove it rather than preserving compatibility structure.
+
+Clean directly touched code when doing so makes the resulting design simpler. Do not expand a focused task into unrelated cleanup.
+
+Straightforward compiler-guided work should be done directly. For a difficult semantic change, make a short plan naming the invariant, owner, and validation.
+
+Use a subagent only for genuinely independent work or disposable high-volume context such as profiling output, broad code search, or dependency investigation.
+
+## Testing and evidence
+
+Prefer independent behavioral evidence over expectations derived from the implementation under test.
+
+For materialization semantics, compare the generated package against the original package whenever practical.
+
+For regressions, capture the failing behavior before changing the implementation. Do not derive the expected result from the proposed fix.
+
+Test observable behavior, semantic invariants, regressions, and important representation constraints.
+
+Do not add tests merely because a helper, function, type, or module was introduced.
+
+Prefer one regression test that fails because of the original broken mechanism over several tests of implementation details.
+
+Do not weaken, delete, skip, or rewrite a test merely to make a change pass unless the behavior it asserts is intentionally being replaced.
+
+Required fixtures, R installations, packages, and other dependencies must not silently turn a test into a skip.
+
+Tests are evidence, not proof that untested semantics are correct. When a rule can be enforced structurally in Rust, prefer that over relying solely on test coverage.
+
+## Performance
+
+Measure before optimizing.
+
+A benchmark is not a correctness oracle.
+
+A performance result is valid only if the same semantic workload and independent correctness oracle still hold.
+
+If an optimization removes work, establish that the removed work is semantically redundant rather than merely absent from the benchmark.
+
+Treat proposed optimizations in the plan as hypotheses until measurement identifies the actual bottleneck.
+
+For analysis regressions, prefer deterministic work counts or operation bounds over wall-clock regression assertions.
+
+Distinguish algorithmic repeated work from R-worker startup, IPC, parsing, serialization, filesystem activity, and cache behavior before changing the implementation.
+
+Do not introduce parallelism, caching, interning, SIMD, unsafe code, or a different data structure merely because it might be faster.
+
+Do not run benchmarks concurrently.
+
+Do not benchmark with `RUSTFLAGS`, `target-cpu=native`, or another machine-specific compilation change unless that configuration is itself what is being measured.
+
+Disable the analysis cache unless the benchmark explicitly measures the warm-cache path.
+
+After an optimization, rerun both the measurement that motivated it and the relevant correctness oracle.
+
+If a performance gain is unexpectedly large, first try to disprove it by checking that the same work, inputs, outputs, failure behavior, and setup boundaries remain.
+
+## Rust boundaries
+
+Use checked conversions at external, R, syntax, worker, serialization, and protocol boundaries.
+
+Do not introduce panic paths for malformed external or runtime data.
+
+Use `.expect()` only for a genuine internal invariant. Where practical, replace the invariant with a representation that makes failure impossible.
+
+Do not use `unsafe` unless the task genuinely requires it. State the safety invariant next to unavoidable unsafe code and make as much of that invariant structural as Rust permits.
+
+Follow existing project mechanisms for errors, logging, serialization, concurrency, and process management rather than introducing competing patterns.
+
+## Repository exploration
+
+Read the smallest amount of repository context needed to establish the relevant behavior and mechanism.
+
+Do not read the entire forward plan when one track is sufficient.
+
+Prefer symbol and reference navigation for code relationships. Use text search for literals, diagnostics, protocol fields, generated text, and cross-language strings.
+
+Capture noisy logs and profiler output and inspect the relevant portions rather than injecting the entire output into context.
+
+## Verification
+
+During iteration, run the narrowest check that exercises the changed behavior.
+
+Before handing off a completed code change, run:
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo build --release --all-features
+```
+
+Benchmarks run separately and sequentially.
+
+Do not claim a check passed unless it actually ran successfully.
+
+If required validation cannot run, state exactly what remains unvalidated.
+
+## Git
+
+Keep changes scoped to the task.
+
+Do not commit temporary instrumentation, debug output, generated junk, commented-out code, or credentials.
+
+When committing, use a concise message describing the behavioral change.
+
+Do not add Claude attribution, co-author lines, generated-by markers, or session trailers.
