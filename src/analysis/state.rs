@@ -26,14 +26,23 @@ use crate::package::{
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, OakParseContext,
-    OakParser, PackageGuard, ParsedRFile, SemanticIssueKind, SourceId, Span, StaticArg,
-    StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    OakParser, PackageGuard, ParsedExpression, ParsedRFile, SemanticIssueKind, SourceId, Span,
+    StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::{Error, Result};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+
+#[derive(Clone, Copy)]
+pub(super) struct ParsedSite<'a> {
+    node: NodeId,
+    package: PackageId,
+    image: &'a PackageImage,
+    binding: &'a str,
+    lexical_environment: &'a str,
+}
 
 pub(super) struct ParseRequest<'a> {
     pub(super) owner_binding: &'a str,
@@ -1058,25 +1067,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &str,
         parsed: &ParsedRFile,
     ) -> Result<()> {
-        let enclosure_known = !lexical_environment.starts_with("unsupported:");
-        for issue in &parsed.issues {
-            let code = match issue.kind {
-                SemanticIssueKind::AmbiguousEffect => RejectCode::SemanticAmbiguity,
-                SemanticIssueKind::AmbiguousAttachOrder => RejectCode::SemanticAmbiguity,
-                SemanticIssueKind::UninstalledPackage => RejectCode::MissingDependency,
-                SemanticIssueKind::SourceCycle => RejectCode::SemanticAmbiguity,
-                SemanticIssueKind::InvalidDeclaration => RejectCode::InvalidDeclaration,
-            };
-            self.diagnostic(
-                node,
-                package,
-                Some(binding),
-                code,
-                issue.message.clone(),
-                issue.span.clone(),
-            );
-        }
-
+        let site = ParsedSite {
+            node,
+            package,
+            image,
+            binding,
+            lexical_environment,
+        };
+        self.report_semantic_issues(site, parsed);
         for expression in &parsed.expressions {
             self.execute_construction(
                 ExecutionContext {
@@ -1089,189 +1087,282 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 },
                 &expression.construction,
             )?;
-            for active in &expression.active_bindings {
-                if binding != ".onLoad" || !active.certain {
-                    continue;
-                }
-                if !self.guards_active(package, image, &active.guards)? {
-                    continue;
-                }
-                if self.active_binding_targets_current_namespace(
-                    package,
-                    image,
-                    lexical_environment,
-                    active,
-                )? && self
-                    .namespace_builders
-                    .get_mut(&package)
-                    .expect("namespace builder initialized")
-                    .add_binding(active.name.clone())
-                {
-                    self.non_returning_bindings.remove(&package);
-                }
-            }
-            let mut consumed_native_selectors = Vec::new();
-            for call in &expression.calls {
-                if !self.guards_active(package, image, &call.guards)?
-                    || !matches!(
-                        call.callee.as_str(),
-                        ".Call" | ".External" | ".C" | ".Fortran"
-                    )
-                    || !self.call_resolves_definitely_to_base(
-                        package,
-                        image,
-                        lexical_environment,
-                        call,
-                    )?
-                {
-                    continue;
-                }
-                let Some(target) =
-                    self.native_component_for_call(package, image, lexical_environment, call)?
-                else {
-                    continue;
-                };
-                if target.consumes_selector
-                    && let Some(span) = native_selector_span(call)
-                {
-                    consumed_native_selectors.push(span.clone());
-                }
-            }
-            for reference in &expression.references {
-                if !self.guards_active(package, image, &reference.guards)? {
-                    continue;
-                }
-                if consumed_native_selectors.contains(&reference.span) {
-                    continue;
-                }
-                let resolved = self.resolve_lexical_name(
-                    package,
-                    image,
-                    lexical_environment,
-                    &reference.name,
-                )?;
-                if (!enclosure_known
-                    || reference.kind != NameRefKind::External
-                    || self.value_closures.contains(&node))
-                    && matches!(
-                        &resolved,
-                        Resolution::OpenDynamic(OpenReason::Unresolved(_))
-                    )
-                {
-                    continue;
-                }
-                if let Some(callable) = callable_target(&resolved)
-                    && !expression.calls.iter().any(|call| {
-                        call.qualified_package.is_none() && call.span.start == reference.span.start
-                    })
-                {
-                    self.record_escape(callable)?;
-                }
-                self.require_resolved(
-                    node,
-                    package,
-                    Some(binding),
-                    resolved,
-                    reference.span.clone(),
-                )?;
-            }
-            for reference in &expression.package_refs {
-                if !self.guards_active(package, image, &reference.guards)? {
-                    continue;
-                }
-                self.namespace_access(node, package, reference)?;
-                if let Some(foreign) = self.known_package(&reference.package)
-                    && !expression.calls.iter().any(|call| {
-                        call.qualified_package.is_some() && call.span.start == reference.span.start
-                    })
-                {
-                    self.record_escape(CallableId {
-                        package: foreign,
-                        binding: reference.symbol.clone(),
-                    })?;
-                }
-            }
+            self.register_active_bindings(site, expression)?;
+            let consumed_native_selectors = self.consumed_native_selectors(site, expression)?;
+            self.process_references(site, expression, &consumed_native_selectors)?;
+            self.process_package_refs(site, expression)?;
             for resource in &expression.resource_refs {
                 if !self.guards_active(package, image, &resource.guards)? {
                     continue;
                 }
                 self.resource_access(node, package, resource)?;
             }
-            let uses = expression
-                .calls
-                .iter()
-                .filter(|call| {
-                    call.callee == "registerS3method"
-                        || (call.callee == "exists"
-                            && self.argument_text(call, "inherits") == Some("FALSE"))
-                })
-                .flat_map(|call| call.arg_names.iter().zip(&call.arg_spans))
-                .filter(|(name, _)| name.as_deref() == Some("envir"))
-                .filter_map(|(_, span)| span.clone())
-                .collect();
-            self.reflection.set_non_reflective_namespace_uses(uses);
-            for call in &expression.calls {
-                if !self.guards_active(package, image, &call.guards)? {
-                    continue;
-                }
-                if let Some(callable) =
-                    self.call_target(package, image, lexical_environment, call)?
-                {
-                    self.record_invocation(parsed, callable, call)?;
-                }
-                if matches!(call.callee.as_str(), "UseMethod" | "NextMethod")
-                    && call.qualified_package.is_none()
-                    && matches!(
-                        self.resolve_lexical_name(
-                            package,
-                            image,
-                            lexical_environment,
-                            &call.callee,
-                        )?,
-                        Resolution::Static(BindingTarget::Base)
-                    )
-                {
-                    self.s3_dispatch(
-                        node,
-                        package,
-                        binding,
-                        lexical_environment,
-                        Some(&expression.parameters),
-                        call,
-                    )?;
-                    continue;
-                }
-                self.semantic_call(node, package, image, binding, lexical_environment, call)?;
+            self.record_non_reflective_namespace_uses(expression);
+            self.process_calls(site, parsed, expression)?;
+            self.process_effects(site, expression)?;
+        }
+        Ok(())
+    }
+
+    fn report_semantic_issues(&mut self, site: ParsedSite<'_>, parsed: &ParsedRFile) {
+        for issue in &parsed.issues {
+            let code = match issue.kind {
+                SemanticIssueKind::AmbiguousEffect => RejectCode::SemanticAmbiguity,
+                SemanticIssueKind::AmbiguousAttachOrder => RejectCode::SemanticAmbiguity,
+                SemanticIssueKind::UninstalledPackage => RejectCode::MissingDependency,
+                SemanticIssueKind::SourceCycle => RejectCode::SemanticAmbiguity,
+                SemanticIssueKind::InvalidDeclaration => RejectCode::InvalidDeclaration,
+            };
+            self.diagnostic(
+                site.node,
+                site.package,
+                Some(site.binding),
+                code,
+                issue.message.clone(),
+                issue.span.clone(),
+            );
+        }
+    }
+
+    fn register_active_bindings(
+        &mut self,
+        site: ParsedSite<'_>,
+        expression: &ParsedExpression,
+    ) -> Result<()> {
+        for active in &expression.active_bindings {
+            if site.binding != ".onLoad" || !active.certain {
+                continue;
             }
-            for effect in &expression.effects {
-                if !self.guards_active(package, image, &effect.guards)? {
-                    continue;
+            if !self.guards_active(site.package, site.image, &active.guards)? {
+                continue;
+            }
+            if self.active_binding_targets_current_namespace(
+                site.package,
+                site.image,
+                site.lexical_environment,
+                active,
+            )? && self
+                .namespace_builders
+                .get_mut(&site.package)
+                .expect("namespace builder initialized")
+                .add_binding(active.name.clone())
+            {
+                self.non_returning_bindings.remove(&site.package);
+            }
+        }
+        Ok(())
+    }
+
+    fn consumed_native_selectors(
+        &mut self,
+        site: ParsedSite<'_>,
+        expression: &ParsedExpression,
+    ) -> Result<Vec<Span>> {
+        let mut consumed_native_selectors = Vec::new();
+        for call in &expression.calls {
+            if !self.guards_active(site.package, site.image, &call.guards)?
+                || !matches!(
+                    call.callee.as_str(),
+                    ".Call" | ".External" | ".C" | ".Fortran"
+                )
+                || !self.call_resolves_definitely_to_base(
+                    site.package,
+                    site.image,
+                    site.lexical_environment,
+                    call,
+                )?
+            {
+                continue;
+            }
+            let Some(target) = self.native_component_for_call(
+                site.package,
+                site.image,
+                site.lexical_environment,
+                call,
+            )?
+            else {
+                continue;
+            };
+            if target.consumes_selector
+                && let Some(span) = native_selector_span(call)
+            {
+                consumed_native_selectors.push(span.clone());
+            }
+        }
+        Ok(consumed_native_selectors)
+    }
+
+    fn process_references(
+        &mut self,
+        site: ParsedSite<'_>,
+        expression: &ParsedExpression,
+        consumed_native_selectors: &[Span],
+    ) -> Result<()> {
+        let enclosure_known = !site.lexical_environment.starts_with("unsupported:");
+        for reference in &expression.references {
+            if !self.guards_active(site.package, site.image, &reference.guards)? {
+                continue;
+            }
+            if consumed_native_selectors.contains(&reference.span) {
+                continue;
+            }
+            let resolved = self.resolve_lexical_name(
+                site.package,
+                site.image,
+                site.lexical_environment,
+                &reference.name,
+            )?;
+            if (!enclosure_known
+                || reference.kind != NameRefKind::External
+                || self.value_closures.contains(&site.node))
+                && matches!(
+                    &resolved,
+                    Resolution::OpenDynamic(OpenReason::Unresolved(_))
+                )
+            {
+                continue;
+            }
+            if let Some(callable) = callable_target(&resolved)
+                && !expression.calls.iter().any(|call| {
+                    call.qualified_package.is_none() && call.span.start == reference.span.start
+                })
+            {
+                self.record_escape(callable)?;
+            }
+            self.require_resolved(
+                site.node,
+                site.package,
+                Some(site.binding),
+                resolved,
+                reference.span.clone(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn process_package_refs(
+        &mut self,
+        site: ParsedSite<'_>,
+        expression: &ParsedExpression,
+    ) -> Result<()> {
+        for reference in &expression.package_refs {
+            if !self.guards_active(site.package, site.image, &reference.guards)? {
+                continue;
+            }
+            self.namespace_access(site.node, site.package, reference)?;
+            if let Some(foreign) = self.known_package(&reference.package)
+                && !expression.calls.iter().any(|call| {
+                    call.qualified_package.is_some() && call.span.start == reference.span.start
+                })
+            {
+                self.record_escape(CallableId {
+                    package: foreign,
+                    binding: reference.symbol.clone(),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_non_reflective_namespace_uses(&mut self, expression: &ParsedExpression) {
+        let uses = expression
+            .calls
+            .iter()
+            .filter(|call| {
+                call.callee == "registerS3method"
+                    || (call.callee == "exists"
+                        && self.argument_text(call, "inherits") == Some("FALSE"))
+            })
+            .flat_map(|call| call.arg_names.iter().zip(&call.arg_spans))
+            .filter(|(name, _)| name.as_deref() == Some("envir"))
+            .filter_map(|(_, span)| span.clone())
+            .collect();
+        self.reflection.set_non_reflective_namespace_uses(uses);
+    }
+
+    fn process_calls(
+        &mut self,
+        site: ParsedSite<'_>,
+        parsed: &ParsedRFile,
+        expression: &ParsedExpression,
+    ) -> Result<()> {
+        for call in &expression.calls {
+            if !self.guards_active(site.package, site.image, &call.guards)? {
+                continue;
+            }
+            if let Some(callable) =
+                self.call_target(site.package, site.image, site.lexical_environment, call)?
+            {
+                self.record_invocation(parsed, callable, call)?;
+            }
+            if matches!(call.callee.as_str(), "UseMethod" | "NextMethod")
+                && call.qualified_package.is_none()
+                && matches!(
+                    self.resolve_lexical_name(
+                        site.package,
+                        site.image,
+                        site.lexical_environment,
+                        &call.callee,
+                    )?,
+                    Resolution::Static(BindingTarget::Base)
+                )
+            {
+                self.s3_dispatch(
+                    site.node,
+                    site.package,
+                    site.binding,
+                    site.lexical_environment,
+                    Some(&expression.parameters),
+                    call,
+                )?;
+                continue;
+            }
+            self.semantic_call(
+                site.node,
+                site.package,
+                site.image,
+                site.binding,
+                site.lexical_environment,
+                call,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn process_effects(
+        &mut self,
+        site: ParsedSite<'_>,
+        expression: &ParsedExpression,
+    ) -> Result<()> {
+        let enclosure_known = !site.lexical_environment.starts_with("unsupported:");
+        for effect in &expression.effects {
+            if !self.guards_active(site.package, site.image, &effect.guards)? {
+                continue;
+            }
+            match effect.kind {
+                SyntaxEffectKind::SuperAssignment => {
+                    if !enclosure_known {
+                        continue;
+                    }
+                    self.handle_superassignment(
+                        site.node,
+                        site.package,
+                        site.image,
+                        site.binding,
+                        site.lexical_environment,
+                        effect,
+                    )?;
                 }
-                match effect.kind {
-                    SyntaxEffectKind::SuperAssignment => {
-                        if !enclosure_known {
-                            continue;
-                        }
-                        self.handle_superassignment(
-                            node,
-                            package,
-                            image,
-                            binding,
-                            lexical_environment,
-                            effect,
-                        )?;
-                    }
-                    SyntaxEffectKind::IndirectPackageWrite
-                    | SyntaxEffectKind::UnsupportedAssignmentTarget => {
-                        self.diagnostic(
-                            node,
-                            package,
-                            Some(binding),
-                            RejectCode::UnsupportedTopLevelEffect,
-                            format!("unsupported R effect: {:?}", effect.kind),
-                            Some(effect.span.clone()),
-                        );
-                    }
+                SyntaxEffectKind::IndirectPackageWrite
+                | SyntaxEffectKind::UnsupportedAssignmentTarget => {
+                    self.diagnostic(
+                        site.node,
+                        site.package,
+                        Some(site.binding),
+                        RejectCode::UnsupportedTopLevelEffect,
+                        format!("unsupported R effect: {:?}", effect.kind),
+                        Some(effect.span.clone()),
+                    );
                 }
             }
         }
