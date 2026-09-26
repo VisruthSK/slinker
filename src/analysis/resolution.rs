@@ -121,8 +121,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return bindings.clone();
         }
 
-        let mut namespace_shadowed = BTreeSet::new();
-        namespace_shadowed.extend(image.bindings.keys().cloned());
+        let mut namespace_shadowed = BTreeSet::<String>::new();
+        namespace_shadowed.extend(image.bindings.keys().map(ToString::to_string));
         namespace_shadowed.extend(
             self.namespace_builders[&package]
                 .bindings
@@ -143,7 +143,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             let before = proven.len();
             for (name, binding) in &image.bindings {
-                if proven.contains(name) {
+                if proven.contains(name.as_str()) {
                     continue;
                 }
                 let Some(closure) = &binding.closure else {
@@ -153,7 +153,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     continue;
                 }
                 if closure_definitely_non_returning(closure.source.as_ref(), &context) {
-                    proven.insert(name.clone());
+                    proven.insert(name.to_string());
                 }
             }
             if proven.len() == before {
@@ -213,8 +213,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 break;
             };
             for (name, binding) in &private.bindings {
-                private_shadowed.insert(name.clone());
-                shadowed.insert(name.clone());
+                private_shadowed.insert(name.to_string());
+                shadowed.insert(name.to_string());
                 // Walk inner-to-outer. The first binding is the one lexical
                 // lookup can actually reach from this closure.
                 visible_private.entry(name.clone()).or_insert(binding);
@@ -239,14 +239,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             let before = non_returning.len();
             for (name, binding) in &visible_private {
-                if non_returning.contains(name) {
+                if non_returning.contains(name.as_str()) {
                     continue;
                 }
                 let Some(closure) = &binding.closure else {
                     continue;
                 };
                 if closure_definitely_non_returning(closure.source.as_ref(), &context) {
-                    non_returning.insert(name.clone());
+                    non_returning.insert(name.to_string());
                 }
             }
             if non_returning.len() == before {

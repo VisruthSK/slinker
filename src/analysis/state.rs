@@ -82,7 +82,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) construction_calls: HashMap<ConstructionCallKey, AbstractValue>,
     pub(super) construction_evaluations: usize,
     pub(super) reflection: ReflectionFacts,
-    pub(super) external_bindings: BTreeMap<(PackageId, String), ExternalBindingAccess>,
+    pub(super) external_bindings: BTreeMap<(PackageId, BindingName), ExternalBindingAccess>,
     pub(super) dependencies: HashMap<NodeId, HashSet<NodeId>>,
     pub(super) provenance: bool,
     pub(super) root: Option<PackageId>,
@@ -2927,7 +2927,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> NodeId {
         let recorded = self
             .external_bindings
-            .entry((package, name.to_owned()))
+            .entry((package, BindingName::from(name)))
             .or_insert(access);
         if access == ExternalBindingAccess::Internal {
             *recorded = access;

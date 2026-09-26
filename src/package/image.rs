@@ -1,4 +1,4 @@
-use crate::package::PackageIndex;
+use crate::package::{BindingName, PackageIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,7 +103,7 @@ pub enum BindingRepresentation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BindingImage {
-    pub name: String,
+    pub name: BindingName,
     pub origin: BindingOrigin,
     pub representation: BindingRepresentation,
     #[serde(default)]
@@ -118,7 +118,7 @@ pub struct BindingImage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrivateBindingImage {
-    pub name: String,
+    pub name: BindingName,
     pub representation: BindingRepresentation,
     #[serde(default)]
     pub classes: Vec<String>,
@@ -134,13 +134,13 @@ pub struct PrivateBindingImage {
 pub struct PrivateEnvironmentImage {
     pub id: String,
     pub parent: String,
-    pub bindings: HashMap<String, PrivateBindingImage>,
+    pub bindings: HashMap<BindingName, PrivateBindingImage>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PackageImage {
     pub index: Arc<PackageIndex>,
-    pub bindings: HashMap<String, BindingImage>,
+    pub bindings: HashMap<BindingName, BindingImage>,
     pub private_environments: HashMap<String, PrivateEnvironmentImage>,
 }
 

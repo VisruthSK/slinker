@@ -140,9 +140,9 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
         .iter()
         .map(|(name, source)| {
             (
-                name.clone(),
+                BindingName::from(name.as_str()),
                 BindingImage {
-                    name: name.clone(),
+                    name: BindingName::from(name.as_str()),
                     origin: BindingOrigin::Code,
                     representation: BindingRepresentation::Value,
                     classes: Vec::new(),
@@ -159,10 +159,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
             )
         })
         .collect::<HashMap<_, _>>();
-    let mut binding_names = bindings
-        .keys()
-        .map(|name| BindingName::from(name.as_str()))
-        .collect::<Vec<_>>();
+    let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
     binding_names.sort();
     PackageImage {
         index: Arc::new(PackageIndex {

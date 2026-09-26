@@ -134,22 +134,22 @@ impl ObjectGraph {
         let mut names = image.bindings.keys().collect::<Vec<_>>();
         names.sort();
         for name in names {
-            if self.namespace_bindings.contains_key(name) {
+            if self.namespace_bindings.contains_key(name.as_str()) {
                 continue;
             }
             let object = self.add_object(
                 &image.bindings[name],
                 ObjectProvenance {
-                    namespace_binding: Some(name.clone()),
+                    namespace_binding: Some(name.to_string()),
                     private_environment: None,
                     private_binding: None,
                     path: "$".into(),
                 },
             );
-            self.namespace_bindings.insert(name.clone(), object);
+            self.namespace_bindings.insert(name.to_string(), object);
             self.environments[namespace.0]
                 .bindings
-                .insert(name.clone(), object);
+                .insert(name.to_string(), object);
         }
 
         let mut private_ids = image.private_environments.keys().collect::<Vec<_>>();
@@ -160,7 +160,10 @@ impl ObjectGraph {
             let mut names = private.bindings.keys().collect::<Vec<_>>();
             names.sort();
             for name in names {
-                if self.environments[environment.0].bindings.contains_key(name) {
+                if self.environments[environment.0]
+                    .bindings
+                    .contains_key(name.as_str())
+                {
                     continue;
                 }
                 let object = self.add_object(
@@ -168,13 +171,13 @@ impl ObjectGraph {
                     ObjectProvenance {
                         namespace_binding: None,
                         private_environment: Some(private_id.clone()),
-                        private_binding: Some(name.clone()),
+                        private_binding: Some(name.to_string()),
                         path: "$".into(),
                     },
                 );
                 self.environments[environment.0]
                     .bindings
-                    .insert(name.clone(), object);
+                    .insert(name.to_string(), object);
             }
         }
     }
@@ -633,7 +636,7 @@ mod tests {
                 lifecycle: LifecycleMetadata::default(),
                 binding_names: bindings
                     .iter()
-                    .map(|binding| binding.name.clone().into())
+                    .map(|binding| binding.name.clone())
                     .collect(),
                 datasets: Vec::new(),
                 files: Vec::new(),

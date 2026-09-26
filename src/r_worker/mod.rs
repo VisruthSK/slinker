@@ -926,7 +926,10 @@ impl ObjectScanner {
             .map(|binding| {
                 let binding = binding?;
                 let name = String::from(binding.name);
-                Ok((name.clone(), self.private_binding(&name, binding.value)?))
+                Ok((
+                    BindingName::from(name.as_str()),
+                    self.private_binding(&name, binding.value)?,
+                ))
             })
             .collect::<std::result::Result<HashMap<_, _>, InspectionError>>()?;
         self.private_environments.insert(

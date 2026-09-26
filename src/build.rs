@@ -100,7 +100,7 @@ impl BuildContext {
                 payloads
                     .entry(payload.package)
                     .or_default()
-                    .insert(payload.binding.clone());
+                    .insert(payload.binding.to_string());
             }
         }
         let mut bundles = BTreeMap::new();

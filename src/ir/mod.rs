@@ -1,7 +1,7 @@
 //! Immutable linked-program representation consumed by build preflight and materialization.
 
 use crate::analysis::{Edge, Graph, Node, NodeId};
-pub use crate::package::{PackageId, PackageIdentity, PackageRole};
+pub use crate::package::{BindingName, PackageId, PackageIdentity, PackageRole};
 
 use crate::package::Digest;
 use crate::syntax::TextRange;
@@ -81,7 +81,7 @@ pub struct ExternalPackageContract {
 /// One stable namespace binding slot.
 #[derive(Clone, Debug)]
 pub struct Binding {
-    pub name: String,
+    pub name: BindingName,
     pub state: LinkBindingState,
 }
 
@@ -152,7 +152,7 @@ pub enum MaterializedRole {
 #[derive(Clone, Debug)]
 pub struct Namespace {
     pub package: PackageId,
-    pub bindings: BTreeMap<String, BindingId>,
+    pub bindings: BTreeMap<BindingName, BindingId>,
     pub imports: Vec<ImportBindingIr>,
     pub state: LinkNamespaceState,
     pub s3_registrations: Vec<S3RegistrationId>,
@@ -160,7 +160,7 @@ pub struct Namespace {
 
 #[derive(Clone, Debug)]
 pub struct ImportBindingIr {
-    pub local: String,
+    pub local: BindingName,
     pub target: BindingId,
 }
 
@@ -200,7 +200,7 @@ pub enum Value {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PayloadRef {
     pub package: PackageId,
-    pub binding: String,
+    pub binding: BindingName,
 }
 
 #[derive(Clone, Debug)]
@@ -543,13 +543,13 @@ pub struct ProgramBuilder {
 #[derive(Debug)]
 pub struct FinalizedNamespace {
     pub namespace: NamespaceId,
-    pub bindings: BTreeMap<String, BindingId>,
+    pub bindings: BTreeMap<BindingName, BindingId>,
 }
 
 /// Final source of one materialized namespace slot.
 #[derive(Clone, Debug)]
 pub struct MaterializedSlot {
-    pub name: String,
+    pub name: BindingName,
     pub source: MaterializedSlotSource,
 }
 
@@ -560,10 +560,10 @@ pub enum MaterializedSlotSource {
     Closure {
         source: Arc<str>,
         normalized_shape: Digest,
-        binding: String,
+        binding: BindingName,
     },
     Payload {
-        binding: String,
+        binding: BindingName,
     },
 }
 
@@ -677,7 +677,7 @@ impl ProgramBuilder {
     pub fn finish_external_namespace(
         &mut self,
         package: PackageId,
-        bindings: impl IntoIterator<Item = (String, ExternalBindingAccess)>,
+        bindings: impl IntoIterator<Item = (BindingName, ExternalBindingAccess)>,
     ) -> FinalizedNamespace {
         let namespace = NamespaceId::from_index(self.namespaces.len());
         let mut slots = BTreeMap::new();
@@ -776,7 +776,7 @@ impl ProgramBuilder {
         })
     }
 
-    pub fn attach_import(&mut self, namespace: NamespaceId, local: String, target: BindingId) {
+    pub fn attach_import(&mut self, namespace: NamespaceId, local: BindingName, target: BindingId) {
         self.namespaces[namespace.index()]
             .imports
             .push(ImportBindingIr { local, target });
@@ -827,7 +827,7 @@ impl ProgramBuilder {
                     .next()
                     .unwrap_or(original)
                     .trim_matches('`');
-                unqualified == self.bindings[target.index()].name
+                self.bindings[target.index()].name == unqualified
             }
             RelocationTarget::RequireNamespace { .. } => callee.starts_with("requireNamespace("),
             RelocationTarget::Namespace { operation, .. } => callee.starts_with(operation.callee()),

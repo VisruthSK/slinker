@@ -273,10 +273,7 @@ fn package_from_fixture(
             },
         );
     }
-    let mut names = images
-        .keys()
-        .map(|name: &String| name.as_str().into())
-        .collect::<Vec<slinker::package::BindingName>>();
+    let mut names = images.keys().cloned().collect::<Vec<_>>();
     names.sort();
     PackageImage {
         index: Arc::new(PackageIndex {
@@ -473,9 +470,9 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
     }
     for name in ["first", "second"] {
         root.bindings.insert(
-            format!("{name}_dependency"),
+            format!("{name}_dependency").into(),
             BindingImage {
-                name: format!("{name}_dependency"),
+                name: format!("{name}_dependency").into(),
                 origin: BindingOrigin::Code,
                 representation: slinker::package::BindingRepresentation::Value,
                 classes: Vec::new(),

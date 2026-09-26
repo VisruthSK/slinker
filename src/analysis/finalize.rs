@@ -3,10 +3,10 @@ use super::state::AnalyzerState;
 use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
-    BindingId, ExportTable, ExternalBindingAccess, ExternalPackageContract, FinalizedNamespace,
-    InvalidRelocation, MaterializedRole, MaterializedSlot, MaterializedSlotSource, NamespaceId,
-    PackageIr, PackageRole as LinkedPackageRole, ProgramBuilder, ProgramIr, RelocationTarget,
-    RootArtifactIr, TargetContract, UnretainedName,
+    BindingId, BindingName, ExportTable, ExternalBindingAccess, ExternalPackageContract,
+    FinalizedNamespace, InvalidRelocation, MaterializedRole, MaterializedSlot,
+    MaterializedSlotSource, NamespaceId, PackageIr, PackageRole as LinkedPackageRole,
+    ProgramBuilder, ProgramIr, RelocationTarget, RootArtifactIr, TargetContract, UnretainedName,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{
@@ -193,13 +193,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
         retained: &BTreeSet<PackageId>,
         issues: &mut Vec<FinalizationIssue>,
     ) -> FinalizedNamespaces {
-        let mut retained_bindings = HashMap::<PackageId, BTreeSet<String>>::new();
+        let mut retained_bindings = HashMap::<PackageId, BTreeSet<BindingName>>::new();
         for need in self.needs.started() {
             if let Need::Binding { package, binding } = need {
                 retained_bindings
                     .entry(*package)
                     .or_default()
-                    .insert(binding.to_string());
+                    .insert(binding.clone());
             }
         }
         let mut namespaces = FinalizedNamespaces::default();
@@ -233,7 +233,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 namespace_builder
                     .registrations
                     .iter()
-                    .map(|registration| registration.method.clone()),
+                    .map(|registration| BindingName::from(registration.method.clone())),
             );
             let slots = names.iter().map(|name| {
                 let source = match image.binding(name) {
@@ -242,7 +242,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         match (
                             &binding.closure,
                             self.parses
-                                .shape(&(package, SourceKey::Binding(name.clone()))),
+                                .shape(&(package, SourceKey::Binding(name.to_string()))),
                         ) {
                             (Some(closure), Some(normalized_shape))
                                 if closure.environment == namespace_label =>
@@ -276,7 +276,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
             for registration in &namespace_builder.registrations {
-                let Some(&method) = namespace.bindings.get(&registration.method) else {
+                let Some(&method) = namespace.bindings.get(registration.method.as_str()) else {
                     continue;
                 };
                 builder.attach_s3_registration(
@@ -365,7 +365,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                 self.external_bindings
                                     .keys()
                                     .filter(|(owner, _)| self.packages.name(*owner) == target)
-                                    .map(|(_, name)| name.clone())
+                                    .map(|(_, name)| name.to_string())
                                     .collect()
                             });
                         (
@@ -382,8 +382,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     continue;
                 };
                 for (local, remote) in pairs {
-                    if let Some(&binding) = target.bindings.get(&remote) {
-                        builder.attach_import(owner, local, binding);
+                    if let Some(&binding) = target.bindings.get(remote.as_str()) {
+                        builder.attach_import(owner, local.into(), binding);
                         namespace_dependencies
                             .entry(owner)
                             .or_default()
