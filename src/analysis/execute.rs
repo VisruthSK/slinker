@@ -9,7 +9,7 @@ use crate::analysis::{EdgeKind, Need, NodeId};
 use crate::package::{PackageId, PackageImage, PackageProvider};
 use crate::syntax::{
     ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
-    ConstructionTarget, ParsedRFile, Span,
+    ConstructionTarget, ParsedRFile, SourceKey, Span,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -34,7 +34,7 @@ pub(super) enum AbstractValue {
 pub(super) struct ConstructionCallKey {
     node: NodeId,
     package: PackageId,
-    owner: String,
+    owner: SourceKey,
     arguments: Vec<(Option<String>, AbstractValue)>,
 }
 
@@ -606,7 +606,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 else {
                     return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
                 };
-                (closure, binding.to_owned())
+                (closure, SourceKey::Binding(binding.to_owned()))
             }
         };
         let specialized = arguments
@@ -629,13 +629,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.construction_calls
             .insert(memo.clone(), AbstractValue::Unknown);
         self.construction_evaluations += 1;
+        let owner_name = owner.to_string();
         let Some(parsed) = self.parsed_source(
             context.package,
             closure.source,
             context.image,
             &closure.environment,
             ParseRequest {
-                owner_binding: &owner,
+                owner_binding: &owner_name,
                 source_key: &owner,
                 owner_node: context.node,
             },

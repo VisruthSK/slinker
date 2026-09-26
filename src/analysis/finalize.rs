@@ -13,7 +13,7 @@ use crate::package::{
     ImportSpec, NativeComponent, PackageAvailability, PackageId, PackageProvider,
 };
 use crate::source::generated_description;
-use crate::syntax::Sources;
+use crate::syntax::{SourceKey, Sources};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -241,7 +241,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(binding) => {
                         match (
                             &binding.closure,
-                            self.parses.shape(&(package, name.clone())),
+                            self.parses
+                                .shape(&(package, SourceKey::Binding(name.clone()))),
                         ) {
                             (Some(closure), Some(normalized_shape))
                                 if closure.environment == namespace_label =>
@@ -442,16 +443,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for relocation in self.relocations.relocations() {
             let source = relocation.source();
             let origin = self.parses.sources().origin(&source.source);
-            let (owner_package, owner_binding) = (&origin.package, &origin.binding);
-            let Some(code) = namespace_ids[owner_package.as_str()]
-                .bindings
-                .get(owner_binding)
+            let owner_package = &origin.package;
+            let Some(code) = origin
+                .key
+                .namespace_binding()
+                .and_then(|binding| namespace_ids[owner_package.as_str()].bindings.get(binding))
                 .and_then(|binding| builder.binding_code(*binding))
             else {
                 if relocation.reaches_removed_installation() {
                     issues.push(FinalizationIssue::NonRelocatableCode {
                         package: owner_package.clone(),
-                        binding: owner_binding.clone(),
+                        binding: origin.key.to_string(),
                     });
                 }
                 continue;

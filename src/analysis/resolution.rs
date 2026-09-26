@@ -5,7 +5,7 @@ use crate::analysis::{EdgeKind, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{ImportSpec, PackageId, PackageImage, PackageProvider};
 use crate::syntax::{
-    NamespaceImportResolution, NamespaceImports, OakParseContext, Span,
+    NamespaceImportResolution, NamespaceImports, OakParseContext, SourceKey, Span,
     closure_definitely_non_returning,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -242,15 +242,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
         ))
     }
 
-    pub(super) fn private_source_key(environment: &str, binding: &str) -> String {
-        format!("{environment}${binding}")
+    pub(super) fn private_source_key(environment: &str, binding: &str) -> SourceKey {
+        SourceKey::Private {
+            environment: environment.to_owned(),
+            binding: binding.to_owned(),
+        }
     }
 
     pub(super) fn closure_execution_source(
         &self,
         package: PackageId,
         closure: ClosureId,
-    ) -> Option<(ClosureObject, String, String, String)> {
+    ) -> Option<(ClosureObject, SourceKey, SourceKey, String)> {
         let graph = self.objects.get(package)?;
         let closure = graph.closure(closure).clone();
         let environment = graph.environment(closure.enclosure).label.clone();
@@ -259,11 +262,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
             &closure.provenance.private_environment,
             &closure.provenance.private_binding,
         ) {
-            (Some(binding), _, _) => binding.clone(),
+            (Some(binding), _, _) => SourceKey::Binding(binding.clone()),
             (_, Some(private), Some(binding)) => Self::private_source_key(private, binding),
-            _ => "runtime".into(),
+            _ => SourceKey::Runtime,
         };
-        let source_key = format!("{owner}{}@{environment}", closure.provenance.path);
+        let source_key = SourceKey::Closure {
+            owner: Box::new(owner.clone()),
+            path: closure.provenance.path.clone(),
+            environment: environment.clone(),
+        };
         Some((closure, owner, source_key, environment))
     }
 

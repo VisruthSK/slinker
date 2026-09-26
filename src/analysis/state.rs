@@ -7,7 +7,7 @@ use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
 use super::namespace::NamespaceBuilder;
 use super::need::{NeedQueue, Popped};
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
-use super::parse_cache::{ParseCache, ParseState};
+use super::parse_cache::{ParseCache, ParseKey, ParseState};
 use super::reflection::ReflectionFacts;
 use super::relocation::{NamespaceCall, PendingRelocation, RelocationPlan, SyntaxObservation};
 use super::resolution::{BindingTarget, OpenReason, Resolution};
@@ -26,8 +26,8 @@ use crate::package::{
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, OakParseContext,
-    OakParser, PackageGuard, ParsedExpression, ParsedRFile, SemanticIssueKind, SourceId, Span,
-    StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    OakParser, PackageGuard, ParsedExpression, ParsedRFile, SemanticIssueKind, SourceId, SourceKey,
+    Span, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::{Error, Result};
 use rayon::prelude::*;
@@ -46,7 +46,7 @@ pub(super) struct ParsedSite<'a> {
 
 pub(super) struct ParseRequest<'a> {
     pub(super) owner_binding: &'a str,
-    pub(super) source_key: &'a str,
+    pub(super) source_key: &'a SourceKey,
     pub(super) owner_node: NodeId,
 }
 
@@ -274,9 +274,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn preparse_frontier_bindings(&mut self, frontier: usize) -> Result<()> {
         struct Work {
-            key: (PackageId, String),
+            key: ParseKey,
             owner_binding: String,
-            source_key: String,
+            source_key: SourceKey,
             owner_node: NodeId,
             source: SourceId,
             text: Arc<str>,
@@ -285,7 +285,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
         let needs = self.needs.upcoming(frontier).cloned().collect::<Vec<_>>();
         let mut work = Vec::<Work>::new();
-        let mut scheduled = HashSet::<(PackageId, String)>::new();
+        let mut scheduled = HashSet::<ParseKey>::new();
 
         for need in needs {
             let (id, owner_binding, source_key, closure, owner_node, image) = match need {
@@ -307,7 +307,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         package: id,
                         binding: binding.clone(),
                     });
-                    (id, binding.clone(), binding, closure, owner_node, image)
+                    (
+                        id,
+                        binding.clone(),
+                        SourceKey::Binding(binding),
+                        closure,
+                        owner_node,
+                        image,
+                    )
                 }
                 Need::PrivateBinding {
                     package: id,
@@ -334,7 +341,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     let source_key = Self::private_source_key(&environment, &binding);
                     (
                         id,
-                        source_key.clone(),
+                        source_key.to_string(),
                         source_key,
                         closure,
                         owner_node,
@@ -360,7 +367,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     });
                     (
                         id,
-                        owner_source,
+                        owner_source.to_string(),
                         source_key,
                         ClosureSource {
                             source: closure_object.source,
@@ -503,12 +510,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             return Ok(());
         };
+        let owner_name = owner_source.to_string();
 
         if environment.starts_with("unsupported:") {
             self.diagnostic(
                 node,
                 id,
-                Some(&owner_source),
+                Some(&owner_name),
                 RejectCode::UnknownClosureEnclosure,
                 format!("executable closure has unknown enclosure `{environment}`"),
                 None,
@@ -520,21 +528,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             &image,
             &environment,
             ParseRequest {
-                owner_binding: &owner_source,
+                owner_binding: &owner_name,
                 source_key: &source_key,
                 owner_node: node,
             },
         )? {
             let image =
                 self.prepare_construction_image(id, &image, &environment, parsed.as_ref())?;
-            self.process_parsed(
-                node,
-                id,
-                &image,
-                &owner_source,
-                &environment,
-                parsed.as_ref(),
-            )?;
+            self.process_parsed(node, id, &image, &owner_name, &environment, parsed.as_ref())?;
         }
         Ok(())
     }
@@ -882,6 +883,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.require_member_closures(node, id, object);
 
         let source_key = Self::private_source_key(&environment, &binding);
+        let source_name = source_key.to_string();
         if let Some(closure) = &binding_image.closure {
             if closure.environment.starts_with("unsupported:") {
                 self.diagnostic(
@@ -902,7 +904,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 &image,
                 &closure.environment,
                 ParseRequest {
-                    owner_binding: &source_key,
+                    owner_binding: &source_name,
                     source_key: &source_key,
                     owner_node: node,
                 },
@@ -917,7 +919,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     node,
                     id,
                     &image,
-                    &source_key,
+                    &source_name,
                     &closure.environment,
                     parsed.as_ref(),
                 )?;
@@ -1393,7 +1395,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             &closure.environment,
             ParseRequest {
                 owner_binding: binding,
-                source_key: binding,
+                source_key: &SourceKey::Binding(binding.to_owned()),
                 owner_node: node,
             },
         )
@@ -1412,7 +1414,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             source_key,
             owner_node,
         } = request;
-        let key = (id, source_key.to_owned());
+        let key = (id, source_key.clone());
         if let Some(state) = self.parses.state(&key) {
             return Ok(match state {
                 ParseState::Parsed(parsed) => Some(Arc::clone(parsed)),
@@ -1442,11 +1444,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         id: PackageId,
         owner_binding: &str,
-        source_key: &str,
+        source_key: &SourceKey,
         owner_node: NodeId,
         text: &Arc<str>,
     ) -> Result<Option<SourceId>> {
-        let key = (id, source_key.to_owned());
+        let key = (id, source_key.clone());
         let source = self
             .parses
             .register(key.clone(), self.packages.name(id), text);
@@ -1474,11 +1476,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         id: PackageId,
         owner_binding: &str,
-        source_key: &str,
+        source_key: &SourceKey,
         owner_node: NodeId,
         air_error: String,
     ) -> Result<()> {
-        let key = (id, source_key.to_owned());
+        let key = (id, source_key.clone());
         let (source_id, source_text) = self.parses.registered(&key).ok_or_else(|| {
             Error::Analysis(format!(
                 "missing virtual source for {}::{source_key}",
@@ -2953,7 +2955,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .closure_execution_source(*package, *closure)
                     .expect("closure execution need references the package object graph");
                 NodeKind::ClosureObject {
-                    owner,
+                    owner: owner.to_string(),
                     path: closure.provenance.path,
                     enclosure,
                     derived: closure.derived_from.is_some(),

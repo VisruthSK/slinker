@@ -14,4 +14,4 @@ pub(crate) use oak::{
     NamespaceImportResolution, NamespaceImports, closure_definitely_non_returning,
 };
 pub use oak::{OakParseContext, OakParser, RParser};
-pub use source::{SourceId, SourceOrigin, Sources, Span, TextRange};
+pub use source::{SourceId, SourceKey, SourceOrigin, Sources, Span, TextRange};

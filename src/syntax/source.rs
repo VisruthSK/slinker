@@ -45,15 +45,57 @@ impl TextRange {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SourceKey {
+    Binding(String),
+    Private {
+        environment: String,
+        binding: String,
+    },
+    Closure {
+        owner: Box<SourceKey>,
+        path: String,
+        environment: String,
+    },
+    Runtime,
+}
+
+impl SourceKey {
+    pub fn namespace_binding(&self) -> Option<&str> {
+        match self {
+            Self::Binding(name) => Some(name),
+            Self::Private { .. } | Self::Closure { .. } | Self::Runtime => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SourceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Binding(name) => f.write_str(name),
+            Self::Private {
+                environment,
+                binding,
+            } => write!(f, "{environment}${binding}"),
+            Self::Closure {
+                owner,
+                path,
+                environment,
+            } => write!(f, "{owner}{path}@{environment}"),
+            Self::Runtime => f.write_str("runtime"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceOrigin {
     pub package: String,
-    pub binding: String,
+    pub key: SourceKey,
 }
 
 impl SourceOrigin {
     pub fn display(&self) -> String {
-        format!("{}::{}", self.package, self.binding)
+        format!("{}::{}", self.package, self.key)
     }
 }
 
@@ -69,17 +111,17 @@ pub struct Sources {
 }
 
 impl Sources {
-    pub fn add_binding(
+    pub fn add(
         &mut self,
         package: impl Into<String>,
-        binding: impl Into<String>,
+        key: SourceKey,
         text: impl Into<Arc<str>>,
     ) -> SourceId {
         let id = SourceId(self.entries.len());
         self.entries.push(SourceEntry {
             origin: SourceOrigin {
                 package: package.into(),
-                binding: binding.into(),
+                key,
             },
             text: text.into(),
         });

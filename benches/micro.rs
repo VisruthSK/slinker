@@ -10,7 +10,7 @@ use slinker::package::{
     InstalledPackage, LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage, PackageIndex,
     PackageLocation, PackageLocator, PackageProvider, PackageStore, SyntaxValidation,
 };
-use slinker::syntax::{OakParseContext, OakParser, Sources};
+use slinker::syntax::{OakParseContext, OakParser, SourceKey, Sources};
 use slinker::{Description, Result, Target, TargetEnvironment, TargetEnvironmentRequest};
 use std::collections::{BTreeSet, HashMap};
 use std::hint::black_box;
@@ -44,7 +44,7 @@ fn oak_parse(criterion: &mut Criterion) {
                 bench.iter_batched(
                     || {
                         let mut sources = Sources::default();
-                        sources.add_binding("bench", "large", text.as_str())
+                        sources.add("bench", SourceKey::Binding("large".into()), text.as_str())
                     },
                     |source| {
                         OakParser
