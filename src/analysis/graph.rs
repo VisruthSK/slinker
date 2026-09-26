@@ -128,8 +128,8 @@ impl Graph {
         let id = NodeId(self.nodes.len());
         self.nodes.push(Node {
             id,
-            package: package.clone(),
-            kind: kind.clone(),
+            package,
+            kind,
             span,
             bytes: 0,
         });

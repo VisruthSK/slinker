@@ -197,7 +197,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             while seen.insert(environment_id) {
                 let shape = graph.environment(environment_id);
                 if !shape.derived {
-                    environment = shape.label.clone();
+                    environment.clone_from(&shape.label);
                     break;
                 }
                 for name in shape.bindings.keys() {
@@ -501,7 +501,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         binding: Option<&str>,
         resolved: Resolution<BindingTarget>,
         span: Span,
-    ) -> Result<()> {
+    ) {
         match resolved {
             Resolution::Static(BindingTarget::Namespace { package, binding }) => self.require_at(
                 from,
@@ -511,7 +511,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 },
                 EdgeKind::Lexical,
                 format!("lexical reference `{binding}`"),
-                Some(span.clone()),
+                Some(span),
             ),
             Resolution::Static(BindingTarget::Private {
                 package,
@@ -526,14 +526,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 },
                 EdgeKind::Lexical,
                 format!("lexical private reference `{binding}` in {environment}"),
-                Some(span.clone()),
+                Some(span),
             ),
             Resolution::Static(BindingTarget::Closure { package, closure }) => self.require_at(
                 from,
                 Need::ClosureExecution { package, closure },
                 EdgeKind::ClosureExecution,
                 "reachable lexical reference resolves to an executable retained closure",
-                Some(span.clone()),
+                Some(span),
             ),
             Resolution::Static(BindingTarget::Native {
                 package,
@@ -547,7 +547,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 },
                 EdgeKind::Native,
                 format!("registered native symbol `{native_binding}` is provided by `{component}`"),
-                Some(span.clone()),
+                Some(span),
             ),
             Resolution::Static(BindingTarget::Imported { package, binding }) => {
                 self.require_at(
@@ -565,7 +565,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     },
                     EdgeKind::Import,
                     format!("imported binding `{binding}`"),
-                    Some(span.clone()),
+                    Some(span),
                 );
             }
             Resolution::Static(BindingTarget::External { package, binding }) => {
@@ -608,14 +608,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
             Resolution::OpenDynamic(OpenReason::MissingPackage { package, binding }) => {
-                let detail = binding
-                    .as_deref()
-                    .map(|name| {
+                let detail = binding.as_deref().map_or_else(
+                    || format!("reachable reference requires missing namespace {package}"),
+                    |name| {
                         format!("imported binding `{name}` requires missing namespace {package}")
-                    })
-                    .unwrap_or_else(|| {
-                        format!("reachable reference requires missing namespace {package}")
-                    });
+                    },
+                );
                 self.record_missing_package(
                     from,
                     requester,
@@ -625,7 +623,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(span),
                 );
             }
-            Resolution::Static(BindingTarget::Local) | Resolution::Static(BindingTarget::Base) => {}
+            Resolution::Static(BindingTarget::Local | BindingTarget::Base) => {}
             Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
                 self.assume(
                     from,
@@ -637,6 +635,5 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
         }
-        Ok(())
     }
 }

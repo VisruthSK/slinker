@@ -307,6 +307,10 @@ impl GeneratedPackage {
 }
 
 /// Materialize a preflight-approved ProgramIr into a generated R source package.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "consuming the preflight capability makes each approved program materialize once"
+)]
 pub fn materialize(
     buildable: BuildableProgram<'_, PureRStatic>,
     output: &Path,
@@ -401,7 +405,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     let root_on_load = program.root_artifact().on_load;
     let mut root_code = String::new();
     for closure in namespace_closures(program, root) {
-        let source = relocated_source(program, program.closure(closure).code)?;
+        let source = relocated_source(program, program.closure(closure).code);
         if Some(closure) == root_on_load {
             let value_start = program
                 .code(program.closure(closure).code)
@@ -469,7 +473,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             );
         }
         for closure in namespace_closures(program, namespace) {
-            let source = relocated_source(program, program.closure(closure).code)?;
+            let source = relocated_source(program, program.closure(closure).code);
             emit!(
                 out,
                 "    eval(parse(text = {}), envir = ns)",
@@ -692,10 +696,7 @@ fn render_namespace(program: &ProgramIr) -> String {
     out
 }
 
-fn relocated_source(
-    program: &ProgramIr,
-    code: crate::ir::CodeId,
-) -> Result<String, MaterializeError> {
+fn relocated_source(program: &ProgramIr, code: crate::ir::CodeId) -> String {
     let code_ir = program.code(code);
     let mut source = code_ir.source().to_owned();
     let mut relocations = program
@@ -742,7 +743,7 @@ fn relocated_source(
         };
         source.replace_range(occurrence.start..occurrence.end, &replacement);
     }
-    Ok(source)
+    source
 }
 
 fn validate_r_source(worker: &mut WorkerClient, source: &str) -> Result<(), MaterializeError> {
@@ -762,7 +763,7 @@ fn validate_program_code(
     worker: &mut WorkerClient,
 ) -> Result<(), MaterializeError> {
     for (code_id, code) in program.indexed_codes() {
-        let emitted = relocated_source(program, code_id)?;
+        let emitted = relocated_source(program, code_id);
         let normalized = worker.normalize_syntax(&emitted)?;
         let normalized_again = worker.normalize_syntax(&normalized)?;
         if normalized != normalized_again {

@@ -48,22 +48,26 @@ impl<P: PackageProvider> Linker<P> {
         Self(AnalyzerState::new(packages, jobs))
     }
 
+    #[must_use]
     pub fn with_policy(mut self, policy: LinkPolicy) -> Self {
         self.0.policy = policy;
         self
     }
 
+    #[must_use]
     pub fn without_provenance(mut self) -> Self {
         self.0.provenance = false;
         self
     }
 
+    #[must_use]
     pub fn with_extra_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
         self.0.extra_packages.extend(packages);
         self
     }
 
     /// Keep the named packages External; frozen before any package resolves.
+    #[must_use]
     pub fn with_external_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
         let packages = packages.into_iter().collect::<Vec<_>>();
         self.0
@@ -74,6 +78,7 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     /// Supply the frozen root DESCRIPTION used to plan the generated package.
+    #[must_use]
     pub fn with_root_source(mut self, description: impl Into<Arc<str>>) -> Self {
         self.0.root_description = Some(description.into());
         self

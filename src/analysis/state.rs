@@ -44,12 +44,14 @@ pub(super) struct ParsedSite<'a> {
     lexical_environment: &'a str,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct ParseRequest<'a> {
     pub(super) owner_binding: &'a str,
     pub(super) source_key: &'a SourceKey,
     pub(super) owner_node: NodeId,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct NativeCallbackContext<'a> {
     pub(super) owner: NodeId,
     pub(super) package: PackageId,
@@ -407,7 +409,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             work.par_iter()
                 .map(|item| {
                     OakParser.parse_binding_with_context(
-                        item.source.clone(),
+                        item.source,
                         item.text.as_ref(),
                         &item.context,
                     )
@@ -421,7 +423,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 work.iter()
                     .map(|item| {
                         OakParser.parse_binding_with_context(
-                            item.source.clone(),
+                            item.source,
                             item.text.as_ref(),
                             &item.context,
                         )
@@ -432,7 +434,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             work.iter()
                 .map(|item| {
                     OakParser.parse_binding_with_context(
-                        item.source.clone(),
+                        item.source,
                         item.text.as_ref(),
                         &item.context,
                     )
@@ -451,7 +453,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         &item.owner_binding,
                         &item.source_key,
                         item.owner_node,
-                        error,
+                        &error,
                     )?;
                 }
             }
@@ -461,24 +463,27 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn process_need(&mut self, need: Need) -> Result<()> {
         match need {
-            Need::Binding { package, binding } => self.process_binding(package, binding),
+            Need::Binding { package, binding } => self.process_binding(package, &binding),
             Need::PrivateBinding {
                 package,
                 environment,
                 binding,
-            } => self.process_private_binding(package, environment, binding),
+            } => self.process_private_binding(package, &environment, &binding),
             Need::ClosureExecution { package, closure } => {
                 self.process_closure_execution(package, closure)
             }
             Need::Activation { package } => self.process_activation(package),
-            Need::Resource { package, resource } => self.process_resource(package, resource),
-            Need::Dataset { package, dataset } => self.process_dataset(package, dataset),
+            Need::Resource { package, resource } => self.process_resource(package, &resource),
+            Need::Dataset { package, dataset } => self.process_dataset(package, &dataset),
             Need::S3Registration {
                 package,
                 registration,
-            } => self.process_s3(package, registration),
-            Need::Native { package, component } => self.process_native(package, component),
-            Need::Lifecycle { package, hook } => self.process_lifecycle(package, hook),
+            } => self.process_s3(package, &registration),
+            Need::Native { package, component } => self.process_native(package, &component),
+            Need::Lifecycle { package, hook } => {
+                self.process_lifecycle(package, hook);
+                Ok(())
+            }
         }
     }
 
@@ -524,7 +529,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         if let Some(parsed) = self.parsed_source(
             id,
-            Arc::clone(&closure_object.source),
+            &closure_object.source,
             &image,
             &environment,
             ParseRequest {
@@ -540,7 +545,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_binding(&mut self, id: PackageId, binding: BindingName) -> Result<()> {
+    pub(super) fn process_binding(&mut self, id: PackageId, binding: &BindingName) -> Result<()> {
         let node = self.need_node(&Need::Binding {
             package: id,
             binding: binding.clone(),
@@ -549,15 +554,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.external.insert(id);
             return Ok(());
         }
-        let image = self.binding_image(id, &binding)?;
-        let Some(binding_image) = image.binding(&binding).cloned() else {
-            return self.process_absent_binding(node, id, &image, &binding);
+        let image = self.binding_image(id, binding)?;
+        let Some(binding_image) = image.binding(binding).cloned() else {
+            return self.process_absent_binding(node, id, &image, binding);
         };
-        self.diagnose_binding_object(node, id, &binding, &binding_image);
-        let object = self.objects.graph(id).namespace_binding(&binding);
+        self.diagnose_binding_object(node, id, binding, &binding_image);
+        let object = self.objects.graph(id).namespace_binding(binding);
         self.require_member_closures(node, id, object);
         if let Some(closure) = &binding_image.closure {
-            self.process_binding_closure(node, id, &image, &binding, &binding_image, closure)?;
+            self.process_binding_closure(node, id, &image, binding, &binding_image, closure)?;
         }
         Ok(())
     }
@@ -671,20 +676,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
                 return Ok(true);
             }
-            Resolution::Static(BindingTarget::Base)
-            | Resolution::Static(BindingTarget::Metadata { .. }) => return Ok(true),
+            Resolution::Static(BindingTarget::Base | BindingTarget::Metadata { .. }) => {
+                return Ok(true);
+            }
             Resolution::OpenDynamic(OpenReason::MissingPackage {
                 package,
                 binding: foreign_binding,
             }) => {
-                let detail = foreign_binding
-                    .as_deref()
-                    .map(|name| {
-                        format!("root re-export `{binding}` requires missing {package}::{name}")
-                    })
-                    .unwrap_or_else(|| {
-                        format!("root re-export `{binding}` requires missing namespace {package}")
-                    });
+                let detail = foreign_binding.as_deref().map_or_else(
+                    || format!("root re-export `{binding}` requires missing namespace {package}"),
+                    |name| format!("root re-export `{binding}` requires missing {package}::{name}"),
+                );
                 self.record_missing_package(node, id, &package, EdgeKind::Export, detail, None);
                 return Ok(true);
             }
@@ -699,10 +701,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
                 return Ok(true);
             }
-            Resolution::Static(BindingTarget::Namespace { .. })
-            | Resolution::Static(BindingTarget::Private { .. })
-            | Resolution::Static(BindingTarget::Closure { .. })
-            | Resolution::Static(BindingTarget::Local) => {}
+            Resolution::Static(
+                BindingTarget::Namespace { .. }
+                | BindingTarget::Private { .. }
+                | BindingTarget::Closure { .. }
+                | BindingTarget::Local,
+            ) => {}
         }
         Ok(false)
     }
@@ -848,12 +852,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn process_private_binding(
         &mut self,
         id: PackageId,
-        environment: String,
-        binding: BindingName,
+        environment: &str,
+        binding: &BindingName,
     ) -> Result<()> {
         let node = self.need_node(&Need::PrivateBinding {
             package: id,
-            environment: environment.clone(),
+            environment: environment.to_owned(),
             binding: binding.clone(),
         });
         if self.packages.is_external(id) {
@@ -861,11 +865,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let image = self.image(id)?;
-        let Some(binding_image) = image.private_binding(&environment, &binding).cloned() else {
+        let Some(binding_image) = image.private_binding(environment, binding).cloned() else {
             self.diagnostic(
                 node,
                 id,
-                Some(&binding),
+                Some(binding),
                 RejectCode::UnresolvedBinding,
                 format!("private environment `{environment}` has no binding `{binding}`"),
                 None,
@@ -873,10 +877,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         };
 
-        self.diagnose_private_object(node, id, &environment, &binding, &binding_image);
+        self.diagnose_private_object(node, id, environment, binding, &binding_image);
         let object = {
             let graph = self.objects.graph(id);
-            graph.environment_id(&environment).and_then(|private| {
+            graph.environment_id(environment).and_then(|private| {
                 graph
                     .environment(private)
                     .bindings
@@ -886,14 +890,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         self.require_member_closures(node, id, object);
 
-        let source_key = Self::private_source_key(&environment, &binding);
+        let source_key = Self::private_source_key(environment, binding);
         let source_name = source_key.to_string();
         if let Some(closure) = &binding_image.closure {
             if closure.environment.starts_with("unsupported:") {
                 self.diagnostic(
                     node,
                     id,
-                    Some(&binding),
+                    Some(binding),
                     RejectCode::UnknownClosureEnclosure,
                     format!(
                         "private closure enclosure `{}` cannot be modeled",
@@ -904,7 +908,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             if let Some(parsed) = self.parsed_source(
                 id,
-                Arc::clone(&closure.source),
+                &closure.source,
                 &image,
                 &closure.environment,
                 ParseRequest {
@@ -1241,7 +1245,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Some(site.binding),
                 resolved,
                 reference.span.clone(),
-            )?;
+            );
         }
         Ok(())
     }
@@ -1394,7 +1398,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         });
         self.parsed_source(
             id,
-            Arc::clone(&closure.source),
+            &closure.source,
             package_image,
             &closure.environment,
             ParseRequest {
@@ -1408,7 +1412,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn parsed_source(
         &mut self,
         id: PackageId,
-        source_text: Arc<str>,
+        source_text: &Arc<str>,
         image: &PackageImage,
         lexical_environment: &str,
         request: ParseRequest<'_>,
@@ -1426,7 +1430,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             });
         }
         let Some(source) =
-            self.admit_source(id, owner_binding, source_key, owner_node, &source_text)?
+            self.admit_source(id, owner_binding, source_key, owner_node, source_text)?
         else {
             return Ok(None);
         };
@@ -1438,7 +1442,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Ok(Some(parsed))
             }
             Err(error) => {
-                self.handle_air_rejection(id, owner_binding, source_key, owner_node, error)?;
+                self.handle_air_rejection(id, owner_binding, source_key, owner_node, &error)?;
                 Ok(None)
             }
         }
@@ -1482,7 +1486,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         owner_binding: &str,
         source_key: &SourceKey,
         owner_node: NodeId,
-        air_error: String,
+        air_error: &str,
     ) -> Result<()> {
         let key = (id, source_key.clone());
         let (source_id, source_text) = self.parses.registered(&key).ok_or_else(|| {
@@ -1529,7 +1533,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             hook: LifecycleHook::OnLoad,
         };
         if self.needs.start(&lifecycle) {
-            self.process_lifecycle(id, LifecycleHook::OnLoad)?;
+            self.process_lifecycle(id, LifecycleHook::OnLoad);
         }
 
         let hook = Need::Binding {
@@ -1537,7 +1541,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             binding: ".onLoad".into(),
         };
         if self.needs.start(&hook) {
-            self.process_binding(id, ".onLoad".into())?;
+            self.process_binding(id, &LifecycleHook::OnLoad.binding())?;
         }
         Ok(())
     }
@@ -1668,20 +1672,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_resource(&mut self, id: PackageId, resource: ResourcePath) -> Result<()> {
+    pub(super) fn process_resource(
+        &mut self,
+        id: PackageId,
+        resource: &ResourcePath,
+    ) -> Result<()> {
         if self.packages.is_external(id) {
             self.external.insert(id);
             return Ok(());
         }
         let _ = self.image(id)?;
-        let _present = self.packages.resource_exists(id, &resource)?;
+        let _present = self.packages.resource_exists(id, resource)?;
         // An absent system.file() path is a valid result when mustWork is false
         // (the default). The reference is retained only when the installed
         // image actually contains the requested path.
         Ok(())
     }
 
-    pub(super) fn process_dataset(&mut self, id: PackageId, dataset: String) -> Result<()> {
+    pub(super) fn process_dataset(&mut self, id: PackageId, dataset: &str) -> Result<()> {
         if self.packages.is_external(id) {
             self.external.insert(id);
             return Ok(());
@@ -1689,9 +1697,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let image = self.image(id)?;
         let node = self.need_node(&Need::Dataset {
             package: id,
-            dataset: dataset.clone(),
+            dataset: dataset.to_owned(),
         });
-        if !image.index.datasets.iter().any(|name| name == &dataset) {
+        if !image.index.datasets.iter().any(|name| name == dataset) {
             self.diagnostic(
                 node,
                 id,
@@ -1704,7 +1712,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_s3(&mut self, id: PackageId, registration: S3Id) -> Result<()> {
+    pub(super) fn process_s3(&mut self, id: PackageId, registration: &S3Id) -> Result<()> {
         let node = self.need_node(&Need::S3Registration {
             package: id,
             registration: registration.clone(),
@@ -1758,7 +1766,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_native(&mut self, id: PackageId, component: ComponentName) -> Result<()> {
+    pub(super) fn process_native(
+        &mut self,
+        id: PackageId,
+        component: &ComponentName,
+    ) -> Result<()> {
         if self.packages.is_external(id) {
             self.external.insert(id);
             return Ok(());
@@ -1768,7 +1780,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             package: id,
             component: component.clone(),
         });
-        if let Some(native) = index.dynlibs.iter().find(|native| component == native.name) {
+        if let Some(native) = index
+            .dynlibs
+            .iter()
+            .find(|native| *component == native.name)
+        {
             if !self.is_root(id) {
                 match &native.library {
                     Some(library) => self.require(
@@ -1838,7 +1854,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_lifecycle(&mut self, id: PackageId, hook: LifecycleHook) -> Result<()> {
+    pub(super) fn process_lifecycle(&mut self, id: PackageId, hook: LifecycleHook) {
         let node = self.need_node(&Need::Lifecycle { package: id, hook });
         self.require(
             node,
@@ -1849,7 +1865,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             EdgeKind::Lifecycle,
             format!("lifecycle hook `{hook}` must be retained"),
         );
-        Ok(())
     }
 
     pub(super) fn namespace_access(
@@ -2159,10 +2174,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         Some(binding),
                         resolved,
                         effect.span.clone(),
-                    )?;
+                    );
                 }
             } else {
-                self.require_resolved(from, package, Some(binding), resolved, effect.span.clone())?;
+                self.require_resolved(from, package, Some(binding), resolved, effect.span.clone());
             }
         }
 
@@ -2198,15 +2213,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Some(effect.span.clone()),
             ),
             Resolution::Static(BindingTarget::Local) if lexical_environment.starts_with("derived:") => {}
-            Resolution::Static(BindingTarget::Native { .. })
-            | Resolution::Static(BindingTarget::Closure { .. })
-            | Resolution::Static(BindingTarget::Imported { .. })
-            | Resolution::Static(BindingTarget::External { .. })
-            | Resolution::Static(BindingTarget::Metadata { .. })
-            | Resolution::OpenDynamic(OpenReason::MissingPackage { .. })
-            | Resolution::Static(BindingTarget::Base)
-            | Resolution::Static(BindingTarget::Local)
-            | Resolution::OpenDynamic(OpenReason::Unresolved(_)) => self.diagnostic(
+            Resolution::Static(BindingTarget::Native { .. } | BindingTarget::Closure { ..
+} | BindingTarget::Imported { .. } | BindingTarget::External { .. } |
+BindingTarget::Metadata { .. } | BindingTarget::Base | BindingTarget::Local) |
+Resolution::OpenDynamic(OpenReason::MissingPackage { .. } |
+OpenReason::Unresolved(_)) => self.diagnostic(
                 from,
                 package,
                 Some(binding),
@@ -2366,7 +2377,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if matches!(resolved, Resolution::OpenDynamic(OpenReason::Unresolved(_))) {
             return Ok(());
         }
-        self.require_resolved(from, current, None, resolved, span.clone())
+        self.require_resolved(from, current, None, resolved, span.clone());
+        Ok(())
     }
 
     pub(super) fn is_slinker_semantic_callee(name: &str) -> bool {
@@ -2435,7 +2447,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 self.attachment_call(from, current, call)?;
             }
             "requireNamespace" => {
-                self.namespace_operation(from, current, binding, call, NamespaceCall::Require)?
+                self.namespace_operation(from, current, binding, call, NamespaceCall::Require)?;
             }
             "loadNamespace" => {
                 self.namespace_operation(
@@ -2481,7 +2493,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     package: current,
                     span: call.span.clone(),
                     kind: call.callee.clone(),
-                })
+                });
             }
             _ => {}
         }

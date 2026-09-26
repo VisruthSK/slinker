@@ -169,11 +169,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     );
                 }
                 Resolution::Static(BindingTarget::Base) => {}
-                Resolution::Static(BindingTarget::Local)
-                | Resolution::Static(BindingTarget::Native { .. })
-                | Resolution::Static(BindingTarget::Metadata { .. })
-                | Resolution::OpenDynamic(OpenReason::MissingPackage { .. })
-                | Resolution::OpenDynamic(OpenReason::Unresolved(_)) => self.diagnostic(
+                Resolution::Static(BindingTarget::Local | BindingTarget::Native { .. } |
+BindingTarget::Metadata { .. }) |
+Resolution::OpenDynamic(OpenReason::MissingPackage { .. } |
+OpenReason::Unresolved(_)) => self.diagnostic(
                     native_node,
                     current,
                     Some(binding),
@@ -246,15 +245,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }));
             }
             Resolution::OpenDynamic(OpenReason::Unresolved(_)) => {}
-            Resolution::Static(BindingTarget::Local)
-            | Resolution::Static(BindingTarget::Closure { .. })
-            | Resolution::Static(BindingTarget::Namespace { .. })
-            | Resolution::Static(BindingTarget::Private { .. })
-            | Resolution::Static(BindingTarget::Imported { .. })
-            | Resolution::Static(BindingTarget::External { .. })
-            | Resolution::Static(BindingTarget::Metadata { .. })
-            | Resolution::OpenDynamic(OpenReason::MissingPackage { .. })
-            | Resolution::Static(BindingTarget::Base) => return Ok(None),
+            Resolution::Static(
+                BindingTarget::Local
+                | BindingTarget::Closure { .. }
+                | BindingTarget::Namespace { .. }
+                | BindingTarget::Private { .. }
+                | BindingTarget::Imported { .. }
+                | BindingTarget::External { .. }
+                | BindingTarget::Metadata { .. }
+                | BindingTarget::Base,
+            )
+            | Resolution::OpenDynamic(OpenReason::MissingPackage { .. }) => return Ok(None),
         }
 
         // With .registration=TRUE, R creates RegisteredNativeSymbol variables

@@ -41,7 +41,7 @@ impl PackageLocator {
             })?;
             if declared_name.as_str() != name {
                 return Err(Error::Metadata {
-                    path: description_path.clone(),
+                    path: description_path,
                     message: format!(
                         "installed directory name `{name}` disagrees with DESCRIPTION Package `{}`",
                         declared_name.as_str(),

@@ -44,7 +44,7 @@ struct PackageImageContext {
 struct WorkerRuntime {
     worker: u64,
     _arguments: Vec<CString>,
-    _contexts: HashMap<String, PackageImageContext>,
+    contexts: HashMap<String, PackageImageContext>,
 }
 
 impl WorkerRuntime {
@@ -107,7 +107,7 @@ impl WorkerRuntime {
         Ok(Self {
             worker: target.worker,
             _arguments: arguments,
-            _contexts: HashMap::new(),
+            contexts: HashMap::new(),
         })
     }
 
@@ -155,7 +155,7 @@ impl WorkerRuntime {
         package: &protocol::PackageSpec,
     ) -> std::result::Result<WorkerPackageIndex, InspectionError> {
         let key = package.root.to_string_lossy().into_owned();
-        if !self._contexts.contains_key(&key) {
+        if !self.contexts.contains_key(&key) {
             if !package.root.is_dir() {
                 return Err(format!(
                     "installed package directory does not exist: {}",
@@ -173,26 +173,28 @@ impl WorkerRuntime {
                         package.name
                     )
                 })?;
-            self._contexts.insert(
+            self.contexts.insert(
                 key.clone(),
                 PackageImageContext {
                     image: context,
                     epoch: InspectionEpoch {
                         worker: self.worker,
-                        context: self._contexts.len() + 1,
+                        context: self.contexts.len() + 1,
                     },
                     private_ids: HashMap::new(),
                 },
             );
         }
         let context = self
-            ._contexts
+            .contexts
             .get(&key)
             .expect("package image context inserted")
             .image
             .clone();
         let mut index = worker_package_index(&context)?;
-        index.image_fingerprint = package.image_fingerprint.clone();
+        index
+            .image_fingerprint
+            .clone_from(&package.image_fingerprint);
         Ok(index)
     }
 
@@ -206,7 +208,7 @@ impl WorkerRuntime {
             .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let key = package.root.to_string_lossy();
         let context = self
-            ._contexts
+            .contexts
             .get(key.as_ref())
             .expect("package context created by index request");
         let image_environment = field(&context.image, "image_env")
@@ -216,7 +218,7 @@ impl WorkerRuntime {
                 format!("installed image has no binding {name}").into(),
             ));
         }
-        self.binding_value(package, name, index)
+        self.binding_value(package, name, &index)
             .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
     }
 
@@ -224,11 +226,11 @@ impl WorkerRuntime {
         &mut self,
         package: &protocol::PackageSpec,
         name: &str,
-        index: WorkerPackageIndex,
+        index: &WorkerPackageIndex,
     ) -> std::result::Result<protocol::WorkerBinding, InspectionError> {
         let key = package.root.to_string_lossy();
         let context = self
-            ._contexts
+            .contexts
             .get_mut(key.as_ref())
             .expect("package context created by index request");
         let image_environment = harp::RObjectExt::elt(&context.image, "image_env")
@@ -251,7 +253,7 @@ impl WorkerRuntime {
             context.epoch,
         );
         let binding = scanner.top_binding(name, origin, binding.value)?;
-        context.private_ids = scanner.private_ids.clone();
+        context.private_ids.clone_from(&scanner.private_ids);
         if binding.name != name || index.name != package.name || index.version != package.version {
             return Err(format!(
                 "installed binding identity changed while inspecting {}::{name}",
@@ -276,7 +278,7 @@ impl WorkerRuntime {
         self.package_index(package)
             .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let context = self
-            ._contexts
+            .contexts
             .get(package.root.to_string_lossy().as_ref())
             .expect("package context created by index request");
         let image_environment = field(&context.image, "image_env")
@@ -365,7 +367,7 @@ fn worker_package_index(
     let export_bindings = Vec::<String>::try_from(&installed_exports)?;
     let mut export_names = names(installed_exports.sexp);
     if export_names.len() != export_bindings.len() {
-        export_names = export_bindings.clone();
+        export_names.clone_from(&export_bindings);
     }
     let mut exports = export_names
         .into_iter()
@@ -414,7 +416,7 @@ fn worker_package_index(
             let remote = Vec::<String>::try_from(remote_object)?;
             let mut local = names(remote_object.sexp);
             if local.len() != remote.len() {
-                local = remote.clone();
+                local.clone_from(&remote);
             } else {
                 for (local, remote) in local.iter_mut().zip(&remote) {
                     if local.is_empty() {

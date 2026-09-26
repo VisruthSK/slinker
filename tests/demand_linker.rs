@@ -1590,7 +1590,7 @@ fn registered_native_symbol_is_not_an_unresolved_r_binding() {
             name: "root".into(),
             registration: Some(NativeRegistration {
                 prefix: "c".into(),
-                suffix: "".into(),
+                suffix: String::new(),
             }),
             symbols: vec![NativeSymbolBinding {
                 binding: "croot_f".into(),
@@ -1621,8 +1621,8 @@ fn opaque_registered_component() -> NativeComponent {
     NativeComponent {
         name: "root".into(),
         registration: Some(NativeRegistration {
-            prefix: "".into(),
-            suffix: "".into(),
+            prefix: String::new(),
+            suffix: String::new(),
         }),
         symbols: Vec::new(),
         routines: Vec::new(),
@@ -1792,7 +1792,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
         name: "root".into(),
         registration: Some(NativeRegistration {
             prefix: "c".into(),
-            suffix: "".into(),
+            suffix: String::new(),
         }),
         symbols: vec![NativeSymbolBinding {
             binding: "croot_f".into(),
@@ -1881,7 +1881,7 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
             name: "root".into(),
             registration: Some(NativeRegistration {
                 prefix: "c".into(),
-                suffix: "".into(),
+                suffix: String::new(),
             }),
             symbols: vec![NativeSymbolBinding {
                 binding: "croot_tick".into(),
@@ -1930,8 +1930,8 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
         vec![NativeComponent {
             name: "root".into(),
             registration: Some(NativeRegistration {
-                prefix: "".into(),
-                suffix: "".into(),
+                prefix: String::new(),
+                suffix: String::new(),
             }),
             symbols: Vec::new(),
             routines: Vec::new(),
@@ -2058,8 +2058,8 @@ fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
         vec![NativeComponent {
             name: "root".into(),
             registration: Some(NativeRegistration {
-                prefix: "".into(),
-                suffix: "".into(),
+                prefix: String::new(),
+                suffix: String::new(),
             }),
             symbols: vec![NativeSymbolBinding {
                 binding: "root_a".into(),
@@ -2117,8 +2117,8 @@ fn native_summary_accepts_oak_proven_local_closure_callback() {
         vec![NativeComponent {
             name: "root".into(),
             registration: Some(NativeRegistration {
-                prefix: "".into(),
-                suffix: "".into(),
+                prefix: String::new(),
+                suffix: String::new(),
             }),
             symbols: vec![NativeSymbolBinding {
                 binding: "root_a".into(),
@@ -2177,8 +2177,8 @@ fn native_callback_positions_ignore_named_package_and_match_named_selector() {
         vec![NativeComponent {
             name: "root".into(),
             registration: Some(NativeRegistration {
-                prefix: "".into(),
-                suffix: "".into(),
+                prefix: String::new(),
+                suffix: String::new(),
             }),
             symbols: vec![NativeSymbolBinding {
                 binding: "root_a".into(),
@@ -2220,8 +2220,8 @@ fn summarized_native_callbacks_are_not_global_component_roots() {
         vec![NativeComponent {
             name: "root".into(),
             registration: Some(NativeRegistration {
-                prefix: "".into(),
-                suffix: "".into(),
+                prefix: String::new(),
+                suffix: String::new(),
             }),
             symbols: vec![NativeSymbolBinding {
                 binding: "root_a".into(),
@@ -2254,8 +2254,8 @@ fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
         vec![NativeComponent {
             name: "root".into(),
             registration: Some(NativeRegistration {
-                prefix: "".into(),
-                suffix: "".into(),
+                prefix: String::new(),
+                suffix: String::new(),
             }),
             symbols: vec![NativeSymbolBinding {
                 binding: "root_a".into(),

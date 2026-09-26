@@ -170,7 +170,7 @@ pub enum SourcePackageError {
 fn copy_tree(source: &Path, target: &Path) -> Result<(), SourcePackageError> {
     fs::create_dir_all(target)?;
     let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
         let destination = target.join(entry.file_name());

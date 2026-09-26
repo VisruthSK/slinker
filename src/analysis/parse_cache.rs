@@ -30,14 +30,14 @@ impl ParseCache {
 
     pub(super) fn register(&mut self, key: ParseKey, package: &str, text: &Arc<str>) -> SourceId {
         let source = self.sources.add(package, key.1.clone(), Arc::clone(text));
-        self.source_ids.insert(key, source.clone());
+        self.source_ids.insert(key, source);
         source
     }
 
     pub(super) fn registered(&self, key: &ParseKey) -> Option<(SourceId, Arc<str>)> {
         let source = self.source_ids.get(key)?;
         let text = Arc::clone(&self.sources.get(source)?.text);
-        Some((source.clone(), text))
+        Some((*source, text))
     }
 
     pub(super) fn block(&mut self, key: ParseKey) {

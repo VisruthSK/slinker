@@ -602,11 +602,7 @@ fn collect_declarations(
         if !is_declare {
             continue;
         }
-        for argument in arguments
-            .items()
-            .iter()
-            .filter_map(|argument| argument.ok())
-        {
+        for argument in arguments.items().iter().filter_map(std::result::Result::ok) {
             let Some(value) = argument.value() else {
                 continue;
             };
@@ -646,11 +642,7 @@ fn collect_slinker_declaration(
     let Ok(arguments) = language.arguments() else {
         return;
     };
-    for argument in arguments
-        .items()
-        .iter()
-        .filter_map(|argument| argument.ok())
-    {
+    for argument in arguments.items().iter().filter_map(std::result::Result::ok) {
         let span = ast_span(source, &argument);
         let name = argument
             .name_clause()
@@ -802,17 +794,11 @@ fn translate_index(
     apply_guard_regions_to_calls(&hook_regions, &mut live_calls);
     guard_regions.extend(hook_regions);
 
-    let resource_refs = collect_resources(source.clone(), context, &live_calls);
-    let active_bindings = collect_active_bindings(
-        source.clone(),
-        text,
-        context,
-        index,
-        &live_calls,
-        &if_regions,
-    );
+    let resource_refs = collect_resources(source, context, &live_calls);
+    let active_bindings =
+        collect_active_bindings(source, text, context, index, &live_calls, &if_regions);
     let (mut effects, suppressed_reference_spans) = collect_superassignments(
-        source.clone(),
+        source,
         text,
         index,
         &function_regions,
@@ -822,9 +808,9 @@ fn translate_index(
     suppress_superassignment_references(&mut effects, &mut references, &suppressed_reference_spans);
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
 
-    let (parameters, construction) = collect_construction(source.clone(), text, root, &live_calls);
+    let (parameters, construction) = collect_construction(source, text, root, &live_calls);
     let calls = live_calls.into_iter().map(|call| call.site).collect();
-    let mut issues = translate_diagnostics(source.clone(), index);
+    let mut issues = translate_diagnostics(source, index);
     issues.extend(declarations.issues);
 
     let used_parameters = used_parameters(index);
@@ -983,7 +969,7 @@ fn name_references(
                 kind,
                 phase: live_use.phase,
                 guards: Vec::new(),
-                span: Span::new(source.clone(), live_use.start, live_use.end),
+                span: Span::new(*source, live_use.start, live_use.end),
             })
         })
         .collect()
@@ -1021,7 +1007,7 @@ fn lexical_calls(
                 arg_bindings,
                 phase: live_use.phase,
                 guards: Vec::new(),
-                span: Span::new(source.clone(), raw.start, raw.end),
+                span: Span::new(*source, raw.start, raw.end),
             },
             raw,
         });
@@ -1073,7 +1059,7 @@ fn namespace_access_facts(
             symbol: access.symbol().to_owned(),
             internal,
             guards: Vec::new(),
-            span: Span::new(source.clone(), start, access_end),
+            span: Span::new(*source, start, access_end),
         });
 
         if let Some(raw) = call_after_name(text, start, access_end) {
@@ -1097,7 +1083,7 @@ fn namespace_access_facts(
                     arg_bindings,
                     phase: phase_for_scope(index, scope),
                     guards: Vec::new(),
-                    span: Span::new(source.clone(), raw.start, raw.end),
+                    span: Span::new(*source, raw.start, raw.end),
                 },
                 raw,
             });
@@ -1147,7 +1133,7 @@ fn binary_operator_facts(
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
                 span: Span::new(
-                    source.clone(),
+                    *source,
                     text_offset(range.start()),
                     text_offset(range.end()),
                 ),
@@ -1237,7 +1223,7 @@ fn collect_construction(
         .ok()
         .into_iter()
         .flat_map(|parameters| parameters.items().iter().collect::<Vec<_>>())
-        .filter_map(|parameter| parameter.ok())
+        .filter_map(std::result::Result::ok)
         .filter_map(|parameter| parameter.name().ok())
         .map(|name| ast_text(text, &name))
         .collect();
@@ -1330,7 +1316,7 @@ fn construction_expr(
                 .ok()?
                 .items()
                 .iter()
-                .find_map(|argument| argument.ok())?
+                .find_map(std::result::Result::ok)?
                 .value()?;
             construction_index(source, text, subset.function().ok()?, index, calls)?
         }
@@ -1340,7 +1326,7 @@ fn construction_expr(
                 .ok()?
                 .items()
                 .iter()
-                .find_map(|item| item.ok())?
+                .find_map(std::result::Result::ok)?
                 .value()?;
             construction_index(source, text, subset.function().ok()?, index, calls)?
         }
@@ -1442,22 +1428,18 @@ fn construction_call(
             span,
         });
     }
-    let callee = site
-        .map(|site| site.callee.clone())
-        .unwrap_or_else(|| ast_text(text, &function));
+    let callee = site.map_or_else(|| ast_text(text, &function), |site| site.callee.clone());
     let kind = ConstructionExprKind::Call {
         call: ConstructionCall {
             callee,
-            callee_kind: site
-                .map(|site| site.callee_kind)
-                .unwrap_or(CalleeKind::DefinitelyLexical),
+            callee_kind: site.map_or(CalleeKind::DefinitelyLexical, |site| site.callee_kind),
             qualified_package: site.and_then(|site| site.qualified_package.clone()),
             arguments: call
                 .arguments()
                 .ok()?
                 .items()
                 .iter()
-                .filter_map(|argument| argument.ok())
+                .filter_map(std::result::Result::ok)
                 .map(|argument| ConstructionArgument {
                     name: argument
                         .name_clause()
@@ -1525,7 +1507,7 @@ fn construction_function(
             .ok()?
             .items()
             .iter()
-            .filter_map(|parameter| parameter.ok())
+            .filter_map(std::result::Result::ok)
             .filter_map(|parameter| parameter.name().ok())
             .map(|name| ast_text(text, &name))
             .collect(),
@@ -1545,13 +1527,16 @@ fn construction_target(
     calls: &[LiveCall],
 ) -> ConstructionTarget {
     match target {
-        AnyRExpression::RIdentifier(identifier) => identifier
-            .name_token()
-            .ok()
-            .map(|name| ConstructionTarget::Local {
-                name: name.text_trimmed().to_owned(),
-            })
-            .unwrap_or(ConstructionTarget::Unknown),
+        AnyRExpression::RIdentifier(identifier) => {
+            identifier
+                .name_token()
+                .ok()
+                .map_or(ConstructionTarget::Unknown, |name| {
+                    ConstructionTarget::Local {
+                        name: name.text_trimmed().to_owned(),
+                    }
+                })
+        }
         AnyRExpression::RExtractExpression(extract) => ConstructionTarget::Member {
             object: Box::new(
                 extract
@@ -1570,7 +1555,7 @@ fn construction_target(
                     arguments
                         .items()
                         .iter()
-                        .filter_map(|argument| argument.ok())
+                        .filter_map(std::result::Result::ok)
                         .next()
                 })
                 .and_then(|argument| argument.value())
@@ -1602,16 +1587,16 @@ fn construction_target(
                     arguments
                         .items()
                         .iter()
-                        .filter_map(|argument| argument.ok())
+                        .filter_map(std::result::Result::ok)
                         .next()
                 })
                 .and_then(|argument| argument.value())
                 .and_then(|closure| construction_expr(source, text, closure, calls));
-            closure
-                .map(|closure| ConstructionTarget::ClosureEnvironment {
+            closure.map_or(ConstructionTarget::Unknown, |closure| {
+                ConstructionTarget::ClosureEnvironment {
                     closure: Box::new(closure),
-                })
-                .unwrap_or(ConstructionTarget::Unknown)
+                }
+            })
         }
         _ => ConstructionTarget::Unknown,
     }
@@ -1620,7 +1605,7 @@ fn construction_target(
 fn ast_span(source: &SourceId, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> Span {
     let range = node.syntax().text_trimmed_range();
     Span::new(
-        source.clone(),
+        *source,
         text_offset(range.start()),
         text_offset(range.end()),
     )
@@ -3346,7 +3331,7 @@ fn collect_resources(
             path,
             must_work,
             guards: call.site.guards.clone(),
-            span: Span::new(source.clone(), call.site.span.start, call.site.span.end),
+            span: Span::new(source, call.site.span.start, call.site.span.end),
         });
     }
     resources
@@ -3393,7 +3378,7 @@ fn collect_active_bindings(
             target,
             certain,
             guards: call.site.guards.clone(),
-            span: Span::new(source.clone(), call.site.span.start, call.site.span.end),
+            span: Span::new(source, call.site.span.start, call.site.span.end),
         });
     }
     bindings
@@ -3542,7 +3527,7 @@ fn collect_superassignments(
                 value_symbol,
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
-                span: Span::new(source.clone(), span_start, span_end),
+                span: Span::new(source, span_start, span_end),
             });
         }
     }
@@ -3692,7 +3677,7 @@ fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<Semanti
                     "Oak could not prove one evaluation effect for `{name}`: {reason:?}"
                 ),
                 span: Some(Span::new(
-                    source.clone(),
+                    source,
                     text_offset(call_range.start()),
                     text_offset(call_range.end()),
                 )),
@@ -3704,7 +3689,7 @@ fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<Semanti
                     packages.join(", ")
                 ),
                 span: Some(Span::new(
-                    source.clone(),
+                    source,
                     text_offset(range.start()),
                     text_offset(range.end()),
                 )),
@@ -3713,7 +3698,7 @@ fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<Semanti
                 kind: SemanticIssueKind::UninstalledPackage,
                 message: format!("Oak could not resolve attached package `{package}`"),
                 span: Some(Span::new(
-                    source.clone(),
+                    source,
                     text_offset(range.start()),
                     text_offset(range.end()),
                 )),
@@ -4092,7 +4077,7 @@ fn argument_spans(source: &SourceId, arguments: &[RawArgument]) -> Vec<Option<Sp
         .iter()
         .map(|argument| {
             (argument.value.start < argument.value.end)
-                .then(|| Span::new(source.clone(), argument.value.start, argument.value.end))
+                .then(|| Span::new(*source, argument.value.start, argument.value.end))
         })
         .collect()
 }
@@ -4774,7 +4759,7 @@ fn word_boundary_after(text: &str, position: usize) -> bool {
 
 impl RParser for OakParser {
     fn parse(&self, source: SourceId, text: &str) -> Result<ParsedRFile> {
-        self.parse_binding(source.clone(), text)
+        self.parse_binding(source, text)
             .map_err(|message| Error::Parse {
                 path: format!("source:{}", source.0),
                 message,

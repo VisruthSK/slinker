@@ -520,8 +520,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             captures,
         }) = state.locals.get(&call.callee).cloned()
         {
-            return self
-                .evaluate_inline_function(context, call, &arguments, parameters, body, captures);
+            return self.evaluate_inline_function(
+                context,
+                call,
+                &arguments,
+                &parameters,
+                &body,
+                captures,
+            );
         }
 
         let resolved = match call.qualified_package.as_deref() {
@@ -563,19 +569,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
-        parameters: Vec<String>,
-        body: ConstructionExpr,
+        parameters: &[String],
+        body: &ConstructionExpr,
         captures: BTreeMap<String, AbstractValue>,
     ) -> Result<ExecutionOutcome> {
         let mut nested = ExecutionState { locals: captures };
-        bind_construction_arguments(&mut nested, &parameters, call, arguments);
+        bind_construction_arguments(&mut nested, parameters, call, arguments);
         self.evaluate_construction(
             ExecutionContext {
                 depth: context.depth + 1,
                 ..context
             },
             &mut nested,
-            &body,
+            body,
         )
     }
 
@@ -632,7 +638,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let owner_name = owner.to_string();
         let Some(parsed) = self.parsed_source(
             context.package,
-            closure.source,
+            &closure.source,
             context.image,
             &closure.environment,
             ParseRequest {
@@ -896,8 +902,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 context,
                 call,
                 std::slice::from_ref(object),
-                parameters.clone(),
-                body.clone(),
+                parameters,
+                body,
                 captures.clone(),
             )?;
         }

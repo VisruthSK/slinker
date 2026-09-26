@@ -87,11 +87,12 @@ impl S3Model {
         callable: CallableId,
         invocation: Option<Invocation>,
     ) -> Option<S3GenericKey> {
+        let generic = self.callable_generics.get(&callable).cloned();
         self.invocations
-            .entry(callable.clone())
+            .entry(callable)
             .or_default()
             .push(invocation);
-        self.callable_generics.get(&callable).cloned()
+        generic
     }
 
     fn callable_to_check(&self, key: &S3GenericKey) -> Option<&CallableId> {

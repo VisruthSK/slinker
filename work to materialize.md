@@ -194,8 +194,6 @@ Invariants into types:
   hashing matters.
 
 Minimal code:
-- Fix the `clippy::pedantic` findings that matter (redundant clones, pass-by-value, `map_or_else`,
-  missing `#[must_use]`) and enable the lints that stay useful in CI.
 - Audit the 544 `.clone()` calls on hot paths once names are interned.
 - Prune tests that pin obsolete details as each area is reworked (`tests/` is about 5,600 lines).
 

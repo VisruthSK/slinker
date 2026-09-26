@@ -154,7 +154,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 LinkedPackageRole::External => {
                     let contract = self.external_contract(
                         *package,
-                        declared.remove(identity.name.as_str()).unwrap_or_default(),
+                        &declared.remove(identity.name.as_str()).unwrap_or_default(),
                         issues,
                     );
                     contracts.push(contract.clone());
@@ -293,7 +293,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
             match materialized {
-                MaterializedRole::Root => namespaces.root_natives = image.index.dynlibs.clone(),
+                MaterializedRole::Root => namespaces.root_natives.clone_from(&image.index.dynlibs),
                 MaterializedRole::Linked => {
                     namespaces
                         .linked_natives
@@ -353,23 +353,25 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             .and_then(PackageAvailability::package)
                             .filter(|package| retained.contains(package))
                             .and_then(|package| self.images.get(&package))
-                            .map(|image| {
-                                image
-                                    .index
-                                    .exports
-                                    .values()
-                                    .map(ToString::to_string)
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_else(|| {
-                                self.external_bindings
-                                    .keys()
-                                    .filter(|(owner, _)| {
-                                        self.packages.name(*owner) == target.as_str()
-                                    })
-                                    .map(|(_, name)| name.to_string())
-                                    .collect()
-                            });
+                            .map_or_else(
+                                || {
+                                    self.external_bindings
+                                        .keys()
+                                        .filter(|(owner, _)| {
+                                            self.packages.name(*owner) == target.as_str()
+                                        })
+                                        .map(|(_, name)| name.to_string())
+                                        .collect()
+                                },
+                                |image| {
+                                    image
+                                        .index
+                                        .exports
+                                        .values()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                },
+                            );
                         (
                             target,
                             exported
@@ -592,7 +594,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn external_contract(
         &self,
         package: PackageId,
-        declared: Vec<Relation>,
+        declared: &[Relation],
         issues: &mut Vec<FinalizationIssue>,
     ) -> ExternalPackageContract {
         let identity = self.packages.identity(package);
@@ -600,7 +602,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let requirements = if declared.is_empty() {
             Vec::new()
         } else {
-            intersect_requirements(&identity.name, &declared).unwrap_or_else(|problem| {
+            intersect_requirements(&identity.name, declared).unwrap_or_else(|problem| {
                 issues.push(FinalizationIssue::IncompatibleRequirements(problem));
                 Vec::new()
             })
@@ -680,7 +682,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                     })
                             })
                             .map(move |key| (package, key.clone()))
-                    }))
+                    }));
                 }
                 Err(error) => {
                     let node = self.need_node(&Need::Activation { package });
