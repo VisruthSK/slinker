@@ -193,7 +193,6 @@ Invariants into types:
 - Names: about 54 `String` fields and 87 string collections hold package, binding, class, and
   generic names. Intern them at the worker boundary into typed symbols (`PackageName`,
   `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
-- Removed bindings and unretained exports become typed slot state instead of parallel string lists.
 
 Structure:
 - Split the rest of `AnalyzerState` into owners with narrow APIs: relocation plan, reflection

@@ -6,12 +6,13 @@ use crate::ir::{
     ExportTable, ExternalBindingAccess, ExternalPackageContract, InvalidRelocation,
     MaterializedRole, MaterializedSlot, MaterializedSlotSource, PackageIr,
     PackageRole as LinkedPackageRole, ProgramIr, RelocationTarget, RootArtifactIr, TargetContract,
+    UnretainedName,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{ImportSpec, PackageAvailability, PackageId, PackageProvider};
 use crate::source::generated_description;
 use crate::syntax::Sources;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -328,26 +329,23 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if self.packages.role(package) == LinkedPackageRole::Linked {
                 let index = &self.images[&package].index;
                 let kept = &namespace_ids[self.packages.name(package)].bindings;
-                let removed = index
+                let mut unretained = index
                     .binding_names
                     .iter()
                     .filter(|name| !kept.contains_key(*name))
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
-                let unretained_exports = index
+                    .map(|name| (name.clone(), UnretainedName::Stub))
+                    .collect::<BTreeMap<_, _>>();
+                for name in index
                     .exports
                     .values()
                     .filter(|name| !kept.contains_key(*name))
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
-                linked_contents.insert(
-                    namespace,
-                    (
-                        ExportTable::new(exports),
-                        unretained_exports.into_iter().collect(),
-                        removed.into_iter().collect(),
-                    ),
-                );
+                {
+                    unretained
+                        .entry(name.clone())
+                        .and_modify(|state| *state = UnretainedName::ExportedStub)
+                        .or_insert(UnretainedName::ExportedByActivation);
+                }
+                linked_contents.insert(namespace, (ExportTable::new(exports), unretained));
             } else {
                 root_exports = ExportTable::new(exports);
             }
@@ -380,7 +378,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     *remaining.iter().next().expect("remaining namespace")
                 });
             remaining.remove(&next);
-            let (exports, unretained_exports, stubs) = linked_contents
+            let (exports, unretained) = linked_contents
                 .remove(&next)
                 .expect("every Linked namespace has activation contents");
             builder.add_activation(crate::ir::NamespaceActivationIr {
@@ -388,8 +386,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 on_load: on_load_bindings.get(&next).copied(),
                 native_components: linked_native_components.remove(&next).unwrap_or_default(),
                 exports,
-                unretained_exports,
-                stubs,
+                unretained,
             });
         }
         let root = self.root.expect("root package established before analysis");

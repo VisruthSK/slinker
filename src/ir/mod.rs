@@ -317,8 +317,24 @@ pub struct NamespaceActivationIr {
     pub on_load: Option<BindingId>,
     pub native_components: Vec<crate::package::NativeComponent>,
     pub exports: ExportTable,
-    pub unretained_exports: Vec<String>,
-    pub stubs: Vec<String>,
+    pub unretained: BTreeMap<String, UnretainedName>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnretainedName {
+    Stub,
+    ExportedStub,
+    ExportedByActivation,
+}
+
+impl UnretainedName {
+    pub fn is_stub(self) -> bool {
+        matches!(self, Self::Stub | Self::ExportedStub)
+    }
+
+    pub fn is_exported(self) -> bool {
+        matches!(self, Self::ExportedStub | Self::ExportedByActivation)
+    }
 }
 
 /// Root source-package transformation decided at finalization: the generated `DESCRIPTION`, the

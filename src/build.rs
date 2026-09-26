@@ -488,10 +488,22 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
                     .bindings()
                     .iter()
                     .map(|binding| program.binding(*binding).name.as_str())
-                    .chain(activation.unretained_exports.iter().map(String::as_str))
+                    .chain(
+                        activation
+                            .unretained
+                            .iter()
+                            .filter(|(_, state)| state.is_exported())
+                            .map(|(name, _)| name.as_str()),
+                    )
             ),
             s3_matrix(program, namespace),
-            r_vector(activation.stubs.iter().map(String::as_str)),
+            r_vector(
+                activation
+                    .unretained
+                    .iter()
+                    .filter(|(_, state)| state.is_stub())
+                    .map(|(name, _)| name.as_str()),
+            ),
             if activation.on_load.is_some() {
                 "TRUE"
             } else {
