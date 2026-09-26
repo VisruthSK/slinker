@@ -653,6 +653,63 @@ fn unresolved_names_continue_to_the_global_environment_as_in_the_original() {
 }
 
 #[test]
+fn linked_namespace_information_reproduces_exports_and_spec() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("infopkg");
+    write_package(
+        &dependency_source,
+        "infopkg",
+        "",
+        "export(described, unused_export)\n",
+        "described <- function() c(sort(names(.__NAMESPACE__.$exports)), .__NAMESPACE__.$spec[['name']], asNamespace('infopkg')$.__NAMESPACE__.$spec[['version']])\nunused_export <- function() 1\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+    let root_source = fixture.path().join("inforoot");
+    write_package(
+        &root_source,
+        "inforoot",
+        "Imports: infopkg\n",
+        "importFrom(infopkg, described)\nexport(check)\n",
+        "check <- function() described()\n",
+    );
+    let output = fixture.path().join("generated-inforoot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run namespace information build");
+    assert_success(&result, "slinker build namespace information fixture");
+
+    let behavior = "library(inforoot); stopifnot(identical(check(), c('described', 'unused_export', 'infopkg', '1.0.0')))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+
+    let absent = fixture.path().join("absent");
+    fs::create_dir(&absent).expect("library without the real Linked package");
+    install_package(&r_home, &output, &absent);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency_source, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    run_r(&r_home, &installed, behavior);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('infopkg'); {behavior}"),
+    );
+}
+
+#[test]
 fn payload_bundle_preserves_identity_within_its_namespace() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

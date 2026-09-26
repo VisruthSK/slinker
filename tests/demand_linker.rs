@@ -2880,6 +2880,56 @@ fn declared_strings_make_computed_names_exact() {
 }
 
 #[test]
+fn namespace_info_reads_accept_only_reproduced_fields() {
+    let linked = |source: &str| {
+        Linker::new(
+            FakeProvider::new(vec![
+                root_calling("dep", "f"),
+                package("dep", &[("f", Some(source))]),
+            ]),
+            1,
+        )
+        .analyze("root")
+        .unwrap()
+        .blockers()
+        .to_vec()
+    };
+    for accepted in [
+        "f <- function() asNamespace('dep')$.__NAMESPACE__.$exports",
+        "f <- function() .__NAMESPACE__.$exports",
+        "f <- function() .__NAMESPACE__.$spec",
+        "f <- function(ns) ns[['.__NAMESPACE__.']][['exports']]",
+    ] {
+        let blockers = linked(accepted);
+        assert!(blockers.is_empty(), "{accepted}: {blockers:?}");
+    }
+    for blocked in [
+        "f <- function() asNamespace('dep')$.__NAMESPACE__.$imports",
+        "f <- function() .__NAMESPACE__.$imports",
+        "f <- function(ns) ns$.__NAMESPACE__.$imports",
+        "f <- function(ns) ns[['.__NAMESPACE__.']]$path",
+    ] {
+        let blockers = linked(blocked);
+        assert!(!blockers.is_empty(), "{blocked}");
+    }
+
+    let root_only = Linker::new(
+        FakeProvider::new(vec![package(
+            "root",
+            &[("f", Some("f <- function(ns) ns$.__NAMESPACE__.$imports"))],
+        )]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+    assert!(
+        root_only.blockers().is_empty(),
+        "{:?}",
+        root_only.blockers()
+    );
+}
+
+#[test]
 fn dynamic_namespace_is_allowed_only_without_reflection() {
     let blocked = |source: &str| {
         let plan = Linker::new(

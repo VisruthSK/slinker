@@ -148,7 +148,6 @@ Minimal code:
 
 ## Track E: Retire heuristics
 
-- Value provenance for reflection: `asNamespace(ns)$.__NAMESPACE__.$exports` reads the export table.
 - Default-argument specialization: a formal defaulting to a constant that no caller passes is
   static (voucher's `system.file(..., package = package)`).
 - `callables()` for a function-valued binding passed to `do.call` or `lapply`: record an invocation

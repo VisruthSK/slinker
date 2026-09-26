@@ -289,6 +289,26 @@ pub struct ParsedExpression {
     pub effects: Vec<SyntaxEffect>,
     #[serde(default)]
     pub construction: Vec<ConstructionExpr>,
+    #[serde(default)]
+    pub namespace_info_reads: Vec<NamespaceInfoRead>,
+}
+
+/// A read of a namespace's `.__NAMESPACE__.` information environment, with the field extracted
+/// from it by `$` or `[[`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceInfoRead {
+    pub receiver: NamespaceInfoReceiver,
+    pub field: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NamespaceInfoReceiver {
+    /// The `.__NAMESPACE__.` binding visible where the code runs.
+    Lexical,
+    /// `asNamespace("pkg")` or `getNamespace("pkg")`.
+    Namespace(String),
+    Computed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

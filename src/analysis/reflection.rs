@@ -1,3 +1,5 @@
+use super::NodeId;
+use crate::package::PackageId;
 use crate::syntax::Span;
 use std::collections::{HashMap, HashSet};
 
@@ -5,6 +7,17 @@ use std::collections::{HashMap, HashSet};
 pub(super) struct ReflectionFacts {
     non_reflective_namespace_uses: HashSet<Span>,
     contextual_namespace_calls: HashMap<Span, Option<String>>,
+    computed_namespace_info_reads: Vec<ComputedNamespaceInfoRead>,
+}
+
+/// A read of an unreproduced `.__NAMESPACE__.` field from a namespace chosen at run time, which
+/// diverges only when that namespace can be a synthetic Linked one.
+pub(super) struct ComputedNamespaceInfoRead {
+    pub(super) node: NodeId,
+    pub(super) package: PackageId,
+    pub(super) binding: String,
+    pub(super) field: String,
+    pub(super) span: Span,
 }
 
 impl ReflectionFacts {
@@ -29,5 +42,27 @@ impl ReflectionFacts {
 
     pub(super) fn contextual_namespace(&self, span: &Span) -> Option<&str> {
         self.contextual_namespace_calls.get(span)?.as_deref()
+    }
+
+    pub(super) fn defer_computed_namespace_info_read(
+        &mut self,
+        node: NodeId,
+        package: PackageId,
+        binding: &str,
+        field: &str,
+        span: Span,
+    ) {
+        self.computed_namespace_info_reads
+            .push(ComputedNamespaceInfoRead {
+                node,
+                package,
+                binding: binding.to_owned(),
+                field: field.to_owned(),
+                span,
+            });
+    }
+
+    pub(super) fn take_computed_namespace_info_reads(&mut self) -> Vec<ComputedNamespaceInfoRead> {
+        std::mem::take(&mut self.computed_namespace_info_reads)
     }
 }

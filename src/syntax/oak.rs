@@ -14,8 +14,9 @@ use crate::syntax::facts::{
     ActiveBindingDef, BindingDeclaration, CallSite, CalleeKind, ConstructionArgument,
     ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredCallable,
     DeclaredDomain, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind,
-    PackageGuard, PackageRef, ParsedExpression, ParsedRFile, ResourcePackage, ResourceRef,
-    SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    NamespaceInfoRead, NamespaceInfoReceiver, PackageGuard, PackageRef, ParsedExpression,
+    ParsedRFile, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg,
+    StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use crate::{Error, Result};
@@ -858,6 +859,7 @@ fn translate_index(
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
 
     let (parameters, construction) = collect_construction(source, text, root, &live_calls);
+    let namespace_info_reads = collect_namespace_info_reads(source, text, root, &declarations);
     let calls = live_calls.into_iter().map(|call| call.site).collect();
     let mut issues = translate_diagnostics(source, index);
     issues.extend(declarations.issues);
@@ -876,11 +878,111 @@ fn translate_index(
             active_bindings,
             effects,
             construction,
+            namespace_info_reads,
         }],
         issues,
         scope_parents: scopes.parents,
         declarations: declarations.declarations,
     }
+}
+
+const NAMESPACE_INFO: &str = ".__NAMESPACE__.";
+
+/// Every read of a `.__NAMESPACE__.` information environment through `$` or `[[`, and every
+/// lexical `.__NAMESPACE__.` whose field is extracted.
+fn collect_namespace_info_reads(
+    source: SourceId,
+    text: &str,
+    root: &RRoot,
+    declarations: &Declarations,
+) -> Vec<NamespaceInfoRead> {
+    let mut reads = Vec::new();
+    for node in root.syntax().descendants() {
+        if declarations.is_inert(text_offset(node.text_trimmed_range().start())) {
+            continue;
+        }
+        let Some(expression) = AnyRExpression::cast(node) else {
+            continue;
+        };
+        if let Some((receiver, member)) = member_access(text, &expression)
+            && member == NAMESPACE_INFO
+        {
+            reads.push(NamespaceInfoRead {
+                receiver: namespace_info_receiver(text, &receiver),
+                field: extracted_field(text, &expression),
+                span: ast_span(&source, &expression),
+            });
+        } else if let AnyRExpression::RIdentifier(_) = &expression
+            && unquoted(&ast_text(text, &expression)) == NAMESPACE_INFO
+            && let Some(field) = extracted_field(text, &expression)
+        {
+            reads.push(NamespaceInfoRead {
+                receiver: NamespaceInfoReceiver::Lexical,
+                field: Some(field),
+                span: ast_span(&source, &expression),
+            });
+        }
+    }
+    reads
+}
+
+/// The receiver and member of `receiver$member` or `receiver[["member"]]`.
+fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpression, String)> {
+    match expression {
+        AnyRExpression::RExtractExpression(extract)
+            if extract.operator().ok()?.text_trimmed() == "$" =>
+        {
+            Some((
+                extract.left().ok()?,
+                unquoted(&ast_text(text, &extract.right().ok()?)),
+            ))
+        }
+        AnyRExpression::RSubset2(subset) => {
+            let mut arguments = subset.arguments().ok()?.items().iter();
+            let index = arguments.next()?.ok()?.value()?;
+            if arguments.next().is_some() {
+                return None;
+            }
+            match static_arg(ast_text(text, &index).trim())? {
+                StaticArg::String(member) => Some((subset.function().ok()?, member)),
+                StaticArg::Symbol(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The member extracted from `expression` by the expression that immediately contains it.
+fn extracted_field(text: &str, expression: &AnyRExpression) -> Option<String> {
+    let parent = AnyRExpression::cast(expression.syntax().parent()?)?;
+    let (receiver, member) = member_access(text, &parent)?;
+    (receiver.syntax() == expression.syntax()).then_some(member)
+}
+
+fn namespace_info_receiver(text: &str, receiver: &AnyRExpression) -> NamespaceInfoReceiver {
+    let AnyRExpression::RCall(call) = receiver else {
+        return NamespaceInfoReceiver::Computed;
+    };
+    let named = call.function().ok().is_some_and(|function| {
+        let callee = ast_text(text, &function);
+        matches!(
+            callee.trim_start_matches("base::"),
+            "asNamespace" | "getNamespace"
+        )
+    });
+    match sole_positional_argument(call)
+        .and_then(|argument| static_arg(ast_text(text, &argument).trim()))
+    {
+        Some(StaticArg::String(package)) if named => NamespaceInfoReceiver::Namespace(package),
+        _ => NamespaceInfoReceiver::Computed,
+    }
+}
+
+fn unquoted(name: &str) -> String {
+    name.trim()
+        .trim_matches('`')
+        .trim_matches(['"', '\''])
+        .to_owned()
 }
 
 fn collect_live_uses(index: &SemanticIndex, declarations: &Declarations) -> Vec<LiveUse> {

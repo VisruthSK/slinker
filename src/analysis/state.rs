@@ -26,9 +26,10 @@ use crate::package::{
     PrivateBindingImage, ResourcePath, SyntaxValidation, TargetUniverse,
 };
 use crate::syntax::{
-    ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, OakParseContext,
-    OakParser, PackageGuard, ParsedExpression, ParsedRFile, ResourcePackage, SemanticIssueKind,
-    SourceId, SourceKey, Span, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, NamespaceInfoReceiver,
+    OakParseContext, OakParser, PackageGuard, ParsedExpression, ParsedRFile, ResourcePackage,
+    SemanticIssueKind, SourceId, SourceKey, Span, StaticArg, StaticEnvironment, SyntaxEffect,
+    SyntaxEffectKind,
 };
 use crate::{Error, Result};
 use rayon::prelude::*;
@@ -1111,6 +1112,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             self.record_non_reflective_namespace_uses(expression);
             self.process_calls(site, parsed, expression)?;
+            self.process_namespace_info_reads(site, expression);
             self.process_effects(site, expression)?;
         }
         Ok(())
@@ -1216,6 +1218,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             if consumed_native_selectors.contains(&reference.span) {
+                continue;
+            }
+            if expression.namespace_info_reads.iter().any(|read| {
+                read.span == reference.span
+                    && read.receiver == NamespaceInfoReceiver::Lexical
+                    && reproduces_namespace_info(read.field.as_deref())
+            }) {
                 continue;
             }
             let resolved = self.resolve_lexical_name(
@@ -1335,6 +1344,46 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.semantic_call(site, parsed, call)?;
         }
         Ok(())
+    }
+
+    fn process_namespace_info_reads(
+        &mut self,
+        site: ParsedSite<'_>,
+        expression: &ParsedExpression,
+    ) {
+        for read in &expression.namespace_info_reads {
+            if reproduces_namespace_info(read.field.as_deref()) {
+                continue;
+            }
+            let field = read.field.as_deref().unwrap_or("<whole>");
+            match &read.receiver {
+                NamespaceInfoReceiver::Lexical => {}
+                NamespaceInfoReceiver::Namespace(name) => {
+                    let linked = self.known_package(name).is_some_and(|package| {
+                        self.packages.role(package) == crate::package::PackageRole::Linked
+                    });
+                    if linked {
+                        self.diagnostic(
+                            site.node,
+                            site.package,
+                            Some(site.binding),
+                            RejectCode::UnsupportedRootTransformation,
+                            format!("reads `.__NAMESPACE__.` field `{field}`, which the synthetic `{name}` namespace does not reproduce"),
+                            Some(read.span.clone()),
+                        );
+                    }
+                }
+                NamespaceInfoReceiver::Computed => {
+                    self.reflection.defer_computed_namespace_info_read(
+                        site.node,
+                        site.package,
+                        site.binding,
+                        field,
+                        read.span.clone(),
+                    );
+                }
+            }
+        }
     }
 
     fn process_effects(
@@ -3705,6 +3754,12 @@ pub(super) fn is_r_constant(name: &str) -> bool {
             | "NA_complex_"
             | "NA_character_"
     )
+}
+
+/// Whether reading `field` of a `.__NAMESPACE__.` environment observes what a synthetic Linked
+/// namespace reproduces: its spec and its export table.
+fn reproduces_namespace_info(field: Option<&str>) -> bool {
+    matches!(field, Some("exports" | "spec"))
 }
 
 /// The run-time name a base binding-creation call can bind, when `call` is one.

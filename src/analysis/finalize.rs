@@ -48,6 +48,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .iter()
             .any(|package| self.packages.role(*package) == LinkedPackageRole::Linked)
         {
+            for read in self.reflection.take_computed_namespace_info_reads() {
+                self.diagnostic(
+                    read.node,
+                    read.package,
+                    Some(&read.binding),
+                    RejectCode::DynamicLookup,
+                    format!(
+                        "reads `.__NAMESPACE__.` field `{}` of a computed namespace, which can be a synthetic Linked namespace that does not reproduce it",
+                        read.field
+                    ),
+                    Some(read.span),
+                );
+            }
             for (node, package, span) in self.relocations.take_dynamic_resource_lookups() {
                 self.diagnostic(
                     node,
