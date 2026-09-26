@@ -233,7 +233,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 namespace_builder
                     .registrations
                     .iter()
-                    .map(|registration| BindingName::from(registration.method.clone())),
+                    .map(|registration| registration.method.clone()),
             );
             let slots = names.iter().map(|name| {
                 let source = match image.binding(name) {

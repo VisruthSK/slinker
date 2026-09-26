@@ -1726,7 +1726,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             node,
             Need::Binding {
                 package: id,
-                binding: registration.method.clone().into(),
+                binding: registration.method.clone(),
             },
             EdgeKind::S3Registration,
             format!(
@@ -1746,7 +1746,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 node,
                 Need::Binding {
                     package: id,
-                    binding: registration.generic.name.clone().into(),
+                    binding: BindingName::from(registration.generic.name.as_str()),
                 },
                 EdgeKind::S3Registration,
                 format!(
@@ -2975,7 +2975,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             },
             Need::S3Registration { registration, .. } => NodeKind::S3Registration {
                 generic: self.generic_label(&registration.generic),
-                class: registration.class.clone(),
+                class: registration.class.to_string(),
             },
             Need::Native { component, .. } => NodeKind::NativeComponent {
                 name: component.clone(),
@@ -3034,7 +3034,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn generic_label(&self, generic: &GenericId) -> String {
         match generic.package {
             Some(package) => format!("{}::{}", self.packages.name(package), generic.name),
-            None => generic.name.clone(),
+            None => generic.name.to_string(),
         }
     }
 

@@ -2,14 +2,14 @@ use super::resolution::{BindingTarget, Resolution};
 use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
-use crate::package::{BindingName, PackageId, PackageProvider};
+use crate::package::{BindingName, ClassName, GenericName, PackageId, PackageProvider};
 use crate::syntax::{CallSite, DeclaredValue, ParsedRFile, Span, StaticArg};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct S3GenericKey {
     pub(super) package: PackageId,
-    pub(super) name: String,
+    pub(super) name: GenericName,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,7 +47,7 @@ pub(super) enum DispatchChange {
     },
     Added {
         from: NodeId,
-        classes: BTreeSet<String>,
+        classes: BTreeSet<ClassName>,
     },
 }
 
@@ -134,6 +134,7 @@ impl S3Model {
             .flatten()
             .flatten()
             .chain(std::iter::once("default".to_owned()))
+            .map(ClassName::from)
             .collect::<BTreeSet<_>>();
         let was_pending = generic.dispatch == S3Dispatch::Pending;
         let known = match &generic.dispatch {
@@ -152,7 +153,7 @@ impl S3Model {
         }
     }
 
-    fn dispatches(&self) -> Vec<(String, NodeId, S3Dispatch)> {
+    fn dispatches(&self) -> Vec<(GenericName, NodeId, S3Dispatch)> {
         self.generics
             .iter()
             .map(|(key, generic)| {
@@ -199,7 +200,7 @@ impl S3Model {
 pub(super) enum S3Dispatch {
     #[default]
     Pending,
-    Classes(BTreeSet<String>),
+    Classes(BTreeSet<ClassName>),
     Open,
 }
 
@@ -253,7 +254,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         let key = S3GenericKey {
             package: current,
-            name: generic.clone(),
+            name: generic.as_str().into(),
         };
         let callable = CallableId {
             package: current,
@@ -371,7 +372,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         from: NodeId,
         package: PackageId,
         generic: &str,
-        classes: Option<&BTreeSet<String>>,
+        classes: Option<&BTreeSet<ClassName>>,
     ) -> Result<()> {
         let image = self.image(package)?;
         let prefix = format!("{generic}.");
@@ -382,12 +383,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .filter(|registration| {
                 registration.generic.name == generic && wanted(&registration.class)
             })
-            .map(|registration| {
-                (
-                    BindingName::from(registration.method.clone()),
-                    EdgeKind::S3Registration,
-                )
-            });
+            .map(|registration| (registration.method.clone(), EdgeKind::S3Registration));
         let methods = image
             .index
             .binding_names

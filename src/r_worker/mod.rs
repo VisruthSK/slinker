@@ -7,7 +7,7 @@ pub(crate) mod client;
 pub mod protocol;
 
 use crate::package::{
-    BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClosureSource,
+    BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClassName, ClosureSource,
     EmbeddedClosureSource, EmbeddedEnvironmentRef, ExportMap, ImportBinding, ImportSpec,
     NativeComponent, NativeRegistration, NativeSafety, NativeSymbolBinding, ObjectIssue,
     ObjectKind, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
@@ -462,10 +462,10 @@ fn worker_package_index(
         s3.push(S3Registration {
             generic: crate::package::GenericSpec {
                 package,
-                name: generic,
+                name: generic.into(),
             },
-            class,
-            method,
+            class: class.into(),
+            method: method.into(),
         });
     }
 
@@ -617,7 +617,10 @@ impl ObjectScanner {
             name: name.into(),
             origin,
             representation,
-            classes: classes(object.sexp),
+            classes: classes(object.sexp)
+                .into_iter()
+                .map(ClassName::from)
+                .collect(),
             object_kind: facts.kind,
             closure: facts.closure.take(),
             environment: facts.environment.take(),
@@ -694,7 +697,10 @@ impl ObjectScanner {
         Ok(PrivateBindingImage {
             name: name.into(),
             representation,
-            classes: classes(object.sexp),
+            classes: classes(object.sexp)
+                .into_iter()
+                .map(ClassName::from)
+                .collect(),
             object_kind: facts.kind,
             closure: facts.closure.take(),
             environment: facts.environment.take(),

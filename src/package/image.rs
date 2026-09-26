@@ -1,4 +1,4 @@
-use crate::package::{BindingName, PackageIndex};
+use crate::package::{BindingName, ClassName, PackageIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -107,7 +107,7 @@ pub struct BindingImage {
     pub origin: BindingOrigin,
     pub representation: BindingRepresentation,
     #[serde(default)]
-    pub classes: Vec<String>,
+    pub classes: Vec<ClassName>,
     pub object_kind: ObjectKind,
     pub closure: Option<ClosureSource>,
     pub environment: Option<String>,
@@ -121,7 +121,7 @@ pub struct PrivateBindingImage {
     pub name: BindingName,
     pub representation: BindingRepresentation,
     #[serde(default)]
-    pub classes: Vec<String>,
+    pub classes: Vec<ClassName>,
     pub object_kind: ObjectKind,
     pub closure: Option<ClosureSource>,
     pub environment: Option<String>,

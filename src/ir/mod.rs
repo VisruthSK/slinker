@@ -1,7 +1,9 @@
 //! Immutable linked-program representation consumed by build preflight and materialization.
 
 use crate::analysis::{Edge, Graph, Node, NodeId};
-pub use crate::package::{BindingName, PackageId, PackageIdentity, PackageRole};
+pub use crate::package::{
+    BindingName, ClassName, GenericName, PackageId, PackageIdentity, PackageRole,
+};
 
 use crate::package::Digest;
 use crate::syntax::TextRange;
@@ -351,14 +353,14 @@ pub struct RootArtifactIr {
 #[derive(Clone, Debug)]
 pub struct GenericId {
     pub package: Option<PackageId>,
-    pub name: String,
+    pub name: GenericName,
 }
 
 #[derive(Clone, Debug)]
 pub struct S3RegistrationIr {
     pub owner_namespace: NamespaceId,
     pub generic: GenericId,
-    pub class: String,
+    pub class: ClassName,
     pub method: BindingId,
 }
 
@@ -749,7 +751,7 @@ impl ProgramBuilder {
         &mut self,
         namespace: NamespaceId,
         generic: GenericId,
-        class: String,
+        class: ClassName,
         method: BindingId,
     ) -> S3RegistrationId {
         let registration = self.add_s3_registration(S3RegistrationIr {

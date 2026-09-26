@@ -1,5 +1,5 @@
 use crate::analysis::object_world::ClosureId;
-use crate::package::PackageId;
+use crate::package::{ClassName, GenericName, PackageId};
 use std::collections::{HashSet, VecDeque};
 
 pub use crate::package::BindingName;
@@ -10,14 +10,14 @@ pub type LifecycleId = String;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct S3Id {
     pub generic: GenericId,
-    pub class: String,
-    pub method: String,
+    pub class: ClassName,
+    pub method: BindingName,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GenericId {
     pub package: Option<PackageId>,
-    pub name: String,
+    pub name: GenericName,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

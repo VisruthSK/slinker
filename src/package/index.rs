@@ -1,5 +1,5 @@
 use crate::Description;
-use crate::package::{BindingName, PackageIdentity};
+use crate::package::{BindingName, ClassName, GenericName, PackageIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -26,14 +26,14 @@ pub enum ImportSpec {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct S3Registration {
     pub generic: GenericSpec,
-    pub class: String,
-    pub method: String,
+    pub class: ClassName,
+    pub method: BindingName,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct GenericSpec {
     pub package: Option<String>,
-    pub name: String,
+    pub name: GenericName,
 }
 
 impl std::fmt::Display for GenericSpec {
