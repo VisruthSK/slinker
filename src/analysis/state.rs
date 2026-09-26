@@ -392,30 +392,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if self.parsed_bindings.contains_key(&key) || !scheduled.insert(key.clone()) {
                 continue;
             }
-            let source = self.sources.add_binding(
-                self.packages.name(id).to_owned(),
-                source_key.clone(),
-                Arc::clone(&closure.source),
-            );
-            self.source_ids.insert(key.clone(), source.clone());
-            let normalized = self.packages.normalize_syntax(closure.source.as_ref())?;
-            let normalized_again = self.packages.normalize_syntax(&normalized)?;
-            if normalized != normalized_again {
-                self.diagnostic(
-                    owner_node,
-                    id,
-                    Some(&owner_binding),
-                    RejectCode::InvalidInstalledRepresentation,
-                    format!(
-                        "target-R canonical source for {source_key} is not stable across parse/deparse"
-                    ),
-                    Some(Span::new(source.clone(), 0, closure.source.len())),
-                );
-                self.parsed_bindings.insert(key, ParseState::Blocked);
+            let Some(source) =
+                self.admit_source(id, &owner_binding, &source_key, owner_node, &closure.source)?
+            else {
                 continue;
-            }
-            self.normalized_shapes
-                .insert(key.clone(), Digest::of(&normalized));
+            };
             work.push(Work {
                 key,
                 owner_binding,
@@ -1339,30 +1320,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 ParseState::Blocked => None,
             });
         }
-        let source = self.sources.add_binding(
-            self.packages.name(id).to_owned(),
-            source_key.to_owned(),
-            Arc::clone(&source_text),
-        );
-        self.source_ids.insert(key.clone(), source.clone());
-        let normalized = self.packages.normalize_syntax(source_text.as_ref())?;
-        let normalized_again = self.packages.normalize_syntax(&normalized)?;
-        if normalized != normalized_again {
-            self.diagnostic(
-                owner_node,
-                id,
-                Some(owner_binding),
-                RejectCode::InvalidInstalledRepresentation,
-                format!(
-                    "target-R canonical source for {source_key} is not stable across parse/deparse"
-                ),
-                Some(Span::new(source.clone(), 0, source_text.len())),
-            );
-            self.parsed_bindings.insert(key, ParseState::Blocked);
+        let Some(source) =
+            self.admit_source(id, owner_binding, source_key, owner_node, &source_text)?
+        else {
             return Ok(None);
-        }
-        self.normalized_shapes
-            .insert(key.clone(), Digest::of(&normalized));
+        };
         let context = self.oak_parse_context(id, image, lexical_environment)?;
         match OakParser.parse_binding_with_context(source, source_text.as_ref(), &context) {
             Ok(parsed) => {
@@ -1376,6 +1338,41 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Ok(None)
             }
         }
+    }
+
+    fn admit_source(
+        &mut self,
+        id: PackageId,
+        owner_binding: &str,
+        source_key: &str,
+        owner_node: NodeId,
+        text: &Arc<str>,
+    ) -> Result<Option<SourceId>> {
+        let key = (id, source_key.to_owned());
+        let source = self.sources.add_binding(
+            self.packages.name(id).to_owned(),
+            source_key.to_owned(),
+            Arc::clone(text),
+        );
+        self.source_ids.insert(key.clone(), source.clone());
+        let normalized = self.packages.normalize_syntax(text)?;
+        let normalized_again = self.packages.normalize_syntax(&normalized)?;
+        if normalized != normalized_again {
+            self.diagnostic(
+                owner_node,
+                id,
+                Some(owner_binding),
+                RejectCode::InvalidInstalledRepresentation,
+                format!(
+                    "target-R canonical source for {source_key} is not stable across parse/deparse"
+                ),
+                Some(Span::new(source, 0, text.len())),
+            );
+            self.parsed_bindings.insert(key, ParseState::Blocked);
+            return Ok(None);
+        }
+        self.normalized_shapes.insert(key, Digest::of(&normalized));
+        Ok(Some(source))
     }
 
     pub(super) fn handle_air_rejection(
