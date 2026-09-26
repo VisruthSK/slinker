@@ -541,137 +541,169 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         let image = self.binding_image(id, &binding)?;
         let Some(binding_image) = image.binding(&binding).cloned() else {
-            if binding != ".onLoad" && image.index.lifecycle.on_load {
-                self.ensure_on_load_analyzed(id)?;
-            }
-            if self
-                .namespace_builders
-                .get(&id)
-                .is_some_and(|namespace| namespace.contains(&binding))
-                && !image.index.binding_names.contains(&binding)
-            {
-                let lifecycle = self.need_node(&Need::Lifecycle {
-                    package: id,
-                    hook: ".onLoad".into(),
-                });
-                self.depend(
-                    node,
-                    lifecycle,
-                    EdgeKind::Lifecycle,
-                    format!("activation creates active binding `{binding}`"),
-                    None,
-                );
-                return Ok(());
-            }
-            if self.is_root(id)
-                && image
-                    .index
-                    .exports
-                    .values()
-                    .any(|exported_binding| exported_binding == &binding)
-            {
-                let resolved = self.resolve_name(id, &image, &binding)?;
-                match resolved {
-                    Resolution::Static(BindingTarget::Imported {
-                        package,
-                        binding: foreign_binding,
-                    }) => {
-                        self.require(
-                            node,
-                            Need::Activation { package },
-                            EdgeKind::Export,
-                            format!("root re-export `{binding}` requires namespace activation"),
-                        );
-                        self.require(
-                            node,
-                            Need::Binding { package, binding: foreign_binding.clone() },
-                            EdgeKind::Export,
-                            format!("root re-export `{binding}` resolves to imported binding `{foreign_binding}`"),
-                        );
-                        return Ok(());
-                    }
-                    Resolution::Static(BindingTarget::External {
-                        package,
-                        binding: foreign_binding,
-                    }) => {
-                        let external = self.external_binding(
-                            package,
-                            &foreign_binding,
-                            ExternalBindingAccess::Exported,
-                            None,
-                        );
-                        self.depend(
-                            node,
-                            external,
-                            EdgeKind::Export,
-                            format!("root re-export `{binding}` resolves to External `{foreign_binding}`"),
-                            None,
-                        );
-                        return Ok(());
-                    }
-                    Resolution::Static(BindingTarget::Native {
-                        package,
-                        component,
-                        binding: native_binding,
-                    }) => {
-                        self.require(
-                            node,
-                            Need::Native { package, component: component.clone() },
-                            EdgeKind::Export,
-                            format!("root export `{binding}` resolves to registered native symbol `{native_binding}` in `{component}`"),
-                        );
-                        return Ok(());
-                    }
-                    Resolution::Static(BindingTarget::Base)
-                    | Resolution::Static(BindingTarget::Metadata { .. }) => return Ok(()),
-                    Resolution::OpenDynamic(OpenReason::MissingPackage {
-                        package,
-                        binding: foreign_binding,
-                    }) => {
-                        let detail = foreign_binding
-                            .as_deref()
-                            .map(|name| format!("root re-export `{binding}` requires missing {package}::{name}"))
-                            .unwrap_or_else(|| format!("root re-export `{binding}` requires missing namespace {package}"));
-                        self.record_missing_package(
-                            node,
-                            id,
-                            &package,
-                            EdgeKind::Export,
-                            detail,
-                            None,
-                        );
-                        return Ok(());
-                    }
-                    Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
-                        self.diagnostic(
-                            node,
-                            id,
-                            Some(&binding),
-                            RejectCode::UnresolvedBinding,
-                            format!(
-                                "exported name `{binding}` resolves to unknown binding `{name}`"
-                            ),
-                            None,
-                        );
-                        return Ok(());
-                    }
-                    Resolution::Static(BindingTarget::Namespace { .. })
-                    | Resolution::Static(BindingTarget::Private { .. })
-                    | Resolution::Static(BindingTarget::Closure { .. })
-                    | Resolution::Static(BindingTarget::Local) => {}
-                }
-            }
-            self.diagnostic(
+            return self.process_absent_binding(node, id, &image, &binding);
+        };
+        self.diagnose_binding_object(node, id, &binding, &binding_image);
+        let object = self.objects.graph(id).namespace_binding(&binding);
+        self.require_member_closures(node, id, object);
+        if let Some(closure) = &binding_image.closure {
+            self.process_binding_closure(node, id, &image, &binding, &binding_image, closure)?;
+        }
+        Ok(())
+    }
+
+    fn process_absent_binding(
+        &mut self,
+        node: NodeId,
+        id: PackageId,
+        image: &Arc<PackageImage>,
+        binding: &str,
+    ) -> Result<()> {
+        if binding != ".onLoad" && image.index.lifecycle.on_load {
+            self.ensure_on_load_analyzed(id)?;
+        }
+        if self
+            .namespace_builders
+            .get(&id)
+            .is_some_and(|namespace| namespace.contains(binding))
+            && !image.index.binding_names.iter().any(|name| name == binding)
+        {
+            let lifecycle = self.need_node(&Need::Lifecycle {
+                package: id,
+                hook: ".onLoad".into(),
+            });
+            self.depend(
                 node,
-                id,
-                Some(&binding),
-                RejectCode::UnresolvedBinding,
-                format!("installed namespace has no binding `{binding}`"),
+                lifecycle,
+                EdgeKind::Lifecycle,
+                format!("activation creates active binding `{binding}`"),
                 None,
             );
             return Ok(());
-        };
+        }
+        if self.is_root(id)
+            && image
+                .index
+                .exports
+                .values()
+                .any(|exported_binding| exported_binding == binding)
+            && self.process_root_reexport(node, id, image, binding)?
+        {
+            return Ok(());
+        }
+        self.diagnostic(
+            node,
+            id,
+            Some(binding),
+            RejectCode::UnresolvedBinding,
+            format!("installed namespace has no binding `{binding}`"),
+            None,
+        );
+        Ok(())
+    }
 
+    fn process_root_reexport(
+        &mut self,
+        node: NodeId,
+        id: PackageId,
+        image: &Arc<PackageImage>,
+        binding: &str,
+    ) -> Result<bool> {
+        let resolved = self.resolve_name(id, image, binding)?;
+        match resolved {
+            Resolution::Static(BindingTarget::Imported {
+                package,
+                binding: foreign_binding,
+            }) => {
+                self.require(
+                    node,
+                    Need::Activation { package },
+                    EdgeKind::Export,
+                    format!("root re-export `{binding}` requires namespace activation"),
+                );
+                self.require(
+                    node,
+                    Need::Binding { package, binding: foreign_binding.clone() },
+                    EdgeKind::Export,
+                    format!("root re-export `{binding}` resolves to imported binding `{foreign_binding}`"),
+                );
+                return Ok(true);
+            }
+            Resolution::Static(BindingTarget::External {
+                package,
+                binding: foreign_binding,
+            }) => {
+                let external = self.external_binding(
+                    package,
+                    &foreign_binding,
+                    ExternalBindingAccess::Exported,
+                    None,
+                );
+                self.depend(
+                    node,
+                    external,
+                    EdgeKind::Export,
+                    format!("root re-export `{binding}` resolves to External `{foreign_binding}`"),
+                    None,
+                );
+                return Ok(true);
+            }
+            Resolution::Static(BindingTarget::Native {
+                package,
+                component,
+                binding: native_binding,
+            }) => {
+                self.require(
+                    node,
+                    Need::Native { package, component: component.clone() },
+                    EdgeKind::Export,
+                    format!("root export `{binding}` resolves to registered native symbol `{native_binding}` in `{component}`"),
+                );
+                return Ok(true);
+            }
+            Resolution::Static(BindingTarget::Base)
+            | Resolution::Static(BindingTarget::Metadata { .. }) => return Ok(true),
+            Resolution::OpenDynamic(OpenReason::MissingPackage {
+                package,
+                binding: foreign_binding,
+            }) => {
+                let detail = foreign_binding
+                    .as_deref()
+                    .map(|name| {
+                        format!("root re-export `{binding}` requires missing {package}::{name}")
+                    })
+                    .unwrap_or_else(|| {
+                        format!("root re-export `{binding}` requires missing namespace {package}")
+                    });
+                self.record_missing_package(node, id, &package, EdgeKind::Export, detail, None);
+                return Ok(true);
+            }
+            Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
+                self.diagnostic(
+                    node,
+                    id,
+                    Some(binding),
+                    RejectCode::UnresolvedBinding,
+                    format!("exported name `{binding}` resolves to unknown binding `{name}`"),
+                    None,
+                );
+                return Ok(true);
+            }
+            Resolution::Static(BindingTarget::Namespace { .. })
+            | Resolution::Static(BindingTarget::Private { .. })
+            | Resolution::Static(BindingTarget::Closure { .. })
+            | Resolution::Static(BindingTarget::Local) => {}
+        }
+        Ok(false)
+    }
+
+    fn diagnose_binding_object(
+        &mut self,
+        node: NodeId,
+        id: PackageId,
+        binding: &str,
+        binding_image: &BindingImage,
+    ) {
         let object_issues = binding_image
             .issues
             .iter()
@@ -684,7 +716,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.diagnostic(
                 node,
                 id,
-                Some(&binding),
+                Some(binding),
                 RejectCode::UnsupportedObject,
                 object_issues.join("; "),
                 None,
@@ -697,7 +729,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.diagnostic(
                 node,
                 id,
-                Some(&binding),
+                Some(binding),
                 RejectCode::ActiveBinding,
                 "active binding is preserved without execution",
                 None,
@@ -707,7 +739,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ObjectKind::Other(kind) => self.diagnostic(
                 node,
                 id,
-                Some(&binding),
+                Some(binding),
                 RejectCode::UnsupportedObject,
                 format!("unsupported installed object type `{kind}`"),
                 None,
@@ -715,66 +747,67 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ObjectKind::Unavailable => self.diagnostic(
                 node,
                 id,
-                Some(&binding),
+                Some(binding),
                 RejectCode::UnsupportedObject,
                 "installed binding could not be forced",
                 None,
             ),
             _ => {}
         }
-        let object = self.objects.graph(id).namespace_binding(&binding);
-        self.require_member_closures(node, id, object);
+    }
 
-        if let Some(closure) = &binding_image.closure {
-            if closure.environment.starts_with("unsupported:") {
+    fn process_binding_closure(
+        &mut self,
+        node: NodeId,
+        id: PackageId,
+        image: &Arc<PackageImage>,
+        binding: &str,
+        binding_image: &BindingImage,
+        closure: &ClosureSource,
+    ) -> Result<()> {
+        if closure.environment.starts_with("unsupported:") {
+            self.diagnostic(
+                node,
+                id,
+                Some(binding),
+                RejectCode::UnknownClosureEnclosure,
+                format!(
+                    "closure enclosure `{}` cannot be modeled",
+                    closure.environment
+                ),
+                None,
+            );
+        }
+        if let Some(parsed) = self.parsed(id, binding, image, binding_image)? {
+            if binding == ".onLoad"
+                && self.packages.role(id) == crate::package::PackageRole::Linked
+                && parsed.expressions.first().is_some_and(|expression| {
+                    expression
+                        .parameters
+                        .first()
+                        .is_some_and(|libname| expression.used_parameters.contains(libname))
+                })
+            {
                 self.diagnostic(
                     node,
                     id,
-                    Some(&binding),
-                    RejectCode::UnknownClosureEnclosure,
-                    format!(
-                        "closure enclosure `{}` cannot be modeled",
-                        closure.environment
-                    ),
+                    Some(binding),
+                    RejectCode::UnsupportedLinkedLibname,
+                    "Linked .onLoad reads libname, which has no installed library once linked",
                     None,
                 );
             }
-            if let Some(parsed) = self.parsed(id, &binding, &image, &binding_image)? {
-                if binding == ".onLoad"
-                    && self.packages.role(id) == crate::package::PackageRole::Linked
-                    && parsed.expressions.first().is_some_and(|expression| {
-                        expression
-                            .parameters
-                            .first()
-                            .is_some_and(|libname| expression.used_parameters.contains(libname))
-                    })
-                {
-                    self.diagnostic(
-                        node,
-                        id,
-                        Some(&binding),
-                        RejectCode::UnsupportedLinkedLibname,
-                        "Linked .onLoad reads libname, which has no installed library once linked",
-                        None,
-                    );
-                }
-                let image = self.prepare_construction_image(
-                    id,
-                    &image,
-                    &closure.environment,
-                    parsed.as_ref(),
-                )?;
-                self.process_parsed(
-                    node,
-                    id,
-                    &image,
-                    &binding,
-                    &closure.environment,
-                    parsed.as_ref(),
-                )?;
-            }
+            let image =
+                self.prepare_construction_image(id, image, &closure.environment, parsed.as_ref())?;
+            self.process_parsed(
+                node,
+                id,
+                &image,
+                binding,
+                &closure.environment,
+                parsed.as_ref(),
+            )?;
         }
-
         Ok(())
     }
 
