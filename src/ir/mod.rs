@@ -4,9 +4,7 @@ use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{PackageId, PackageIdentity, PackageRole};
 
 use crate::package::Digest;
-use crate::syntax::Span;
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 macro_rules! id_type {
@@ -28,7 +26,6 @@ macro_rules! id_type {
 
 id_type!(NamespaceId);
 id_type!(BindingId);
-id_type!(EnvironmentBindingId);
 id_type!(ValueId);
 id_type!(ClosureId);
 id_type!(EnvironmentId);
@@ -38,46 +35,6 @@ id_type!(NamespaceActivationId);
 id_type!(S3RegistrationId);
 id_type!(NativeComponentId);
 id_type!(ResourceId);
-
-mod sealed {
-    pub trait Sealed {}
-}
-
-/// Marker for immutable installed-image runtime facts.
-#[derive(Debug)]
-pub enum ImagePhase {}
-
-/// Marker for immutable finalized linked-program facts.
-#[derive(Debug)]
-pub enum LinkPhase {}
-
-impl sealed::Sealed for ImagePhase {}
-impl sealed::Sealed for LinkPhase {}
-
-/// Shared ID vocabulary for persistent image/link runtime entities.
-pub trait RuntimePhase: sealed::Sealed {
-    type BindingId: Copy + Eq + std::hash::Hash;
-    type EnvironmentBindingId: Copy + Eq + std::hash::Hash;
-    type ValueId: Copy + Eq + std::hash::Hash;
-    type ClosureId: Copy + Eq + std::hash::Hash;
-    type EnvironmentId: Copy + Eq + std::hash::Hash;
-    type NamespaceId: Copy + Eq + std::hash::Hash;
-    type CodeId: Copy + Eq + std::hash::Hash;
-    type BindingState;
-    type NamespaceState;
-}
-
-impl RuntimePhase for LinkPhase {
-    type BindingId = BindingId;
-    type EnvironmentBindingId = EnvironmentBindingId;
-    type ValueId = ValueId;
-    type ClosureId = ClosureId;
-    type EnvironmentId = EnvironmentId;
-    type NamespaceId = NamespaceId;
-    type CodeId = CodeId;
-    type BindingState = LinkBindingState;
-    type NamespaceState = LinkNamespaceState;
-}
 
 /// Final package runtime contract.
 #[derive(Clone, Debug)]
@@ -124,9 +81,9 @@ pub struct ExternalPackageContract {
 
 /// One stable namespace binding slot.
 #[derive(Clone, Debug)]
-pub struct Binding<P: RuntimePhase> {
+pub struct Binding {
     pub name: String,
-    pub state: P::BindingState,
+    pub state: LinkBindingState,
 }
 
 /// Value state before runtime activation.
@@ -192,11 +149,11 @@ pub struct MaterializedNamespaceState {
 }
 
 #[derive(Clone, Debug)]
-pub struct Namespace<P: RuntimePhase> {
+pub struct Namespace {
     pub package: PackageId,
-    pub bindings: BTreeMap<String, P::BindingId>,
+    pub bindings: BTreeMap<String, BindingId>,
     pub imports: Vec<ImportBindingIr>,
-    pub state: P::NamespaceState,
+    pub state: LinkNamespaceState,
     pub s3_registrations: Vec<S3RegistrationId>,
     pub native_components: Vec<NativeComponentId>,
 }
@@ -211,74 +168,39 @@ pub struct ImportBindingIr {
 pub enum EnvironmentKind {
     Namespace(NamespaceId),
     Imports(NamespaceId),
-    Private,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnvironmentParentIr {
     Materialized(EnvironmentId),
-    ExternalNamespace(NamespaceId),
     BaseNamespace,
-    Empty,
 }
 
 #[derive(Clone, Debug)]
-pub struct Environment<P: RuntimePhase> {
+pub struct Environment {
     pub kind: EnvironmentKind,
     pub parent: EnvironmentParentIr,
-    pub bindings: BTreeMap<String, P::EnvironmentBindingId>,
 }
 
 #[derive(Clone, Debug)]
-pub struct EnvironmentBinding<P: RuntimePhase> {
-    pub environment: P::EnvironmentId,
-    pub name: String,
-    pub initial: InitialBindingState,
-}
-
-#[derive(Clone, Debug)]
-pub struct Closure<P: RuntimePhase> {
-    pub code: P::CodeId,
-    pub enclosure: P::EnvironmentId,
+pub struct Closure {
+    pub code: CodeId,
+    pub enclosure: EnvironmentId,
     pub payload: PayloadRef,
 }
 
 /// Supported persistent runtime value without an Unknown state.
 #[derive(Clone, Debug)]
-pub enum Value<P: RuntimePhase> {
-    Null,
-    Logical(Vec<Option<bool>>),
-    Integer(Vec<Option<i32>>),
-    Double(Vec<f64>),
-    Character(Vec<Option<String>>),
-    Raw(Vec<u8>),
-    List(Vec<P::ValueId>),
-    Closure(P::ClosureId),
-    Environment(P::EnvironmentId),
+pub enum Value {
+    Closure(ClosureId),
     Payload(PayloadRef),
-}
-
-/// Durable locator relative to one exact installed package binding.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct InstalledObjectLocator {
-    pub root: String,
-    pub path: Vec<ObjectPathStep>,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum ObjectPathStep {
-    ListElement(usize),
-    PairlistElement(usize),
-    Attribute(String),
-    EnvironmentBinding(String),
-    ClosureEnclosure,
 }
 
 /// Physical payload source selected only after linked identity is fixed.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PayloadRef {
     pub package: PackageId,
-    pub locator: InstalledObjectLocator,
+    pub binding: String,
 }
 
 #[derive(Clone, Debug)]
@@ -427,17 +349,6 @@ pub struct ResourceIr {
     pub path: String,
 }
 
-#[derive(Clone, Debug)]
-pub enum Root {
-    RootNamespace(NamespaceId),
-    ExportedBinding(BindingId),
-    Lifecycle(NamespaceActivationId),
-}
-
-/// Deferred finite runtime behavior. The first profile rejects every value.
-#[derive(Clone, Debug)]
-pub enum ResidualCapability {}
-
 /// Selected target-R compatibility contract recorded in the artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetContract {
@@ -452,20 +363,17 @@ pub struct ProgramIr {
     target: TargetContract,
     root_package: PackageId,
     packages: BTreeMap<PackageId, PackageIr>,
-    namespaces: Vec<Namespace<LinkPhase>>,
-    bindings: Vec<Binding<LinkPhase>>,
-    environment_bindings: Vec<EnvironmentBinding<LinkPhase>>,
-    values: Vec<Value<LinkPhase>>,
-    closures: Vec<Closure<LinkPhase>>,
-    environments: Vec<Environment<LinkPhase>>,
+    namespaces: Vec<Namespace>,
+    bindings: Vec<Binding>,
+    values: Vec<Value>,
+    closures: Vec<Closure>,
+    environments: Vec<Environment>,
     codes: Vec<CodeIr>,
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     native_components: Vec<NativeComponentIr>,
     resources: Vec<ResourceIr>,
     relocations: Vec<Relocation>,
-    residuals: Vec<ResidualCapability>,
-    roots: Vec<Root>,
     root_artifact: RootArtifactIr,
 }
 
@@ -486,27 +394,23 @@ impl ProgramIr {
         self.packages.iter().map(|(id, package)| (*id, package))
     }
 
-    pub fn namespaces(&self) -> &[Namespace<LinkPhase>] {
+    pub fn namespaces(&self) -> &[Namespace] {
         &self.namespaces
     }
 
-    pub fn bindings(&self) -> &[Binding<LinkPhase>] {
+    pub fn bindings(&self) -> &[Binding] {
         &self.bindings
     }
 
-    pub fn values(&self) -> &[Value<LinkPhase>] {
+    pub fn values(&self) -> &[Value] {
         &self.values
     }
 
-    pub fn closures(&self) -> &[Closure<LinkPhase>] {
+    pub fn closures(&self) -> &[Closure] {
         &self.closures
     }
 
-    pub fn environment_bindings(&self) -> &[EnvironmentBinding<LinkPhase>] {
-        &self.environment_bindings
-    }
-
-    pub fn environments(&self) -> &[Environment<LinkPhase>] {
+    pub fn environments(&self) -> &[Environment] {
         &self.environments
     }
 
@@ -544,16 +448,8 @@ impl ProgramIr {
             .map(|(index, resource)| (ResourceId::from_index(index), resource))
     }
 
-    pub fn roots(&self) -> &[Root] {
-        &self.roots
-    }
-
     pub fn relocations(&self) -> &[Relocation] {
         &self.relocations
-    }
-
-    pub fn residuals(&self) -> &[ResidualCapability] {
-        &self.residuals
     }
 
     pub fn root_artifact(&self) -> &RootArtifactIr {
@@ -564,18 +460,18 @@ impl ProgramIr {
         &self.packages[&id]
     }
 
-    pub fn namespace(&self, id: NamespaceId) -> &Namespace<LinkPhase> {
+    pub fn namespace(&self, id: NamespaceId) -> &Namespace {
         &self.namespaces[id.index()]
     }
 
-    pub fn root_namespace(&self) -> &Namespace<LinkPhase> {
+    pub fn root_namespace(&self) -> &Namespace {
         self.namespaces
             .iter()
             .find(|namespace| matches!(namespace.state, LinkNamespaceState::Root(_)))
             .expect("ProgramIr has one Root namespace")
     }
 
-    pub fn binding(&self, id: BindingId) -> &Binding<LinkPhase> {
+    pub fn binding(&self, id: BindingId) -> &Binding {
         &self.bindings[id.index()]
     }
 
@@ -586,11 +482,11 @@ impl ProgramIr {
         }
     }
 
-    pub fn closure(&self, id: ClosureId) -> &Closure<LinkPhase> {
+    pub fn closure(&self, id: ClosureId) -> &Closure {
         &self.closures[id.index()]
     }
 
-    pub fn environment(&self, id: EnvironmentId) -> &Environment<LinkPhase> {
+    pub fn environment(&self, id: EnvironmentId) -> &Environment {
         &self.environments[id.index()]
     }
 
@@ -598,12 +494,8 @@ impl ProgramIr {
         &self.codes[id.index()]
     }
 
-    pub fn value(&self, id: ValueId) -> &Value<LinkPhase> {
+    pub fn value(&self, id: ValueId) -> &Value {
         &self.values[id.index()]
-    }
-
-    pub fn environment_binding(&self, id: EnvironmentBindingId) -> &EnvironmentBinding<LinkPhase> {
-        &self.environment_bindings[id.index()]
     }
 
     pub fn activation(&self, id: NamespaceActivationId) -> &NamespaceActivationIr {
@@ -627,22 +519,19 @@ impl ProgramIr {
 pub struct ProgramBuilder {
     target: TargetContract,
     packages: BTreeMap<PackageId, PackageIr>,
-    namespaces: Vec<Namespace<LinkPhase>>,
-    bindings: Vec<Binding<LinkPhase>>,
-    environment_bindings: Vec<EnvironmentBinding<LinkPhase>>,
-    values: Vec<Value<LinkPhase>>,
-    closures: Vec<Closure<LinkPhase>>,
-    environments: Vec<Environment<LinkPhase>>,
+    namespaces: Vec<Namespace>,
+    bindings: Vec<Binding>,
+    values: Vec<Value>,
+    closures: Vec<Closure>,
+    environments: Vec<Environment>,
     codes: Vec<CodeIr>,
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     native_components: Vec<NativeComponentIr>,
     resources: Vec<ResourceIr>,
     relocations: Vec<Relocation>,
-    roots: Vec<Root>,
     root_artifact: RootArtifactIr,
     root_package: Option<PackageId>,
-    _phase: PhantomData<LinkPhase>,
 }
 
 /// IDs allocated while a namespace builder closes its final slot universe.
@@ -668,10 +557,10 @@ pub enum MaterializedSlotSource {
     Closure {
         source: Arc<str>,
         normalized_shape: Digest,
-        locator: InstalledObjectLocator,
+        binding: String,
     },
     Payload {
-        locator: InstalledObjectLocator,
+        binding: String,
     },
 }
 
@@ -682,7 +571,6 @@ impl ProgramBuilder {
             packages: BTreeMap::new(),
             namespaces: Vec::new(),
             bindings: Vec::new(),
-            environment_bindings: Vec::new(),
             values: Vec::new(),
             closures: Vec::new(),
             environments: Vec::new(),
@@ -692,10 +580,8 @@ impl ProgramBuilder {
             native_components: Vec::new(),
             resources: Vec::new(),
             relocations: Vec::new(),
-            roots: Vec::new(),
             root_artifact: RootArtifactIr::default(),
             root_package: None,
-            _phase: PhantomData,
         }
     }
 
@@ -712,7 +598,7 @@ impl ProgramBuilder {
         );
     }
 
-    pub fn add_namespace(&mut self, namespace: Namespace<LinkPhase>) -> NamespaceId {
+    pub fn add_namespace(&mut self, namespace: Namespace) -> NamespaceId {
         let id = NamespaceId::from_index(self.namespaces.len());
         self.namespaces.push(namespace);
         id
@@ -730,31 +616,29 @@ impl ProgramBuilder {
         let imports_environment = self.add_environment(Environment {
             kind: EnvironmentKind::Imports(namespace),
             parent: EnvironmentParentIr::BaseNamespace,
-            bindings: BTreeMap::new(),
         });
         let namespace_environment = self.add_environment(Environment {
             kind: EnvironmentKind::Namespace(namespace),
             parent: EnvironmentParentIr::Materialized(imports_environment),
-            bindings: BTreeMap::new(),
         });
         let mut bindings = BTreeMap::new();
         for slot in slots {
             let initial = match slot.source {
                 MaterializedSlotSource::Unbound => InitialBindingState::Unbound,
-                MaterializedSlotSource::Payload { locator } => {
-                    let value = self.add_value(Value::Payload(PayloadRef { package, locator }));
+                MaterializedSlotSource::Payload { binding } => {
+                    let value = self.add_value(Value::Payload(PayloadRef { package, binding }));
                     InitialBindingState::Value(value)
                 }
                 MaterializedSlotSource::Closure {
                     source,
                     normalized_shape,
-                    locator,
+                    binding,
                 } => {
                     let code = self.add_code(CodeIr::new(source, Vec::new(), normalized_shape));
                     let closure = self.add_closure(Closure {
                         code,
                         enclosure: namespace_environment,
-                        payload: PayloadRef { package, locator },
+                        payload: PayloadRef { package, binding },
                     });
                     let value = self.add_value(Value::Closure(closure));
                     InitialBindingState::Value(value)
@@ -853,28 +737,19 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn add_binding(&mut self, binding: Binding<LinkPhase>) -> BindingId {
+    pub fn add_binding(&mut self, binding: Binding) -> BindingId {
         let id = BindingId::from_index(self.bindings.len());
         self.bindings.push(binding);
         id
     }
 
-    pub fn add_environment(&mut self, environment: Environment<LinkPhase>) -> EnvironmentId {
+    pub fn add_environment(&mut self, environment: Environment) -> EnvironmentId {
         let id = EnvironmentId::from_index(self.environments.len());
         self.environments.push(environment);
         id
     }
 
-    pub fn add_environment_binding(
-        &mut self,
-        binding: EnvironmentBinding<LinkPhase>,
-    ) -> EnvironmentBindingId {
-        let id = EnvironmentBindingId::from_index(self.environment_bindings.len());
-        self.environment_bindings.push(binding);
-        id
-    }
-
-    pub fn add_value(&mut self, value: Value<LinkPhase>) -> ValueId {
+    pub fn add_value(&mut self, value: Value) -> ValueId {
         let id = ValueId::from_index(self.values.len());
         self.values.push(value);
         id
@@ -886,7 +761,7 @@ impl ProgramBuilder {
         id
     }
 
-    pub fn add_closure(&mut self, closure: Closure<LinkPhase>) -> ClosureId {
+    pub fn add_closure(&mut self, closure: Closure) -> ClosureId {
         let id = ClosureId::from_index(self.closures.len());
         self.closures.push(closure);
         id
@@ -1047,10 +922,6 @@ impl ProgramBuilder {
         CodeSite { code, occurrence }
     }
 
-    pub fn add_root(&mut self, root: Root) {
-        self.roots.push(root);
-    }
-
     pub fn set_root_artifact(&mut self, root_artifact: RootArtifactIr) {
         self.root_artifact = root_artifact;
     }
@@ -1064,7 +935,6 @@ impl ProgramBuilder {
             packages: self.packages,
             namespaces: self.namespaces,
             bindings: self.bindings,
-            environment_bindings: self.environment_bindings,
             values: self.values,
             closures: self.closures,
             environments: self.environments,
@@ -1074,8 +944,6 @@ impl ProgramBuilder {
             native_components: self.native_components,
             resources: self.resources,
             relocations: self.relocations,
-            residuals: Vec::new(),
-            roots: self.roots,
             root_artifact: self.root_artifact,
         }
     }
@@ -1087,31 +955,15 @@ pub struct ProvenanceIr {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     roots: Vec<NodeId>,
-    records: Vec<ProvenanceRecord>,
 }
 
 impl ProvenanceIr {
     pub(crate) fn from_analysis(graph: Graph, roots: Vec<NodeId>) -> Self {
-        let records = graph
-            .edges
-            .iter()
-            .map(|edge| ProvenanceRecord {
-                from: format!("{:?}", graph.nodes[edge.from.0].kind),
-                to: format!("{:?}", graph.nodes[edge.to.0].kind),
-                reason: edge.reason.clone(),
-                source: edge.span.clone(),
-            })
-            .collect();
         Self {
             nodes: graph.nodes,
             edges: graph.edges,
             roots,
-            records,
         }
-    }
-
-    pub fn records(&self) -> &[ProvenanceRecord] {
-        &self.records
     }
 
     pub fn nodes(&self) -> &[Node] {
@@ -1180,12 +1032,4 @@ impl ProvenanceIr {
     pub fn dump(&self) -> String {
         self.graph().dump()
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct ProvenanceRecord {
-    pub from: String,
-    pub to: String,
-    pub reason: String,
-    pub source: Option<Span>,
 }

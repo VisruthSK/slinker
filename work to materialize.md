@@ -206,10 +206,6 @@ Invariants into types:
 - Removed bindings and unretained exports become typed slot state instead of parallel string lists.
 
 IR cleanup (breaking):
-- Delete what nothing produces or reads: `ProgramIr.roots`/`Root`/`add_root`, `ProvenanceRecord`
-  and `records()`, `environment_bindings`/`EnvironmentBinding`, unused `Value` variants,
-  `EnvironmentKind::Private`, `EnvironmentParentIr::{ExternalNamespace, Empty}`,
-  `ResidualCapability`, `ImagePhase`, `InstalledObjectLocator` path steps.
 - `NamespaceActivationIr` is the materializer's single source for activation: order, `.onLoad`,
   native components, stubs, and exports. Delete `RootArtifactIr.bootstrap_namespaces` and the
   runtime `exists(".onLoad")` discovery.

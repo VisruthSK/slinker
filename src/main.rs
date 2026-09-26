@@ -511,7 +511,6 @@ fn print_analysis(target: &TargetEnvironment, plan: &LinkIr) {
     println!("  closures: {}", program.closures().len());
     println!("  environments: {}", program.environments().len());
     println!("  relocations: {}", program.relocations().len());
-    println!("  residual capabilities: {}", program.residuals().len());
     println!();
     println!("provenance");
     println!("  entities: {}", plan.provenance().nodes().len());

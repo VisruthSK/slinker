@@ -127,7 +127,7 @@ impl BuildContext {
                 payloads
                     .entry(payload.package)
                     .or_default()
-                    .insert(payload.locator.root.clone());
+                    .insert(payload.binding.clone());
             }
         }
         let mut bundles = BTreeMap::new();
@@ -258,17 +258,8 @@ impl PureRStatic {
                 ),
             })
             .collect::<BTreeSet<_>>();
-        if !ir.program().residuals().is_empty() {
-            blockers.insert("residual runtime capability is outside PureRStatic".into());
-        }
         if ir.program().root_artifact().description.is_empty() {
             blockers.insert("Root source-package DESCRIPTION plan is missing".into());
-        }
-        for value in ir.program().values() {
-            if matches!(value, Value::Payload(payload) if !payload.locator.path.is_empty()) {
-                blockers
-                    .insert("nested payload reconstruction is not supported by PureRStatic".into());
-            }
         }
         blockers.extend(relocation_site_issues(ir.program()));
         let program = ir.program();
@@ -591,7 +582,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
 
 fn namespace_closures(
     program: &ProgramIr,
-    namespace: &crate::ir::Namespace<crate::ir::LinkPhase>,
+    namespace: &crate::ir::Namespace,
 ) -> impl Iterator<Item = crate::ir::ClosureId> {
     namespace.bindings.values().filter_map(|binding| {
         match initial_value(program, *binding).map(|value| program.value(value)) {
@@ -601,10 +592,7 @@ fn namespace_closures(
     })
 }
 
-fn has_payloads(
-    program: &ProgramIr,
-    namespace: &crate::ir::Namespace<crate::ir::LinkPhase>,
-) -> bool {
+fn has_payloads(program: &ProgramIr, namespace: &crate::ir::Namespace) -> bool {
     namespace.bindings.values().any(|binding| {
         matches!(
             initial_value(program, *binding).map(|value| program.value(value)),
@@ -645,10 +633,7 @@ fn namespace_get(package: &str, name: &str) -> String {
     format!("base::get({name}, envir = base::asNamespace({package}), inherits = FALSE)")
 }
 
-fn s3_matrix(
-    program: &ProgramIr,
-    namespace: &crate::ir::Namespace<crate::ir::LinkPhase>,
-) -> String {
+fn s3_matrix(program: &ProgramIr, namespace: &crate::ir::Namespace) -> String {
     let rows = namespace
         .s3_registrations
         .iter()

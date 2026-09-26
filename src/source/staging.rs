@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use thiserror::Error;
 
-/// Privately installed root image used as the root ImagePhase input.
+/// Privately installed root image analyzed as the Root package.
 #[derive(Debug)]
 pub struct StagedRoot {
     library: PathBuf,

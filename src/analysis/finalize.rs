@@ -3,9 +3,9 @@ use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::build::{PackageOperation, PendingRelocation};
 use crate::ir::{
-    ExternalBindingAccess, ExternalPackageContract, InstalledObjectLocator, MaterializedSlot,
-    MaterializedSlotSource, PackageIr, PackageOperationIr, PackageRole as LinkedPackageRole,
-    ProgramIr, RootArtifactIr, TargetContract,
+    ExternalBindingAccess, ExternalPackageContract, MaterializedSlot, MaterializedSlotSource,
+    PackageIr, PackageOperationIr, PackageRole as LinkedPackageRole, ProgramIr, RootArtifactIr,
+    TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{ImportSpec, PackageAvailability, PackageId, PackageProvider};
@@ -186,10 +186,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let source = match image.binding(name) {
                     None => MaterializedSlotSource::Unbound,
                     Some(binding) => {
-                        let locator = InstalledObjectLocator {
-                            root: name.clone(),
-                            path: Vec::new(),
-                        };
                         match (
                             &binding.closure,
                             self.normalized_shapes.get(&(package, name.clone())),
@@ -200,10 +196,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                 MaterializedSlotSource::Closure {
                                     source: Arc::clone(&closure.source),
                                     normalized_shape: normalized_shape.clone(),
-                                    locator,
+                                    binding: name.clone(),
                                 }
                             }
-                            _ => MaterializedSlotSource::Payload { locator },
+                            _ => MaterializedSlotSource::Payload {
+                                binding: name.clone(),
+                            },
                         }
                     }
                 };
