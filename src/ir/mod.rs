@@ -973,8 +973,4 @@ impl ProvenanceIr {
             .filter(|node| matches!(node.kind, crate::analysis::NodeKind::MissingPackage))
             .map(|node| node.id)
     }
-
-    pub fn dump(&self) -> String {
-        self.graph().dump()
-    }
 }

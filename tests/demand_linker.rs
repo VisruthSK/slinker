@@ -555,24 +555,6 @@ fn unknown_closure_enclosure_reports_root_cause_without_lexical_cascade() {
 }
 
 #[test]
-fn provenance_dump_is_deterministic() {
-    let root = package(
-        "root",
-        &[
-            ("b", Some("b <- function() 1")),
-            ("a", Some("a <- function() b()")),
-        ],
-    );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
-    let first = plan.provenance().dump();
-    let second = plan.provenance().dump();
-    assert_eq!(first, second);
-    assert!(first.contains("LexicalReference"));
-}
-
-#[test]
 fn root_keeps_every_binding_while_dependencies_keep_only_reached_ones() {
     let root = package_with!(
         "root",
