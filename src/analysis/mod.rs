@@ -1,5 +1,6 @@
 mod arguments;
 pub mod diagnostic;
+mod dynamic_names;
 mod execute;
 pub mod explain;
 pub mod export;

@@ -148,9 +148,6 @@ Minimal code:
 
 ## Track E: Retire heuristics
 
-- Unresolved names: prove nothing in the retained program creates names dynamically (`assign`,
-  `makeActiveBinding`, `list2env`, `<<-` with computed names or unknown environments,
-  `environment<-`, unanalyzed native code defining R objects); then accept them.
 - Value provenance for reflection: `asNamespace(ns)$.__NAMESPACE__.$exports` reads the export table.
 - Default-argument specialization: a formal defaulting to a constant that no caller passes is
   static (voucher's `system.file(..., package = package)`).

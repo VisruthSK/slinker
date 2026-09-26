@@ -129,7 +129,6 @@ fn voucher_blocks_on_unproven_cli_and_fs_behavior() {
         "ObjectSystem in fs::compare.fs_path: NextMethod is not inside a registered method",
         "UnknownNativeEffects in cli: native component `cli` has unanalyzed C-to-R callbacks",
         "UnknownNativeEffects in fs: native component `fs` has unanalyzed C-to-R callbacks",
-        "UnresolvedBinding in cli::",
     ]);
 }
 

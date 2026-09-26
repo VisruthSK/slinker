@@ -1,3 +1,4 @@
+use super::dynamic_names::{CreatedName, NameCreator};
 use super::object_world::reachable_environment_labels;
 use super::relocation::PendingRelocation;
 use super::state::AnalyzerState;
@@ -59,6 +60,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         self.finalize_s3_dispatch(&retained);
+        self.finalize_unresolved_names();
         let blockers = self.diagnostics.into_sorted();
         LinkIr {
             program,
@@ -955,6 +957,60 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(span),
                 );
             }
+        }
+    }
+
+    fn finalize_unresolved_names(&mut self) {
+        let unknown_registrations = self
+            .images
+            .iter()
+            .flat_map(|(&package, image)| {
+                image
+                    .index
+                    .dynlibs
+                    .iter()
+                    .filter(|native| {
+                        native.registration.is_some() && native.library.routines().is_none()
+                    })
+                    .map(move |native| (package, native.name.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (package, component) in unknown_registrations {
+            self.dynamic_names.observe_creator(NameCreator {
+                package,
+                binding: component,
+                operation: "useDynLib(.registration = TRUE)",
+                name: CreatedName::Any,
+            });
+        }
+        let creatable = self
+            .dynamic_names
+            .creatable()
+            .map(|(unresolved, creator)| {
+                (
+                    unresolved.node,
+                    unresolved.package,
+                    unresolved.binding.clone(),
+                    format!(
+                        "unresolved name `{}` can be bound at run time by `{}` in `{}::{}`",
+                        unresolved.name,
+                        creator.operation,
+                        self.packages.name(creator.package),
+                        creator.binding
+                    ),
+                    unresolved.span.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (node, package, binding, message, span) in creatable {
+            self.diagnostic(
+                node,
+                package,
+                binding.as_deref(),
+                RejectCode::UnresolvedBinding,
+                message,
+                Some(span),
+            );
         }
     }
 

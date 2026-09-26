@@ -81,6 +81,10 @@ impl FakeProvider {
                     "NextMethod",
                     "new.env",
                     "list2env",
+                    "assign",
+                    "delayedAssign",
+                    "globalenv",
+                    "environment<-",
                     "lapply",
                     "get",
                     "get0",
@@ -2652,20 +2656,38 @@ fn find_package_of_a_linked_package_blocks_before_materialization() {
 }
 
 #[test]
-fn unresolved_name_blocks() {
-    let plan = Linker::new(
-        FakeProvider::new(vec![package(
-            "root",
-            &[("f", Some("f <- function() missing_everywhere()"))],
-        )]),
-        1,
-    )
-    .analyze("root")
-    .unwrap();
+fn unresolved_name_blocks_only_where_retained_code_can_bind_it() {
+    let analyze = |creator: Option<&str>| {
+        let mut bindings = vec![("f", Some("f <- function() missing_everywhere()"))];
+        bindings.extend(creator.map(|source| ("g", Some(source))));
+        Linker::new(FakeProvider::new(vec![package("root", &bindings)]), 1)
+            .analyze("root")
+            .unwrap()
+    };
+    let unresolved = |plan: &slinker::analysis::LinkIr| {
+        plan.blockers().iter().any(|diagnostic| {
+            diagnostic.code == RejectCode::UnresolvedBinding
+                && diagnostic.message.contains("missing_everywhere")
+        })
+    };
+
+    let alone = analyze(None);
+    assert!(alone.blockers().is_empty(), "{:?}", alone.blockers());
+    for creator in [
+        "g <- function(name) assign(name, function() 1, envir = globalenv())",
+        "g <- function() assign('missing_everywhere', function() 1, envir = globalenv())",
+        "g <- function(values) list2env(values, globalenv())",
+        "g <- function(f, e) { environment(f) <- e; f }",
+    ] {
+        assert!(unresolved(&analyze(Some(creator))), "{creator}");
+    }
+    let unrelated = analyze(Some(
+        "g <- function() assign('other_name', function() 1, envir = globalenv())",
+    ));
     assert!(
-        plan.blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::UnresolvedBinding)
+        unrelated.blockers().is_empty(),
+        "{:?}",
+        unrelated.blockers()
     );
 }
 
@@ -2942,20 +2964,13 @@ fn air_frontend_failure_is_localized_not_package_fatal() {
 }
 
 #[test]
-fn air_accepted_unknown_name_is_a_semantic_error_not_a_frontend_error() {
+fn air_accepted_unknown_name_is_not_a_frontend_error() {
     let root = package("root", &[("f", Some("f <- function() missing_symbol()"))]);
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
 
-    assert!(plan.blockers().iter().any(|diagnostic| {
-        diagnostic.binding.as_deref() == Some("f")
-            && diagnostic.code == RejectCode::UnresolvedBinding
-    }));
-    assert!(!plan.blockers().iter().any(|diagnostic| {
-        diagnostic.binding.as_deref() == Some("f")
-            && diagnostic.code == RejectCode::AirUnsupportedSyntax
-    }));
+    assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
 }
 
 #[test]

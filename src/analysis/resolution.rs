@@ -1,3 +1,4 @@
+use super::dynamic_names::UnresolvedName;
 use super::object_world::{ClosureId, ClosureObject};
 use super::state::AnalyzerState;
 use crate::Result;
@@ -625,14 +626,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             Resolution::Static(BindingTarget::Local | BindingTarget::Base) => {}
             Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
-                self.diagnostic(
-                    from,
-                    requester,
-                    binding,
-                    RejectCode::UnresolvedBinding,
-                    format!("unresolved name `{name}`"),
-                    Some(span),
-                );
+                self.dynamic_names.observe_unresolved(UnresolvedName {
+                    node: from,
+                    package: requester,
+                    binding: binding.map(str::to_owned),
+                    name,
+                    span,
+                });
             }
         }
     }

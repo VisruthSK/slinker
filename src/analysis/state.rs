@@ -4,6 +4,7 @@ use super::arguments::{
     static_package_arg, static_string_arg,
 };
 use super::diagnostic::DiagnosticSink;
+use super::dynamic_names::{CreatedName, DynamicNames, NameCreator};
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
 use super::namespace::{NamespaceBuilder, OptionalRegistration};
 use super::need::{NeedQueue, Popped};
@@ -83,6 +84,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) construction_calls: HashMap<ConstructionCallKey, AbstractValue>,
     pub(super) construction_evaluations: usize,
     pub(super) reflection: ReflectionFacts,
+    pub(super) dynamic_names: DynamicNames,
     pub(super) external_bindings: BTreeMap<(PackageId, BindingName), ExternalBindingAccess>,
     pub(super) dependencies: HashMap<NodeId, HashSet<NodeId>>,
     pub(super) provenance: bool,
@@ -122,6 +124,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             construction_calls: HashMap::new(),
             construction_evaluations: 0,
             reflection: ReflectionFacts::default(),
+            dynamic_names: DynamicNames::default(),
             external_bindings: BTreeMap::new(),
             dependencies: HashMap::new(),
             provenance: true,
@@ -1220,6 +1223,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 site.lexical_environment,
                 &reference.name,
             )?;
+            if reference.name == "environment<-"
+                && matches!(resolved, Resolution::Static(BindingTarget::Base))
+            {
+                self.dynamic_names.observe_creator(NameCreator {
+                    package: site.package,
+                    binding: site.binding.to_owned(),
+                    operation: "environment<-",
+                    name: CreatedName::Any,
+                });
+            }
             if (!enclosure_known
                 || reference.kind != NameRefKind::External
                 || self.value_closures.contains(&site.node))
@@ -1336,6 +1349,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
             match effect.kind {
                 SyntaxEffectKind::SuperAssignment => {
                     if !enclosure_known {
+                        self.dynamic_names.observe_creator(NameCreator {
+                            package: site.package,
+                            binding: site.binding.to_owned(),
+                            operation: "<<-",
+                            name: CreatedName::Any,
+                        });
                         continue;
                     }
                     self.handle_superassignment(
@@ -2921,6 +2940,14 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             }
             return Ok(());
         }
+        if let Some((operation, name)) = created_name(call) {
+            self.dynamic_names.observe_creator(NameCreator {
+                package: current,
+                binding: binding.to_owned(),
+                operation,
+                name,
+            });
+        }
         if reflective_name_formals(&call.callee).is_some() {
             return self.reflective_lookup(site, parsed, call);
         }
@@ -3672,6 +3699,30 @@ pub(super) fn is_r_constant(name: &str) -> bool {
             | "NA_complex_"
             | "NA_character_"
     )
+}
+
+/// The run-time name a base binding-creation call can bind, when `call` is one.
+fn created_name(call: &CallSite) -> Option<(&'static str, CreatedName)> {
+    let (operation, formals, target): (_, &[&str], _) = match call.callee.as_str() {
+        "assign" => (
+            "assign",
+            &["x", "value", "pos", "envir", "inherits", "immediate"],
+            "x",
+        ),
+        "delayedAssign" => (
+            "delayedAssign",
+            &["x", "value", "eval.env", "assign.env"],
+            "x",
+        ),
+        "makeActiveBinding" => ("makeActiveBinding", &["sym", "fun", "env"], "sym"),
+        "list2env" => return Some(("list2env", CreatedName::Any)),
+        _ => return None,
+    };
+    let name = match matched_static_arg(call, formals, target) {
+        Some(StaticArg::String(name)) => CreatedName::Named(name.clone()),
+        Some(StaticArg::Symbol(_)) | None => CreatedName::Any,
+    };
+    Some((operation, name))
 }
 
 enum Discovered {
