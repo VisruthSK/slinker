@@ -4,7 +4,7 @@ use super::arguments::{
 };
 use super::diagnostic::DiagnosticSink;
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
-use super::namespace::NamespaceBuilder;
+use super::namespace::{NamespaceBuilder, OptionalRegistration};
 use super::need::{NeedQueue, Popped};
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
 use super::parse_cache::{ParseCache, ParseKey, ParseState};
@@ -1596,6 +1596,28 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 && self.package_is_suggested_only(id, package_name)?
                 && !self.optional_package_selected(package_name)
             {
+                self.namespace_builders
+                    .get_mut(&id)
+                    .expect("namespace builder initialized")
+                    .optional_registrations
+                    .push(OptionalRegistration {
+                        package: package_name.into(),
+                        generic: registration.generic.name.clone(),
+                        class: registration.class.clone(),
+                        method: registration.method.clone(),
+                    });
+                self.require(
+                    node,
+                    Need::Binding {
+                        package: id,
+                        binding: registration.method.clone(),
+                    },
+                    EdgeKind::S3Registration,
+                    format!(
+                        "loading optional `{package_name}` registers {}/{}",
+                        registration.generic, registration.class
+                    ),
+                );
                 continue;
             }
             let generic_package = match registration.generic.package.as_deref() {

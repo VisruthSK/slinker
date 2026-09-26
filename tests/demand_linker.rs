@@ -393,11 +393,13 @@ fn program_has_s3_registration(
         .any(|registration| {
             let namespace = plan.program().namespace(registration.owner_namespace);
             let owner_matches = plan.program().package(namespace.package).identity().name == owner;
-            let generic_package_matches = registration
-                .generic
-                .package
-                .map(|package| plan.program().package(package).identity().name.as_str())
-                == generic_package;
+            let generic_package_matches = match &registration.generic.home {
+                slinker::ir::GenericHome::Lexical => None,
+                slinker::ir::GenericHome::Program(package) => {
+                    Some(plan.program().package(*package).identity().name.as_str())
+                }
+                slinker::ir::GenericHome::Optional(package) => Some(package.as_str()),
+            } == generic_package;
             owner_matches
                 && generic_package_matches
                 && registration.generic.name == generic
@@ -3909,7 +3911,7 @@ fn registered_operator_method_is_retained_with_its_dependencies() {
 }
 
 #[test]
-fn unselected_suggested_s3_generic_does_not_retain_optional_registration_method() {
+fn unselected_suggested_s3_generic_keeps_a_delayed_registration_without_inspecting_it() {
     let root = package_with!(
         "root",
         &[
@@ -3935,7 +3937,7 @@ fn unselected_suggested_s3_generic_does_not_retain_optional_registration_method(
     let counts = provider.count_handle();
     let plan = Linker::new(provider, 1).analyze("root").unwrap();
 
-    assert!(!program_has_s3_registration(
+    assert!(program_has_s3_registration(
         &plan,
         "root",
         Some("foo"),
@@ -3954,7 +3956,7 @@ fn unselected_suggested_s3_generic_does_not_retain_optional_registration_method(
 }
 
 #[test]
-fn retained_dependency_method_does_not_pull_unselected_suggested_generic() {
+fn retained_dependency_method_keeps_its_delayed_registration_on_an_unselected_generic() {
     let root = package("root", &[("f", Some("f <- function() dep::method()"))]);
     let dep = package_with!(
         "dep",
@@ -3979,7 +3981,7 @@ fn retained_dependency_method_does_not_pull_unselected_suggested_generic() {
     let plan = Linker::new(provider, 2).analyze("root").unwrap();
 
     assert!(retained_binding(&plan, "dep", "method"));
-    assert!(!program_has_s3_registration(
+    assert!(program_has_s3_registration(
         &plan,
         "dep",
         Some("foo"),

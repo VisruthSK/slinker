@@ -1,11 +1,20 @@
 use crate::analysis::S3Id;
-use crate::package::{BindingName, PackageIndex};
+use crate::package::{BindingName, ClassName, GenericName, PackageIndex, PackageName};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
 pub(super) struct NamespaceBuilder {
     pub(super) bindings: BTreeSet<BindingName>,
     pub(super) registrations: Vec<S3Id>,
+    pub(super) optional_registrations: Vec<OptionalRegistration>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct OptionalRegistration {
+    pub(super) package: PackageName,
+    pub(super) generic: GenericName,
+    pub(super) class: ClassName,
+    pub(super) method: BindingName,
 }
 
 impl NamespaceBuilder {
@@ -19,6 +28,7 @@ impl NamespaceBuilder {
         Self {
             bindings,
             registrations: Vec::new(),
+            optional_registrations: Vec::new(),
         }
     }
 

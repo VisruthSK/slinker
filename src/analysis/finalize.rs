@@ -4,7 +4,7 @@ use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
     BindingId, BindingName, ClosureHome, CodeId, ExportTable, ExternalBindingAccess,
-    ExternalPackageContract, FinalizedNamespace, InvalidRelocation, MaterializedRole,
+    ExternalPackageContract, FinalizedNamespace, GenericHome, InvalidRelocation, MaterializedRole,
     MaterializedSlot, MaterializedSlotSource, NamespaceId, ObjectStep,
     PackageRole as LinkedPackageRole, ProgramBuilder, ProgramIr, RelocationTarget, RootArtifactIr,
     TargetContract, UnretainedName,
@@ -280,11 +280,26 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 builder.attach_s3_registration(
                     namespace.namespace,
                     crate::ir::GenericId {
-                        package: registration
+                        home: registration
                             .generic
                             .package
-                            .filter(|package| retained.contains(package)),
+                            .filter(|package| retained.contains(package))
+                            .map_or(GenericHome::Lexical, GenericHome::Program),
                         name: registration.generic.name.clone(),
+                    },
+                    registration.class.clone(),
+                    method,
+                );
+            }
+            for registration in &namespace_builder.optional_registrations {
+                let Some(&method) = namespace.bindings.get(registration.method.as_str()) else {
+                    continue;
+                };
+                builder.attach_s3_registration(
+                    namespace.namespace,
+                    crate::ir::GenericId {
+                        home: GenericHome::Optional(registration.package.clone()),
+                        name: registration.generic.clone(),
                     },
                     registration.class.clone(),
                     method,

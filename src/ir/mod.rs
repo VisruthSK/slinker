@@ -409,8 +409,15 @@ pub struct RootArtifactIr {
 
 #[derive(Clone, Debug)]
 pub struct GenericId {
-    pub package: Option<PackageId>,
+    pub home: GenericHome,
     pub name: GenericName,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GenericHome {
+    Lexical,
+    Program(PackageId),
+    Optional(PackageName),
 }
 
 #[derive(Clone, Debug)]
@@ -894,11 +901,12 @@ impl ProgramBuilder {
             .copied()
             .filter(|&id| {
                 let generic = &self.s3_registrations[id.index()].generic;
-                match generic.package {
-                    Some(package) => {
-                        matches!(self.packages[&package], PackageIr::Linked { .. })
+                match &generic.home {
+                    GenericHome::Program(package) => {
+                        matches!(self.packages[package], PackageIr::Linked { .. })
                     }
-                    None => {
+                    GenericHome::Optional(_) => false,
+                    GenericHome::Lexical => {
                         !owner.bindings.contains_key(generic.name.as_str())
                             && self.visible_binding(namespace, &generic.name).is_some_and(
                                 |binding| {

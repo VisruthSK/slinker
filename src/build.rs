@@ -1,8 +1,8 @@
 use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::ir::{
-    ClosureHome, LinkBindingState, LinkNamespaceState, ObjectStep, ProgramIr, RelocationTarget,
-    ResourceId, Value,
+    ClosureHome, GenericHome, LinkBindingState, LinkNamespaceState, ObjectStep, ProgramIr,
+    RelocationTarget, ResourceId, Value,
 };
 use crate::package::PackageId;
 use crate::r_worker::client::WorkerClient;
@@ -670,11 +670,12 @@ fn s3_matrix(program: &ProgramIr, registrations: &[crate::ir::S3RegistrationId])
             rows.iter()
                 .map(|row| r_string(&program.binding(row.method).name)),
         )
-        .chain(rows.iter().map(|row| {
-            row.generic.package.map_or_else(
-                || "NA_character_".to_owned(),
-                |package| r_string(program.package(package).registered_namespace().as_str()),
-            )
+        .chain(rows.iter().map(|row| match &row.generic.home {
+            GenericHome::Lexical => "NA_character_".to_owned(),
+            GenericHome::Program(package) => {
+                r_string(program.package(*package).registered_namespace().as_str())
+            }
+            GenericHome::Optional(package) => r_string(package),
         }))
         .collect::<Vec<_>>();
     format!("matrix(as.character(c({})), ncol = 4L)", cells.join(", "))
@@ -735,13 +736,18 @@ fn render_namespace(program: &ProgramIr) -> String {
         .filter(|registration| !program.root_artifact().activated_s3.contains(registration))
     {
         let registration = program.s3_registration(*registration);
-        let generic = match registration.generic.package {
-            Some(package) => format!(
+        let generic = match &registration.generic.home {
+            GenericHome::Program(package) => format!(
                 "{}::{}",
-                r_binding_name(&program.package(package).identity().name),
+                r_binding_name(&program.package(*package).identity().name),
                 r_binding_name(&registration.generic.name)
             ),
-            None => r_string(&registration.generic.name),
+            GenericHome::Optional(package) => format!(
+                "{}::{}",
+                r_binding_name(package),
+                r_binding_name(&registration.generic.name)
+            ),
+            GenericHome::Lexical => r_string(&registration.generic.name),
         };
         emit!(
             out,

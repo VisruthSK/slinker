@@ -788,6 +788,84 @@ fn s3_registrations_on_linked_generics_reach_the_private_namespace() {
     );
 }
 
+#[test]
+fn delayed_registrations_on_suggested_generics_reach_the_real_package() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let optional_source = fixture.path().join("tinylate");
+    write_package(
+        &optional_source,
+        "tinylate",
+        "",
+        "export(render)\n",
+        "render <- function(x) UseMethod('render')\n",
+    );
+    let linked_source = fixture.path().join("tinyopt");
+    write_package(
+        &linked_source,
+        "tinyopt",
+        "Suggests: tinylate\n",
+        "export(make_opt)\nS3method(tinylate::render, optcls)\n",
+        "make_opt <- function() structure(1, class = 'optcls')\nrender.optcls <- function(x) 'opt'\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &linked_source, &build_library);
+
+    let root_source = fixture.path().join("optroot");
+    write_package(
+        &root_source,
+        "optroot",
+        "Imports: tinyopt\nSuggests: tinylate\n",
+        "importFrom(tinyopt, make_opt)\nexport(objects)\nS3method(tinylate::render, rootcls)\n",
+        "objects <- function() list(make_opt(), structure(1, class = 'rootcls'))\nrender.rootcls <- function(x) 'root'\n",
+    );
+    let output = fixture.path().join("generated-optroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run optional registration build");
+    assert_success(&result, "slinker build optional registration fixture");
+
+    let rendered =
+        "stopifnot(identical(vapply(objects(), tinylate::render, ''), c('opt', 'root')))";
+    let behaviors = [
+        format!("library(optroot); loadNamespace('tinylate'); {rendered}"),
+        format!("loadNamespace('tinylate'); library(optroot); {rendered}"),
+    ];
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &optional_source, &original);
+    install_package(&r_home, &linked_source, &original);
+    install_package(&r_home, &root_source, &original);
+    for behavior in &behaviors {
+        run_r(&r_home, &original, behavior);
+    }
+
+    let absent = fixture.path().join("absent");
+    fs::create_dir(&absent).expect("library without the real Linked package");
+    install_package(&r_home, &optional_source, &absent);
+    install_package(&r_home, &output, &absent);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &optional_source, &installed);
+    install_package(&r_home, &linked_source, &installed);
+    install_package(&r_home, &output, &installed);
+    for behavior in &behaviors {
+        run_r(&r_home, &absent, behavior);
+        run_r(&r_home, &installed, behavior);
+        run_r(
+            &r_home,
+            &installed,
+            &format!("loadNamespace('tinyopt'); {behavior}"),
+        );
+    }
+}
+
 fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &str) {
     fs::create_dir_all(root.join("R")).expect("R directory");
     fs::write(
