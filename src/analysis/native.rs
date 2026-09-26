@@ -59,7 +59,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         let native_node = self.need_node(&Need::Native {
             package: current,
-            component: component.to_owned(),
+            component: component.to_owned().into(),
         });
         let Some(summary) = Self::native_summary_for_selector(native, selector, summaries) else {
             self.diagnostic(

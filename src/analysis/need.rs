@@ -1,10 +1,8 @@
 use crate::analysis::object_world::ClosureId;
-use crate::package::{ClassName, GenericName, PackageId};
+use crate::package::{ClassName, ComponentName, GenericName, PackageId, ResourcePath};
 use std::collections::{HashSet, VecDeque};
 
 pub use crate::package::BindingName;
-pub type ResourceId = String;
-pub type NativeId = String;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LifecycleHook {
     OnLoad,
@@ -57,7 +55,7 @@ pub enum Need {
     },
     Resource {
         package: PackageId,
-        resource: ResourceId,
+        resource: ResourcePath,
     },
     Dataset {
         package: PackageId,
@@ -69,7 +67,7 @@ pub enum Need {
     },
     Native {
         package: PackageId,
-        component: NativeId,
+        component: ComponentName,
     },
     Lifecycle {
         package: PackageId,

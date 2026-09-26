@@ -190,10 +190,10 @@ Performance:
   inspect different packages in parallel), and string-keyed maps in the analyzer (interning).
 
 Invariants into types:
-- `PackageName`, `BindingName`, `ClassName`, and `GenericName` are distinct string newtypes.
+- `PackageName`, `BindingName`, `ClassName`, `GenericName`, `ComponentName`, and `ResourcePath` are
+  distinct string newtypes.
   Interning them so they hash and compare as integers is unmeasured; do it only if a profile shows
-  name hashing matters. Resource paths, native component names, and lifecycle hooks in `Need` are
-  still plain strings.
+  name hashing matters.
 
 Minimal code:
 - Fix the `clippy::pedantic` findings that matter (redundant clones, pass-by-value, `map_or_else`,

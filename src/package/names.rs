@@ -85,3 +85,5 @@ name_type!(BindingName);
 name_type!(ClassName);
 name_type!(GenericName);
 name_type!(PackageName);
+name_type!(ComponentName);
+name_type!(ResourcePath);

@@ -543,7 +543,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 from,
                 Need::Native {
                     package,
-                    component: component.clone(),
+                    component: component.clone().into(),
                 },
                 EdgeKind::Native,
                 format!("registered native symbol `{native_binding}` is provided by `{component}`"),

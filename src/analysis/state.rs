@@ -20,9 +20,9 @@ use crate::ir::ExternalBindingAccess;
 use crate::ir::NamespaceOperation;
 use crate::metadata::{RelationField, relations};
 use crate::package::{
-    BindingImage, BindingName, BindingRepresentation, ClosureSource, Digest, ImportSpec,
-    NativeSafety, ObjectKind, PackageId, PackageImage, PackageProvider, PrivateBindingImage,
-    SyntaxValidation, TargetUniverse,
+    BindingImage, BindingName, BindingRepresentation, ClosureSource, ComponentName, Digest,
+    ImportSpec, NativeSafety, ObjectKind, PackageId, PackageImage, PackageProvider,
+    PrivateBindingImage, ResourcePath, SyntaxValidation, TargetUniverse,
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, OakParseContext,
@@ -665,7 +665,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }) => {
                 self.require(
                     node,
-                    Need::Native { package, component: component.clone() },
+                    Need::Native { package, component: component.clone().into() },
                     EdgeKind::Export,
                     format!("root export `{binding}` resolves to registered native symbol `{native_binding}` in `{component}`"),
                 );
@@ -1648,7 +1648,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 node,
                 Need::Native {
                     package: id,
-                    component: native.name.clone(),
+                    component: native.name.clone().into(),
                 },
                 EdgeKind::Native,
                 format!("effective useDynLib requires {}", native.name),
@@ -1668,7 +1668,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_resource(&mut self, id: PackageId, resource: String) -> Result<()> {
+    pub(super) fn process_resource(&mut self, id: PackageId, resource: ResourcePath) -> Result<()> {
         if self.packages.is_external(id) {
             self.external.insert(id);
             return Ok(());
@@ -1758,7 +1758,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_native(&mut self, id: PackageId, component: String) -> Result<()> {
+    pub(super) fn process_native(&mut self, id: PackageId, component: ComponentName) -> Result<()> {
         if self.packages.is_external(id) {
             self.external.insert(id);
             return Ok(());
@@ -1768,14 +1768,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             package: id,
             component: component.clone(),
         });
-        if let Some(native) = index.dynlibs.iter().find(|native| native.name == component) {
+        if let Some(native) = index.dynlibs.iter().find(|native| component == native.name) {
             if !self.is_root(id) {
                 match &native.library {
                     Some(library) => self.require(
                         node,
                         Need::Resource {
                             package: id,
-                            resource: library.clone(),
+                            resource: library.clone().into(),
                         },
                         EdgeKind::Native,
                         format!("native component `{component}` ships its compiled library"),
@@ -2061,7 +2061,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             from,
             Need::Resource {
                 package: foreign,
-                resource: path.clone(),
+                resource: path.clone().into(),
             },
             EdgeKind::Resource,
             format!("system.file requires {package_name}/{path}"),
@@ -2147,7 +2147,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     // this cannot turn an unknown symbol into an accepted link.
                     self.require_at(
                         from,
-                        Need::Native { package, component: component.to_owned() },
+                        Need::Native { package, component: component.to_owned().into() },
                         EdgeKind::Native,
                         format!(".onLoad may receive registered native symbol `{value}` from `{component}`"),
                         Some(effect.span.clone()),
@@ -2592,7 +2592,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 from,
                 Need::Native {
                     package: current,
-                    component: component.clone(),
+                    component: component.clone().into(),
                 },
                 EdgeKind::Native,
                 format!(
@@ -2965,7 +2965,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             Need::Activation { .. } => NodeKind::Activation,
             Need::Resource { resource, .. } => NodeKind::Resource {
-                path: resource.clone(),
+                path: resource.to_string(),
             },
             Need::Dataset { dataset, .. } => NodeKind::Dataset {
                 name: dataset.clone(),
@@ -2975,7 +2975,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 class: registration.class.to_string(),
             },
             Need::Native { component, .. } => NodeKind::NativeComponent {
-                name: component.clone(),
+                name: component.to_string(),
             },
             Need::Lifecycle { hook, .. } => NodeKind::Lifecycle {
                 hook: hook.to_string(),
