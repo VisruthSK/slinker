@@ -10,6 +10,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempPath;
 
+const RESPONSE_SPIN: std::time::Duration = std::time::Duration::from_millis(2);
+
 pub(crate) struct WorkerClient {
     child: Child,
     input: BufWriter<ChildStdin>,
@@ -224,6 +226,7 @@ impl WorkerClient {
             source,
         })?;
         let mut line = String::new();
+        let waiting = std::time::Instant::now();
         loop {
             let bytes = self
                 .output
@@ -240,7 +243,11 @@ impl WorkerClient {
                     "Harp worker terminated while processing {context}; status {status}"
                 )));
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if waiting.elapsed() < RESPONSE_SPIN {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
         serde_json::from_str(&line).map_err(|error| {
             Error::Analysis(format!(
