@@ -3,18 +3,19 @@ use super::state::AnalyzerState;
 use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
-    BindingId, BindingName, ExportTable, ExternalBindingAccess, ExternalPackageContract,
-    FinalizedNamespace, InvalidRelocation, MaterializedRole, MaterializedSlot,
-    MaterializedSlotSource, NamespaceId, PackageRole as LinkedPackageRole, ProgramBuilder,
-    ProgramIr, RelocationTarget, RootArtifactIr, TargetContract, UnretainedName,
+    BindingId, BindingName, ClosureHome, CodeId, ExportTable, ExternalBindingAccess,
+    ExternalPackageContract, FinalizedNamespace, InvalidRelocation, MaterializedRole,
+    MaterializedSlot, MaterializedSlotSource, NamespaceId, ObjectStep,
+    PackageRole as LinkedPackageRole, ProgramBuilder, ProgramIr, RelocationTarget, RootArtifactIr,
+    TargetContract, UnretainedName,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{
     ImportSpec, NativeComponent, PackageAvailability, PackageId, PackageProvider,
 };
 use crate::source::generated_description;
-use crate::syntax::{SourceKey, Sources};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::syntax::{SourceKey, SourceOrigin, Sources};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -449,26 +450,41 @@ impl<P: PackageProvider> AnalyzerState<P> {
         namespace_ids: &HashMap<String, FinalizedNamespace>,
         issues: &mut Vec<FinalizationIssue>,
     ) {
+        let emitted_code = |builder: &ProgramBuilder, origin: &SourceOrigin| {
+            origin
+                .key
+                .namespace_binding()
+                .and_then(|binding| namespace_ids[origin.package.as_str()].bindings.get(binding))
+                .and_then(|binding| builder.binding_code(*binding))
+        };
+        let mut payload_codes = HashMap::<&SourceOrigin, Option<CodeId>>::new();
+        for relocation in self.relocations.relocations() {
+            let origin = self.parses.sources().origin(&relocation.source().source);
+            let required = relocation.reaches_removed_installation()
+                || relocation.named_namespace().is_some_and(|package| {
+                    self.packages.role(package) == LinkedPackageRole::Linked
+                });
+            if !required
+                || payload_codes.contains_key(origin)
+                || emitted_code(builder, origin).is_some()
+            {
+                continue;
+            }
+            let code = self.payload_closure(builder, namespace_ids, origin);
+            if code.is_none() {
+                issues.push(FinalizationIssue::NonRelocatableCode {
+                    package: origin.package.clone(),
+                    binding: origin.key.to_string(),
+                });
+            }
+            payload_codes.insert(origin, code);
+        }
         for relocation in self.relocations.relocations() {
             let source = relocation.source();
             let origin = self.parses.sources().origin(&source.source);
-            let owner_package = &origin.package;
-            let Some(code) = origin
-                .key
-                .namespace_binding()
-                .and_then(|binding| namespace_ids[owner_package.as_str()].bindings.get(binding))
-                .and_then(|binding| builder.binding_code(*binding))
+            let Some(code) = emitted_code(builder, origin)
+                .or_else(|| payload_codes.get(origin).copied().flatten())
             else {
-                if relocation.reaches_removed_installation()
-                    || relocation.named_namespace().is_some_and(|package| {
-                        self.packages.role(package) == LinkedPackageRole::Linked
-                    })
-                {
-                    issues.push(FinalizationIssue::NonRelocatableCode {
-                        package: owner_package.clone(),
-                        binding: origin.key.to_string(),
-                    });
-                }
                 continue;
             };
             let target = match relocation {
@@ -526,6 +542,104 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 issues.push(FinalizationIssue::InvalidRelocation(invalid));
             }
         }
+    }
+
+    fn payload_closure(
+        &self,
+        builder: &mut ProgramBuilder,
+        namespace_ids: &HashMap<String, FinalizedNamespace>,
+        origin: &SourceOrigin,
+    ) -> Option<CodeId> {
+        let package = self.known_package(&origin.package)?;
+        let image = self.images.get(&package)?;
+        let shape = self.parses.shape(&(package, origin.key.clone()))?.clone();
+        let (home, binding, closure) = match &origin.key {
+            SourceKey::Binding(name) => {
+                let binding = *namespace_ids[origin.package.as_str()]
+                    .bindings
+                    .get(name.as_str())?;
+                if !builder.binding_is_payload(binding) {
+                    return None;
+                }
+                (
+                    ClosureHome::Namespace,
+                    BindingName::from(name.as_str()),
+                    image.binding(name)?.closure.as_ref()?,
+                )
+            }
+            SourceKey::Private {
+                environment,
+                binding,
+            } => {
+                let (root, steps) = self
+                    .payload_environment_paths(
+                        builder,
+                        &namespace_ids[origin.package.as_str()],
+                        image,
+                    )
+                    .remove(environment)?;
+                (
+                    ClosureHome::Reached { root, steps },
+                    BindingName::from(binding.as_str()),
+                    image
+                        .private_binding(environment, binding)?
+                        .closure
+                        .as_ref()?,
+                )
+            }
+            SourceKey::Closure { .. } | SourceKey::Runtime => return None,
+        };
+        Some(builder.add_payload_closure(
+            package,
+            home,
+            binding,
+            crate::ir::CodeIr::new(Arc::clone(&closure.source), shape),
+        ))
+    }
+
+    fn payload_environment_paths(
+        &self,
+        builder: &ProgramBuilder,
+        namespace: &FinalizedNamespace,
+        image: &crate::package::PackageImage,
+    ) -> HashMap<String, (BindingName, Vec<ObjectStep>)> {
+        let mut queue = VecDeque::new();
+        for (name, &binding) in &namespace.bindings {
+            if builder.binding_is_payload(binding)
+                && let Some(environment) = image
+                    .binding(name)
+                    .and_then(|binding| binding.environment.as_ref())
+            {
+                queue.push_back((
+                    environment.clone(),
+                    name.clone(),
+                    vec![ObjectStep::Environment],
+                ));
+            }
+        }
+        let mut paths = HashMap::new();
+        while let Some((environment, root, steps)) = queue.pop_front() {
+            let Some(private) = image.private_environment(&environment) else {
+                continue;
+            };
+            if paths.contains_key(&environment) {
+                continue;
+            }
+            let mut parent = steps.clone();
+            parent.push(ObjectStep::Parent);
+            queue.push_back((private.parent.clone(), root.clone(), parent));
+            let mut bindings = private.bindings.iter().collect::<Vec<_>>();
+            bindings.sort_by(|left, right| left.0.cmp(right.0));
+            for (name, binding) in bindings {
+                if let Some(reached) = &binding.environment {
+                    let mut through = steps.clone();
+                    through.extend([ObjectStep::Binding(name.clone()), ObjectStep::Environment]);
+                    queue.push_back((reached.clone(), root.clone(), through));
+                }
+            }
+            paths.insert(environment, (root, steps));
+        }
+        paths
     }
 
     fn root_description(

@@ -409,6 +409,30 @@ pub struct ResourceIr {
     pub path: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObjectStep {
+    Environment,
+    Parent,
+    Binding(BindingName),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClosureHome {
+    Namespace,
+    Reached {
+        root: BindingName,
+        steps: Vec<ObjectStep>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct PayloadClosureIr {
+    pub package: PackageId,
+    pub home: ClosureHome,
+    pub binding: BindingName,
+    pub code: CodeId,
+}
+
 /// Selected target-R compatibility contract recorded in the artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetContract {
@@ -432,6 +456,7 @@ pub struct ProgramIr {
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     resources: Vec<ResourceIr>,
+    payload_closures: Vec<PayloadClosureIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
 }
@@ -507,6 +532,10 @@ impl ProgramIr {
             .map(|(index, resource)| (ResourceId::from_index(index), resource))
     }
 
+    pub fn payload_closures(&self) -> &[PayloadClosureIr] {
+        &self.payload_closures
+    }
+
     pub fn relocations(&self) -> &[Relocation] {
         &self.relocations
     }
@@ -579,6 +608,7 @@ pub struct ProgramBuilder {
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     resources: Vec<ResourceIr>,
+    payload_closures: Vec<PayloadClosureIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
     root_package: PackageId,
@@ -631,6 +661,7 @@ impl ProgramBuilder {
             activations: Vec::new(),
             s3_registrations: Vec::new(),
             resources: Vec::new(),
+            payload_closures: Vec::new(),
             relocations: Vec::new(),
             root_artifact: RootArtifactIr::default(),
             root_package: root,
@@ -855,6 +886,23 @@ impl ProgramBuilder {
             .push(ImportBindingIr { local, target });
     }
 
+    pub fn add_payload_closure(
+        &mut self,
+        package: PackageId,
+        home: ClosureHome,
+        binding: BindingName,
+        code: CodeIr,
+    ) -> CodeId {
+        let code = self.add_code(code);
+        self.payload_closures.push(PayloadClosureIr {
+            package,
+            home,
+            binding,
+            code,
+        });
+        code
+    }
+
     pub fn add_resource(&mut self, resource: ResourceIr) -> ResourceId {
         let id = ResourceId::from_index(self.resources.len());
         self.resources.push(resource);
@@ -923,6 +971,17 @@ impl ProgramBuilder {
         Some(*closure)
     }
 
+    pub fn binding_is_payload(&self, binding: BindingId) -> bool {
+        let LinkBindingState::Materialized {
+            initial: InitialBindingState::Value(value),
+            ..
+        } = &self.bindings[binding.index()].state
+        else {
+            return false;
+        };
+        matches!(self.values[value.index()], Value::Payload(_))
+    }
+
     pub fn binding_code(&self, binding: BindingId) -> Option<CodeId> {
         self.binding_closure(binding)
             .map(|closure| self.closures[closure.index()].code)
@@ -957,6 +1016,7 @@ impl ProgramBuilder {
             activations: self.activations,
             s3_registrations: self.s3_registrations,
             resources: self.resources,
+            payload_closures: self.payload_closures,
             relocations: self.relocations,
             root_artifact: self.root_artifact,
         }

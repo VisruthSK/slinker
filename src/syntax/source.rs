@@ -87,7 +87,7 @@ impl std::fmt::Display for SourceKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceOrigin {
     pub package: String,
     pub key: SourceKey,

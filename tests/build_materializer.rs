@@ -538,6 +538,63 @@ fn real_pure_r_packages_build_install_and_run() {
     );
 }
 
+#[test]
+fn payload_closures_reach_their_private_namespace() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("tinypay");
+    write_package(
+        &dependency_source,
+        "tinypay",
+        "",
+        "export(wrapped, shout)\n",
+        "shout <- function() 'S'\nwrapped <- local({\n  inner <- function() identical(environment(tinypay::shout), topenv()) && identical(asNamespace('tinypay'), topenv())\n  function() inner()\n})\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+    let root_source = fixture.path().join("payroot");
+    write_package(
+        &root_source,
+        "payroot",
+        "Imports: tinypay\n",
+        "importFrom(tinypay, wrapped)\nexport(check)\n",
+        "check <- function() wrapped()\n",
+    );
+    let output = fixture.path().join("generated-payroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run payload closure build");
+    assert_success(&result, "slinker build payload closure fixture");
+
+    let behavior = "library(payroot); stopifnot(isTRUE(check()))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+
+    let absent = fixture.path().join("absent");
+    fs::create_dir(&absent).expect("library without the real Linked package");
+    install_package(&r_home, &output, &absent);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency_source, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    run_r(&r_home, &installed, behavior);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('tinypay'); {behavior}"),
+    );
+}
+
 fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &str) {
     fs::create_dir_all(root.join("R")).expect("R directory");
     fs::write(

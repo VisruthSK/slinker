@@ -1,11 +1,14 @@
 use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::ir::{
-    LinkBindingState, LinkNamespaceState, ProgramIr, RelocationTarget, ResourceId, Value,
+    ClosureHome, LinkBindingState, LinkNamespaceState, ObjectStep, ProgramIr, RelocationTarget,
+    ResourceId, Value,
 };
 use crate::package::PackageId;
 use crate::r_worker::client::WorkerClient;
-use crate::r_worker::protocol::{NamespaceImageSpec, PackageSpec, PayloadSpec};
+use crate::r_worker::protocol::{
+    ClosurePatchSpec, NamespaceImageSpec, ObjectStepSpec, PackageSpec, PayloadSpec,
+};
 use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -130,6 +133,7 @@ impl BuildContext {
                         PayloadSpec {
                             package: spec(package),
                             names: names.into_iter().collect(),
+                            patches: closure_patches(program, package),
                         },
                     )
                 })
@@ -736,6 +740,41 @@ fn render_namespace(program: &ProgramIr) -> String {
     out
 }
 
+fn closure_patches(program: &ProgramIr, package: PackageId) -> Vec<ClosurePatchSpec> {
+    program
+        .payload_closures()
+        .iter()
+        .filter(|closure| closure.package == package)
+        .map(|closure| {
+            let code = program.code(closure.code);
+            let source = relocated_source(program, closure.code);
+            let (root, steps) = match &closure.home {
+                ClosureHome::Namespace => (None, Vec::new()),
+                ClosureHome::Reached { root, steps } => (
+                    Some(root.to_string()),
+                    steps
+                        .iter()
+                        .map(|step| match step {
+                            ObjectStep::Environment => ObjectStepSpec::Environment,
+                            ObjectStep::Parent => ObjectStepSpec::Parent,
+                            ObjectStep::Binding(name) => ObjectStepSpec::Binding(name.to_string()),
+                        })
+                        .collect(),
+                ),
+            };
+            ClosurePatchSpec {
+                root,
+                steps,
+                binding: closure.binding.to_string(),
+                expected_shape: code.normalized_shape().0.clone(),
+                source: code
+                    .assigned_value_start()
+                    .map_or(source.as_str(), |start| &source[start..])
+                    .to_owned(),
+            }
+        })
+        .collect()
+}
 fn relocated_source(program: &ProgramIr, code: crate::ir::CodeId) -> String {
     let code_ir = program.code(code);
     let mut source = code_ir.source().to_owned();

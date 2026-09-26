@@ -34,6 +34,24 @@ pub struct NamespaceImageSpec {
 pub struct PayloadSpec {
     pub package: PackageSpec,
     pub names: Vec<String>,
+    pub patches: Vec<ClosurePatchSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClosurePatchSpec {
+    pub root: Option<String>,
+    pub steps: Vec<ObjectStepSpec>,
+    pub binding: String,
+    pub expected_shape: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
+pub enum ObjectStepSpec {
+    Environment,
+    Parent,
+    Binding(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

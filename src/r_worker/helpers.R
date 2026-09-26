@@ -141,6 +141,67 @@
   )
 }
 
+.slinker_closure_home <- function(image, root, kinds, names) {
+  if (!length(root)) {
+    return(image)
+  }
+  value <- get(root, envir = image, inherits = FALSE)
+  for (index in seq_along(kinds)) {
+    value <- switch(
+      kinds[[index]],
+      environment = if (is.function(value)) environment(value) else value,
+      parent = parent.env(value),
+      binding = .slinker_binding_value(value, names[[index]])
+    )
+  }
+  if (!is.environment(value)) {
+    stop("payload closure home is not an environment", call. = FALSE)
+  }
+  value
+}
+
+.slinker_binding_value <- function(environment, name) {
+  if (bindingIsActive(name, environment)) {
+    stop(sprintf("payload path crosses active binding %s", name), call. = FALSE)
+  }
+  get(name, envir = environment, inherits = FALSE)
+}
+
+.slinker_closure_at <- function(home, binding) {
+  closure <- .slinker_binding_value(home, binding)
+  if (typeof(closure) != "closure") {
+    stop(sprintf("payload binding %s is not a closure", binding), call. = FALSE)
+  }
+  closure
+}
+
+.slinker_patch_closure <- function(home, binding, old, source) {
+  expression <- parse(text = source, keep.source = FALSE)
+  if (
+    length(expression) != 1L ||
+      !is.call(expression[[1L]]) ||
+      !identical(expression[[1L]][[1L]], as.name("function"))
+  ) {
+    stop("rewritten payload closure source is not a function", call. = FALSE)
+  }
+  definition <- expression[[1L]]
+  new <- as.function(
+    c(as.list(definition[[2L]]), list(definition[[3L]])),
+    envir = environment(old)
+  )
+  attributes(new) <- attributes(old)
+  attr(new, "srcref") <- NULL
+  locked <- bindingIsLocked(binding, home)
+  if (locked) {
+    unlockBinding(binding, home)
+  }
+  assign(binding, new, envir = home)
+  if (locked) {
+    lockBinding(binding, home)
+  }
+  invisible(NULL)
+}
+
 .slinker_payloads <- function(images, packages, registered, sources, names) {
   for (index in seq_along(images)) {
     if (!identical(.Internal(getRegisteredNamespace(packages[[index]])), images[[index]])) {
