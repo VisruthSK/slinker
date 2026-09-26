@@ -234,9 +234,44 @@
       call. = FALSE
     )
   }
-  serialize(
-    mget(names, envir = image_env, inherits = FALSE),
-    NULL,
-    version = 3L
+  bundle <- .slinker_serialize(mget(names, envir = image_env, inherits = FALSE))
+  bundle$namespaces <- .slinker_serialized_namespaces(bundle$bytes)
+  bundle
+}
+
+.slinker_serialize <- function(value) {
+  references <- vector("list", 64L)
+  count <- 0L
+  record <- function(object) {
+    count <<- count + 1L
+    if (count > length(references)) {
+      length(references) <<- 2L * length(references)
+    }
+    references[[count]] <<- object
+    NULL
+  }
+  bytes <- serialize(value, NULL, version = 3L, refhook = record)
+  list(bytes = bytes, references = references[seq_len(count)])
+}
+
+.slinker_serialized_namespaces <- function(bytes) {
+  found <- character()
+  original <- get("..getNamespace", envir = baseenv(), inherits = FALSE)
+  # unserialize() resolves each namespace reference through base's ..getNamespace; a recorder
+  # compiled in advance avoids JIT compilation inside unserialize(), which fails.
+  recorder <- compiler::cmpfun(function(name, where) {
+    found <<- c(found, name[[1L]])
+    emptyenv()
+  })
+  unlockBinding("..getNamespace", baseenv())
+  on.exit(
+    {
+      assign("..getNamespace", original, envir = baseenv())
+      lockBinding("..getNamespace", baseenv())
+    },
+    add = TRUE
   )
+  assign("..getNamespace", recorder, envir = baseenv())
+  unserialize(bytes)
+  unique(found)
 }

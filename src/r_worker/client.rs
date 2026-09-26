@@ -1,7 +1,7 @@
 use crate::package::InstalledPackage;
 use crate::r_worker::protocol::{
-    NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSpec, TargetSpec, WorkerRequest,
-    WorkerResponse,
+    NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization, PayloadSite,
+    PayloadSpec, TargetSpec, WorkerRequest, WorkerResponse,
 };
 use crate::{Error, Result, Target, TargetEnvironment};
 use std::collections::BTreeSet;
@@ -151,9 +151,17 @@ impl WorkerClient {
         &mut self,
         namespaces: Vec<NamespaceImageSpec>,
         payloads: Vec<PayloadSpec>,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<PayloadSerialization> {
         let request_id = self.request_id();
-        let expected = payloads.len();
+        let names = payloads
+            .iter()
+            .map(|payload| payload.names.clone())
+            .collect::<Vec<_>>();
+        let reaches = |site: &PayloadSite| {
+            names
+                .get(site.payload)
+                .is_some_and(|names| names.contains(&site.binding))
+        };
         match self.exchange(&WorkerRequest::SerializePayloads {
             request_id,
             namespaces,
@@ -161,8 +169,17 @@ impl WorkerClient {
         })? {
             WorkerResponse::Payloads {
                 request_id: response_id,
-                bundles,
-            } if response_id == request_id && bundles.len() == expected => Ok(bundles),
+                serialization,
+            } if response_id == request_id
+                && match &serialization {
+                    PayloadSerialization::Serialized { bundles } => bundles.len() == names.len(),
+                    PayloadSerialization::SharedIdentity { first, second } => {
+                        first.payload != second.payload && reaches(first) && reaches(second)
+                    }
+                } =>
+            {
+                Ok(serialization)
+            }
             response => Err(worker_error("payload serialization", response)),
         }
     }

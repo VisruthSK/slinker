@@ -1,13 +1,14 @@
+use super::object_world::reachable_environment_labels;
 use super::relocation::PendingRelocation;
 use super::state::AnalyzerState;
 use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
     BindingId, BindingName, ClosureHome, CodeId, ExportTable, ExternalBindingAccess,
-    ExternalPackageContract, FinalizedNamespace, GenericHome, InvalidRelocation, MaterializedRole,
-    MaterializedSlot, MaterializedSlotSource, NamespaceId, ObjectStep,
-    PackageRole as LinkedPackageRole, ProgramBuilder, ProgramIr, RelocationTarget, RootArtifactIr,
-    TargetContract, UnretainedName,
+    ExternalPackageContract, FinalizedNamespace, GenericHome, InvalidPayloadDependency,
+    InvalidRelocation, MaterializedRole, MaterializedSlot, MaterializedSlotSource, NamespaceId,
+    ObjectStep, PackageRole as LinkedPackageRole, PayloadDependency, ProgramBuilder, ProgramIr,
+    RelocationTarget, RootArtifactIr, TargetContract, UnretainedName,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{
@@ -96,7 +97,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let mut dependencies = self.attach_imports(&mut builder, retained, &namespaces.ids);
         let (root_exports, mut linked_contents) =
             self.export_contents(&builder, retained, &namespaces.ids);
-        for (owner, dependency) in self.activation_time_dependencies(&namespaces.ids) {
+        for (owner, dependency) in self
+            .activation_time_dependencies(&namespaces.ids)
+            .into_iter()
+            .chain(self.attach_payload_dependencies(
+                &mut builder,
+                retained,
+                &namespaces.ids,
+                &mut issues,
+            ))
+        {
             if owner != dependency {
                 dependencies.entry(owner).or_default().insert(dependency);
             }
@@ -248,12 +258,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                 MaterializedSlotSource::Closure {
                                     source: Arc::clone(&closure.source),
                                     normalized_shape: normalized_shape.clone(),
-                                    binding: name.clone(),
                                 }
                             }
-                            _ => MaterializedSlotSource::Payload {
-                                binding: name.clone(),
-                            },
+                            _ => MaterializedSlotSource::Payload,
                         }
                     }
                 };
@@ -600,6 +607,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let package = self.known_package(&origin.package)?;
         let image = self.images.get(&package)?;
         let shape = self.parses.shape(&(package, origin.key.clone()))?.clone();
+        let bundle = builder.payload_bundle(namespace_ids[origin.package.as_str()].namespace)?;
         let (home, binding, closure) = match &origin.key {
             SourceKey::Binding(name) => {
                 let binding = *namespace_ids[origin.package.as_str()]
@@ -637,11 +645,63 @@ impl<P: PackageProvider> AnalyzerState<P> {
             SourceKey::Closure { .. } | SourceKey::Runtime => return None,
         };
         Some(builder.add_payload_closure(
-            package,
+            bundle,
             home,
             binding,
             crate::ir::CodeIr::new(Arc::clone(&closure.source), shape),
         ))
+    }
+
+    /// Attach every foreign namespace the payload bundles refer to, returning the Linked ones as
+    /// activation-order edges from the bundle owner.
+    fn attach_payload_dependencies(
+        &self,
+        builder: &mut ProgramBuilder,
+        retained: &BTreeSet<PackageId>,
+        namespace_ids: &HashMap<String, FinalizedNamespace>,
+        issues: &mut Vec<FinalizationIssue>,
+    ) -> Vec<(NamespaceId, NamespaceId)> {
+        let mut linked = Vec::new();
+        for &package in retained {
+            let name = self.packages.name(package);
+            let owner = &namespace_ids[name];
+            let (Some(bundle), Some(image)) = (
+                builder.payload_bundle(owner.namespace),
+                self.images.get(&package),
+            ) else {
+                continue;
+            };
+            let payloads = owner
+                .bindings
+                .iter()
+                .filter(|&(_, &binding)| builder.binding_is_payload(binding))
+                .map(|(binding, _)| binding.as_str());
+            for label in reachable_environment_labels(image, payloads) {
+                let Some(target) = label
+                    .strip_prefix("namespace:")
+                    .filter(|&target| target != "base")
+                else {
+                    continue;
+                };
+                let Some(dependency) = namespace_ids.get(target) else {
+                    issues.push(FinalizationIssue::PayloadOutsideProgram {
+                        package: name.to_owned(),
+                        namespace: target.to_owned(),
+                    });
+                    continue;
+                };
+                match builder.attach_payload_dependency(bundle, dependency.namespace) {
+                    Ok(Some(PayloadDependency::Linked(dependency))) => {
+                        linked.push((owner.namespace, dependency));
+                    }
+                    Ok(Some(PayloadDependency::External(_)) | None) => {}
+                    Err(InvalidPayloadDependency::RootNamespace) => {
+                        issues.push(FinalizationIssue::PayloadRefersToRoot(name.to_owned()));
+                    }
+                }
+            }
+        }
+        linked
     }
 
     fn payload_environment_paths(
@@ -970,6 +1030,11 @@ pub(super) enum FinalizationIssue {
     },
     InvalidRelocation(InvalidRelocation),
     Description(String),
+    PayloadOutsideProgram {
+        package: String,
+        namespace: String,
+    },
+    PayloadRefersToRoot(String),
 }
 
 impl FinalizationIssue {
@@ -990,8 +1055,17 @@ impl std::fmt::Display for FinalizationIssue {
                 "`{package}::.onLoad` runs when the namespace loads but is not retained"
             ),
             Self::CyclicLinkedImports => f.write_str(
-                "Linked namespaces import each other cyclically, which R cannot load",
+                "Linked namespaces import each other or refer to each other's namespace from payloads cyclically, which R cannot load",
             ),
+            Self::PayloadOutsideProgram { package, namespace } => write!(
+                f,
+                "payload bindings of `{package}` refer to namespace `{namespace}`, which the retained program does not contain"
+            ),
+            Self::PayloadRefersToRoot(package) => write!(
+                f,
+                "payload bindings of Linked `{package}` refer to the Root namespace, which activates after them"
+            ),
+
             Self::RootOnLoadNotRelocatable => f.write_str(
                 "the Root `.onLoad` is not relocatable source, so the generated wrapper cannot call it",
             ),

@@ -88,11 +88,6 @@ cases here.
 Each item can make a successful build behave differently from the original, and each gets a test
 that fails before its fix.
 
-- Payload bundles become IR entities, one per namespace: the bindings carried, the namespaces its
-  serialized references resolve to (activated first), and the contract: within one bundle R
-  serialization preserves sharing, cycles, private environments and parents, closure enclosures,
-  and attributes; identity is never shared across bundles. An environment reachable from two
-  namespaces' bundles would split into two objects: detect it in `.slinker_bundle` and block.
 - Linked datasets: nothing requests `Need::Dataset` today, so `pkg::dataset`,
   `data(x, package = "pkg")`, and lazy data used inside a Linked package are not carried. Demand the
   reachable datasets, copy them into a lazy-load database under the generated package, attach them

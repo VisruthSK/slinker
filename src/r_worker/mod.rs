@@ -275,7 +275,7 @@ impl WorkerRuntime {
         &mut self,
         namespaces: &[protocol::NamespaceImageSpec],
         payloads: &[protocol::PayloadSpec],
-    ) -> std::result::Result<Vec<Vec<u8>>, WorkerOperationError> {
+    ) -> std::result::Result<protocol::PayloadSerialization, WorkerOperationError> {
         let mut images = harp::RFunction::new("base", "list");
         let mut package_names = Vec::with_capacity(namespaces.len());
         let mut registered_names = Vec::with_capacity(namespaces.len());
@@ -348,24 +348,89 @@ impl WorkerRuntime {
             sources.add(self.image_environment(&payload.package)?);
             names.add(payload.names.clone());
         }
-        let serialize = || -> harp::Result<Vec<Vec<u8>>> {
-            let bundles = harp::RFunction::new("", ".slinker_payloads")
-                .add(images.call()?)
-                .add(package_names)
-                .add(registered_names)
-                .add(sources.call()?)
-                .add(names.call()?)
-                .call()?;
-            Vec::<harp::object::RObject>::try_from(bundles)?
-                .iter()
-                .map(Vec::<u8>::try_from)
-                .collect()
-        };
-        serialize().map_err(|error| {
+        let failed = |error: harp::Error| {
             WorkerOperationError::with(WorkerErrorCode::BindingForce)(
                 format!("failed to serialize payload bundles: {error}").into(),
             )
-        })
+        };
+        let bundles = harp::RFunction::new("", ".slinker_payloads")
+            .add(images.call().map_err(failed)?)
+            .add(package_names)
+            .add(registered_names)
+            .add(sources.call().map_err(failed)?)
+            .add(names.call().map_err(failed)?)
+            .call()
+            .and_then(Vec::<harp::object::RObject>::try_from)
+            .map_err(failed)?;
+        let mut owners = HashMap::<libr::SEXP, usize>::new();
+        for (index, bundle) in bundles.iter().enumerate() {
+            let references = bundle
+                .elt("references")
+                .and_then(Vec::<harp::object::RObject>::try_from)
+                .map_err(failed)?;
+            for reference in references {
+                let owner = *owners.entry(reference.sexp).or_insert(index);
+                if owner != index {
+                    return Ok(protocol::PayloadSerialization::SharedIdentity {
+                        first: self.payload_site(&payloads[owner], owner, reference.sexp)?,
+                        second: self.payload_site(&payloads[index], index, reference.sexp)?,
+                    });
+                }
+            }
+        }
+        let bundles = bundles
+            .iter()
+            .map(|bundle| {
+                Ok(protocol::SerializedPayload {
+                    bytes: Vec::<u8>::try_from(&bundle.elt("bytes")?)?,
+                    namespaces: Vec::<String>::try_from(&bundle.elt("namespaces")?)?,
+                })
+            })
+            .collect::<harp::Result<_>>()
+            .map_err(failed)?;
+        Ok(protocol::PayloadSerialization::Serialized { bundles })
+    }
+
+    /// The first binding of `payload` whose serialization reaches `reference`.
+    fn payload_site(
+        &mut self,
+        payload: &protocol::PayloadSpec,
+        index: usize,
+        reference: libr::SEXP,
+    ) -> std::result::Result<protocol::PayloadSite, WorkerOperationError> {
+        let image = self.image_environment(&payload.package)?;
+        let failed = |error: harp::Error| {
+            WorkerOperationError::with(WorkerErrorCode::BindingForce)(InspectionError::from(error))
+        };
+        for name in &payload.names {
+            let value = harp::RFunction::new("base", "get")
+                .add(name.clone())
+                .param("envir", image.clone())
+                .param("inherits", false)
+                .call()
+                .map_err(failed)?;
+            let reached = harp::RFunction::new("", ".slinker_serialize")
+                .add(value)
+                .call()
+                .and_then(|serialized| serialized.elt("references"))
+                .and_then(Vec::<harp::object::RObject>::try_from)
+                .map_err(failed)?
+                .iter()
+                .any(|candidate| candidate.sexp == reference);
+            if reached {
+                return Ok(protocol::PayloadSite {
+                    payload: index,
+                    binding: name.clone(),
+                });
+            }
+        }
+        Err(WorkerOperationError::with(WorkerErrorCode::Protocol)(
+            format!(
+                "no payload binding of {} reaches its shared reference object",
+                payload.package.name
+            )
+            .into(),
+        ))
     }
 
     fn image_environment(
@@ -1471,9 +1536,9 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                 payloads,
             } => match runtime.as_mut() {
                 Some(runtime) => match runtime.serialize_payloads(&namespaces, &payloads) {
-                    Ok(bundles) => WorkerResponse::Payloads {
+                    Ok(serialization) => WorkerResponse::Payloads {
                         request_id,
-                        bundles,
+                        serialization,
                     },
                     Err(error) => operation_failure(Some(request_id), error, None, None),
                 },
@@ -1783,8 +1848,114 @@ mod tests {
                 .libraries,
             initial_target.libraries
         );
+        payload_identity_stays_within_one_bundle(&mut runtime, &package, &fixture_temp);
         drop(runtime);
         std::fs::remove_dir_all(fixture_temp).expect("remove installed fixture");
+    }
+
+    fn payload_identity_stays_within_one_bundle(
+        runtime: &mut WorkerRuntime,
+        package: &PackageSpec,
+        scratch: &std::path::Path,
+    ) {
+        let image = runtime.image_environment(package).expect("fixture image");
+        harp::parse_eval_global(
+            r#"
+            .slinker_test_payloads <- function(image) {
+              shared <- new.env(parent = emptyenv())
+              cycle <- new.env(parent = emptyenv())
+              cycle$self <- cycle
+              parent <- new.env(parent = emptyenv())
+              parent$tag <- "parent"
+              counter <- local({
+                count <- 0L
+                function() {
+                  count <<- count + 1L
+                  count
+                }
+              })
+              image$first <- list(state = shared, cycle = cycle, child = new.env(parent = parent))
+              image$second <- structure(list(counter = counter), home = shared, class = "tagged")
+              image$third <- counter
+              image$external <- tools::file_ext
+              stopifnot(
+                identical(image$first$state, attr(image$second, "home")),
+                !identical(
+                  unserialize(serialize(image$first, NULL))$state,
+                  attr(unserialize(serialize(image$second, NULL)), "home")
+                )
+              )
+            }
+            "#,
+        )
+        .expect("define payload fixture");
+        harp::RFunction::new("", ".slinker_test_payloads")
+            .add(image)
+            .call()
+            .expect("original identity is shared and separate serializations split it");
+        let namespaces = [NamespaceImageSpec {
+            package: package.clone(),
+            registered_name: "root:harpfixture".into(),
+        }];
+        let payload = |names: &[&str]| PayloadSpec {
+            package: package.clone(),
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+            patches: Vec::new(),
+        };
+
+        let split = runtime
+            .serialize_payloads(
+                &namespaces,
+                &[payload(&["first"]), payload(&["second", "third"])],
+            )
+            .expect("serialize split bundles");
+        let PayloadSerialization::SharedIdentity { first, second } = split else {
+            panic!("an environment shared by two bundles was serialized twice");
+        };
+        assert_eq!((first.payload, first.binding.as_str()), (0, "first"));
+        assert_eq!((second.payload, second.binding.as_str()), (1, "second"));
+
+        let independent = runtime
+            .serialize_payloads(
+                &namespaces,
+                &[payload(&["first"]), payload(&["external", "good"])],
+            )
+            .expect("serialize independent bundles");
+        let PayloadSerialization::Serialized { bundles } = independent else {
+            panic!("independent bundles were reported as sharing identity");
+        };
+        assert!(bundles[0].namespaces.is_empty());
+        let mut observed = bundles[1].namespaces.clone();
+        observed.sort();
+        assert_eq!(observed, ["root:harpfixture", "tools"]);
+
+        let joint = runtime
+            .serialize_payloads(&namespaces, &[payload(&["first", "second", "third"])])
+            .expect("serialize one bundle");
+        let PayloadSerialization::Serialized { bundles } = joint else {
+            panic!("bindings of one bundle were reported as sharing identity across bundles");
+        };
+        let restored = scratch.join("joint-bundle");
+        std::fs::write(&restored, &bundles[0].bytes).expect("write serialized bundle");
+        harp::parse_eval_global(&format!(
+            r#"
+            local({{
+              path <- "{}"
+              restored <- unserialize(readBin(path, "raw", file.size(path)))
+              stopifnot(
+                identical(restored$first$state, attr(restored$second, "home")),
+                identical(restored$first$cycle$self, restored$first$cycle),
+                identical(get("tag", envir = restored$first$child), "parent"),
+                identical(environment(restored$second$counter), environment(restored$third)),
+                identical(restored$third(), 1L),
+                identical(restored$second$counter(), 2L),
+                inherits(restored$second, "tagged")
+              )
+            }})
+            "#,
+            restored.to_string_lossy().replace('\\', "/")
+        ))
+        .expect("one bundle preserves sharing, cycles, parents, enclosures, and attributes");
     }
 
     fn test_r_home() -> Option<std::path::PathBuf> {

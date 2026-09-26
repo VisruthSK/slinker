@@ -486,6 +486,34 @@ impl ObjectWorld {
     }
 }
 
+/// Environment labels reachable from the named namespace bindings through closure enclosures,
+/// embedded objects, and private environments with their parents and bindings.
+pub(super) fn reachable_environment_labels<'a>(
+    image: &PackageImage,
+    names: impl IntoIterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut labels = BTreeSet::new();
+    for binding in names.into_iter().filter_map(|name| image.binding(name)) {
+        collect_binding_environments(binding, &mut labels);
+    }
+    let mut pending = labels.iter().cloned().collect::<Vec<_>>();
+    while let Some(label) = pending.pop() {
+        let Some(private) = image.private_environment(&label) else {
+            continue;
+        };
+        let mut reached = BTreeSet::from([private.parent.clone()]);
+        for binding in private.bindings.values() {
+            collect_binding_environments(binding, &mut reached);
+        }
+        pending.extend(
+            reached
+                .into_iter()
+                .filter(|label| labels.insert(label.clone())),
+        );
+    }
+    labels
+}
+
 fn collect_binding_environments<T: BindingObjectView>(binding: &T, labels: &mut BTreeSet<String>) {
     labels.extend(
         binding

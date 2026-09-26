@@ -596,6 +596,155 @@ fn payload_closures_reach_their_private_namespace() {
 }
 
 #[test]
+fn payload_bundle_preserves_identity_within_its_namespace() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("tinybundle");
+    write_package(
+        &dependency_source,
+        "tinybundle",
+        "",
+        "export(probe)\n",
+        r#"shared <- new.env(parent = emptyenv())
+cycle <- local({
+  self <- new.env(parent = emptyenv())
+  self$self <- self
+  self
+})
+boxes <- list(a = shared, b = shared)
+tagged <- structure(list(1), class = "tagged", home = shared)
+counter <- local({
+  count <- 0L
+  function() {
+    count <<- count + 1L
+    count
+  }
+})
+alias <- counter
+child <- local({
+  parent <- new.env(parent = emptyenv())
+  parent$tag <- "parent"
+  new.env(parent = parent)
+})
+tool <- list(ext = tools::file_ext)
+probe <- function() c(
+  shared = identical(boxes$a, boxes$b) && identical(boxes$a, shared) && identical(attr(tagged, "home"), shared),
+  cycle = identical(cycle$self, cycle),
+  enclosure = identical(environment(counter), environment(alias)) && counter() == 1L && alias() == 2L,
+  parent = identical(parent.env(child)$tag, "parent"),
+  attributes = inherits(tagged, "tagged"),
+  external = identical(environment(tool$ext), asNamespace("tools"))
+)
+"#,
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+    let root_source = fixture.path().join("bundleroot");
+    write_package(
+        &root_source,
+        "bundleroot",
+        "Imports: tinybundle\n",
+        "importFrom(tinybundle, probe)\nexport(check)\n",
+        "check <- function() probe()\n",
+    );
+    let output = fixture.path().join("generated-bundleroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run payload bundle build");
+    assert_success(&result, "slinker build payload bundle fixture");
+    assert!(output.join("inst/slinker/payload/tinybundle.rds").is_file());
+
+    let behavior = "library(bundleroot); result <- check(); if (!all(result)) print(result); stopifnot(all(result))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+
+    let absent = fixture.path().join("absent");
+    fs::create_dir(&absent).expect("library without the real Linked package");
+    install_package(&r_home, &output, &absent);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency_source, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    run_r(&r_home, &installed, behavior);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('tinybundle'); {behavior}"),
+    );
+}
+
+#[test]
+fn payload_namespace_reference_hidden_from_analysis_blocks() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let hidden_source = fixture.path().join("hiddenbase");
+    write_package(
+        &hidden_source,
+        "hiddenbase",
+        "",
+        "export(value)\n",
+        "value <- 1\n",
+    );
+    let dependency_source = fixture.path().join("hiddenref");
+    write_package(
+        &dependency_source,
+        "hiddenref",
+        "Imports: hiddenbase\n",
+        "import(hiddenbase)\nexport(home)\n",
+        "model <- local({\n  f <- y ~ x\n  environment(f) <- asNamespace('hiddenbase')\n  f\n})\nhome <- function() environmentName(environment(model))\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &hidden_source, &build_library);
+    install_package(&r_home, &dependency_source, &build_library);
+    let root_source = fixture.path().join("hiddenroot");
+    write_package(
+        &root_source,
+        "hiddenroot",
+        "Imports: hiddenref\n",
+        "importFrom(hiddenref, home)\nexport(check)\n",
+        "check <- function() home()\n",
+    );
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &hidden_source, &original);
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(
+        &r_home,
+        &original,
+        "library(hiddenroot); stopifnot(identical(check(), 'hiddenbase'))",
+    );
+
+    let output = fixture.path().join("generated-hiddenroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run hidden namespace build");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("payload bundle of `hiddenref` refers to namespace `hiddenbase`"),
+        "{stderr}"
+    );
+    assert!(!output.exists());
+}
+
+#[test]
 fn name_addressed_queries_answer_for_the_linked_copy() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

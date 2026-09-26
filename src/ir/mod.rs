@@ -8,7 +8,7 @@ pub use crate::package::{
 
 use crate::package::Digest;
 use crate::syntax::TextRange;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 macro_rules! id_type {
@@ -37,6 +37,7 @@ id_type!(CodeId);
 id_type!(CodeOccurrenceId);
 id_type!(S3RegistrationId);
 id_type!(ResourceId);
+id_type!(PayloadBundleId);
 
 /// Final package runtime contract.
 #[derive(Clone, Debug)]
@@ -102,8 +103,8 @@ pub enum RegisteredNamespace<'a> {
     Private(&'a PrivateNamespaceKey),
 }
 
-impl RegisteredNamespace<'_> {
-    pub fn as_str(&self) -> &str {
+impl<'a> RegisteredNamespace<'a> {
+    pub fn as_str(&self) -> &'a str {
         match self {
             Self::Package(name) => name.as_str(),
             Self::Private(key) => key.as_str(),
@@ -183,6 +184,7 @@ pub enum LinkNamespaceState {
 pub struct MaterializedNamespaceState {
     pub namespace_environment: EnvironmentId,
     pub imports_environment: EnvironmentId,
+    pub payload: Option<PayloadBundleId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,21 +230,65 @@ pub struct Environment {
 pub struct Closure {
     pub code: CodeId,
     pub enclosure: EnvironmentId,
-    pub payload: PayloadRef,
 }
 
 /// Supported persistent runtime value without an Unknown state.
 #[derive(Clone, Debug)]
 pub enum Value {
     Closure(ClosureId),
-    Payload(PayloadRef),
+    Payload(PayloadBundleId),
 }
 
-/// Physical payload source selected only after linked identity is fixed.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct PayloadRef {
-    pub package: PackageId,
-    pub binding: BindingName,
+/// The retained non-source bindings of one Root or Linked namespace, carried by a single R
+/// serialization and restored into that namespace. One serialization preserves sharing, cycles,
+/// private environments with their parents, closure enclosures, and attributes among these
+/// bindings; identity never extends to another bundle.
+#[derive(Clone, Debug)]
+pub struct PayloadBundleIr {
+    namespace: NamespaceId,
+    bindings: Vec<BindingId>,
+    closure_patches: Vec<PayloadClosurePatch>,
+    dependencies: BTreeSet<PayloadDependency>,
+}
+
+impl PayloadBundleIr {
+    pub fn namespace(&self) -> NamespaceId {
+        self.namespace
+    }
+
+    pub fn bindings(&self) -> &[BindingId] {
+        &self.bindings
+    }
+
+    pub fn closure_patches(&self) -> &[PayloadClosurePatch] {
+        &self.closure_patches
+    }
+
+    /// Foreign namespaces the serialized references resolve to, each activated before restore.
+    pub fn dependencies(&self) -> &BTreeSet<PayloadDependency> {
+        &self.dependencies
+    }
+}
+
+/// A namespace a payload bundle refers to. The Root namespace is activated only after every
+/// Linked bundle is restored, so it is never a dependency.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PayloadDependency {
+    Linked(NamespaceId),
+    External(NamespaceId),
+}
+
+impl PayloadDependency {
+    pub fn namespace(self) -> NamespaceId {
+        match self {
+            Self::Linked(namespace) | Self::External(namespace) => namespace,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidPayloadDependency {
+    RootNamespace,
 }
 
 #[derive(Clone, Debug)]
@@ -454,8 +500,7 @@ pub enum ClosureHome {
 }
 
 #[derive(Clone, Debug)]
-pub struct PayloadClosureIr {
-    pub package: PackageId,
+pub struct PayloadClosurePatch {
     pub home: ClosureHome,
     pub binding: BindingName,
     pub code: CodeId,
@@ -484,7 +529,7 @@ pub struct ProgramIr {
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     resources: Vec<ResourceIr>,
-    payload_closures: Vec<PayloadClosureIr>,
+    payload_bundles: Vec<PayloadBundleIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
 }
@@ -560,8 +605,21 @@ impl ProgramIr {
             .map(|(index, resource)| (ResourceId::from_index(index), resource))
     }
 
-    pub fn payload_closures(&self) -> &[PayloadClosureIr] {
-        &self.payload_closures
+    pub fn payload_bundles(&self) -> &[PayloadBundleIr] {
+        &self.payload_bundles
+    }
+
+    pub fn indexed_payload_bundles(
+        &self,
+    ) -> impl Iterator<Item = (PayloadBundleId, &PayloadBundleIr)> {
+        self.payload_bundles
+            .iter()
+            .enumerate()
+            .map(|(index, bundle)| (PayloadBundleId::from_index(index), bundle))
+    }
+
+    pub fn payload_bundle(&self, id: PayloadBundleId) -> &PayloadBundleIr {
+        &self.payload_bundles[id.index()]
     }
 
     pub fn relocations(&self) -> &[Relocation] {
@@ -636,7 +694,7 @@ pub struct ProgramBuilder {
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     resources: Vec<ResourceIr>,
-    payload_closures: Vec<PayloadClosureIr>,
+    payload_bundles: Vec<PayloadBundleIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
     root_package: PackageId,
@@ -663,11 +721,8 @@ pub enum MaterializedSlotSource {
     Closure {
         source: Arc<str>,
         normalized_shape: Digest,
-        binding: BindingName,
     },
-    Payload {
-        binding: BindingName,
-    },
+    Payload,
 }
 
 impl ProgramBuilder {
@@ -689,7 +744,7 @@ impl ProgramBuilder {
             activations: Vec::new(),
             s3_registrations: Vec::new(),
             resources: Vec::new(),
-            payload_closures: Vec::new(),
+            payload_bundles: Vec::new(),
             relocations: Vec::new(),
             root_artifact: RootArtifactIr::default(),
             root_package: root,
@@ -754,32 +809,44 @@ impl ProgramBuilder {
             parent: EnvironmentParentIr::Materialized(imports_environment),
         });
         let mut bindings = BTreeMap::new();
+        let mut payload = None;
         for slot in slots {
-            let initial = match slot.source {
-                MaterializedSlotSource::Unbound => InitialBindingState::Unbound,
-                MaterializedSlotSource::Payload { binding } => {
-                    let value = self.add_value(Value::Payload(PayloadRef { package, binding }));
-                    InitialBindingState::Value(value)
+            let (initial, bundle) = match slot.source {
+                MaterializedSlotSource::Unbound => (InitialBindingState::Unbound, None),
+                MaterializedSlotSource::Payload => {
+                    let bundle = *payload.get_or_insert_with(|| {
+                        let id = PayloadBundleId::from_index(self.payload_bundles.len());
+                        self.payload_bundles.push(PayloadBundleIr {
+                            namespace,
+                            bindings: Vec::new(),
+                            closure_patches: Vec::new(),
+                            dependencies: BTreeSet::new(),
+                        });
+                        id
+                    });
+                    let value = self.add_value(Value::Payload(bundle));
+                    (InitialBindingState::Value(value), Some(bundle))
                 }
                 MaterializedSlotSource::Closure {
                     source,
                     normalized_shape,
-                    binding,
                 } => {
                     let code = self.add_code(CodeIr::new(source, normalized_shape));
                     let closure = self.add_closure(Closure {
                         code,
                         enclosure: namespace_environment,
-                        payload: PayloadRef { package, binding },
                     });
                     let value = self.add_value(Value::Closure(closure));
-                    InitialBindingState::Value(value)
+                    (InitialBindingState::Value(value), None)
                 }
             };
             let binding = self.add_binding(Binding {
                 name: slot.name.clone(),
                 state: LinkBindingState::Materialized { namespace, initial },
             });
+            if let Some(bundle) = bundle {
+                self.payload_bundles[bundle.index()].bindings.push(binding);
+            }
             assert!(
                 bindings.insert(slot.name, binding).is_none(),
                 "duplicate namespace slot"
@@ -788,6 +855,7 @@ impl ProgramBuilder {
         let state = MaterializedNamespaceState {
             namespace_environment,
             imports_environment,
+            payload,
         };
         let id = self.add_namespace(Namespace {
             package,
@@ -944,21 +1012,49 @@ impl ProgramBuilder {
             .push(ImportBindingIr { local, target });
     }
 
+    pub fn payload_bundle(&self, namespace: NamespaceId) -> Option<PayloadBundleId> {
+        match &self.namespaces[namespace.index()].state {
+            LinkNamespaceState::Root(state) | LinkNamespaceState::Linked(state) => state.payload,
+            LinkNamespaceState::External { .. } => None,
+        }
+    }
+
     pub fn add_payload_closure(
         &mut self,
-        package: PackageId,
+        bundle: PayloadBundleId,
         home: ClosureHome,
         binding: BindingName,
         code: CodeIr,
     ) -> CodeId {
         let code = self.add_code(code);
-        self.payload_closures.push(PayloadClosureIr {
-            package,
-            home,
-            binding,
-            code,
-        });
+        self.payload_bundles[bundle.index()]
+            .closure_patches
+            .push(PayloadClosurePatch {
+                home,
+                binding,
+                code,
+            });
         code
+    }
+
+    /// Record that `bundle` refers to `namespace`; a reference to the owner itself needs no
+    /// activation and yields `None`.
+    pub fn attach_payload_dependency(
+        &mut self,
+        bundle: PayloadBundleId,
+        namespace: NamespaceId,
+    ) -> Result<Option<PayloadDependency>, InvalidPayloadDependency> {
+        let bundle = &mut self.payload_bundles[bundle.index()];
+        if bundle.namespace == namespace {
+            return Ok(None);
+        }
+        let dependency = match self.namespaces[namespace.index()].state {
+            LinkNamespaceState::Root(_) => return Err(InvalidPayloadDependency::RootNamespace),
+            LinkNamespaceState::Linked(_) => PayloadDependency::Linked(namespace),
+            LinkNamespaceState::External { .. } => PayloadDependency::External(namespace),
+        };
+        bundle.dependencies.insert(dependency);
+        Ok(Some(dependency))
     }
 
     pub fn add_resource(&mut self, resource: ResourceIr) -> ResourceId {
@@ -1090,8 +1186,9 @@ impl ProgramBuilder {
             activations: self.activations,
             s3_registrations: self.s3_registrations,
             resources: self.resources,
-            payload_closures: self.payload_closures,
+            payload_bundles: self.payload_bundles,
             relocations: self.relocations,
+
             root_artifact: self.root_artifact,
         }
     }

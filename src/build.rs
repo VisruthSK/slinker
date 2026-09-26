@@ -1,13 +1,15 @@
 use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::ir::{
-    ClosureHome, GenericHome, LinkBindingState, LinkNamespaceState, ObjectStep, ProgramIr,
-    RegisteredNamespace, RelocationTarget, ResourceId, Value,
+    ClosureHome, GenericHome, LinkBindingState, LinkNamespaceState, NamespaceId, ObjectStep,
+    PayloadBundleId, PayloadBundleIr, PayloadDependency, ProgramIr, RegisteredNamespace,
+    RelocationTarget, ResourceId, Value,
 };
 use crate::package::PackageId;
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{
-    ClosurePatchSpec, NamespaceImageSpec, ObjectStepSpec, PackageSpec, PayloadSpec,
+    ClosurePatchSpec, NamespaceImageSpec, ObjectStepSpec, PackageSpec, PayloadSerialization,
+    PayloadSite, PayloadSpec, SerializedPayload,
 };
 use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,9 +62,17 @@ pub struct BuildContext {
 /// Exact installed bytes redeemed from the selected images before preflight.
 #[derive(Debug)]
 struct FrozenInputs {
-    bundles: BTreeMap<PackageId, Vec<u8>>,
+    bundles: Vec<CheckedPayloadBundle>,
     resources: BTreeMap<ResourceId, PathBuf>,
     _directory: TempDir,
+}
+
+/// One payload bundle serialized by the target R whose namespace references match its IR
+/// dependencies and whose reference objects are reached from no other bundle.
+#[derive(Debug)]
+struct CheckedPayloadBundle {
+    bundle: PayloadBundleId,
+    bytes: Vec<u8>,
 }
 
 impl BuildContext {
@@ -84,9 +94,10 @@ impl BuildContext {
     ///
     /// # Errors
     ///
-    /// Fails when payload serialization or resource copying fails, or with
+    /// Blocks when a serialized payload bundle diverges from its IR entity. Fails when payload
+    /// serialization or resource copying fails, or with
     /// [`BuildContextError::TargetUniverseChanged`] when a selected image no longer matches.
-    fn freeze(&self, ir: &LinkIr) -> Result<FrozenInputs, BuildContextError> {
+    fn freeze(&self, ir: &LinkIr) -> Result<FrozenInputs, PreflightError> {
         let program = ir.program();
         let sources = ir.package_sources();
         let location = |package| {
@@ -97,15 +108,6 @@ impl BuildContext {
                 .root
         };
 
-        let mut payloads = BTreeMap::<PackageId, BTreeSet<String>>::new();
-        for value in program.values() {
-            if let Value::Payload(payload) = value {
-                payloads
-                    .entry(payload.package)
-                    .or_default()
-                    .insert(payload.binding.to_string());
-            }
-        }
         let spec = |package| {
             let identity = program.package(package).identity();
             PackageSpec {
@@ -115,8 +117,8 @@ impl BuildContext {
                 root: location(package).clone(),
             }
         };
-        let mut bundles = BTreeMap::new();
-        if !payloads.is_empty() {
+        let mut bundles = Vec::new();
+        if !program.payload_bundles().is_empty() {
             let namespaces = program
                 .packages()
                 .filter(|(_, package)| package.role() != crate::ir::PackageRole::External)
@@ -125,24 +127,24 @@ impl BuildContext {
                     registered_name: package.registered_namespace().as_str().to_owned(),
                 })
                 .collect();
-            let (packages, specs): (Vec<_>, Vec<_>) = payloads
-                .into_iter()
-                .map(|(package, names)| {
-                    (
-                        package,
-                        PayloadSpec {
-                            package: spec(package),
-                            names: names.into_iter().collect(),
-                            patches: closure_patches(program, package),
-                        },
-                    )
+            let specs = program
+                .payload_bundles()
+                .iter()
+                .map(|bundle| PayloadSpec {
+                    package: spec(program.namespace(bundle.namespace()).package),
+                    names: bundle
+                        .bindings()
+                        .iter()
+                        .map(|binding| program.binding(*binding).name.to_string())
+                        .collect(),
+                    patches: closure_patches(program, bundle),
                 })
-                .unzip();
+                .collect();
             let serialized = self
                 .target_runtime
                 .worker()?
                 .serialize_payloads(namespaces, specs)?;
-            bundles.extend(packages.into_iter().zip(serialized));
+            bundles = check_payload_bundles(program, serialized)?;
         }
 
         let directory = tempfile::Builder::new()
@@ -156,9 +158,7 @@ impl BuildContext {
         }
 
         if let Some(changed) = sources.changed()? {
-            return Err(BuildContextError::TargetUniverseChanged(
-                changed.name.to_string(),
-            ));
+            return Err(BuildContextError::TargetUniverseChanged(changed.name.to_string()).into());
         }
         Ok(FrozenInputs {
             bundles,
@@ -207,8 +207,8 @@ impl MaterializationContext<'_> {
         self.target_runtime
     }
 
-    fn bundle(&self, package: PackageId) -> &[u8] {
-        &self.frozen.bundles[&package]
+    fn bundles(&self) -> &[CheckedPayloadBundle] {
+        &self.frozen.bundles
     }
 
     fn resource(&self, resource: ResourceId) -> &Path {
@@ -295,6 +295,18 @@ pub enum PreflightError {
     Freeze(#[from] BuildContextError),
 }
 
+impl From<crate::Error> for PreflightError {
+    fn from(error: crate::Error) -> Self {
+        Self::Freeze(error.into())
+    }
+}
+
+impl From<std::io::Error> for PreflightError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Freeze(error.into())
+    }
+}
+
 /// Deterministic complete build-preflight failure report.
 #[derive(Clone, Debug, Error)]
 #[error("build preflight failed:\n{rendered}")]
@@ -369,16 +381,16 @@ pub fn materialize(
     copy_root_resources(materialization.source_files().root(), &package_root)?;
     let payload_directory = package_root.join("inst/slinker/payload");
     fs::create_dir_all(&payload_directory)?;
-    for namespace in buildable.program.namespaces() {
-        if has_payloads(buildable.program, namespace) {
-            fs::write(
-                payload_directory.join(format!(
-                    "{}.rds",
-                    buildable.program.package(namespace.package).identity().name
-                )),
-                materialization.bundle(namespace.package),
-            )?;
-        }
+    for checked in materialization.bundles() {
+        let bundle = buildable.program.payload_bundle(checked.bundle);
+        let package = buildable.program.namespace(bundle.namespace()).package;
+        fs::write(
+            payload_directory.join(format!(
+                "{}.rds",
+                buildable.program.package(package).identity().name
+            )),
+            &checked.bytes,
+        )?;
     }
     let generated = generate_r_source(buildable.program)?;
     let mut worker = materialization.target_runtime().worker()?;
@@ -506,8 +518,13 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
                 r_string(&source)
             );
         }
-        if has_payloads(program, namespace) {
-            emit!(out, "    .slinker_populate(ns, {})", r_string(name));
+        if let Some(bundle) = payload_bundle(program, namespace) {
+            emit!(
+                out,
+                "    .slinker_populate(ns, {}, {})",
+                r_string(name),
+                external_payload_dependencies(program, bundle)
+            );
         }
         emit!(
             out,
@@ -556,11 +573,12 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             );
         }
     }
-    if has_payloads(program, root) {
+    if let Some(bundle) = payload_bundle(program, root) {
         emit!(
             out,
-            "  .slinker_populate(root, {})",
-            r_string(&program.package(root.package).identity().name)
+            "  .slinker_populate(root, {}, {})",
+            r_string(&program.package(root.package).identity().name),
+            external_payload_dependencies(program, bundle)
         );
     }
     let activated_s3 = &program.root_artifact().activated_s3;
@@ -598,13 +616,100 @@ fn namespace_closures(
     })
 }
 
-fn has_payloads(program: &ProgramIr, namespace: &crate::ir::Namespace) -> bool {
-    namespace.bindings.values().any(|binding| {
-        matches!(
-            initial_value(program, *binding).map(|value| program.value(value)),
-            Some(Value::Payload(_))
-        )
-    })
+fn payload_bundle<'a>(
+    program: &'a ProgramIr,
+    namespace: &crate::ir::Namespace,
+) -> Option<&'a PayloadBundleIr> {
+    match &namespace.state {
+        LinkNamespaceState::Root(state) | LinkNamespaceState::Linked(state) => {
+            state.payload.map(|bundle| program.payload_bundle(bundle))
+        }
+        LinkNamespaceState::External { .. } => None,
+    }
+}
+
+fn external_payload_dependencies(program: &ProgramIr, bundle: &PayloadBundleIr) -> String {
+    r_vector(bundle.dependencies().iter().filter_map(|dependency| {
+        match dependency {
+            PayloadDependency::External(namespace) => Some(
+                program
+                    .package(program.namespace(*namespace).package)
+                    .identity()
+                    .name
+                    .as_str(),
+            ),
+            PayloadDependency::Linked(_) => None,
+        }
+    }))
+}
+
+fn registered_name(program: &ProgramIr, namespace: NamespaceId) -> &str {
+    program
+        .package(program.namespace(namespace).package)
+        .registered_namespace()
+        .as_str()
+}
+
+/// Accept the target-R serialization of every IR payload bundle only when no reference object
+/// is shared between bundles and each bundle resolves exactly the namespaces its IR entity
+/// depends on.
+fn check_payload_bundles(
+    program: &ProgramIr,
+    serialization: PayloadSerialization,
+) -> Result<Vec<CheckedPayloadBundle>, BuildReport> {
+    let bundles = program.payload_bundles();
+    let package_name = |bundle: &PayloadBundleIr| {
+        &program
+            .package(program.namespace(bundle.namespace()).package)
+            .identity()
+            .name
+    };
+    let site =
+        |site: &PayloadSite| format!("{}::{}", package_name(&bundles[site.payload]), site.binding);
+    let serialized = match serialization {
+        PayloadSerialization::SharedIdentity { first, second } => {
+            return Err(BuildReport::new(vec![format!(
+                "payload `{}` and payload `{}` reach one environment or reference object, which separate namespace bundles would split into two",
+                site(&first),
+                site(&second)
+            )]));
+        }
+        PayloadSerialization::Serialized { bundles } => bundles,
+    };
+    let mut blockers = Vec::new();
+    let mut checked = Vec::new();
+    for ((id, bundle), SerializedPayload { bytes, namespaces }) in
+        program.indexed_payload_bundles().zip(serialized)
+    {
+        let owner = registered_name(program, bundle.namespace());
+        let package = package_name(bundle);
+        let established = bundle
+            .dependencies()
+            .iter()
+            .map(|dependency| registered_name(program, dependency.namespace()))
+            .collect::<BTreeSet<_>>();
+        let observed = namespaces
+            .iter()
+            .map(String::as_str)
+            .filter(|namespace| *namespace != owner)
+            .collect::<BTreeSet<_>>();
+        blockers.extend(observed.difference(&established).map(|namespace| {
+            format!(
+                "payload bundle of `{package}` refers to namespace `{namespace}`, which analysis did not establish as a dependency"
+            )
+        }));
+        blockers.extend(established.difference(&observed).map(|namespace| {
+            format!(
+                "payload bundle of `{package}` does not refer to namespace `{namespace}`, which analysis established as a dependency"
+            )
+        }));
+        checked.push(CheckedPayloadBundle { bundle: id, bytes });
+    }
+    if blockers.is_empty() {
+        Ok(checked)
+    } else {
+        Err(BuildReport::new(blockers))
+    }
 }
 
 fn initial_value(program: &ProgramIr, binding: crate::ir::BindingId) -> Option<crate::ir::ValueId> {
@@ -765,11 +870,10 @@ fn render_namespace(program: &ProgramIr) -> String {
     out
 }
 
-fn closure_patches(program: &ProgramIr, package: PackageId) -> Vec<ClosurePatchSpec> {
-    program
-        .payload_closures()
+fn closure_patches(program: &ProgramIr, bundle: &PayloadBundleIr) -> Vec<ClosurePatchSpec> {
+    bundle
+        .closure_patches()
         .iter()
-        .filter(|closure| closure.package == package)
         .map(|closure| {
             let code = program.code(closure.code);
             let source = relocated_source(program, closure.code);
@@ -1040,7 +1144,8 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
     assign(binding, getNativeSymbolInfo(symbols[[binding]], dll), envir = namespace)
   }
 }
-.slinker_populate <- function(namespace, package) {
+.slinker_populate <- function(namespace, package, external) {
+  for (dependency in external) loadNamespace(dependency)
   bundle <- system.file("slinker", "payload", paste0(package, ".rds"), package = .slinker_root_package, mustWork = TRUE)
   invisible(list2env(readRDS(bundle), envir = namespace))
 }
