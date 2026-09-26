@@ -148,8 +148,14 @@ Minimal code:
 
 ## Track E: Retire heuristics
 
-- Default-argument specialization: a formal defaulting to a constant that no caller passes is
-  static (voucher's `system.file(..., package = package)`).
+- Invocation model: record every way a retained function is invoked, with its arguments: direct
+  calls; `FUN` of base `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` with the call's forwarded
+  `...`; `do.call`; S3 dispatch, including methods found lexically; lifecycle hooks; native
+  callbacks; condition handlers, `on.exit`, and finalizers. Owned by analysis state, never derived
+  from provenance edge kinds. Both items below need it to prove what callers pass.
+- Default-argument specialization: a formal defaulting to a constant that no invocation supplies
+  and the body never rebinds is static (voucher's `find_vouch_workflow_template(action, package =
+  "voucher")`, whose only caller is `vapply(actions, find_vouch_workflow_template, character(1))`).
 - `callables()` for a function-valued binding passed to `do.call` or `lapply`: record an invocation
   of each declared callable instead of an escape, so a closed S3 generic stays closed.
 
