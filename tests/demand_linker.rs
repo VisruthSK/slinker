@@ -49,7 +49,6 @@ impl FakeProvider {
                     "loadNamespace",
                     "getNamespace",
                     "asNamespace",
-                    "packageVersion",
                     "find.package",
                     "system.file",
                     ".Call",
@@ -244,6 +243,22 @@ fn package_importing(name: &str, bindings: &[(&str, Option<&str>)], imports: &st
         Vec::new(),
         Vec::new(),
         format!("Imports: {imports}\n"),
+    )
+}
+
+fn utils_platform() -> PackageImage {
+    package_with!(
+        "utils",
+        &[("packageVersion", None), ("packageDescription", None)],
+        Vec::new(),
+        ExportMap::from([
+            ("packageVersion".to_owned(), "packageVersion".into()),
+            ("packageDescription".to_owned(), "packageDescription".into()),
+        ]),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Priority: base\n",
     )
 }
 
@@ -2628,7 +2643,7 @@ fn find_package_of_a_linked_package_blocks_before_materialization() {
     let analyze = |source: &str| {
         let root = package_importing("root", &[("f", Some(source))], "foo");
         let foo = package("foo", &[("x", Some("x <- function() 1"))]);
-        Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        Linker::new(FakeProvider::new(vec![root, foo, utils_platform()]), 1)
             .analyze("root")
             .unwrap()
     };
@@ -2639,7 +2654,7 @@ fn find_package_of_a_linked_package_blocks_before_materialization() {
             && diagnostic.message.contains("find.package")
     }));
 
-    let versioned = analyze("f <- function() { foo::x(); packageVersion('foo') }");
+    let versioned = analyze("f <- function() { foo::x(); utils::packageVersion('foo') }");
     assert!(
         versioned.blockers().is_empty(),
         "{:?}",
@@ -4792,7 +4807,7 @@ fn linked_discovery_with_unhonored_arguments_blocks() {
     let analyze = |source: &str| {
         let root = package_importing("root", &[("f", Some(source))], "foo");
         let foo = package("foo", &[("x", Some("x <- function() 1"))]);
-        Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        Linker::new(FakeProvider::new(vec![root, foo, utils_platform()]), 1)
             .analyze("root")
             .unwrap()
     };
@@ -4807,7 +4822,7 @@ fn linked_discovery_with_unhonored_arguments_blocks() {
         "f <- function() loadNamespace('foo', versionCheck = list(op = '>=', version = '2.0'))"
     ));
     assert!(blocks(
-        "f <- function() packageVersion('foo', lib.loc = 'x')"
+        "f <- function() utils::packageVersion('foo', lib.loc = 'x')"
     ));
     assert!(blocks(
         "f <- function() requireNamespace('foo', lib.loc = 'x')"

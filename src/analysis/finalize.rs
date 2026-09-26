@@ -537,6 +537,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         version: version.clone(),
                     }
                 }
+                PendingRelocation::LoadedQuery { .. } => RelocationTarget::LoadedQuery,
+                PendingRelocation::NamespaceArgument { package, .. } => {
+                    RelocationTarget::NamespaceArgument { package: *package }
+                }
+                PendingRelocation::DescriptionArgument { package, .. } => {
+                    RelocationTarget::DescriptionArgument {
+                        description: builder.add_resource(crate::ir::ResourceIr {
+                            package: *package,
+                            path: "Meta/package.rds".into(),
+                        }),
+                    }
+                }
             };
             if let Err(invalid) = builder.relocate(code, source.range(), target) {
                 issues.push(FinalizationIssue::InvalidRelocation(invalid));

@@ -2248,14 +2248,14 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         current: PackageId,
         binding: &str,
         call: &CallSite,
-    ) {
+    ) -> Result<()> {
         if call.callee == "getNamespaceInfo"
             && !matches!(
                 matched_static_arg(call, &["ns", "which"], "which"),
                 Some(StaticArg::String(field)) if matches!(field.as_str(), "imports" | "path" | "dynlibs" | "S3methods")
             )
         {
-            return;
+            return self.namespace_argument(from, current, binding, call, &["ns", "which"], "ns");
         }
         match matched_static_arg(call, &["ns", "which"], "ns") {
             Some(StaticArg::String(name)) => {
@@ -2283,6 +2283,303 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 ),
                 Some(call.span.clone()),
             ),
+        }
+        Ok(())
+    }
+
+    fn namespace_argument(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+        formals: &[&str],
+        target: &str,
+    ) -> Result<()> {
+        let Some(index) = matched_call_arg_index(call, formals, target) else {
+            return Ok(());
+        };
+        let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
+            self.dynamic_package_name(from, current, binding, call);
+            return Ok(());
+        };
+        let name = name.clone();
+        match self.discovered_package(from, current, call, &name)? {
+            Discovered::Linked(package) => {
+                let Some(source) = call.arg_spans.get(index).cloned().flatten() else {
+                    self.unrewritable_package_call(from, current, call, &name);
+                    return Ok(());
+                };
+                if package != current {
+                    self.require_at(
+                        from,
+                        Need::Activation { package },
+                        EdgeKind::Discovery,
+                        format!("{}() names Linked `{name}`", call.callee),
+                        Some(call.span.clone()),
+                    );
+                }
+                self.relocations
+                    .push(PendingRelocation::NamespaceArgument { source, package });
+            }
+            Discovered::Missing => self.missing_package_call(from, current, call, &name),
+            Discovered::Settled | Discovered::Optional => {}
+        }
+        Ok(())
+    }
+
+    fn installed_package_query(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+        formals: &[&str],
+        target: &str,
+    ) -> Result<()> {
+        let Some(index) = matched_call_arg_index(call, formals, target) else {
+            return Ok(());
+        };
+        let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
+            self.dynamic_package_name(from, current, binding, call);
+            return Ok(());
+        };
+        let name = name.clone();
+        match self.discovered_package(from, current, call, &name)? {
+            Discovered::Linked(_) => self.unrewritable_package_call(from, current, call, &name),
+            Discovered::Missing => self.missing_package_call(from, current, call, &name),
+            Discovered::Settled | Discovered::Optional => {}
+        }
+        Ok(())
+    }
+
+    fn package_description(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+    ) -> Result<()> {
+        let formals = ["pkg", "lib.loc", "fields", "drop", "encoding"];
+        let Some(index) = matched_call_arg_index(call, &formals, "pkg") else {
+            return Ok(());
+        };
+        let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
+            self.dynamic_package_name(from, current, binding, call);
+            return Ok(());
+        };
+        let name = name.clone();
+        match self.discovered_package(from, current, call, &name)? {
+            Discovered::Linked(package) => match call.arg_spans.get(index).cloned().flatten() {
+                Some(source) if only_package_argument(call, &["fields", "drop", "encoding"]) => {
+                    self.relocations
+                        .push(PendingRelocation::DescriptionArgument { source, package });
+                }
+                _ => self.unrewritable_package_call(from, current, call, &name),
+            },
+            Discovered::Missing => self.missing_package_call(from, current, call, &name),
+            Discovered::Settled | Discovered::Optional => {}
+        }
+        Ok(())
+    }
+
+    fn loaded_query(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+        name: Option<&str>,
+    ) -> Result<()> {
+        let Some(name) = name else {
+            self.dynamic_package_name(from, current, binding, call);
+            return Ok(());
+        };
+        let imported = self.images[&current]
+            .index
+            .imports
+            .iter()
+            .any(|import| match import {
+                ImportSpec::All { package, .. } | ImportSpec::From { package, .. } => {
+                    package == name
+                }
+            });
+        let package = if name == self.packages.name(current) {
+            (!self.is_root(current)).then_some(current)
+        } else if imported {
+            self.packages.resolve(name)?.filter(|package| {
+                self.packages.role(*package) == crate::package::PackageRole::Linked
+            })
+        } else {
+            None
+        };
+        if let Some(package) = package {
+            if package != current {
+                self.require_at(
+                    from,
+                    Need::Activation { package },
+                    EdgeKind::Discovery,
+                    format!("{}() asks whether imported `{name}` is loaded", call.callee),
+                    Some(call.span.clone()),
+                );
+            }
+            self.relocations.push(PendingRelocation::LoadedQuery {
+                source: call.span.clone(),
+                package,
+            });
+        }
+        Ok(())
+    }
+
+    fn loaded_membership(
+        &mut self,
+        current: PackageId,
+        image: &PackageImage,
+        lexical_environment: &str,
+        call: &CallSite,
+    ) -> Result<Option<String>> {
+        let ([Some(StaticArg::String(name)), _], [None, None], [_, Some(set)]) = (
+            call.args.as_slice(),
+            call.arg_names.as_slice(),
+            call.arg_spans.as_slice(),
+        ) else {
+            return Ok(None);
+        };
+        let base = match self.parses.text(set).unwrap_or_default().trim() {
+            "base::loadedNamespaces()" => true,
+            "loadedNamespaces()" => matches!(
+                self.resolve_lexical_name(current, image, lexical_environment, "loadedNamespaces")?,
+                Resolution::Static(BindingTarget::Base)
+            ),
+            _ => false,
+        };
+        Ok(base.then(|| name.clone()))
+    }
+
+    fn dynamic_package_name(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+    ) {
+        self.assume(
+            from,
+            current,
+            Some(binding),
+            RejectCode::DynamicPackageDiscovery,
+            format!(
+                "{}() with a dynamic package name can name a Linked package",
+                call.callee
+            ),
+            Some(call.span.clone()),
+        );
+    }
+
+    fn unrewritable_package_call(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        call: &CallSite,
+        name: &str,
+    ) {
+        self.diagnostic(
+            from,
+            current,
+            None,
+            RejectCode::UnsupportedRootTransformation,
+            format!(
+                "{}() on Linked `{name}` has no equivalent on its private namespace",
+                call.callee
+            ),
+            Some(call.span.clone()),
+        );
+    }
+
+    fn missing_package_call(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        call: &CallSite,
+        name: &str,
+    ) {
+        self.record_missing_package(
+            from,
+            current,
+            name,
+            EdgeKind::Discovery,
+            format!("{} requires unavailable package {name}", call.callee),
+            Some(call.span.clone()),
+        );
+    }
+
+    fn callee_is_utils(
+        &mut self,
+        current: PackageId,
+        image: &PackageImage,
+        lexical_environment: &str,
+        call: &CallSite,
+    ) -> Result<bool> {
+        if call.callee_kind != CalleeKind::DefinitelyExternal {
+            return Ok(false);
+        }
+        Ok(match call.qualified_package.as_deref() {
+            Some(package) => package == "utils",
+            None => matches!(
+                self.resolve_lexical_name(current, image, lexical_environment, &call.callee)?,
+                Resolution::Static(BindingTarget::External { package, binding })
+                    if self.packages.name(package) == "utils" && binding == call.callee.as_str()
+            ),
+        })
+    }
+
+    fn utils_call(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+    ) -> Result<()> {
+        match call.callee.as_str() {
+            "packageVersion" => self.identity_query(from, current, call, true),
+            "packageDescription" => self.package_description(from, current, binding, call),
+            "getFromNamespace" => self.namespace_argument(
+                from,
+                current,
+                binding,
+                call,
+                &["x", "ns", "pos", "envir"],
+                "ns",
+            ),
+            "assignInNamespace" => self.namespace_argument(
+                from,
+                current,
+                binding,
+                call,
+                &["x", "value", "ns", "pos", "envir"],
+                "ns",
+            ),
+            "citation" => {
+                self.installed_package_query(from, current, binding, call, &["package"], "package")
+            }
+            "vignette" | "help" => self.installed_package_query(
+                from,
+                current,
+                binding,
+                call,
+                &["topic", "package"],
+                "package",
+            ),
+            "data"
+                if call
+                    .arg_names
+                    .iter()
+                    .flatten()
+                    .any(|name| name == "package") =>
+            {
+                self.installed_package_query(from, current, binding, call, &["package"], "package")
+            }
+            _ => Ok(()),
         }
     }
 
@@ -2417,6 +2714,13 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 | "match.call"
                 | "isNamespaceLoaded"
                 | "getNamespaceExports"
+                | "getNamespaceName"
+                | "getNamespaceVersion"
+                | "getExportedValue"
+                | "attachNamespace"
+                | "unloadNamespace"
+                | "path.package"
+                | "library.dynam"
                 | "setHook"
                 | "packageEvent"
                 | "makeActiveBinding"
@@ -2443,6 +2747,9 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             lexical_environment,
             call,
         )? {
+            if self.callee_is_utils(current, image, lexical_environment, call)? {
+                self.utils_call(from, current, binding, call)?;
+            }
             return Ok(());
         }
         if reflective_name_formals(&call.callee).is_some() {
@@ -2490,9 +2797,51 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 )?;
             }
             "getNamespaceImports" | "getNamespaceInfo" => {
-                self.namespace_metadata_query(from, current, binding, call);
+                self.namespace_metadata_query(from, current, binding, call)?;
             }
-            "packageVersion" => self.identity_query(from, current, call, true)?,
+            "getExportedValue" => {
+                self.namespace_argument(from, current, binding, call, &["ns", "name"], "ns")?;
+            }
+            "getNamespaceExports" | "getNamespaceName" | "getNamespaceVersion" => {
+                self.namespace_argument(from, current, binding, call, &["ns"], "ns")?;
+            }
+            "isNamespaceLoaded" => {
+                let name = match matched_static_arg(call, &["name"], "name") {
+                    Some(StaticArg::String(name)) => Some(name.clone()),
+                    _ => None,
+                };
+                self.loaded_query(from, current, binding, call, name.as_deref())?;
+            }
+            "%in%" => {
+                if let Some(name) =
+                    self.loaded_membership(current, image, lexical_environment, call)?
+                {
+                    self.loaded_query(from, current, binding, call, Some(&name))?;
+                }
+            }
+            "attachNamespace" | "unloadNamespace" => {
+                self.installed_package_query(from, current, binding, call, &["ns"], "ns")?;
+            }
+            "path.package" => {
+                self.installed_package_query(
+                    from,
+                    current,
+                    binding,
+                    call,
+                    &["package"],
+                    "package",
+                )?;
+            }
+            "library.dynam" => {
+                self.installed_package_query(
+                    from,
+                    current,
+                    binding,
+                    call,
+                    &["chname", "package"],
+                    "package",
+                )?;
+            }
             "find.package" => self.identity_query(from, current, call, false)?,
             "UseMethod" | "NextMethod" => {
                 self.s3_dispatch(from, current, binding, lexical_environment, None, call)?;

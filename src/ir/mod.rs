@@ -310,6 +310,13 @@ pub enum RelocationTarget {
     Resource {
         target: ResourceId,
     },
+    LoadedQuery,
+    NamespaceArgument {
+        package: PackageId,
+    },
+    DescriptionArgument {
+        description: ResourceId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -940,7 +947,9 @@ impl ProgramBuilder {
     }
 
     fn relocation_matches(&self, target: &RelocationTarget, original: &str) -> bool {
-        let callee = original.trim_start_matches("base::");
+        let callee = original
+            .trim_start_matches("base::")
+            .trim_start_matches("utils::");
         match target {
             RelocationTarget::Binding { target, .. } => {
                 let unqualified = original
@@ -954,6 +963,11 @@ impl ProgramBuilder {
             RelocationTarget::Namespace { operation, .. } => callee.starts_with(operation.callee()),
             RelocationTarget::PackageVersion { .. } => callee.starts_with("packageVersion("),
             RelocationTarget::Resource { .. } => callee.starts_with("system.file("),
+            RelocationTarget::LoadedQuery => {
+                callee.starts_with("isNamespaceLoaded(") || original.contains("%in%")
+            }
+            RelocationTarget::NamespaceArgument { .. }
+            | RelocationTarget::DescriptionArgument { .. } => original.starts_with(['"', '\'']),
         }
     }
 

@@ -35,6 +35,18 @@ pub(super) enum PendingRelocation {
         source: Span,
         version: String,
     },
+    LoadedQuery {
+        source: Span,
+        package: PackageId,
+    },
+    NamespaceArgument {
+        source: Span,
+        package: PackageId,
+    },
+    DescriptionArgument {
+        source: Span,
+        package: PackageId,
+    },
 }
 
 impl PendingRelocation {
@@ -58,24 +70,32 @@ impl PendingRelocation {
             | Self::ResourceAccess { source, .. }
             | Self::RequireNamespace { source, .. }
             | Self::NamespaceLoad { source, .. }
-            | Self::PackageVersion { source, .. } => source,
+            | Self::PackageVersion { source, .. }
+            | Self::LoadedQuery { source, .. }
+            | Self::NamespaceArgument { source, .. }
+            | Self::DescriptionArgument { source, .. } => source,
         }
     }
 
     pub(super) fn reaches_removed_installation(&self) -> bool {
         matches!(
             self,
-            Self::ResourceAccess { .. } | Self::PackageVersion { .. }
+            Self::ResourceAccess { .. }
+                | Self::PackageVersion { .. }
+                | Self::DescriptionArgument { .. }
         )
     }
 
     pub(super) fn named_namespace(&self) -> Option<PackageId> {
         match self {
-            Self::NamespaceAccess { package, .. } | Self::NamespaceLoad { package, .. } => {
-                Some(*package)
-            }
+            Self::NamespaceAccess { package, .. }
+            | Self::NamespaceLoad { package, .. }
+            | Self::LoadedQuery { package, .. }
+            | Self::NamespaceArgument { package, .. } => Some(*package),
             Self::RequireNamespace { loaded, .. } => *loaded,
-            Self::ResourceAccess { .. } | Self::PackageVersion { .. } => None,
+            Self::ResourceAccess { .. }
+            | Self::PackageVersion { .. }
+            | Self::DescriptionArgument { .. } => None,
         }
     }
 }

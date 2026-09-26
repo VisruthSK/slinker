@@ -595,6 +595,67 @@ fn payload_closures_reach_their_private_namespace() {
     );
 }
 
+#[test]
+fn name_addressed_queries_answer_for_the_linked_copy() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let probe = "probe <- function() {\n  ns <- topenv()\n  c(\n    loaded = isNamespaceLoaded('tinyq'),\n    member = 'tinyq' %in% loadedNamespaces(),\n    exported = identical(environment(getExportedValue('tinyq', 'probe')), ns),\n    fetched = identical(environment(utils::getFromNamespace('probe', 'tinyq')), ns),\n    name = identical(getNamespaceName('tinyq'), c(name = 'tinyq')),\n    version = identical(getNamespaceVersion('tinyq'), c(version = '1.0.0')),\n    described = identical(utils::packageDescription('tinyq')$Version, '1.0.0'),\n    versioned = identical(as.character(utils::packageVersion('tinyq')), '1.0.0')\n  )\n}\n";
+    let linked_source = fixture.path().join("tinyq");
+    write_package(&linked_source, "tinyq", "", "export(probe)\n", probe);
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &linked_source, &build_library);
+    let newer_source = fixture.path().join("newer").join("tinyq");
+    write_package(&newer_source, "tinyq", "", "export(probe)\n", probe);
+    let description = fs::read_to_string(newer_source.join("DESCRIPTION")).expect("DESCRIPTION");
+    fs::write(
+        newer_source.join("DESCRIPTION"),
+        description.replace("Version: 1.0.0", "Version: 2.0.0"),
+    )
+    .expect("newer DESCRIPTION");
+
+    let root_source = fixture.path().join("queryroot");
+    write_package(
+        &root_source,
+        "queryroot",
+        "Imports: tinyq\n",
+        "importFrom(tinyq, probe)\nexport(check)\n",
+        "check <- function() all(probe()) && isNamespaceLoaded('tinyq')\n",
+    );
+    let output = fixture.path().join("generated-queryroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run query build");
+    assert_success(&result, "slinker build query fixture");
+
+    let behavior = "library(queryroot); result <- get('probe', envir = asNamespace('queryroot'))(); if (!all(result)) print(result); stopifnot(isTRUE(check()))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &linked_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+
+    let absent = fixture.path().join("absent");
+    fs::create_dir(&absent).expect("library without the real Linked package");
+    install_package(&r_home, &output, &absent);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with a newer real Linked package");
+    install_package(&r_home, &newer_source, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    run_r(&r_home, &installed, behavior);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('tinyq'); {behavior}"),
+    );
+}
+
 fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &str) {
     fs::create_dir_all(root.join("R")).expect("R directory");
     fs::write(

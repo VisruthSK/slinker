@@ -18,7 +18,7 @@ The Root keeps every binding it defines. Each Linked namespace is registered und
 
 Linked code that names a Linked namespace, including its own (`pkg::f`, `asNamespace("pkg")`, `requireNamespace("pkg")`), is rewritten to the private namespace. A payload closure containing such a site is rebuilt from its rewritten source and replaces the original in its binding before the payload is serialized; the build blocks if the closure sits inside a list or attribute, or if the original is still referenced from anywhere else in a payload. A computed name that resolves to the Linked package itself is a dynamic namespace target.
 
-Static `asNamespace`, `getNamespace`, `loadNamespace`, `requireNamespace`, and `packageVersion` calls on a declared dependency are rewritten: a Linked target to its private namespace, `TRUE`, or its recorded version; an External one stays as written. Naming an installed package that is not a declared dependency blocks, as do `find.package` on a Linked package and arguments the private namespace cannot honor, such as `lib.loc` or `versionCheck`.
+Static `asNamespace`, `getNamespace`, `loadNamespace`, `requireNamespace`, and `packageVersion` calls on a declared dependency are rewritten: a Linked target to its private namespace, `TRUE`, or its recorded version; an External one stays as written. Naming an installed package that is not a declared dependency blocks, as do `find.package` on a Linked package and arguments the private namespace cannot honor, such as `lib.loc` or `versionCheck`. `isNamespaceLoaded("pkg")` and `"pkg" %in% loadedNamespaces()` answer `TRUE` for the Linked package itself or one its code imports. `getExportedValue`, `getNamespaceExports`, `getNamespaceName`, `getNamespaceVersion`, `getNamespaceInfo`, `utils::getFromNamespace`, and `utils::assignInNamespace` receive the private namespace, and `utils::packageDescription` reads the Linked copy's installed metadata, which the generated package ships. `attachNamespace`, `unloadNamespace`, `path.package`, `library.dynam`, `citation`, `vignette`, `help`, and `data(package =)` on a Linked package block. utils functions are recognized when called as `utils::f` or imported from utils.
 
 The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then calls the Root's original `.onLoad`. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
 
@@ -28,7 +28,7 @@ The generated Root `.onLoad` activates Linked namespaces in an order finalizatio
 
 - unanalyzed native code (its C-to-R callbacks are not checked);
 - a free name bound nowhere (assumed to fail as in the original);
-- a dynamic `asNamespace`/`getNamespace`/`requireNamespace`/`loadNamespace` target;
+- a dynamic namespace or package name passed to a namespace or package query (`asNamespace`, `requireNamespace`, `getExportedValue`, `isNamespaceLoaded`, `packageDescription`, ...);
 - `get`/`get0`/`exists`/`match.fun`/`do.call` with a computed name or environment;
 - `system.file(package = x)` with a computed `x` while a package is Linked;
 - `NextMethod()` outside a known method set.

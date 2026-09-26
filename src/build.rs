@@ -796,7 +796,19 @@ fn relocated_source(program: &ProgramIr, code: crate::ir::CodeId) -> String {
             RelocationTarget::RequireNamespace { result } => {
                 if *result { "TRUE" } else { "FALSE" }.into()
             }
-            RelocationTarget::Namespace { package, .. } => namespace_expression(program, *package),
+            RelocationTarget::Namespace { package, .. }
+            | RelocationTarget::NamespaceArgument { package } => {
+                namespace_expression(program, *package)
+            }
+            RelocationTarget::LoadedQuery => "TRUE".into(),
+            RelocationTarget::DescriptionArgument { description } => {
+                let package = program.package(program.resource(*description).package);
+                format!(
+                    "{}, lib.loc = base::system.file(\"slinker\", \"resources\", package = {})",
+                    r_string(&package.identity().name),
+                    r_string(&program.package(program.root_package()).identity().name)
+                )
+            }
             RelocationTarget::PackageVersion { version } => {
                 format!("base::package_version({})", r_string(version))
             }
