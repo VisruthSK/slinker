@@ -541,6 +541,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 PendingRelocation::NamespaceArgument { package, .. } => {
                     RelocationTarget::NamespaceArgument { package: *package }
                 }
+                PendingRelocation::NativeSymbol {
+                    package,
+                    component,
+                    symbol,
+                    ..
+                } => RelocationTarget::NativeSymbol {
+                    package: *package,
+                    component: component.clone(),
+                    symbol: symbol.clone(),
+                },
+                PendingRelocation::NativeLibrary {
+                    package, component, ..
+                } => RelocationTarget::NativeLibrary {
+                    package: *package,
+                    component: component.clone(),
+                },
                 PendingRelocation::DescriptionArgument { package, .. } => {
                     RelocationTarget::DescriptionArgument {
                         description: builder.add_resource(crate::ir::ResourceIr {

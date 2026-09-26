@@ -15,9 +15,9 @@ pub use image::{
     PrivateEnvironmentImage,
 };
 pub use index::{
-    ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NativeComponent,
-    NativeFacts, NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding,
-    PackageIndex, S3Registration,
+    ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NameLookup,
+    NativeComponent, NativeFacts, NativeInterface, NativeRegistration, NativeRoutineSummary,
+    NativeRoutines, NativeSafety, NativeSymbolBinding, PackageIndex, S3Registration,
 };
 pub use locator::PackageLocator;
 pub(crate) use locator::fingerprint_image;

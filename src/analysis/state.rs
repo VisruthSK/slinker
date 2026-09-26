@@ -2849,6 +2849,9 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             ".Call" | ".External" | ".C" | ".Fortran" => {
                 self.native_call(from, current, image, binding, lexical_environment, call)?;
             }
+            "getNativeSymbolInfo" if !self.is_root(current) => {
+                self.linked_native_symbol_query(from, current, image, binding, call);
+            }
             "deparse" | "substitute" | "match.call" => {
                 self.relocations.observe(SyntaxObservation {
                     node: from,
@@ -2984,6 +2987,9 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 component: &component,
                 call,
             })?;
+            if !self.is_root(current) {
+                self.linked_native_selector(from, current, image, call, &component);
+            }
         } else {
             self.diagnostic(
                 from,

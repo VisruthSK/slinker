@@ -1,11 +1,14 @@
-use super::arguments::{matched_call_arg_index, native_call_argument_index};
+use super::NodeId;
+use super::arguments::{matched_call_arg_index, matched_static_arg, native_call_argument_index};
+use super::relocation::PendingRelocation;
 use super::resolution::{BindingTarget, OpenReason, Resolution};
 use super::state::{AnalyzerState, NativeCallTarget, NativeCallbackContext};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    NativeRoutineSummary, NativeSafety, PackageId, PackageImage, PackageIndex, PackageProvider,
+    NameLookup, NativeInterface, NativeRoutineSummary, NativeSafety, PackageId, PackageImage,
+    PackageIndex, PackageProvider,
 };
 use crate::syntax::{CallSite, StaticArg};
 
@@ -185,6 +188,136 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             }
         }
         Ok(())
+    }
+
+    pub(super) fn linked_native_selector(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        image: &PackageImage,
+        call: &CallSite,
+        component: &str,
+    ) {
+        let Some(index) = matched_call_arg_index(call, &[".NAME"], ".NAME") else {
+            return;
+        };
+        let Some(StaticArg::String(symbol)) = call.args.get(index).and_then(Option::as_ref) else {
+            return;
+        };
+        let Some(native) = image
+            .index
+            .dynlibs
+            .iter()
+            .find(|native| native.name == component)
+        else {
+            return;
+        };
+        let names_other_library = call
+            .arg_names
+            .iter()
+            .zip(&call.args)
+            .any(|(name, argument)| {
+                name.as_deref() == Some("PACKAGE")
+                    && !matches!(argument, Some(StaticArg::String(library)) if library == component)
+            });
+        let registered = NativeInterface::of_callee(&call.callee)
+            .is_some_and(|interface| native.routines.of(interface).contains(symbol));
+        let source = call.arg_spans.get(index).cloned().flatten();
+        match (native.name_lookup, source) {
+            (NameLookup::Forced, _) if !names_other_library => {}
+            (NameLookup::Allowed, Some(source)) if registered && !names_other_library => {
+                self.relocations.push(PendingRelocation::NativeSymbol {
+                    source,
+                    package: current,
+                    component: component.into(),
+                    symbol: symbol.clone(),
+                });
+            }
+            _ => self.diagnostic(
+                from,
+                current,
+                None,
+                RejectCode::UnknownNativeLookup,
+                format!(
+                    "{} selector \"{symbol}\" of Linked `{component}` cannot be resolved through its own DLL copy",
+                    call.callee
+                ),
+                Some(call.span.clone()),
+            ),
+        }
+    }
+
+    pub(super) fn linked_native_symbol_query(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        image: &PackageImage,
+        binding: &str,
+        call: &CallSite,
+    ) {
+        let formals = ["name", "PACKAGE", "unlist", "withRegistrationInfo"];
+        let library = matched_call_arg_index(call, &formals, "PACKAGE");
+        match library.map(|index| (index, call.args.get(index).and_then(Option::as_ref))) {
+            None => {
+                let Some(StaticArg::String(symbol)) = matched_static_arg(call, &formals, "name")
+                else {
+                    return;
+                };
+                if image.index.dynlibs.iter().any(|native| {
+                    native.name_lookup != NameLookup::Forced
+                        && native.routines.names().contains(symbol.as_str())
+                }) {
+                    self.diagnostic(
+                        from,
+                        current,
+                        None,
+                        RejectCode::UnknownNativeLookup,
+                        format!(
+                            "getNativeSymbolInfo(\"{symbol}\") searches every loaded DLL, including another copy of this Linked package's"
+                        ),
+                        Some(call.span.clone()),
+                    );
+                }
+            }
+            Some((index, Some(StaticArg::String(library)))) => {
+                let Some(native) = image
+                    .index
+                    .dynlibs
+                    .iter()
+                    .find(|native| native.name == *library)
+                else {
+                    return;
+                };
+                match (native.name_lookup, call.arg_spans.get(index).cloned().flatten()) {
+                    (NameLookup::Forced, _) => {}
+                    (NameLookup::Allowed, Some(source)) => {
+                        self.relocations.push(PendingRelocation::NativeLibrary {
+                            source,
+                            package: current,
+                            component: library.as_str().into(),
+                        });
+                    }
+                    _ => self.diagnostic(
+                        from,
+                        current,
+                        None,
+                        RejectCode::UnknownNativeLookup,
+                        format!(
+                            "getNativeSymbolInfo() names Linked DLL `{library}`, which cannot be resolved through its own copy"
+                        ),
+                        Some(call.span.clone()),
+                    ),
+                }
+            }
+            Some(_) => self.assume(
+                from,
+                current,
+                Some(binding),
+                RejectCode::DynamicLookup,
+                "getNativeSymbolInfo() with a computed PACKAGE can name a Linked DLL",
+                Some(call.span.clone()),
+            ),
+        }
     }
 
     pub(super) fn native_component_for_binding<'a>(

@@ -2,7 +2,8 @@
 
 use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{
-    BindingName, ClassName, GenericName, PackageId, PackageIdentity, PackageName, PackageRole,
+    BindingName, ClassName, ComponentName, GenericName, PackageId, PackageIdentity, PackageName,
+    PackageRole,
 };
 
 use crate::package::Digest;
@@ -316,6 +317,15 @@ pub enum RelocationTarget {
     },
     DescriptionArgument {
         description: ResourceId,
+    },
+    NativeSymbol {
+        package: PackageId,
+        component: ComponentName,
+        symbol: String,
+    },
+    NativeLibrary {
+        package: PackageId,
+        component: ComponentName,
     },
 }
 
@@ -967,7 +977,9 @@ impl ProgramBuilder {
                 callee.starts_with("isNamespaceLoaded(") || original.contains("%in%")
             }
             RelocationTarget::NamespaceArgument { .. }
-            | RelocationTarget::DescriptionArgument { .. } => original.starts_with(['"', '\'']),
+            | RelocationTarget::DescriptionArgument { .. }
+            | RelocationTarget::NativeSymbol { .. }
+            | RelocationTarget::NativeLibrary { .. } => original.starts_with(['"', '\'']),
         }
     }
 

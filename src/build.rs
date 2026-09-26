@@ -484,8 +484,9 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
                 .join(", ");
             emit!(
                 out,
-                "    .slinker_load_native(ns, {}, {}, c({symbols}))",
+                "    .slinker_load_native(ns, {}, {}, {}, c({symbols}))",
                 r_string(name),
+                r_string(&native.name),
                 r_string(library)
             );
         }
@@ -801,6 +802,18 @@ fn relocated_source(program: &ProgramIr, code: crate::ir::CodeId) -> String {
                 namespace_expression(program, *package)
             }
             RelocationTarget::LoadedQuery => "TRUE".into(),
+            RelocationTarget::NativeSymbol {
+                package,
+                component,
+                symbol,
+            } => format!(
+                "base::getNativeSymbolInfo({}, {})",
+                r_string(symbol),
+                native_library(program, *package, component)
+            ),
+            RelocationTarget::NativeLibrary { package, component } => {
+                native_library(program, *package, component)
+            }
             RelocationTarget::DescriptionArgument { description } => {
                 let package = program.package(program.resource(*description).package);
                 format!(
@@ -826,6 +839,14 @@ fn relocated_source(program: &ProgramIr, code: crate::ir::CodeId) -> String {
         source.replace_range(occurrence.start..occurrence.end, &replacement);
     }
     source
+}
+
+fn native_library(program: &ProgramIr, package: PackageId, component: &str) -> String {
+    format!(
+        "base::getNamespaceInfo({}, \"DLLs\")[[{}]]",
+        namespace_expression(program, package),
+        r_string(component)
+    )
 }
 
 fn validate_r_source(worker: &mut WorkerClient, source: &str) -> Result<(), MaterializeError> {
@@ -970,14 +991,18 @@ const GENERATED_RUNTIME: &str = r#"
   setNamespaceInfo(namespace, "imports", list(base = TRUE))
   setNamespaceInfo(namespace, "path", "")
   setNamespaceInfo(namespace, "dynlibs", NULL)
+  setNamespaceInfo(namespace, "DLLs", list())
   setNamespaceInfo(namespace, "S3methods", matrix(NA_character_, 0L, 4L))
   namespace$.__S3MethodsTable__. <- new.env(hash = TRUE, parent = baseenv())
   .Internal(registerNamespace(key, namespace))
   namespace
 }
-.slinker_load_native <- function(namespace, package, library, symbols) {
+.slinker_load_native <- function(namespace, package, component, library, symbols) {
   path <- system.file("slinker", "resources", package, library, package = .slinker_root_package, mustWork = TRUE)
   dll <- dyn.load(path, local = TRUE)
+  dlls <- getNamespaceInfo(namespace, "DLLs")
+  dlls[[component]] <- dll
+  setNamespaceInfo(namespace, "DLLs", dlls)
   for (binding in names(symbols)) {
     assign(binding, getNativeSymbolInfo(symbols[[binding]], dll), envir = namespace)
   }

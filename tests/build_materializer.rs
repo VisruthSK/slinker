@@ -656,6 +656,74 @@ fn name_addressed_queries_answer_for_the_linked_copy() {
     );
 }
 
+#[test]
+fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let linked_source = fixture.path().join("tinyc");
+    write_package(
+        &linked_source,
+        "tinyc",
+        "",
+        "useDynLib(tinyc, .registration = TRUE, .fixes = \"C_\")\nexport(by_name, by_symbol, same_copy)\n",
+        "by_name <- function() .Call(\"tinyc_tick\", PACKAGE = \"tinyc\")\nby_symbol <- function() .Call(C_tinyc_tick)\nsame_copy <- function() identical(getNativeSymbolInfo(\"tinyc_tick\", \"tinyc\")$dll[[\"path\"]], C_tinyc_tick$dll[[\"path\"]])\n",
+    );
+    fs::create_dir_all(linked_source.join("src")).expect("src directory");
+    fs::write(
+        linked_source.join("src/tinyc.c"),
+        "#include <R.h>\n#include <Rinternals.h>\n#include <R_ext/Rdynload.h>\nstatic int count = 0;\nSEXP tinyc_tick(void) { return Rf_ScalarInteger(++count); }\nstatic const R_CallMethodDef calls[] = {{\"tinyc_tick\", (DL_FUNC) &tinyc_tick, 0}, {NULL, NULL, 0}};\nvoid R_init_tinyc(DllInfo *dll) { R_registerRoutines(dll, NULL, calls, NULL, NULL); R_useDynamicSymbols(dll, FALSE); }\n",
+    )
+    .expect("C source");
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &linked_source, &build_library);
+
+    let root_source = fixture.path().join("nativeroot");
+    write_package(
+        &root_source,
+        "nativeroot",
+        "Imports: tinyc\n",
+        "importFrom(tinyc, by_name, by_symbol, same_copy)\nexport(ticks, same_copy)\n",
+        "ticks <- function() c(by_name(), by_symbol(), by_name())\n",
+    );
+    let output = fixture.path().join("generated-nativeroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--strict", "false", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run native build");
+    assert_success(&result, "slinker build native fixture");
+
+    let behavior = "library(nativeroot); stopifnot(identical(ticks(), 1:3), isTRUE(same_copy()))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &linked_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &linked_source, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &installed, behavior);
+    let tick_real = "for (i in 1:5) tinyc::by_name()";
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('tinyc'); {tick_real}; {behavior}"),
+    );
+    run_r(
+        &r_home,
+        &installed,
+        &format!(
+            "library(nativeroot); loadNamespace('tinyc'); {tick_real}; stopifnot(identical(ticks(), 1:3), isTRUE(same_copy()))"
+        ),
+    );
+}
+
 fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &str) {
     fs::create_dir_all(root.join("R")).expect("R directory");
     fs::write(

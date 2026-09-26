@@ -1,7 +1,7 @@
 use crate::Description;
 use crate::package::{BindingName, ClassName, GenericName, PackageIdentity, PackageName};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type ExportMap = BTreeMap<String, BindingName>;
 
@@ -87,19 +87,76 @@ pub struct NativeComponent {
     pub name: String,
     pub registration: Option<NativeRegistration>,
     pub symbols: Vec<NativeSymbolBinding>,
-    pub routines: Vec<String>,
+    pub routines: NativeRoutines,
+    pub name_lookup: NameLookup,
     pub library: Option<String>,
     pub safety: NativeSafety,
+}
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct NativeRoutines {
+    pub c: Vec<String>,
+    pub call: Vec<String>,
+    pub fortran: Vec<String>,
+    pub external: Vec<String>,
+}
+
+impl NativeRoutines {
+    pub fn of(&self, interface: NativeInterface) -> &[String] {
+        match interface {
+            NativeInterface::C => &self.c,
+            NativeInterface::Call => &self.call,
+            NativeInterface::Fortran => &self.fortran,
+            NativeInterface::External => &self.external,
+        }
+    }
+
+    pub fn names(&self) -> BTreeSet<&str> {
+        [&self.c, &self.call, &self.fortran, &self.external]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum NativeInterface {
+    C,
+    Call,
+    Fortran,
+    External,
+}
+
+impl NativeInterface {
+    pub fn of_callee(callee: &str) -> Option<Self> {
+        match callee {
+            ".C" => Some(Self::C),
+            ".Call" => Some(Self::Call),
+            ".Fortran" => Some(Self::Fortran),
+            ".External" => Some(Self::External),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum NameLookup {
+    #[default]
+    Unknown,
+    Forced,
+    Allowed,
 }
 
 impl NativeComponent {
     pub fn bindings(&self) -> impl Iterator<Item = NativeSymbolBinding> + '_ {
         let registered = self.registration.iter().flat_map(|fixes| {
             self.routines
-                .iter()
+                .names()
+                .into_iter()
                 .map(move |routine| NativeSymbolBinding {
                     binding: format!("{}{routine}{}", fixes.prefix, fixes.suffix),
-                    symbol: routine.clone(),
+                    symbol: routine.to_owned(),
                 })
         });
         self.symbols.iter().cloned().chain(registered)

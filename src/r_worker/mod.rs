@@ -9,8 +9,9 @@ pub mod protocol;
 use crate::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClassName, ClosureSource,
     EmbeddedClosureSource, EmbeddedEnvironmentRef, ExportMap, ImportBinding, ImportSpec,
-    NativeComponent, NativeRegistration, NativeSafety, NativeSymbolBinding, ObjectIssue,
-    ObjectKind, PackageName, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
+    NameLookup, NativeComponent, NativeRegistration, NativeRoutines, NativeSafety,
+    NativeSymbolBinding, ObjectIssue, ObjectKind, PackageName, PrivateBindingImage,
+    PrivateEnvironmentImage, S3Registration,
 };
 use crate::{Error, Result};
 use harp::{RFunctionExt, RObjectExt};
@@ -607,7 +608,20 @@ fn worker_package_index(
                     .zip(symbols)
                     .map(|(binding, symbol)| NativeSymbolBinding { binding, symbol })
                     .collect(),
-                routines: strings_field(&compiled, "routines")?,
+                routines: {
+                    let routines = field(&compiled, "routines")?;
+                    NativeRoutines {
+                        c: strings_field(&routines, "c")?,
+                        call: strings_field(&routines, "call")?,
+                        fortran: strings_field(&routines, "fortran")?,
+                        external: strings_field(&routines, "external")?,
+                    }
+                },
+                name_lookup: match bool::try_from(field(&compiled, "force_symbols")?) {
+                    Ok(true) => NameLookup::Forced,
+                    Ok(false) => NameLookup::Allowed,
+                    Err(_) => NameLookup::Unknown,
+                },
                 library: strings_field(&compiled, "library")?.into_iter().next(),
                 safety: NativeSafety::Unanalyzed,
             })

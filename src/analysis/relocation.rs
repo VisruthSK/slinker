@@ -1,6 +1,6 @@
 use super::NodeId;
 use crate::ir::NamespaceOperation;
-use crate::package::{BindingName, PackageId};
+use crate::package::{BindingName, ComponentName, PackageId};
 use crate::syntax::Span;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +47,17 @@ pub(super) enum PendingRelocation {
         source: Span,
         package: PackageId,
     },
+    NativeSymbol {
+        source: Span,
+        package: PackageId,
+        component: ComponentName,
+        symbol: String,
+    },
+    NativeLibrary {
+        source: Span,
+        package: PackageId,
+        component: ComponentName,
+    },
 }
 
 impl PendingRelocation {
@@ -73,7 +84,9 @@ impl PendingRelocation {
             | Self::PackageVersion { source, .. }
             | Self::LoadedQuery { source, .. }
             | Self::NamespaceArgument { source, .. }
-            | Self::DescriptionArgument { source, .. } => source,
+            | Self::DescriptionArgument { source, .. }
+            | Self::NativeSymbol { source, .. }
+            | Self::NativeLibrary { source, .. } => source,
         }
     }
 
@@ -91,7 +104,9 @@ impl PendingRelocation {
             Self::NamespaceAccess { package, .. }
             | Self::NamespaceLoad { package, .. }
             | Self::LoadedQuery { package, .. }
-            | Self::NamespaceArgument { package, .. } => Some(*package),
+            | Self::NamespaceArgument { package, .. }
+            | Self::NativeSymbol { package, .. }
+            | Self::NativeLibrary { package, .. } => Some(*package),
             Self::RequireNamespace { loaded, .. } => *loaded,
             Self::ResourceAccess { .. }
             | Self::PackageVersion { .. }
