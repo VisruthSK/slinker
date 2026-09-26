@@ -101,3 +101,19 @@ pub fn assert_success(output: &Output, operation: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+pub fn install_package_using(
+    r_home: &Path,
+    package: &Path,
+    library: &Path,
+    libraries: impl AsRef<OsStr>,
+) {
+    let output = Command::new(r_executable(r_home))
+        .args(["CMD", "INSTALL", "--no-test-load"])
+        .arg(format!("--library={}", library.display()))
+        .arg(package)
+        .env("R_LIBS", libraries.as_ref())
+        .output()
+        .expect("R CMD INSTALL");
+    assert_success(&output, "R CMD INSTALL");
+}
