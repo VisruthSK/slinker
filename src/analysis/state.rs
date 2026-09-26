@@ -2430,134 +2430,39 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(call.span.clone()),
                 );
             }
-            "requireNamespace" | "loadNamespace" | "getNamespace" | "asNamespace" => {
-                let name = static_string_arg(call).map(Cow::Borrowed).or_else(|| {
-                    self.contextual_namespace_calls
-                        .get(&call.span)
-                        .and_then(Option::as_ref)
-                        .cloned()
-                        .map(Cow::Owned)
-                });
-                let Some(name) = name else {
-                    if self.non_reflective_namespace_uses.contains(&call.span) {
-                        return Ok(());
-                    }
-                    self.assume(
-                        from,
-                        current,
-                        Some(binding),
-                        RejectCode::DynamicPackageDiscovery,
-                        format!("{}() with a dynamic namespace name", call.callee),
-                        Some(call.span.clone()),
-                    );
-                    return Ok(());
-                };
-                if name == self.packages.name(current) {
-                    return Ok(());
-                }
-                let operation = match call.callee.as_str() {
-                    "requireNamespace" => PackageOperation::RequireNamespace { result: true },
-                    "loadNamespace" => PackageOperation::LoadNamespace,
-                    "getNamespace" => PackageOperation::GetNamespace,
-                    "asNamespace" => PackageOperation::AsNamespace,
-                    _ => unreachable!(),
-                };
-                let suggested = self.package_is_suggested_only(current, &name)?;
-                let discovery_policy = if self.optional_package_selected(&name) {
-                    DiscoveryPolicy::Internalize
-                } else if suggested && call.callee == "requireNamespace" {
-                    self.pending_relocations
-                        .push(PendingRelocation::PackageOperation {
-                            source: call.span.clone(),
-                            package: None,
-                            operation: PackageOperation::RequireNamespace { result: false },
-                        });
-                    return Ok(());
-                } else if suggested {
-                    return Ok(());
-                } else {
-                    self.policy.namespace_discovery
-                };
-                match discovery_policy {
-                    DiscoveryPolicy::Reject => self.diagnostic(
-                        from,
-                        current,
-                        None,
-                        RejectCode::DynamicPackageDiscovery,
-                        format!(
-                            "reachable {} for `{name}` is not specialized by policy",
-                            call.callee
-                        ),
-                        Some(call.span.clone()),
-                    ),
-                    DiscoveryPolicy::ExternalOnly => match self.packages.resolve(&name)? {
-                        Some(foreign) if self.packages.is_external(foreign) => {
-                            self.external.insert(foreign);
-                        }
-                        Some(_) => self.diagnostic(
-                            from,
-                            current,
-                            None,
-                            RejectCode::DynamicPackageDiscovery,
-                            format!("`{name}` is installed but is not configured External"),
-                            Some(call.span.clone()),
-                        ),
-                        None if call.callee == "requireNamespace" => {
-                            self.pending_relocations
-                                .push(PendingRelocation::PackageOperation {
-                                    source: call.span.clone(),
-                                    package: None,
-                                    operation: PackageOperation::RequireNamespace { result: false },
-                                });
-                        }
-                        None => self.record_missing_package(
-                            from,
-                            current,
-                            &name,
-                            EdgeKind::Discovery,
-                            format!("{} requires unavailable namespace {name}", call.callee),
-                            Some(call.span.clone()),
-                        ),
-                    },
-                    DiscoveryPolicy::Internalize => match self.packages.resolve(&name)? {
-                        Some(foreign) if self.packages.is_external(foreign) => {
-                            self.external.insert(foreign);
-                        }
-                        Some(foreign) => {
-                            self.require_at(
-                                from,
-                                Need::Activation { package: foreign },
-                                EdgeKind::Discovery,
-                                format!("specialized {} requires `{name}`", call.callee),
-                                Some(call.span.clone()),
-                            );
-                            self.pending_relocations
-                                .push(PendingRelocation::PackageOperation {
-                                    source: call.span.clone(),
-                                    package: Some(foreign),
-                                    operation,
-                                });
-                        }
-                        None if call.callee == "requireNamespace"
-                            && !self.optional_package_selected(&name) =>
-                        {
-                            self.pending_relocations
-                                .push(PendingRelocation::PackageOperation {
-                                    source: call.span.clone(),
-                                    package: None,
-                                    operation: PackageOperation::RequireNamespace { result: false },
-                                });
-                        }
-                        None => self.record_missing_package(
-                            from,
-                            current,
-                            &name,
-                            EdgeKind::Discovery,
-                            format!("{} requires unavailable namespace {name}", call.callee),
-                            Some(call.span.clone()),
-                        ),
-                    },
-                }
+            "requireNamespace" => self.namespace_operation(
+                from,
+                current,
+                binding,
+                call,
+                PackageOperation::RequireNamespace { result: true },
+            )?,
+            "loadNamespace" => {
+                self.namespace_operation(
+                    from,
+                    current,
+                    binding,
+                    call,
+                    PackageOperation::LoadNamespace,
+                )?;
+            }
+            "getNamespace" => {
+                self.namespace_operation(
+                    from,
+                    current,
+                    binding,
+                    call,
+                    PackageOperation::GetNamespace,
+                )?;
+            }
+            "asNamespace" => {
+                self.namespace_operation(
+                    from,
+                    current,
+                    binding,
+                    call,
+                    PackageOperation::AsNamespace,
+                )?;
             }
             "getNamespaceImports" | "getNamespaceInfo" => {
                 self.namespace_metadata_query(from, current, binding, call);
@@ -2609,6 +2514,137 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 kind: call.callee.clone(),
             }),
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn namespace_operation(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        call: &CallSite,
+        operation: PackageOperation,
+    ) -> Result<()> {
+        let name = static_string_arg(call).map(Cow::Borrowed).or_else(|| {
+            self.contextual_namespace_calls
+                .get(&call.span)
+                .and_then(Option::as_ref)
+                .cloned()
+                .map(Cow::Owned)
+        });
+        let Some(name) = name else {
+            if self.non_reflective_namespace_uses.contains(&call.span) {
+                return Ok(());
+            }
+            self.assume(
+                from,
+                current,
+                Some(binding),
+                RejectCode::DynamicPackageDiscovery,
+                format!("{}() with a dynamic namespace name", call.callee),
+                Some(call.span.clone()),
+            );
+            return Ok(());
+        };
+        if name == self.packages.name(current) {
+            return Ok(());
+        }
+        let suggested = self.package_is_suggested_only(current, &name)?;
+        let discovery_policy = if self.optional_package_selected(&name) {
+            DiscoveryPolicy::Internalize
+        } else if suggested && matches!(operation, PackageOperation::RequireNamespace { .. }) {
+            self.pending_relocations
+                .push(PendingRelocation::PackageOperation {
+                    source: call.span.clone(),
+                    package: None,
+                    operation: PackageOperation::RequireNamespace { result: false },
+                });
+            return Ok(());
+        } else if suggested {
+            return Ok(());
+        } else {
+            self.policy.namespace_discovery
+        };
+        match discovery_policy {
+            DiscoveryPolicy::Reject => self.diagnostic(
+                from,
+                current,
+                None,
+                RejectCode::DynamicPackageDiscovery,
+                format!(
+                    "reachable {} for `{name}` is not specialized by policy",
+                    call.callee
+                ),
+                Some(call.span.clone()),
+            ),
+            DiscoveryPolicy::ExternalOnly => match self.packages.resolve(&name)? {
+                Some(foreign) if self.packages.is_external(foreign) => {
+                    self.external.insert(foreign);
+                }
+                Some(_) => self.diagnostic(
+                    from,
+                    current,
+                    None,
+                    RejectCode::DynamicPackageDiscovery,
+                    format!("`{name}` is installed but is not configured External"),
+                    Some(call.span.clone()),
+                ),
+                None if matches!(operation, PackageOperation::RequireNamespace { .. }) => {
+                    self.pending_relocations
+                        .push(PendingRelocation::PackageOperation {
+                            source: call.span.clone(),
+                            package: None,
+                            operation: PackageOperation::RequireNamespace { result: false },
+                        });
+                }
+                None => self.record_missing_package(
+                    from,
+                    current,
+                    &name,
+                    EdgeKind::Discovery,
+                    format!("{} requires unavailable namespace {name}", call.callee),
+                    Some(call.span.clone()),
+                ),
+            },
+            DiscoveryPolicy::Internalize => match self.packages.resolve(&name)? {
+                Some(foreign) if self.packages.is_external(foreign) => {
+                    self.external.insert(foreign);
+                }
+                Some(foreign) => {
+                    self.require_at(
+                        from,
+                        Need::Activation { package: foreign },
+                        EdgeKind::Discovery,
+                        format!("specialized {} requires `{name}`", call.callee),
+                        Some(call.span.clone()),
+                    );
+                    self.pending_relocations
+                        .push(PendingRelocation::PackageOperation {
+                            source: call.span.clone(),
+                            package: Some(foreign),
+                            operation,
+                        });
+                }
+                None if matches!(operation, PackageOperation::RequireNamespace { .. })
+                    && !self.optional_package_selected(&name) =>
+                {
+                    self.pending_relocations
+                        .push(PendingRelocation::PackageOperation {
+                            source: call.span.clone(),
+                            package: None,
+                            operation: PackageOperation::RequireNamespace { result: false },
+                        });
+                }
+                None => self.record_missing_package(
+                    from,
+                    current,
+                    &name,
+                    EdgeKind::Discovery,
+                    format!("{} requires unavailable namespace {name}", call.callee),
+                    Some(call.span.clone()),
+                ),
+            },
         }
         Ok(())
     }

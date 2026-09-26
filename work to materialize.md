@@ -194,8 +194,8 @@ Invariants into types:
 - Names: about 54 `String` fields and 87 string collections hold package, binding, class, and
   generic names. Intern them at the worker boundary into typed symbols (`PackageName`,
   `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
-- `unreachable!` (11) that encode invariants the types do not, such as "bootstrap activates only
-  Linked namespaces": type the collections so the impossible branch does not exist.
+- Finalization recovers a relocation's owning binding from the source map behind `unreachable!`;
+  `PendingRelocation` should carry its owner (including private-closure source keys) as a type.
 - 179 `.expect()` calls, mostly infallible `writeln!` into `String` in the materializer: generate R
   through a writer whose API cannot fail.
 - Worker protocol `Result<_, String>` (19) becomes typed errors.

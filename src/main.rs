@@ -30,6 +30,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(flatten)]
+    User(UserCommand),
+    #[command(name = "__r-worker", hide = true)]
+    RWorker { protocol: PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+enum UserCommand {
     #[command(about = "Build a generated linked R source package")]
     Build(BuildArgs),
     #[command(about = "Analyze an installed package image", alias = "analyse")]
@@ -38,8 +46,6 @@ enum Command {
     Why(QueryArgs),
     #[command(about = "Show semantic paths from ROOT into TARGET")]
     Path(QueryArgs),
-    #[command(name = "__r-worker", hide = true)]
-    RWorker { protocol: PathBuf },
 }
 
 #[derive(Debug, Args)]
@@ -121,7 +127,7 @@ fn main() -> ExitCode {
         Command::RWorker { protocol } => {
             report(slinker::r_worker::run(&protocol).map_err(Into::into))
         }
-        command => std::thread::Builder::new()
+        Command::User(command) => std::thread::Builder::new()
             .name("slinker".into())
             .stack_size(ANALYSIS_STACK_BYTES)
             .spawn(move || report(run(command)))
@@ -146,13 +152,12 @@ fn report(result: Result<(), Box<dyn Error>>) -> ExitCode {
     }
 }
 
-fn run(command: Command) -> Result<(), Box<dyn Error>> {
+fn run(command: UserCommand) -> Result<(), Box<dyn Error>> {
     match command {
-        Command::Build(args) => build(&args),
-        Command::Analyze(args) => analyze(&args),
-        Command::Why(args) => explain_why(&args),
-        Command::Path(args) => explain_paths(&args),
-        Command::RWorker { .. } => unreachable!("the R worker runs on the main thread"),
+        UserCommand::Build(args) => build(&args),
+        UserCommand::Analyze(args) => analyze(&args),
+        UserCommand::Why(args) => explain_why(&args),
+        UserCommand::Path(args) => explain_paths(&args),
     }
 }
 
@@ -572,7 +577,7 @@ fn parse_r_home(stdout: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, parse_r_home};
+    use super::{Cli, Command, UserCommand, parse_r_home};
     use clap::{CommandFactory, Parser};
     use std::path::Path;
 
@@ -583,7 +588,8 @@ mod tests {
 
     #[test]
     fn build_defaults_to_current_directory() {
-        let Command::Build(args) = Cli::parse_from(["slinker", "build"]).command else {
+        let Command::User(UserCommand::Build(args)) = Cli::parse_from(["slinker", "build"]).command
+        else {
             panic!("expected build command");
         };
         assert_eq!(args.path, Path::new("."));
@@ -592,7 +598,7 @@ mod tests {
 
     #[test]
     fn analyze_accepts_ordered_libraries_and_package_lists() {
-        let Command::Analyze(args) = Cli::parse_from([
+        let Command::User(UserCommand::Analyze(args)) = Cli::parse_from([
             "slinker",
             "analyze",
             "voucher",
@@ -623,7 +629,7 @@ mod tests {
 
     #[test]
     fn query_takes_root_then_target() {
-        let Command::Why(args) =
+        let Command::User(UserCommand::Why(args)) =
             Cli::parse_from(["slinker", "why", "voucher", "cli::cli_abort"]).command
         else {
             panic!("expected why command");
