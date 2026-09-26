@@ -45,6 +45,7 @@ pub enum PackageIr {
     },
     Linked {
         build_identity: PackageIdentity,
+        namespace_key: PrivateNamespaceKey,
     },
     External {
         analyzed_identity: PackageIdentity,
@@ -63,10 +64,48 @@ impl PackageIr {
 
     pub fn identity(&self) -> &PackageIdentity {
         match self {
-            Self::Root { build_identity } | Self::Linked { build_identity } => build_identity,
+            Self::Root { build_identity } | Self::Linked { build_identity, .. } => build_identity,
             Self::External {
                 analyzed_identity, ..
             } => analyzed_identity,
+        }
+    }
+
+    pub fn registered_namespace(&self) -> RegisteredNamespace<'_> {
+        match self {
+            Self::Root { build_identity } => RegisteredNamespace::Package(&build_identity.name),
+            Self::External {
+                analyzed_identity, ..
+            } => RegisteredNamespace::Package(&analyzed_identity.name),
+            Self::Linked { namespace_key, .. } => RegisteredNamespace::Private(namespace_key),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivateNamespaceKey(String);
+
+impl PrivateNamespaceKey {
+    fn derive(root: &PackageName, linked: &PackageName) -> Self {
+        Self(format!("{root}:{linked}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegisteredNamespace<'a> {
+    Package(&'a PackageName),
+    Private(&'a PrivateNamespaceKey),
+}
+
+impl RegisteredNamespace<'_> {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Package(name) => name.as_str(),
+            Self::Private(key) => key.as_str(),
         }
     }
 }
@@ -398,8 +437,12 @@ pub struct ProgramIr {
 }
 
 impl ProgramIr {
-    pub fn builder(target: TargetContract) -> ProgramBuilder {
-        ProgramBuilder::new(target)
+    pub fn builder(
+        target: TargetContract,
+        root: PackageId,
+        root_identity: PackageIdentity,
+    ) -> ProgramBuilder {
+        ProgramBuilder::new(target, root, root_identity)
     }
 
     pub fn target(&self) -> &TargetContract {
@@ -538,7 +581,7 @@ pub struct ProgramBuilder {
     resources: Vec<ResourceIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
-    root_package: Option<PackageId>,
+    root_package: PackageId,
 }
 
 /// IDs allocated while a namespace builder closes its final slot universe.
@@ -570,10 +613,15 @@ pub enum MaterializedSlotSource {
 }
 
 impl ProgramBuilder {
-    fn new(target: TargetContract) -> Self {
+    fn new(target: TargetContract, root: PackageId, root_identity: PackageIdentity) -> Self {
         Self {
             target,
-            packages: BTreeMap::new(),
+            packages: BTreeMap::from([(
+                root,
+                PackageIr::Root {
+                    build_identity: root_identity,
+                },
+            )]),
             namespaces: Vec::new(),
             bindings: Vec::new(),
             values: Vec::new(),
@@ -585,17 +633,40 @@ impl ProgramBuilder {
             resources: Vec::new(),
             relocations: Vec::new(),
             root_artifact: RootArtifactIr::default(),
-            root_package: None,
+            root_package: root,
         }
     }
 
-    pub fn add_package(&mut self, id: PackageId, package: PackageIr) {
-        if package.role() == PackageRole::Root {
-            assert!(
-                self.root_package.replace(id).is_none(),
-                "one Root package per ProgramIr"
-            );
-        }
+    pub fn add_linked_package(&mut self, id: PackageId, build_identity: PackageIdentity) {
+        let namespace_key = PrivateNamespaceKey::derive(
+            &self.packages[&self.root_package].identity().name,
+            &build_identity.name,
+        );
+        self.insert_package(
+            id,
+            PackageIr::Linked {
+                build_identity,
+                namespace_key,
+            },
+        );
+    }
+
+    pub fn add_external_package(
+        &mut self,
+        id: PackageId,
+        analyzed_identity: PackageIdentity,
+        contract: ExternalPackageContract,
+    ) {
+        self.insert_package(
+            id,
+            PackageIr::External {
+                analyzed_identity,
+                contract,
+            },
+        );
+    }
+
+    fn insert_package(&mut self, id: PackageId, package: PackageIr) {
         assert!(
             self.packages.insert(id, package).is_none(),
             "one PackageIr per PackageId"
@@ -875,9 +946,7 @@ impl ProgramBuilder {
     pub fn finish(self) -> ProgramIr {
         ProgramIr {
             target: self.target,
-            root_package: self
-                .root_package
-                .expect("ProgramIr requires one Root package"),
+            root_package: self.root_package,
             packages: self.packages,
             namespaces: self.namespaces,
             bindings: self.bindings,

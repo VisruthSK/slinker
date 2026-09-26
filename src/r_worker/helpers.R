@@ -141,6 +141,22 @@
   )
 }
 
+.slinker_payloads <- function(images, packages, registered, sources, names) {
+  for (index in seq_along(images)) {
+    if (!identical(.Internal(getRegisteredNamespace(packages[[index]])), images[[index]])) {
+      stop(
+        sprintf("namespace %s is not registered as its installed image", packages[[index]]),
+        call. = FALSE
+      )
+    }
+  }
+  infos <- lapply(images, function(image) get(".__NAMESPACE__.", envir = image, inherits = FALSE))
+  rename <- function(info, name) info$spec[["name"]] <- name
+  on.exit(Map(rename, infos, packages), add = TRUE)
+  Map(rename, infos, registered)
+  Map(.slinker_bundle, sources, names)
+}
+
 .slinker_bundle <- function(image_env, names) {
   active <- vapply(names, bindingIsActive, logical(1L), env = image_env)
   if (any(active)) {

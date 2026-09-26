@@ -270,29 +270,69 @@ impl WorkerRuntime {
         })
     }
 
-    fn serialize_bundle(
+    fn serialize_payloads(
+        &mut self,
+        namespaces: &[protocol::NamespaceImageSpec],
+        payloads: &[protocol::PayloadSpec],
+    ) -> std::result::Result<Vec<Vec<u8>>, WorkerOperationError> {
+        let mut images = harp::RFunction::new("base", "list");
+        let mut package_names = Vec::with_capacity(namespaces.len());
+        let mut registered_names = Vec::with_capacity(namespaces.len());
+        for namespace in namespaces {
+            images.add(self.image_environment(&namespace.package)?);
+            package_names.push(namespace.package.name.clone());
+            registered_names.push(namespace.registered_name.clone());
+        }
+        let mut sources = harp::RFunction::new("base", "list");
+        let mut names = harp::RFunction::new("base", "list");
+        for payload in payloads {
+            if !namespaces
+                .iter()
+                .any(|namespace| namespace.package.root == payload.package.root)
+            {
+                return Err(WorkerOperationError::with(WorkerErrorCode::Protocol)(
+                    format!(
+                        "payload of {} is not a materialized namespace image",
+                        payload.package.name
+                    )
+                    .into(),
+                ));
+            }
+            sources.add(self.image_environment(&payload.package)?);
+            names.add(payload.names.clone());
+        }
+        let serialize = || -> harp::Result<Vec<Vec<u8>>> {
+            let bundles = harp::RFunction::new("", ".slinker_payloads")
+                .add(images.call()?)
+                .add(package_names)
+                .add(registered_names)
+                .add(sources.call()?)
+                .add(names.call()?)
+                .call()?;
+            Vec::<harp::object::RObject>::try_from(bundles)?
+                .iter()
+                .map(Vec::<u8>::try_from)
+                .collect()
+        };
+        serialize().map_err(|error| {
+            WorkerOperationError::with(WorkerErrorCode::BindingForce)(
+                format!("failed to serialize payload bundles: {error}").into(),
+            )
+        })
+    }
+
+    fn image_environment(
         &mut self,
         package: &protocol::PackageSpec,
-        names: &[String],
-    ) -> std::result::Result<Vec<u8>, WorkerOperationError> {
+    ) -> std::result::Result<harp::object::RObject, WorkerOperationError> {
         self.package_index(package)
             .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let context = self
             .contexts
             .get(package.root.to_string_lossy().as_ref())
             .expect("package context created by index request");
-        let image_environment = field(&context.image, "image_env")
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
-        harp::RFunction::new("", ".slinker_bundle")
-            .add(image_environment)
-            .add(names.to_vec())
-            .call()
-            .and_then(|bundle| Vec::<u8>::try_from(&bundle))
-            .map_err(|error| {
-                WorkerOperationError::with(WorkerErrorCode::BindingForce)(
-                    format!("failed to serialize payload bundle: {error}").into(),
-                )
-            })
+        field(&context.image, "image_env")
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))
     }
 }
 
@@ -1249,20 +1289,23 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                     Some(name),
                 ),
             },
-            WorkerRequest::SerializeBundle {
+            WorkerRequest::SerializePayloads {
                 request_id,
-                package,
-                names,
+                namespaces,
+                payloads,
             } => match runtime.as_mut() {
-                Some(runtime) => match runtime.serialize_bundle(&package, &names) {
-                    Ok(bytes) => WorkerResponse::Payload { request_id, bytes },
-                    Err(error) => operation_failure(Some(request_id), error, Some(&package), None),
+                Some(runtime) => match runtime.serialize_payloads(&namespaces, &payloads) {
+                    Ok(bundles) => WorkerResponse::Payloads {
+                        request_id,
+                        bundles,
+                    },
+                    Err(error) => operation_failure(Some(request_id), error, None, None),
                 },
                 None => worker_failure(
                     Some(request_id),
                     WorkerErrorCode::RuntimeStartup,
                     "Harp worker must receive hello before semantic requests",
-                    Some(&package),
+                    None,
                     None,
                 ),
             },

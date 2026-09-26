@@ -24,7 +24,7 @@ pub(super) enum PendingRelocation {
     },
     RequireNamespace {
         source: Span,
-        result: bool,
+        loaded: Option<PackageId>,
     },
     NamespaceLoad {
         source: Span,
@@ -38,6 +38,20 @@ pub(super) enum PendingRelocation {
 }
 
 impl PendingRelocation {
+    pub(super) fn namespace(source: Span, package: PackageId, call: NamespaceCall) -> Self {
+        match call {
+            NamespaceCall::Require => Self::RequireNamespace {
+                source,
+                loaded: Some(package),
+            },
+            NamespaceCall::Operation(operation) => Self::NamespaceLoad {
+                source,
+                package,
+                operation,
+            },
+        }
+    }
+
     pub(super) fn source(&self) -> &Span {
         match self {
             Self::NamespaceAccess { source, .. }
@@ -53,6 +67,16 @@ impl PendingRelocation {
             self,
             Self::ResourceAccess { .. } | Self::PackageVersion { .. }
         )
+    }
+
+    pub(super) fn named_namespace(&self) -> Option<PackageId> {
+        match self {
+            Self::NamespaceAccess { package, .. } | Self::NamespaceLoad { package, .. } => {
+                Some(*package)
+            }
+            Self::RequireNamespace { loaded, .. } => *loaded,
+            Self::ResourceAccess { .. } | Self::PackageVersion { .. } => None,
+        }
     }
 }
 

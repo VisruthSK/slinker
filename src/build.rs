@@ -5,7 +5,7 @@ use crate::ir::{
 };
 use crate::package::PackageId;
 use crate::r_worker::client::WorkerClient;
-use crate::r_worker::protocol::PackageSpec;
+use crate::r_worker::protocol::{NamespaceImageSpec, PackageSpec, PayloadSpec};
 use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -103,22 +103,42 @@ impl BuildContext {
                     .insert(payload.binding.to_string());
             }
         }
+        let spec = |package| {
+            let identity = program.package(package).identity();
+            PackageSpec {
+                name: identity.name.to_string(),
+                version: identity.version.to_string(),
+                image_fingerprint: identity.image_fingerprint.0.clone(),
+                root: location(package).clone(),
+            }
+        };
         let mut bundles = BTreeMap::new();
         if !payloads.is_empty() {
-            let mut worker = self.target_runtime.worker()?;
-            for (package, names) in payloads {
-                let identity = program.package(package).identity();
-                let spec = PackageSpec {
-                    name: identity.name.to_string(),
-                    version: identity.version.to_string(),
-                    image_fingerprint: identity.image_fingerprint.0.clone(),
-                    root: location(package).clone(),
-                };
-                bundles.insert(
-                    package,
-                    worker.serialize_bundle(spec, names.into_iter().collect())?,
-                );
-            }
+            let namespaces = program
+                .packages()
+                .filter(|(_, package)| package.role() != crate::ir::PackageRole::External)
+                .map(|(id, package)| NamespaceImageSpec {
+                    package: spec(id),
+                    registered_name: package.registered_namespace().as_str().to_owned(),
+                })
+                .collect();
+            let (packages, specs): (Vec<_>, Vec<_>) = payloads
+                .into_iter()
+                .map(|(package, names)| {
+                    (
+                        package,
+                        PayloadSpec {
+                            package: spec(package),
+                            names: names.into_iter().collect(),
+                        },
+                    )
+                })
+                .unzip();
+            let serialized = self
+                .target_runtime
+                .worker()?
+                .serialize_payloads(namespaces, specs)?;
+            bundles.extend(packages.into_iter().zip(serialized));
         }
 
         let directory = tempfile::Builder::new()
@@ -424,23 +444,24 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     out.push_str("bootstrap <- function(root, libname, pkgname) {\n  .slinker_check_target()\n");
     out.push_str("  linked <- list()\n");
     for activation in program.activations() {
-        let package = program
-            .package(program.namespace(activation.namespace).package)
-            .identity();
+        let package = program.package(program.namespace(activation.namespace).package);
+        let identity = package.identity();
         emit!(
             out,
-            "  linked[[{name}]] <- .slinker_new_namespace({name}, {})",
-            r_string(package.version.as_ref()),
-            name = r_string(&package.name),
+            "  linked[[{key}]] <- .slinker_new_namespace({key}, {}, {})",
+            r_string(&identity.name),
+            r_string(identity.version.as_ref()),
+            key = r_string(package.registered_namespace().as_str()),
         );
     }
     for activation in program.activations() {
         let namespace = program.namespace(activation.namespace);
-        let name = &program.package(namespace.package).identity().name;
+        let package = program.package(namespace.package);
+        let name = &package.identity().name;
         emit!(
             out,
             "  local({{\n    ns <- linked[[{}]]\n    imports <- parent.env(ns)",
-            r_string(name)
+            r_string(package.registered_namespace().as_str())
         );
         for native in &activation.native_components {
             let Some(library) = &native.library else {
@@ -583,24 +604,43 @@ fn initial_value(program: &ProgramIr, binding: crate::ir::BindingId) -> Option<c
 
 fn binding_reference(program: &ProgramIr, binding: crate::ir::BindingId) -> String {
     let namespace = program.namespace(program.binding_namespace(binding));
-    let package = r_string(&program.package(namespace.package).identity().name);
-    let name = r_string(&program.binding(binding).name);
-    match namespace.state {
-        LinkNamespaceState::External { .. } => match program.binding(binding).state {
-            LinkBindingState::External {
-                access: crate::ir::ExternalBindingAccess::Internal,
-                ..
-            } => namespace_get(&package, &name),
-            _ => format!("base::getExportedValue({package}, {name})"),
-        },
-        LinkNamespaceState::Root(_) | LinkNamespaceState::Linked(_) => {
-            namespace_get(&package, &name)
+    let package = program.package(namespace.package);
+    let exported_external = matches!(
+        program.binding(binding).state,
+        LinkBindingState::External {
+            access: crate::ir::ExternalBindingAccess::Exported,
+            ..
         }
+    );
+    if exported_external {
+        format!(
+            "base::getExportedValue({}, {})",
+            r_string(&package.identity().name),
+            r_string(&program.binding(binding).name)
+        )
+    } else {
+        namespace_get(program, binding)
     }
 }
 
-fn namespace_get(package: &str, name: &str) -> String {
-    format!("base::get({name}, envir = base::asNamespace({package}), inherits = FALSE)")
+fn namespace_get(program: &ProgramIr, binding: crate::ir::BindingId) -> String {
+    format!(
+        "base::get({}, envir = {}, inherits = FALSE)",
+        r_string(&program.binding(binding).name),
+        namespace_expression(
+            program,
+            program
+                .namespace(program.binding_namespace(binding))
+                .package
+        )
+    )
+}
+
+fn namespace_expression(program: &ProgramIr, package: PackageId) -> String {
+    format!(
+        "base::asNamespace({})",
+        r_string(program.package(package).registered_namespace().as_str())
+    )
 }
 
 fn s3_matrix(program: &ProgramIr, namespace: &crate::ir::Namespace) -> String {
@@ -620,7 +660,7 @@ fn s3_matrix(program: &ProgramIr, namespace: &crate::ir::Namespace) -> String {
         .chain(rows.iter().map(|row| {
             row.generic.package.map_or_else(
                 || "NA_character_".to_owned(),
-                |package| r_string(&program.package(package).identity().name),
+                |package| r_string(program.package(package).registered_namespace().as_str()),
             )
         }))
         .collect::<Vec<_>>();
@@ -712,21 +752,12 @@ fn relocated_source(program: &ProgramIr, code: crate::ir::CodeId) -> String {
         let replacement = match &relocation.target {
             RelocationTarget::Binding { target, access } => match access {
                 crate::ir::ExternalBindingAccess::Exported => binding_reference(program, *target),
-                crate::ir::ExternalBindingAccess::Internal => {
-                    let namespace = program.namespace(program.binding_namespace(*target));
-                    namespace_get(
-                        &r_string(&program.package(namespace.package).identity().name),
-                        &r_string(&program.binding(*target).name),
-                    )
-                }
+                crate::ir::ExternalBindingAccess::Internal => namespace_get(program, *target),
             },
             RelocationTarget::RequireNamespace { result } => {
                 if *result { "TRUE" } else { "FALSE" }.into()
             }
-            RelocationTarget::Namespace { package, .. } => format!(
-                "base::asNamespace({})",
-                r_string(&program.package(*package).identity().name)
-            ),
+            RelocationTarget::Namespace { package, .. } => namespace_expression(program, *package),
             RelocationTarget::PackageVersion { version } => {
                 format!("base::package_version({})", r_string(version))
             }
@@ -876,8 +907,7 @@ const GENERATED_RUNTIME: &str = r#"
     stop(sprintf("slinker target mismatch: expected %s, got %s", paste(.slinker_target, collapse = "/"), paste(actual, collapse = "/")), call. = FALSE)
   }
 }
-.slinker_new_namespace <- function(name, version) {
-  if (isNamespaceLoaded(name)) stop(sprintf("LinkedNamespaceCollision(%s)", name), call. = FALSE)
+.slinker_new_namespace <- function(key, name, version) {
   imports <- new.env(parent = .BaseNamespaceEnv, hash = TRUE)
   attr(imports, "name") <- paste0("imports:", name)
   namespace <- new.env(parent = imports, hash = TRUE)
@@ -891,7 +921,7 @@ const GENERATED_RUNTIME: &str = r#"
   setNamespaceInfo(namespace, "dynlibs", NULL)
   setNamespaceInfo(namespace, "S3methods", matrix(NA_character_, 0L, 4L))
   namespace$.__S3MethodsTable__. <- new.env(hash = TRUE, parent = baseenv())
-  .Internal(registerNamespace(name, namespace))
+  .Internal(registerNamespace(key, namespace))
   namespace
 }
 .slinker_load_native <- function(namespace, package, library, symbols) {

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{assert_success, discover_r_home, install_package, run_r, run_r_output};
+use common::{assert_success, discover_r_home, install_package, run_r};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -55,8 +55,8 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
         &dependency_source,
         "tinylinked",
         "",
-        "export(bfun)\n",
-        "state <- new.env(parent = emptyenv())\nstate$loaded <- FALSE\nbfun <- function(x) paste0('B:', x, ':', state$loaded)\n.onLoad <- function(libname, pkgname) state$loaded <- identical(pkgname, 'tinylinked')\n",
+        "export(bfun, own)\n",
+        "state <- new.env(parent = emptyenv())\nstate$loaded <- FALSE\nbfun <- function(x) paste0('B:', x, ':', state$loaded)\nown <- function() identical(asNamespace('tinylinked'), environment(own)) && requireNamespace('tinylinked', quietly = TRUE) && identical(tinylinked::bfun('s'), bfun('s'))\n.onLoad <- function(libname, pkgname) state$loaded <- identical(pkgname, 'tinylinked')\n",
     );
     let build_library = fixture.path().join("build-library");
     fs::create_dir(&build_library).expect("build library");
@@ -67,8 +67,8 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
         &root_source,
         "linkroot",
         "Imports: tinylinked\n",
-        "importFrom(tinylinked, bfun)\nexport(afun)\nexport(qualified)\n",
-        "afun <- function(x) bfun(x)\nqualified <- function(x) tinylinked::bfun(x)\n",
+        "importFrom(tinylinked, bfun, own)\nexport(afun, qualified, owncheck)\n",
+        "afun <- function(x) bfun(x)\nqualified <- function(x) tinylinked::bfun(x)\nowncheck <- function() own()\n",
     );
     let output = fixture.path().join("generated-linkroot");
     let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
@@ -86,14 +86,24 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
     assert!(!description.contains("tinylinked"));
     assert!(!namespace.contains("tinylinked"));
 
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    let behavior = "library(linkroot); value <- afun('x'); if (!identical(value, 'B:x:TRUE')) stop(sprintf('unexpected value: %s', value)); stopifnot(identical(qualified('q'), 'B:q:TRUE'), isTRUE(owncheck()))";
+    run_r(&r_home, &original, behavior);
+
     let validation = fixture.path().join("validation");
     fs::create_dir(&validation).expect("validation library");
     install_package(&r_home, &output, &validation);
-    run_r(
-        &r_home,
-        &validation,
-        "library(linkroot); value <- afun('x'); if (!identical(value, 'B:x:TRUE')) stop(sprintf('unexpected value: %s', value)); stopifnot(identical(qualified('q'), 'B:q:TRUE')); stopifnot(isNamespaceLoaded('tinylinked'))",
-    );
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency_source, &installed);
+    install_package(&r_home, &output, &installed);
+    let private = "stopifnot(!isNamespaceLoaded('tinylinked')); linked <- environment(get('bfun', envir = parent.env(asNamespace('linkroot')))); stopifnot(isNamespace(linked), identical(unname(getNamespaceName(linked)), 'tinylinked'), identical(environmentName(linked), 'tinylinked'))";
+    for library in [&validation, &installed] {
+        run_r(&r_home, library, &format!("{behavior}; {private}"));
+    }
 }
 
 #[test]
@@ -292,21 +302,26 @@ fn build_preserves_transitive_external_contract() {
     run_r(
         &r_home,
         &validation,
-        "library(externalroot); stopifnot(identical(run('x'), 'B:E:x')); stopifnot(isNamespaceLoaded('tinybridge')); stopifnot(length(find.package('tinybridge', quiet=TRUE)) == 0L); stopifnot(isNamespaceLoaded('tinyexternal'))",
+        "library(externalroot); stopifnot(identical(run('x'), 'B:E:x')); stopifnot(!isNamespaceLoaded('tinybridge')); stopifnot(length(find.package('tinybridge', quiet=TRUE)) == 0L); stopifnot(isNamespaceLoaded('tinyexternal'))",
     );
 
-    let collision = fixture.path().join("collision");
-    fs::create_dir(&collision).expect("collision library");
-    install_package(&r_home, &external_source, &collision);
-    install_package(&r_home, &linked_source, &collision);
-    install_package(&r_home, &output, &collision);
-    let collision_result = run_r_output(
-        &r_home,
-        &collision,
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &external_source, &installed);
+    install_package(&r_home, &linked_source, &installed);
+    install_package(&r_home, &output, &installed);
+    let coexists = r#"
+        linked <- function() environment(get("bfun", envir = parent.env(asNamespace("externalroot"))))
+        stopifnot(identical(run("x"), "B:E:x"), identical(tinybridge::bfun("y"), "B:E:y"))
+        stopifnot(!identical(linked(), asNamespace("tinybridge")))
+        stopifnot(identical(unname(getNamespaceName(linked())), "tinybridge"))
+    "#;
+    for order in [
         "loadNamespace('tinybridge'); library(externalroot)",
-    );
-    assert!(!collision_result.status.success());
-    assert!(String::from_utf8_lossy(&collision_result.stderr).contains("LinkedNamespaceCollision"));
+        "library(externalroot); loadNamespace('tinybridge')",
+    ] {
+        run_r(&r_home, &installed, &format!("{order}\n{coexists}"));
+    }
 }
 
 #[test]
@@ -444,20 +459,39 @@ fn private_environments_and_registrations_survive_linking() {
     let validation = fixture.path().join("validation");
     fs::create_dir(&validation).expect("validation library");
     install_package(&r_home, &output, &validation);
-    run_r(
-        &r_home,
-        &validation,
-        r#"
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency_source, &installed);
+    install_package(&r_home, &output, &installed);
+    let check = r#"
         library(stateroot)
         stopifnot(identical(run(), c("2", "7", "formatted tinystate")))
         stopifnot(identical(local_counter(), 11L), identical(local_counter(), 12L))
-        stopifnot(exists("unused", envir = asNamespace("tinystate"), inherits = FALSE))
-        removed <- tryCatch(get("unused", envir = asNamespace("tinystate")), error = conditionMessage)
+        imports <- parent.env(asNamespace("stateroot"))
+        linked <- environment(get("make", envir = imports))
+        stopifnot(identical(unname(getNamespaceName(linked)), "tinystate"))
+        stopifnot(identical(topenv(environment(get("counter", envir = imports))), linked))
+        stopifnot(!isNamespaceLoaded("tinystate") || !identical(linked, asNamespace("tinystate")))
+        stopifnot(exists("unused", envir = linked, inherits = FALSE))
+        removed <- tryCatch(get("unused", envir = linked), error = conditionMessage)
         stopifnot(grepl("`tinystate::unused` was removed by slinker", removed, fixed = TRUE))
-        stopifnot(setequal(getNamespaceExports("tinystate"), c("counter", "get_value", "set_value", "make", "unused")))
-        stopifnot(exists(".packageName", envir = asNamespace("tinystate"), inherits = FALSE))
-        stopifnot(length(find.package("tinystate", quiet = TRUE)) == 0L)
-        "#,
+        stopifnot(setequal(getNamespaceExports(linked), c("counter", "get_value", "set_value", "make", "unused")))
+        stopifnot(identical(get(".packageName", envir = linked, inherits = FALSE), "tinystate"))
+    "#;
+    run_r(
+        &r_home,
+        &validation,
+        &format!("{check}\nstopifnot(length(find.package('tinystate', quiet = TRUE)) == 0L)"),
+    );
+    run_r(
+        &r_home,
+        &installed,
+        &format!("{check}\nstopifnot(!isNamespaceLoaded('tinystate'))"),
+    );
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('tinystate')\n{check}"),
     );
 }
 

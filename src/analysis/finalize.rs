@@ -5,8 +5,8 @@ use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
     BindingId, BindingName, ExportTable, ExternalBindingAccess, ExternalPackageContract,
     FinalizedNamespace, InvalidRelocation, MaterializedRole, MaterializedSlot,
-    MaterializedSlotSource, NamespaceId, PackageIr, PackageRole as LinkedPackageRole,
-    ProgramBuilder, ProgramIr, RelocationTarget, RootArtifactIr, TargetContract, UnretainedName,
+    MaterializedSlotSource, NamespaceId, PackageRole as LinkedPackageRole, ProgramBuilder,
+    ProgramIr, RelocationTarget, RootArtifactIr, TargetContract, UnretainedName,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{
@@ -75,11 +75,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         retained: &BTreeSet<PackageId>,
     ) -> (ProgramIr, Vec<FinalizationIssue>) {
         let target = &self.packages.target_environment().target;
-        let mut builder = ProgramIr::builder(TargetContract {
-            r_version: target.r_version.clone(),
-            platform: target.os.clone(),
-            arch: target.arch.clone(),
-        });
+        let root = self.root.expect("root package established before analysis");
+        let mut builder = ProgramIr::builder(
+            TargetContract {
+                r_version: target.r_version.clone(),
+                platform: target.os.clone(),
+                arch: target.arch.clone(),
+            },
+            root,
+            self.packages.identity(root).clone(),
+        );
         let ordered = retained
             .iter()
             .map(|package| (*package, self.packages.role(*package)))
@@ -110,7 +115,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 unretained,
             });
         }
-        let root = self.root.expect("root package established before analysis");
         let root_namespace = namespaces.ids[self.packages.name(root)].namespace;
         let root_on_load = namespaces
             .on_load
@@ -144,13 +148,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let mut declared = self.declared_external_requirements(ordered);
         for (package, role) in ordered {
             let identity = self.packages.identity(*package).clone();
-            let package_ir = match role {
-                LinkedPackageRole::Root => PackageIr::Root {
-                    build_identity: identity,
-                },
-                LinkedPackageRole::Linked => PackageIr::Linked {
-                    build_identity: identity,
-                },
+            match role {
+                LinkedPackageRole::Root => {}
+                LinkedPackageRole::Linked => builder.add_linked_package(*package, identity),
                 LinkedPackageRole::External => {
                     let contract = self.external_contract(
                         *package,
@@ -158,13 +158,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         issues,
                     );
                     contracts.push(contract.clone());
-                    PackageIr::External {
-                        contract,
-                        analyzed_identity: identity,
-                    }
+                    builder.add_external_package(*package, identity, contract);
                 }
-            };
-            builder.add_package(*package, package_ir);
+            }
         }
         contracts.sort_by(|left, right| left.package.cmp(&right.package));
         let mut unreached = self
@@ -463,7 +459,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .and_then(|binding| namespace_ids[owner_package.as_str()].bindings.get(binding))
                 .and_then(|binding| builder.binding_code(*binding))
             else {
-                if relocation.reaches_removed_installation() {
+                if relocation.reaches_removed_installation()
+                    || relocation.named_namespace().is_some_and(|package| {
+                        self.packages.role(package) == LinkedPackageRole::Linked
+                    })
+                {
                     issues.push(FinalizationIssue::NonRelocatableCode {
                         package: owner_package.clone(),
                         binding: origin.key.to_string(),
@@ -505,8 +505,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         target: resource_id,
                     }
                 }
-                PendingRelocation::RequireNamespace { result, .. } => {
-                    RelocationTarget::RequireNamespace { result: *result }
+                PendingRelocation::RequireNamespace { loaded, .. } => {
+                    RelocationTarget::RequireNamespace {
+                        result: loaded.is_some(),
+                    }
                 }
                 PendingRelocation::NamespaceLoad {
                     package, operation, ..

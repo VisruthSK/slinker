@@ -25,6 +25,18 @@ pub struct PackageSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NamespaceImageSpec {
+    pub package: PackageSpec,
+    pub registered_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PayloadSpec {
+    pub package: PackageSpec,
+    pub names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerTarget {
     pub r_home: PathBuf,
     pub r_version: String,
@@ -74,10 +86,10 @@ pub enum WorkerRequest {
         package: PackageSpec,
         name: String,
     },
-    SerializeBundle {
+    SerializePayloads {
         request_id: u64,
-        package: PackageSpec,
-        names: Vec<String>,
+        namespaces: Vec<NamespaceImageSpec>,
+        payloads: Vec<PayloadSpec>,
     },
     ValidateSyntax {
         request_id: u64,
@@ -106,9 +118,9 @@ pub enum WorkerResponse {
         request_id: u64,
         binding: WorkerBinding,
     },
-    Payload {
+    Payloads {
         request_id: u64,
-        bytes: Vec<u8>,
+        bundles: Vec<Vec<u8>>,
     },
     SyntaxValidation {
         request_id: u64,

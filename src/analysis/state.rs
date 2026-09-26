@@ -2646,7 +2646,8 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         call: &CallSite,
         operation: NamespaceCall,
     ) -> Result<()> {
-        let name = static_string_arg(call).map(Cow::Borrowed).or_else(|| {
+        let literal = static_string_arg(call);
+        let name = literal.map(Cow::Borrowed).or_else(|| {
             self.reflection
                 .contextual_namespace(&call.span)
                 .map(|name| Cow::Owned(name.to_owned()))
@@ -2666,6 +2667,28 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             return Ok(());
         };
         if name == self.packages.name(current) {
+            if self.is_root(current) {
+                return Ok(());
+            }
+            if literal.is_none() {
+                self.assume(
+                    from,
+                    current,
+                    Some(binding),
+                    RejectCode::DynamicPackageDiscovery,
+                    format!(
+                        "{}() names this Linked package through a computed value, which cannot be rewritten to its private namespace",
+                        call.callee
+                    ),
+                    Some(call.span.clone()),
+                );
+                return Ok(());
+            }
+            self.relocations.push(PendingRelocation::namespace(
+                call.span.clone(),
+                current,
+                operation,
+            ));
             return Ok(());
         }
         let suggested = self.package_is_suggested_only(current, &name)?;
@@ -2674,7 +2697,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         } else if suggested && operation == NamespaceCall::Require {
             self.relocations.push(PendingRelocation::RequireNamespace {
                 source: call.span.clone(),
-                result: false,
+                loaded: None,
             });
             return Ok(());
         } else if suggested {
@@ -2709,7 +2732,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 None if operation == NamespaceCall::Require => {
                     self.relocations.push(PendingRelocation::RequireNamespace {
                         source: call.span.clone(),
-                        result: false,
+                        loaded: None,
                     });
                 }
                 None => self.record_missing_package(
@@ -2733,24 +2756,18 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                         format!("specialized {} requires `{name}`", call.callee),
                         Some(call.span.clone()),
                     );
-                    self.relocations.push(match operation {
-                        NamespaceCall::Require => PendingRelocation::RequireNamespace {
-                            source: call.span.clone(),
-                            result: true,
-                        },
-                        NamespaceCall::Operation(operation) => PendingRelocation::NamespaceLoad {
-                            source: call.span.clone(),
-                            package: foreign,
-                            operation,
-                        },
-                    });
+                    self.relocations.push(PendingRelocation::namespace(
+                        call.span.clone(),
+                        foreign,
+                        operation,
+                    ));
                 }
                 None if operation == NamespaceCall::Require
                     && !self.optional_package_selected(&name) =>
                 {
                     self.relocations.push(PendingRelocation::RequireNamespace {
                         source: call.span.clone(),
-                        result: false,
+                        loaded: None,
                     });
                 }
                 None => self.record_missing_package(

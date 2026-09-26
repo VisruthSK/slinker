@@ -1,6 +1,7 @@
 use crate::package::InstalledPackage;
 use crate::r_worker::protocol::{
-    PROTOCOL_VERSION, PackageSpec, TargetSpec, WorkerRequest, WorkerResponse,
+    NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSpec, TargetSpec, WorkerRequest,
+    WorkerResponse,
 };
 use crate::{Error, Result, Target, TargetEnvironment};
 use std::collections::BTreeSet;
@@ -146,21 +147,22 @@ impl WorkerClient {
         }
     }
 
-    pub(crate) fn serialize_bundle(
+    pub(crate) fn serialize_payloads(
         &mut self,
-        package: PackageSpec,
-        names: Vec<String>,
-    ) -> Result<Vec<u8>> {
+        namespaces: Vec<NamespaceImageSpec>,
+        payloads: Vec<PayloadSpec>,
+    ) -> Result<Vec<Vec<u8>>> {
         let request_id = self.request_id();
-        match self.exchange(&WorkerRequest::SerializeBundle {
+        let expected = payloads.len();
+        match self.exchange(&WorkerRequest::SerializePayloads {
             request_id,
-            package,
-            names,
+            namespaces,
+            payloads,
         })? {
-            WorkerResponse::Payload {
+            WorkerResponse::Payloads {
                 request_id: response_id,
-                bytes,
-            } if response_id == request_id => Ok(bytes),
+                bundles,
+            } if response_id == request_id && bundles.len() == expected => Ok(bundles),
             response => Err(worker_error("payload serialization", response)),
         }
     }
@@ -275,16 +277,22 @@ fn request_context(request: &WorkerRequest) -> String {
             "request {request_id} binding {}::{name} {} {}",
             package.name, package.version, package.image_fingerprint
         ),
-        WorkerRequest::SerializeBundle {
+        WorkerRequest::SerializePayloads {
             request_id,
-            package,
-            names,
+            payloads,
+            ..
         } => format!(
-            "request {request_id} payload bundle of {} {} bindings {} {}",
-            package.name,
-            names.len(),
-            package.version,
-            package.image_fingerprint
+            "request {request_id} payload bundles of {}",
+            payloads
+                .iter()
+                .map(|payload| format!(
+                    "{} {} ({} bindings)",
+                    payload.package.name,
+                    payload.package.version,
+                    payload.names.len()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         WorkerRequest::ValidateSyntax { request_id, .. } => {
             format!("request {request_id} target syntax validation")
