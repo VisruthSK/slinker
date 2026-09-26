@@ -3,7 +3,7 @@ use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
-use crate::package::{ImportSpec, PackageId, PackageImage, PackageProvider};
+use crate::package::{BindingName, ImportSpec, PackageId, PackageImage, PackageProvider};
 use crate::syntax::{
     NamespaceImportResolution, NamespaceImports, OakParseContext, SourceKey, Span,
     closure_definitely_non_returning,
@@ -34,16 +34,16 @@ pub(super) enum BindingTarget {
     Base,
     Namespace {
         package: PackageId,
-        binding: String,
+        binding: BindingName,
     },
     Imported {
         package: PackageId,
-        binding: String,
+        binding: BindingName,
     },
     Private {
         package: PackageId,
         environment: String,
-        binding: String,
+        binding: BindingName,
     },
     Closure {
         package: PackageId,
@@ -52,11 +52,11 @@ pub(super) enum BindingTarget {
     Native {
         package: PackageId,
         component: String,
-        binding: String,
+        binding: BindingName,
     },
     External {
         package: PackageId,
-        binding: String,
+        binding: BindingName,
     },
     Metadata {
         package: PackageId,
@@ -95,7 +95,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Some(foreign) => Some(self.packages.index(foreign)?.exports.clone()),
                 None => None,
             };
-            imports.add_import_all(package_name, exports, except.iter().cloned());
+            imports.add_import_all(
+                package_name,
+                exports.map(|exports| {
+                    exports
+                        .into_iter()
+                        .map(|(export, binding)| (export, binding.into_string()))
+                        .collect()
+                }),
+                except.iter().cloned(),
+            );
         }
 
         self.namespace_imports.insert(package, imports.clone());
@@ -114,7 +123,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
         let mut namespace_shadowed = BTreeSet::new();
         namespace_shadowed.extend(image.bindings.keys().cloned());
-        namespace_shadowed.extend(self.namespace_builders[&package].bindings.iter().cloned());
+        namespace_shadowed.extend(
+            self.namespace_builders[&package]
+                .bindings
+                .iter()
+                .map(ToString::to_string),
+        );
         for component in &image.index.dynlibs {
             namespace_shadowed.extend(component.bindings().map(|symbol| symbol.binding));
         }
@@ -158,8 +172,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &str,
     ) -> Result<OakParseContext> {
         let mut shadowed = BTreeSet::new();
-        shadowed.extend(image.index.binding_names.iter().cloned());
-        shadowed.extend(self.namespace_builders[&package].bindings.iter().cloned());
+        shadowed.extend(image.index.binding_names.iter().map(ToString::to_string));
+        shadowed.extend(
+            self.namespace_builders[&package]
+                .bindings
+                .iter()
+                .map(ToString::to_string),
+        );
         for component in &image.index.dynlibs {
             shadowed.extend(component.bindings().map(|symbol| symbol.binding));
         }
@@ -307,7 +326,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                 } else if let Some(binding) = &provenance.namespace_binding {
                                     Resolution::Static(BindingTarget::Namespace {
                                         package: current,
-                                        binding: binding.clone(),
+                                        binding: binding.clone().into(),
                                     })
                                 } else if let (Some(environment), Some(binding)) =
                                     (&provenance.private_environment, &provenance.private_binding)
@@ -315,7 +334,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                     Resolution::Static(BindingTarget::Private {
                                         package: current,
                                         environment: environment.clone(),
-                                        binding: binding.clone(),
+                                        binding: binding.clone().into(),
                                     })
                                 } else {
                                     Resolution::Static(BindingTarget::Local)
@@ -347,7 +366,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     return Ok(Resolution::Static(BindingTarget::Private {
                         package: current,
                         environment: private.id.clone(),
-                        binding: name.to_owned(),
+                        binding: name.to_owned().into(),
                     }));
                 }
                 environment = private.parent.clone();
@@ -367,7 +386,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     self.external.insert(foreign);
                     return Ok(Resolution::Static(BindingTarget::External {
                         package: foreign,
-                        binding: name.to_owned(),
+                        binding: name.to_owned().into(),
                     }));
                 }
                 let foreign_image = self.image(foreign)?;
@@ -416,7 +435,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         {
             return Ok(Resolution::Static(BindingTarget::Namespace {
                 package: current,
-                binding: name.to_owned(),
+                binding: name.to_owned().into(),
             }));
         }
 
@@ -424,7 +443,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(Resolution::Static(BindingTarget::Native {
                 package: current,
                 component: component.to_owned(),
-                binding: name.to_owned(),
+                binding: name.to_owned().into(),
             }));
         }
 
@@ -444,12 +463,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     self.external.insert(foreign);
                     Resolution::Static(BindingTarget::External {
                         package: foreign,
-                        binding,
+                        binding: binding.into(),
                     })
                 } else {
                     Resolution::Static(BindingTarget::Imported {
                         package: foreign,
-                        binding,
+                        binding: binding.into(),
                     })
                 });
             }

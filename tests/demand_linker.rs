@@ -189,7 +189,7 @@ fn root_calling(dependency: &str, entry: &str) -> PackageImage {
 fn package(name: &str, bindings: &[(&str, Option<&str>)]) -> PackageImage {
     let exports = bindings
         .iter()
-        .map(|(binding, _)| ((*binding).to_owned(), (*binding).to_owned()))
+        .map(|(binding, _)| ((*binding).to_owned(), (*binding).into()))
         .collect::<ExportMap>();
     package_from_fixture(
         name,
@@ -273,7 +273,10 @@ fn package_from_fixture(
             },
         );
     }
-    let mut names = images.keys().cloned().collect::<Vec<_>>();
+    let mut names = images
+        .keys()
+        .map(|name: &String| name.as_str().into())
+        .collect::<Vec<slinker::package::BindingName>>();
     names.sort();
     PackageImage {
         index: Arc::new(PackageIndex {
@@ -311,7 +314,7 @@ fn installed(index: &PackageIndex) -> InstalledPackage {
 }
 
 fn export(name: &str) -> ExportMap {
-    ExportMap::from([(name.to_owned(), name.to_owned())])
+    ExportMap::from([(name.to_owned(), name.into())])
 }
 
 fn test_target() -> TargetEnvironment {
@@ -513,7 +516,11 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
             ]),
         },
     );
-    Arc::make_mut(&mut root.index).binding_names = root.bindings.keys().cloned().collect();
+    Arc::make_mut(&mut root.index).binding_names = root
+        .bindings
+        .keys()
+        .map(|name| name.as_str().into())
+        .collect();
 
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")

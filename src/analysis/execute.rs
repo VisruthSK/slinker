@@ -287,7 +287,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     graph
                         .environment(environment)
                         .bindings
-                        .get(&binding)
+                        .get(binding.as_str())
                         .copied()
                 })
             }
@@ -349,7 +349,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 context.node,
                 Need::Binding {
                     package: context.package,
-                    binding: name.to_owned(),
+                    binding: name.to_owned().into(),
                 },
                 EdgeKind::Lexical,
                 format!("namespace member access `${name}`"),

@@ -2,7 +2,7 @@ use super::resolution::{BindingTarget, Resolution};
 use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
-use crate::package::{PackageId, PackageProvider};
+use crate::package::{BindingName, PackageId, PackageProvider};
 use crate::syntax::{CallSite, DeclaredValue, ParsedRFile, Span, StaticArg};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -15,7 +15,7 @@ pub(super) struct S3GenericKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct CallableId {
     pub(super) package: PackageId,
-    pub(super) binding: String,
+    pub(super) binding: BindingName,
 }
 
 type ClassDomain = Option<Vec<Vec<String>>>;
@@ -56,7 +56,7 @@ pub(super) struct S3Model {
     generics: BTreeMap<S3GenericKey, S3Generic>,
     callable_generics: HashMap<CallableId, S3GenericKey>,
     invocations: HashMap<CallableId, Vec<Option<Invocation>>>,
-    closed_methods: HashSet<(PackageId, String)>,
+    closed_methods: HashSet<(PackageId, BindingName)>,
     next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
 }
 
@@ -190,7 +190,8 @@ impl S3Model {
     }
 
     pub(super) fn is_closed_method(&self, package: PackageId, binding: &str) -> bool {
-        self.closed_methods.contains(&(package, binding.to_owned()))
+        self.closed_methods
+            .contains(&(package, BindingName::from(binding)))
     }
 }
 
@@ -256,7 +257,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         let callable = CallableId {
             package: current,
-            binding: binding.to_owned(),
+            binding: binding.into(),
         };
         let definition = selector
             .filter(|_| namespace_generic)
@@ -381,7 +382,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .filter(|registration| {
                 registration.generic.name == generic && wanted(&registration.class)
             })
-            .map(|registration| (registration.method.clone(), EdgeKind::S3Registration));
+            .map(|registration| {
+                (
+                    BindingName::from(registration.method.clone()),
+                    EdgeKind::S3Registration,
+                )
+            });
         let methods = image
             .index
             .binding_names
@@ -457,7 +463,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Some("base") => Ok(None),
             Some(package) => Ok(self.known_package(package).map(|package| CallableId {
                 package,
-                binding: call.callee.clone(),
+                binding: call.callee.clone().into(),
             })),
             None if call.callee_kind == crate::syntax::CalleeKind::DefinitelyLexical => Ok(None),
             None => Ok(callable_target(&self.resolve_lexical_name(

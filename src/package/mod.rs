@@ -2,6 +2,7 @@ mod identity;
 mod image;
 mod index;
 mod locator;
+mod names;
 mod store;
 mod universe;
 
@@ -23,4 +24,4 @@ pub(crate) use locator::fingerprint_image;
 pub use store::{PackageProvider, PackageStore, SyntaxValidation};
 pub use universe::{PackageAvailability, PackageSources, TargetUniverse};
 
-pub type BindingName = String;
+pub use names::BindingName;

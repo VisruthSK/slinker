@@ -2,7 +2,7 @@ use crate::analysis::object_world::ClosureId;
 use crate::package::PackageId;
 use std::collections::{HashSet, VecDeque};
 
-pub type BindingName = String;
+pub use crate::package::BindingName;
 pub type ResourceId = String;
 pub type NativeId = String;
 pub type LifecycleId = String;

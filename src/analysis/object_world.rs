@@ -633,7 +633,7 @@ mod tests {
                 lifecycle: LifecycleMetadata::default(),
                 binding_names: bindings
                     .iter()
-                    .map(|binding| binding.name.clone())
+                    .map(|binding| binding.name.clone().into())
                     .collect(),
                 datasets: Vec::new(),
                 files: Vec::new(),

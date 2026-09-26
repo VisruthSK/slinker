@@ -6,9 +6,9 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group};
 use slinker::analysis::Linker;
 use slinker::cache::CacheLocation;
 use slinker::package::{
-    BindingImage, BindingOrigin, BindingRepresentation, ClosureSource, Digest, ExportMap,
-    InstalledPackage, LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage, PackageIndex,
-    PackageLocation, PackageLocator, PackageProvider, PackageStore, SyntaxValidation,
+    BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClosureSource, Digest,
+    ExportMap, InstalledPackage, LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage,
+    PackageIndex, PackageLocation, PackageLocator, PackageProvider, PackageStore, SyntaxValidation,
 };
 use slinker::syntax::{OakParseContext, OakParser, SourceKey, Sources};
 use slinker::{Description, Result, Target, TargetEnvironment, TargetEnvironmentRequest};
@@ -159,7 +159,10 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
             )
         })
         .collect::<HashMap<_, _>>();
-    let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
+    let mut binding_names = bindings
+        .keys()
+        .map(|name| BindingName::from(name.as_str()))
+        .collect::<Vec<_>>();
     binding_names.sort();
     PackageImage {
         index: Arc::new(PackageIndex {
@@ -171,7 +174,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
             description: Description::parse("Package: root\nVersion: 1.0.0\n"),
             exports: binding_names
                 .iter()
-                .map(|name| (name.clone(), name.clone()))
+                .map(|name| (name.to_string(), name.clone()))
                 .collect::<ExportMap>(),
             imports: Vec::new(),
             s3: Vec::new(),

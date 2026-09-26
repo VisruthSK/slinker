@@ -199,7 +199,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 retained_bindings
                     .entry(*package)
                     .or_default()
-                    .insert(binding.clone());
+                    .insert(binding.to_string());
             }
         }
         let mut namespaces = FinalizedNamespaces::default();
@@ -353,7 +353,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             .and_then(PackageAvailability::package)
                             .filter(|package| retained.contains(package))
                             .and_then(|package| self.images.get(&package))
-                            .map(|image| image.index.exports.values().cloned().collect::<Vec<_>>())
+                            .map(|image| {
+                                image
+                                    .index
+                                    .exports
+                                    .values()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                            })
                             .unwrap_or_else(|| {
                                 self.external_bindings
                                     .keys()
@@ -413,16 +420,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let mut unretained = index
                     .binding_names
                     .iter()
-                    .filter(|name| !kept.contains_key(*name))
-                    .map(|name| (name.clone(), UnretainedName::Stub))
+                    .filter(|name| !kept.contains_key(name.as_str()))
+                    .map(|name| (name.to_string(), UnretainedName::Stub))
                     .collect::<BTreeMap<_, _>>();
                 for name in index
                     .exports
                     .values()
-                    .filter(|name| !kept.contains_key(*name))
+                    .filter(|name| !kept.contains_key(name.as_str()))
                 {
                     unretained
-                        .entry(name.clone())
+                        .entry(name.to_string())
                         .and_modify(|state| *state = UnretainedName::ExportedStub)
                         .or_insert(UnretainedName::ExportedByActivation);
                 }
@@ -469,7 +476,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     else {
                         continue;
                     };
-                    let Some(&target) = target_namespace.bindings.get(binding) else {
+                    let Some(&target) = target_namespace.bindings.get(binding.as_str()) else {
                         continue;
                     };
                     RelocationTarget::Binding {

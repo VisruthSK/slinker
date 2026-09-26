@@ -1,10 +1,10 @@
 use crate::analysis::S3Id;
-use crate::package::PackageIndex;
+use crate::package::{BindingName, PackageIndex};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
 pub(super) struct NamespaceBuilder {
-    pub(super) bindings: BTreeSet<String>,
+    pub(super) bindings: BTreeSet<BindingName>,
     pub(super) registrations: Vec<S3Id>,
 }
 
@@ -22,7 +22,7 @@ impl NamespaceBuilder {
         }
     }
 
-    pub(super) fn add_binding(&mut self, name: String) -> bool {
+    pub(super) fn add_binding(&mut self, name: BindingName) -> bool {
         self.bindings.insert(name)
     }
 

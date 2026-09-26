@@ -20,9 +20,9 @@ use crate::ir::ExternalBindingAccess;
 use crate::ir::NamespaceOperation;
 use crate::metadata::{RelationField, relations};
 use crate::package::{
-    BindingImage, BindingRepresentation, ClosureSource, Digest, ImportSpec, NativeSafety,
-    ObjectKind, PackageId, PackageImage, PackageProvider, PrivateBindingImage, SyntaxValidation,
-    TargetUniverse,
+    BindingImage, BindingName, BindingRepresentation, ClosureSource, Digest, ImportSpec,
+    NativeSafety, ObjectKind, PackageId, PackageImage, PackageProvider, PrivateBindingImage,
+    SyntaxValidation, TargetUniverse,
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, OakParseContext,
@@ -309,8 +309,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     });
                     (
                         id,
-                        binding.clone(),
-                        SourceKey::Binding(binding),
+                        binding.to_string(),
+                        SourceKey::Binding(binding.into_string()),
                         closure,
                         owner_node,
                         image,
@@ -540,7 +540,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_binding(&mut self, id: PackageId, binding: String) -> Result<()> {
+    pub(super) fn process_binding(&mut self, id: PackageId, binding: BindingName) -> Result<()> {
         let node = self.need_node(&Need::Binding {
             package: id,
             binding: binding.clone(),
@@ -849,7 +849,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         id: PackageId,
         environment: String,
-        binding: String,
+        binding: BindingName,
     ) -> Result<()> {
         let node = self.need_node(&Need::PrivateBinding {
             package: id,
@@ -876,9 +876,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.diagnose_private_object(node, id, &environment, &binding, &binding_image);
         let object = {
             let graph = self.objects.graph(id);
-            graph
-                .environment_id(&environment)
-                .and_then(|private| graph.environment(private).bindings.get(&binding).copied())
+            graph.environment_id(&environment).and_then(|private| {
+                graph
+                    .environment(private)
+                    .bindings
+                    .get(binding.as_str())
+                    .copied()
+            })
         };
         self.require_member_closures(node, id, object);
 
@@ -1147,7 +1151,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .namespace_builders
                 .get_mut(&site.package)
                 .expect("namespace builder initialized")
-                .add_binding(active.name.clone())
+                .add_binding(active.name.clone().into())
             {
                 self.non_returning_bindings.remove(&site.package);
             }
@@ -1259,7 +1263,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 self.record_escape(CallableId {
                     package: foreign,
-                    binding: reference.symbol.clone(),
+                    binding: reference.symbol.clone().into(),
                 })?;
             }
         }
@@ -1386,7 +1390,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         })?;
         let node = self.need_node(&Need::Binding {
             package: id,
-            binding: binding.to_owned(),
+            binding: binding.to_owned().into(),
         });
         self.parsed_source(
             id,
@@ -1722,7 +1726,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             node,
             Need::Binding {
                 package: id,
-                binding: registration.method.clone(),
+                binding: registration.method.clone().into(),
             },
             EdgeKind::S3Registration,
             format!(
@@ -1735,13 +1739,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .image(id)?
                 .index
                 .binding_names
-                .contains(&registration.generic.name)
+                .iter()
+                .any(|name| name == registration.generic.name.as_str())
         {
             self.require(
                 node,
                 Need::Binding {
                     package: id,
-                    binding: registration.generic.name.clone(),
+                    binding: registration.generic.name.clone().into(),
                 },
                 EdgeKind::S3Registration,
                 format!(
@@ -1800,7 +1805,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             node,
                             Need::Binding {
                                 package: id,
-                                binding: callback.clone(),
+                                binding: callback.clone().into(),
                             },
                             EdgeKind::Callback,
                             format!("native component `{component}` calls R binding `{callback}`"),
@@ -1842,7 +1847,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             node,
             Need::Binding {
                 package: id,
-                binding: hook.clone(),
+                binding: hook.clone().into(),
             },
             EdgeKind::Lifecycle,
             format!("lifecycle hook `{hook}` must be retained"),
@@ -1886,14 +1891,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         if self.is_root(current) && foreign == current {
             let binding = if reference.internal {
-                reference.symbol.clone()
+                BindingName::from(reference.symbol.clone())
             } else {
                 let index = self.packages.index(foreign)?;
                 index
                     .exports
                     .get(&reference.symbol)
                     .cloned()
-                    .unwrap_or_else(|| reference.symbol.clone())
+                    .unwrap_or_else(|| BindingName::from(reference.symbol.clone()))
             };
             self.require_at(
                 from,
@@ -1938,13 +1943,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         let index = self.packages.index(foreign)?;
         let binding = if reference.internal {
-            reference.symbol.clone()
+            BindingName::from(reference.symbol.clone())
         } else {
             index
                 .exports
                 .get(&reference.symbol)
                 .cloned()
-                .unwrap_or_else(|| reference.symbol.clone())
+                .unwrap_or_else(|| BindingName::from(reference.symbol.clone()))
         };
         self.require_at(
             from,
@@ -2940,7 +2945,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let package = self.packages.name(need.package()).to_owned();
         let kind = match need {
             Need::Binding { binding, .. } => NodeKind::Binding {
-                name: binding.clone(),
+                name: binding.to_string(),
             },
             Need::PrivateBinding {
                 environment,
@@ -2948,7 +2953,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 ..
             } => NodeKind::PrivateBinding {
                 environment: environment.clone(),
-                name: binding.clone(),
+                name: binding.to_string(),
             },
             Need::ClosureExecution { package, closure } => {
                 let (closure, owner, _, enclosure) = self

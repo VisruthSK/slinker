@@ -7,10 +7,10 @@ pub(crate) mod client;
 pub mod protocol;
 
 use crate::package::{
-    BindingImage, BindingOrigin, BindingRepresentation, ClosureSource, EmbeddedClosureSource,
-    EmbeddedEnvironmentRef, ExportMap, ImportBinding, ImportSpec, NativeComponent,
-    NativeRegistration, NativeSafety, NativeSymbolBinding, ObjectIssue, ObjectKind,
-    PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
+    BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClosureSource,
+    EmbeddedClosureSource, EmbeddedEnvironmentRef, ExportMap, ImportBinding, ImportSpec,
+    NativeComponent, NativeRegistration, NativeSafety, NativeSymbolBinding, ObjectIssue,
+    ObjectKind, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
 };
 use crate::{Error, Result};
 use harp::{RFunctionExt, RObjectExt};
@@ -369,7 +369,7 @@ fn worker_package_index(
     }
     let mut exports = export_names
         .into_iter()
-        .zip(export_bindings)
+        .zip(export_bindings.into_iter().map(BindingName::from))
         .collect::<ExportMap>();
     for pattern in strings_field(&namespace, "exportPatterns")? {
         let matches = harp::RFunction::new("base", "ls")
@@ -378,7 +378,11 @@ fn worker_package_index(
             .param("all.names", true)
             .call()
             .and_then(Vec::<String>::try_from)?;
-        exports.extend(matches.into_iter().map(|name| (name.clone(), name)));
+        exports.extend(
+            matches
+                .into_iter()
+                .map(|name| (name.clone(), BindingName::from(name))),
+        );
     }
 
     let imports = list_field(&namespace, "imports")?

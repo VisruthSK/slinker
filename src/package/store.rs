@@ -1,8 +1,8 @@
 use crate::cache::{Cache, CacheLocation};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
-    PackageIdentity, PackageImage, PackageIndex, PackageLocator,
+    BindingName, InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary,
+    NativeSafety, PackageIdentity, PackageImage, PackageIndex, PackageLocator,
 };
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{WorkerBinding, WorkerPackageIndex};
@@ -277,7 +277,11 @@ impl PackageStore {
             lifecycle: LifecycleMetadata {
                 on_load: worker.on_load,
             },
-            binding_names: worker.binding_names,
+            binding_names: worker
+                .binding_names
+                .into_iter()
+                .map(BindingName::from)
+                .collect(),
             datasets: worker.datasets,
             files: Vec::new(),
             has_sysdata: worker.has_sysdata,
