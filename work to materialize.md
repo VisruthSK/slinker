@@ -196,8 +196,6 @@ Invariants into types:
   `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
 - Finalization recovers a relocation's owning binding from the source map behind `unreachable!`;
   `PendingRelocation` should carry its owner (including private-closure source keys) as a type.
-- 179 `.expect()` calls, mostly infallible `writeln!` into `String` in the materializer: generate R
-  through a writer whose API cannot fail.
 - Worker protocol `Result<_, String>` (19) becomes typed errors.
 - Hand-written range comparisons in `syntax/oak.rs` and `finalize.rs` become one span type with
   `contains` and `overlaps`.

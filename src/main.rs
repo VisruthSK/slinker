@@ -236,7 +236,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
         .with_policy(args.universe.policy())
         .with_root_source(source.description_source())
         .analyze(source.package())?;
-    let mut context = BuildContext::new(source, staged, r_home, target);
+    let context = BuildContext::new(source, staged, r_home, target);
     let output = args.output.clone().unwrap_or_else(|| {
         context
             .source()
@@ -245,7 +245,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
             .join("slinker")
             .join(context.source().package())
     });
-    let buildable = PureRStatic::check(&ir, &mut context)?;
+    let buildable = PureRStatic::check(&ir, &context)?;
     let generated = materialize(buildable, &output)?;
     for assumption in ir.assumptions() {
         let owner = assumption.binding.as_ref().map_or_else(

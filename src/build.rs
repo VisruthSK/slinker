@@ -8,12 +8,18 @@ use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::PackageSpec;
 use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use thiserror::Error;
+
+macro_rules! emit {
+    ($out:expr, $($argument:tt)*) => {{
+        $out.push_str(&format!($($argument)*));
+        $out.push('\n');
+    }};
+}
 
 /// Selected target-R physical handle available to staging and materialization.
 #[derive(Debug)]
@@ -46,7 +52,6 @@ pub struct BuildContext {
     source: SourcePackageSnapshot,
     _staged_root: StagedRoot,
     target_runtime: TargetRuntimeHandle,
-    frozen: Option<FrozenInputs>,
 }
 
 /// Exact installed bytes redeemed from the selected images before preflight.
@@ -68,7 +73,6 @@ impl BuildContext {
             source,
             _staged_root: staged_root,
             target_runtime: TargetRuntimeHandle::new(r_home, target),
-            frozen: None,
         }
     }
 
@@ -79,7 +83,7 @@ impl BuildContext {
     ///
     /// Fails when payload serialization or resource copying fails, or with
     /// [`BuildContextError::TargetUniverseChanged`] when a selected image no longer matches.
-    fn freeze(&mut self, ir: &LinkIr) -> Result<(), BuildContextError> {
+    fn freeze(&self, ir: &LinkIr) -> Result<FrozenInputs, BuildContextError> {
         let program = ir.program();
         let sources = ir.package_sources();
         let location = |package| {
@@ -132,26 +136,22 @@ impl BuildContext {
                 changed.name.clone(),
             ));
         }
-        self.frozen = Some(FrozenInputs {
+        Ok(FrozenInputs {
             bundles,
             resources,
             _directory: directory,
-        });
-        Ok(())
+        })
     }
 
     pub fn source(&self) -> &SourcePackageSnapshot {
         &self.source
     }
 
-    fn materialization(&self) -> MaterializationContext<'_> {
+    fn materialization<'a>(&'a self, frozen: &'a FrozenInputs) -> MaterializationContext<'a> {
         MaterializationContext {
             source_files: self.source.files(),
             target_runtime: &self.target_runtime,
-            frozen: self
-                .frozen
-                .as_ref()
-                .expect("preflight freezes inputs before materialization"),
+            frozen,
         }
     }
 }
@@ -199,7 +199,8 @@ pub enum PureRStatic {}
 pub struct BuildableProgram<'a, Profile> {
     program: &'a ProgramIr,
     description: &'a str,
-    materialization: MaterializationContext<'a>,
+    context: &'a BuildContext,
+    frozen: FrozenInputs,
     _profile: PhantomData<Profile>,
 }
 
@@ -212,7 +213,7 @@ impl PureRStatic {
     /// Returns one deterministic report of every blocker, or the failure to freeze inputs.
     pub fn check<'a>(
         ir: &'a LinkIr,
-        context: &'a mut BuildContext,
+        context: &'a BuildContext,
     ) -> Result<BuildableProgram<'a, PureRStatic>, PreflightError> {
         let mut blockers = ir
             .blockers()
@@ -251,12 +252,12 @@ impl PureRStatic {
         let Some(description) = description.filter(|_| blockers.is_empty()) else {
             return Err(BuildReport::new(blockers.into_iter().collect()).into());
         };
-        context.freeze(ir)?;
-        let context: &'a BuildContext = context;
+        let frozen = context.freeze(ir)?;
         Ok(BuildableProgram {
             program: ir.program(),
             description,
-            materialization: context.materialization(),
+            context,
+            frozen,
             _profile: PhantomData,
         })
     }
@@ -317,6 +318,7 @@ pub fn materialize(
         .parent()
         .ok_or_else(|| MaterializeError::InvalidOutput(output.into()))?;
     fs::create_dir_all(parent)?;
+    let materialization = buildable.context.materialization(&buildable.frozen);
     let temporary = tempfile::Builder::new()
         .prefix(".slinker-materialize-")
         .tempdir_in(parent)?;
@@ -336,10 +338,7 @@ pub fn materialize(
         package_root.join("NAMESPACE"),
         render_namespace(buildable.program),
     )?;
-    copy_root_resources(
-        buildable.materialization.source_files().root(),
-        &package_root,
-    )?;
+    copy_root_resources(materialization.source_files().root(), &package_root)?;
     let payload_directory = package_root.join("inst/slinker/payload");
     fs::create_dir_all(&payload_directory)?;
     for namespace in buildable.program.namespaces() {
@@ -349,16 +348,16 @@ pub fn materialize(
                     "{}.rds",
                     buildable.program.package(namespace.package).identity().name
                 )),
-                buildable.materialization.bundle(namespace.package),
+                materialization.bundle(namespace.package),
             )?;
         }
     }
     let generated = generate_r_source(buildable.program)?;
-    let mut worker = buildable.materialization.target_runtime().worker()?;
+    let mut worker = materialization.target_runtime().worker()?;
     validate_program_code(buildable.program, &mut worker)?;
     validate_r_source(&mut worker, &generated)?;
     fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
-    copy_linked_resources(buildable.program, buildable.materialization, &package_root)?;
+    copy_linked_resources(buildable.program, materialization, &package_root)?;
     fs::rename(&package_root, output)?;
     Ok(GeneratedPackage {
         path: output.to_path_buf(),
@@ -386,20 +385,18 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     );
     out.push_str(GENERATED_RUNTIME);
     out.push('\n');
-    writeln!(
+    emit!(
         out,
         ".slinker_target <- c(version = {}, platform = {}, arch = {})",
         r_string(&program.target().r_version),
         r_string(&program.target().platform),
         r_string(&program.target().arch)
-    )
-    .expect("String writes cannot fail");
-    writeln!(
+    );
+    emit!(
         out,
         ".slinker_root_package <- {}",
         r_string(&program.package(program.root_package()).identity().name)
-    )
-    .expect("String writes cannot fail");
+    );
     let root = program.root_namespace();
     let root_on_load = program.root_artifact().on_load;
     let mut root_code = String::new();
@@ -426,23 +423,21 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
         let package = program
             .package(program.namespace(activation.namespace).package)
             .identity();
-        writeln!(
+        emit!(
             out,
             "  linked[[{name}]] <- .slinker_new_namespace({name}, {})",
             r_string(package.version.as_ref()),
             name = r_string(&package.name),
-        )
-        .expect("String writes cannot fail");
+        );
     }
     for activation in program.activations() {
         let namespace = program.namespace(activation.namespace);
         let name = &program.package(namespace.package).identity().name;
-        writeln!(
+        emit!(
             out,
             "  local({{\n    ns <- linked[[{}]]\n    imports <- parent.env(ns)",
             r_string(name)
-        )
-        .expect("String writes cannot fail");
+        );
         for native in &activation.native_components {
             let Some(library) = &native.library else {
                 continue;
@@ -458,37 +453,33 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            writeln!(
+            emit!(
                 out,
                 "    .slinker_load_native(ns, {}, {}, c({symbols}))",
                 r_string(name),
                 r_string(library)
-            )
-            .expect("String writes cannot fail");
+            );
         }
         for import in &namespace.imports {
-            writeln!(
+            emit!(
                 out,
                 "    assign({}, {}, envir = imports)",
                 r_string(&import.local),
                 binding_reference(program, import.target)
-            )
-            .expect("String writes cannot fail");
+            );
         }
         for closure in namespace_closures(program, namespace) {
             let source = relocated_source(program, program.closure(closure).code)?;
-            writeln!(
+            emit!(
                 out,
                 "    eval(parse(text = {}), envir = ns)",
                 r_string(&source)
-            )
-            .expect("String writes cannot fail");
+            );
         }
         if has_payloads(program, namespace) {
-            writeln!(out, "    .slinker_populate(ns, {})", r_string(name))
-                .expect("String writes cannot fail");
+            emit!(out, "    .slinker_populate(ns, {})", r_string(name));
         }
-        writeln!(
+        emit!(
             out,
             "    .slinker_activate(ns, {}, {}, {}, {})\n  }})",
             r_vector(
@@ -506,8 +497,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             } else {
                 "FALSE"
             }
-        )
-        .expect("String writes cannot fail");
+        );
     }
     for import in &root.imports {
         if matches!(
@@ -516,22 +506,20 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
                 .state,
             LinkNamespaceState::Linked(_)
         ) {
-            writeln!(
+            emit!(
                 out,
                 "  assign({}, {}, envir = parent.env(root))",
                 r_string(&import.local),
                 binding_reference(program, import.target)
-            )
-            .expect("String writes cannot fail");
+            );
         }
     }
     if has_payloads(program, root) {
-        writeln!(
+        emit!(
             out,
             "  .slinker_populate(root, {})",
             r_string(&program.package(root.package).identity().name)
-        )
-        .expect("String writes cannot fail");
+        );
     }
     if root_on_load.is_some() {
         out.push_str(
@@ -634,19 +622,17 @@ fn render_namespace(program: &ProgramIr) -> String {
     let root = program.root_namespace();
     let mut out = String::new();
     for binding in program.root_artifact().exports.bindings() {
-        writeln!(out, "export({})", r_string(&program.binding(*binding).name))
-            .expect("String writes cannot fail");
+        emit!(out, "export({})", r_string(&program.binding(*binding).name));
     }
     for import in &root.imports {
         let target = program.namespace(program.binding_namespace(import.target));
         if let LinkNamespaceState::External { package } = target.state {
-            writeln!(
+            emit!(
                 out,
                 "importFrom({}, {})",
                 r_string(&program.package(package).identity().name),
                 r_string(&program.binding(import.target).name)
-            )
-            .expect("String writes cannot fail");
+            );
         }
     }
     for native in &program.root_artifact().native_components {
@@ -664,7 +650,7 @@ fn render_namespace(program: &ProgramIr) -> String {
                 r_string(&symbol.symbol)
             )
         });
-        writeln!(
+        emit!(
             out,
             "useDynLib({})",
             std::iter::once(r_binding_name(&native.name))
@@ -672,8 +658,7 @@ fn render_namespace(program: &ProgramIr) -> String {
                 .chain(symbols)
                 .collect::<Vec<_>>()
                 .join(", ")
-        )
-        .expect("String writes cannot fail");
+        );
     }
     for registration in &root.s3_registrations {
         let registration = program.s3_registration(*registration);
@@ -685,13 +670,12 @@ fn render_namespace(program: &ProgramIr) -> String {
             ),
             None => r_string(&registration.generic.name),
         };
-        writeln!(
+        emit!(
             out,
             "S3method({generic}, {}, {})",
             r_string(&registration.class),
             r_string(&program.binding(registration.method).name)
-        )
-        .expect("String writes cannot fail");
+        );
     }
     out
 }
