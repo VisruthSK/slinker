@@ -1,3 +1,4 @@
+use crate::package::PackageName;
 use crate::{Description, Version};
 use sha2::{Digest as _, Sha256};
 use std::fmt;
@@ -34,7 +35,7 @@ impl PackageId {
 /// Exact installed image selected for one invocation, independent of where its bytes live.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PackageIdentity {
-    pub name: String,
+    pub name: PackageName,
     pub version: Version,
     pub image_fingerprint: Digest,
 }

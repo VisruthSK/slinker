@@ -2,7 +2,7 @@
 
 use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{
-    BindingName, ClassName, GenericName, PackageId, PackageIdentity, PackageRole,
+    BindingName, ClassName, GenericName, PackageId, PackageIdentity, PackageName, PackageRole,
 };
 
 use crate::package::Digest;
@@ -75,7 +75,7 @@ impl PackageIr {
 /// the selected R, so the target contract already satisfies them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalPackageContract {
-    pub package: String,
+    pub package: PackageName,
     pub platform: bool,
     pub requirements: Vec<crate::Relation>,
 }

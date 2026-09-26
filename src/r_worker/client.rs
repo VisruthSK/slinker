@@ -331,7 +331,7 @@ fn protocol_file() -> Result<(File, TempPath)> {
 
 fn package_spec(package: &InstalledPackage) -> PackageSpec {
     PackageSpec {
-        name: package.identity.name.clone(),
+        name: package.identity.name.to_string(),
         version: package.identity.version.to_string(),
         image_fingerprint: package.identity.image_fingerprint.0.clone(),
         root: package.location.root.clone(),

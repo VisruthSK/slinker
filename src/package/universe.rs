@@ -353,8 +353,8 @@ mod tests {
             sources
                 .changed()
                 .expect("fingerprint")
-                .map(|identity| &identity.name),
-            Some(&"fixture".to_owned())
+                .map(|identity| identity.name.as_str()),
+            Some("fixture")
         );
     }
 }

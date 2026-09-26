@@ -190,9 +190,10 @@ Performance:
   inspect different packages in parallel), and string-keyed maps in the analyzer (interning).
 
 Invariants into types:
-- Names: about 54 `String` fields and 87 string collections hold package, binding, class, and
-  generic names. Intern them at the worker boundary into typed symbols (`PackageName`,
-  `BindingName`, `ClassName`) so they cannot be mixed up and hash and compare as integers.
+- `PackageName`, `BindingName`, `ClassName`, and `GenericName` are distinct string newtypes.
+  Interning them so they hash and compare as integers is unmeasured; do it only if a profile shows
+  name hashing matters. Resource paths, native component names, and lifecycle hooks in `Need` are
+  still plain strings.
 
 Minimal code:
 - Fix the `clippy::pedantic` findings that matter (redundant clones, pass-by-value, `map_or_else`,

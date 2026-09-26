@@ -2094,7 +2094,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let package = match import {
                     ImportSpec::All { package, .. } | ImportSpec::From { package, .. } => package,
                 };
-                required.insert(package.clone());
+                required.insert(package.to_string());
             }
             for dependency in relations(&index.description, RelationField::Imports)
                 .map_err(Error::Analysis)?

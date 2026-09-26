@@ -1,5 +1,5 @@
 use crate::Description;
-use crate::package::{BindingName, ClassName, GenericName, PackageIdentity};
+use crate::package::{BindingName, ClassName, GenericName, PackageIdentity, PackageName};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -7,18 +7,18 @@ pub type ExportMap = BTreeMap<String, BindingName>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ImportBinding {
-    pub local: String,
-    pub remote: String,
+    pub local: BindingName,
+    pub remote: BindingName,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ImportSpec {
     All {
-        package: String,
-        except: Vec<String>,
+        package: PackageName,
+        except: Vec<BindingName>,
     },
     From {
-        package: String,
+        package: PackageName,
         bindings: Vec<ImportBinding>,
     },
 }
@@ -32,7 +32,7 @@ pub struct S3Registration {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct GenericSpec {
-    pub package: Option<String>,
+    pub package: Option<PackageName>,
     pub name: GenericName,
 }
 

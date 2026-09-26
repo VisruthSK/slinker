@@ -84,7 +84,7 @@ impl PackageProvider for MemoryProvider {
     }
 
     fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
-        Ok((name == self.image.index.identity.name).then(|| self.installed()))
+        Ok((self.image.index.identity.name == name).then(|| self.installed()))
     }
 
     fn index(&mut self, _package: &InstalledPackage) -> Result<Arc<PackageIndex>> {

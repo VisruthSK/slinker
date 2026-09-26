@@ -109,7 +109,7 @@ impl BuildContext {
             for (package, names) in payloads {
                 let identity = program.package(package).identity();
                 let spec = PackageSpec {
-                    name: identity.name.clone(),
+                    name: identity.name.to_string(),
                     version: identity.version.to_string(),
                     image_fingerprint: identity.image_fingerprint.0.clone(),
                     root: location(package).clone(),
@@ -133,7 +133,7 @@ impl BuildContext {
 
         if let Some(changed) = sources.changed()? {
             return Err(BuildContextError::TargetUniverseChanged(
-                changed.name.clone(),
+                changed.name.to_string(),
             ));
         }
         Ok(FrozenInputs {
@@ -327,7 +327,7 @@ pub fn materialize(
         .package(buildable.program.root_package())
         .identity()
         .name;
-    let package_root = temporary.path().join(package_name);
+    let package_root = temporary.path().join(package_name.as_str());
     fs::create_dir_all(package_root.join("R"))?;
     fs::create_dir_all(package_root.join("inst/slinker"))?;
     fs::write(
@@ -813,7 +813,7 @@ fn copy_linked_resources(
         let source = context.resource(id);
         let target = output
             .join("inst/slinker/resources")
-            .join(&package.name)
+            .join(package.name.as_str())
             .join(&resource.path);
         copy_entry(source, &target)?;
     }

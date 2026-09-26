@@ -150,7 +150,7 @@ impl NativeSummaryManifest {
 
     fn apply(&self, index: &mut PackageIndex) {
         let Some(package) = self.packages.iter().find(|summary| {
-            summary.package == index.identity.name
+            index.identity.name == summary.package
                 && summary.version == index.identity.version.as_ref()
                 && summary.image_fingerprint == index.identity.image_fingerprint.0
         }) else {
@@ -258,7 +258,7 @@ impl PackageStore {
         package: &InstalledPackage,
     ) -> Result<Arc<PackageIndex>> {
         let identity = &package.identity;
-        if worker.name != identity.name
+        if identity.name != worker.name
             || worker.version != identity.version.to_string()
             || worker.image_fingerprint != identity.image_fingerprint.0
         {
@@ -295,7 +295,7 @@ impl PackageStore {
         index: Arc<PackageIndex>,
         worker: WorkerBinding,
     ) -> Result<Arc<PackageImage>> {
-        if worker.package_name != identity.name
+        if identity.name != worker.package_name
             || worker.package_version != identity.version.to_string()
             || worker.image_fingerprint != identity.image_fingerprint.0
             || !index

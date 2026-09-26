@@ -24,4 +24,4 @@ pub(crate) use locator::fingerprint_image;
 pub use store::{PackageProvider, PackageStore, SyntaxValidation};
 pub use universe::{PackageAvailability, PackageSources, TargetUniverse};
 
-pub use names::{BindingName, ClassName, GenericName};
+pub use names::{BindingName, ClassName, GenericName, PackageName};

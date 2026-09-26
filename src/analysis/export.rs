@@ -90,7 +90,7 @@ pub(crate) fn root_identity(
         ));
     }
     Ok(PackageIdentityExport {
-        name: root_package.name.clone(),
+        name: root_package.name.to_string(),
         version: root_package.version.to_string(),
         image_fingerprint: root_package.image_fingerprint.0.clone(),
     })

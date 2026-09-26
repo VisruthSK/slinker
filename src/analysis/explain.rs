@@ -485,11 +485,11 @@ fn package_identities(
     for (_, package) in plan.program().packages() {
         let package = package.identity();
         let identity = PackageIdentityExport {
-            name: package.name.clone(),
+            name: package.name.to_string(),
             version: package.version.to_string(),
             image_fingerprint: package.image_fingerprint.0.clone(),
         };
-        if let Some(existing) = identities.get(&package.name)
+        if let Some(existing) = identities.get(package.name.as_str())
             && existing != &identity
         {
             return Err(ExplanationError(format!(
@@ -497,7 +497,7 @@ fn package_identities(
                 package.name
             )));
         }
-        identities.insert(package.name.clone(), identity);
+        identities.insert(package.name.to_string(), identity);
     }
     Ok(identities)
 }

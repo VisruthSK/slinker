@@ -30,7 +30,7 @@ impl FakeProvider {
         Self {
             packages: images
                 .into_iter()
-                .map(|image| (image.index.identity.name.clone(), Arc::new(image)))
+                .map(|image| (image.index.identity.name.to_string(), Arc::new(image)))
                 .collect(),
             image_counts: Arc::new(Mutex::new(HashMap::new())),
             optional_locate_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -150,7 +150,7 @@ impl PackageProvider for FakeProvider {
 
     fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         self.packages
-            .get(&package.identity.name)
+            .get(package.identity.name.as_str())
             .map(|image| Arc::clone(&image.index))
             .ok_or_else(|| Error::Analysis(format!("missing fake index {}", package.identity.name)))
     }
@@ -164,10 +164,10 @@ impl PackageProvider for FakeProvider {
             .image_counts
             .lock()
             .unwrap()
-            .entry(package.identity.name.clone())
+            .entry(package.identity.name.to_string())
             .or_default() += 1;
         self.packages
-            .get(&package.identity.name)
+            .get(package.identity.name.as_str())
             .cloned()
             .ok_or_else(|| Error::Analysis(format!("missing fake image {}", package.identity.name)))
     }
@@ -2517,7 +2517,7 @@ fn activation_order_follows_lifecycle_dependencies_not_only_imports() {
                 .package(plan.program().namespace(activation.namespace).package)
                 .identity()
                 .name
-                .clone();
+                .to_string();
             (package, activation.on_load.is_some())
         })
         .collect::<Vec<_>>();

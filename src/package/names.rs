@@ -84,3 +84,4 @@ macro_rules! name_type {
 name_type!(BindingName);
 name_type!(ClassName);
 name_type!(GenericName);
+name_type!(PackageName);

@@ -364,7 +364,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             .unwrap_or_else(|| {
                                 self.external_bindings
                                     .keys()
-                                    .filter(|(owner, _)| self.packages.name(*owner) == target)
+                                    .filter(|(owner, _)| {
+                                        self.packages.name(*owner) == target.as_str()
+                                    })
                                     .map(|(_, name)| name.to_string())
                                     .collect()
                             });
@@ -372,18 +374,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             target,
                             exported
                                 .into_iter()
-                                .filter(|name| !except.contains(name))
-                                .map(|name| (name.clone(), name))
+                                .filter(|name| !except.iter().any(|excluded| excluded == name))
+                                .map(|name| {
+                                    (BindingName::from(name.as_str()), BindingName::from(name))
+                                })
                                 .collect(),
                         )
                     }
                 };
-                let Some(target) = namespace_ids.get(target_name) else {
+                let Some(target) = namespace_ids.get(target_name.as_str()) else {
                     continue;
                 };
                 for (local, remote) in pairs {
                     if let Some(&binding) = target.bindings.get(remote.as_str()) {
-                        builder.attach_import(owner, local.into(), binding);
+                        builder.attach_import(owner, local, binding);
                         namespace_dependencies
                             .entry(owner)
                             .or_default()
@@ -602,7 +606,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             })
         };
         if !platform && declared.is_empty() {
-            issues.push(FinalizationIssue::UndeclaredExternal(identity.name.clone()));
+            issues.push(FinalizationIssue::UndeclaredExternal(
+                identity.name.to_string(),
+            ));
         }
         if let Some(unmet) = requirements
             .iter()

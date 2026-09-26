@@ -10,7 +10,7 @@ use crate::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClassName, ClosureSource,
     EmbeddedClosureSource, EmbeddedEnvironmentRef, ExportMap, ImportBinding, ImportSpec,
     NativeComponent, NativeRegistration, NativeSafety, NativeSymbolBinding, ObjectIssue,
-    ObjectKind, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
+    ObjectKind, PackageName, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
 };
 use crate::{Error, Result};
 use harp::{RFunctionExt, RObjectExt};
@@ -390,7 +390,7 @@ fn worker_package_index(
         .map(|item| {
             if harp::utils::r_typeof(item.sexp) == libr::STRSXP {
                 return Ok(ImportSpec::All {
-                    package: String::try_from(item)?,
+                    package: PackageName::from(String::try_from(item)?),
                     except: Vec::new(),
                 });
             }
@@ -401,8 +401,11 @@ fn worker_package_index(
                 .and_then(|value| Ok(String::try_from(value)?))?;
             if names(item.sexp).iter().any(|name| name == "except") {
                 return Ok(ImportSpec::All {
-                    package,
-                    except: strings_field(&item, "except")?,
+                    package: package.into(),
+                    except: strings_field(&item, "except")?
+                        .into_iter()
+                        .map(BindingName::from)
+                        .collect(),
                 });
             }
             let remote_object = values
@@ -420,11 +423,14 @@ fn worker_package_index(
                 }
             }
             Ok(ImportSpec::From {
-                package,
+                package: package.into(),
                 bindings: local
                     .into_iter()
                     .zip(remote)
-                    .map(|(local, remote)| ImportBinding { local, remote })
+                    .map(|(local, remote)| ImportBinding {
+                        local: local.into(),
+                        remote: remote.into(),
+                    })
                     .collect(),
             })
         })
@@ -461,7 +467,7 @@ fn worker_package_index(
             .flatten();
         s3.push(S3Registration {
             generic: crate::package::GenericSpec {
-                package,
+                package: package.map(PackageName::from),
                 name: generic.into(),
             },
             class: class.into(),

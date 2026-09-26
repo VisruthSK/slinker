@@ -61,7 +61,7 @@ impl PackageLocator {
             let image_fingerprint = fingerprint_image(&root)?;
             return Ok(Some(InstalledPackage {
                 identity: PackageIdentity {
-                    name: name.to_owned(),
+                    name: name.into(),
                     version,
                     image_fingerprint,
                 },

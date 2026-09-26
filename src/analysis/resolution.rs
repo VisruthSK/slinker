@@ -78,7 +78,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for import in &image.index.imports {
             if let ImportSpec::From { package, bindings } = import {
                 for binding in bindings {
-                    imports.add_import_from(&binding.local, package, &binding.remote);
+                    imports.add_import_from(
+                        binding.local.as_str(),
+                        package.as_str(),
+                        binding.remote.as_str(),
+                    );
                 }
             }
         }
@@ -96,14 +100,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 None => None,
             };
             imports.add_import_all(
-                package_name,
+                package_name.as_str(),
                 exports.map(|exports| {
                     exports
                         .into_iter()
                         .map(|(export, binding)| (export, binding.into_string()))
                         .collect()
                 }),
-                except.iter().cloned(),
+                except.iter().map(ToString::to_string),
             );
         }
 
