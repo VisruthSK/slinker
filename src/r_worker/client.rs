@@ -1,7 +1,7 @@
 use crate::package::InstalledPackage;
 use crate::r_worker::protocol::{
     NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization, PayloadSite,
-    PayloadSpec, TargetSpec, WorkerRequest, WorkerResponse,
+    PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
 };
 use crate::{Error, Result, Target, TargetEnvironment};
 use std::collections::BTreeSet;
@@ -191,26 +191,27 @@ impl WorkerClient {
         source: &str,
     ) -> Result<crate::package::SyntaxValidation> {
         let request_id = self.request_id();
-        match self.exchange(&WorkerRequest::ValidateSyntax {
+        let response = self.exchange(&WorkerRequest::ValidateSyntax {
             request_id,
             source: source.to_owned(),
-        })? {
-            WorkerResponse::SyntaxValidation {
-                request_id: response_id,
-                accepted,
-                message: _,
-            } if response_id == request_id && accepted => {
-                Ok(crate::package::SyntaxValidation::Accepted)
-            }
-            WorkerResponse::SyntaxValidation {
-                request_id: response_id,
-                accepted: false,
-                message,
-            } if response_id == request_id => Ok(crate::package::SyntaxValidation::Rejected(
-                message.unwrap_or_else(|| "target R rejected syntax".into()),
-            )),
-            response => Err(worker_error("syntax validation", response)),
-        }
+        })?;
+        syntax_verdict(request_id, response, "syntax validation")
+    }
+
+    pub(crate) fn verify_relocation(
+        &mut self,
+        original: &str,
+        rewritten: &str,
+        sites: Vec<RelocationSiteSpec>,
+    ) -> Result<crate::package::SyntaxValidation> {
+        let request_id = self.request_id();
+        let response = self.exchange(&WorkerRequest::VerifyRelocation {
+            request_id,
+            original: original.to_owned(),
+            rewritten: rewritten.to_owned(),
+            sites,
+        })?;
+        syntax_verdict(request_id, response, "relocation verification")
     }
 
     pub(crate) fn normalize_syntax(&mut self, source: &str) -> Result<String> {
@@ -319,6 +320,12 @@ fn request_context(request: &WorkerRequest) -> String {
         WorkerRequest::NormalizeSyntax { request_id, .. } => {
             format!("request {request_id} target syntax normalization")
         }
+        WorkerRequest::VerifyRelocation {
+            request_id, sites, ..
+        } => format!(
+            "request {request_id} relocation verification of {} sites",
+            sites.len()
+        ),
         WorkerRequest::Shutdown => "worker shutdown".into(),
     }
 }
@@ -385,6 +392,28 @@ fn package_spec(package: &InstalledPackage) -> PackageSpec {
         version: package.identity.version.to_string(),
         image_fingerprint: package.identity.image_fingerprint.0.clone(),
         root: package.location.root.clone(),
+    }
+}
+
+fn syntax_verdict(
+    request_id: u64,
+    response: WorkerResponse,
+    operation: &str,
+) -> Result<crate::package::SyntaxValidation> {
+    match response {
+        WorkerResponse::SyntaxValidation {
+            request_id: response_id,
+            accepted: true,
+            message: _,
+        } if response_id == request_id => Ok(crate::package::SyntaxValidation::Accepted),
+        WorkerResponse::SyntaxValidation {
+            request_id: response_id,
+            accepted: false,
+            message,
+        } if response_id == request_id => Ok(crate::package::SyntaxValidation::Rejected(
+            message.unwrap_or_else(|| format!("target R rejected {operation}")),
+        )),
+        response => Err(worker_error(operation, response)),
     }
 }
 

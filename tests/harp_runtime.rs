@@ -1,4 +1,7 @@
-use slinker::r_worker::protocol::{PROTOCOL_VERSION, TargetSpec, WorkerRequest, WorkerResponse};
+use slinker::r_worker::protocol::{
+    AppendedArgumentSpec, PROTOCOL_VERSION, RelocationSiteSpec, TargetSpec, WorkerRequest,
+    WorkerResponse,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +37,192 @@ fn worker_library_selection_matches_target_r_semantics() {
     );
     explicit.shutdown();
     std::fs::remove_dir_all(root).expect("remove explicit libraries");
+}
+
+#[test]
+fn relocation_verifier_accepts_exactly_the_planned_replacements() {
+    let r_home = discover_r_home().expect("selected R installation");
+    let mut worker = WorkerProbe::start(&r_home, Vec::new()).expect("worker");
+
+    let original = "f <- function(x) {\n  # keep going\n  y <- pkg::g(h(x),   pkg::k)   \n  if (requireNamespace(\"pkg\", quietly = TRUE)) y else utils::packageDescription(\"pkg\", fields = \"Version\")\n}";
+    let sites = vec![
+        site(
+            original,
+            "pkg::g",
+            "base::get(\"g\", envir = base::asNamespace(\"root\"), inherits = FALSE)",
+        ),
+        site(original, "pkg::k", "base::getExportedValue(\"pkg\", \"k\")"),
+        site(
+            original,
+            "requireNamespace(\"pkg\", quietly = TRUE)",
+            "TRUE",
+        ),
+        appending(
+            site_in(original, "\"pkg\", fields", "\"pkg\"", "\"pkg\""),
+            "lib.loc",
+            "base::system.file(\"slinker\", \"resources\", package = \"root\")",
+        ),
+    ];
+    let rewritten = splice(original, &sites);
+    assert_eq!(worker.verify(original, &rewritten, &sites), Ok(()));
+    let reformatted = rewritten
+        .replace("  # keep going\n", "")
+        .replace("   ", " ")
+        .replace(") y else", ")\n    y\n  else");
+    assert_ne!(reformatted, rewritten);
+    assert_eq!(worker.verify(original, &reformatted, &sites), Ok(()));
+
+    let unchanged = "f <- function(x)   x + 1L  # trailing";
+    let reformatted = worker.normalize(unchanged);
+    assert_ne!(reformatted, unchanged);
+    assert_eq!(worker.verify(unchanged, &reformatted, &[]), Ok(()));
+    worker.shutdown();
+}
+
+#[test]
+fn relocation_verifier_rejects_syntactically_valid_unplanned_changes() {
+    let r_home = discover_r_home().expect("selected R installation");
+    let mut worker = WorkerProbe::start(&r_home, Vec::new()).expect("worker");
+
+    let original = "f <- function(x) pkg::g(x) + 1";
+    let sites = [site(
+        original,
+        "pkg::g",
+        "base::getExportedValue(\"pkg\", \"g\")",
+    )];
+    reject(
+        &mut worker,
+        original,
+        &splice(original, &sites).replace("+ 1", "+ 2"),
+        &sites,
+        UNPLANNED,
+    );
+
+    let original = "f <- function(x) -\"pkg\" %in% x";
+    let sites = [site(original, "\"pkg\" %in% x", "TRUE")];
+    reject(
+        &mut worker,
+        original,
+        &splice(original, &sites),
+        &sites,
+        NOT_A_SITE,
+    );
+
+    let original = "f <- function(x) -x^2";
+    let sites = [site_in(original, "x^", "x", "a + b")];
+    reject(
+        &mut worker,
+        original,
+        &splice(original, &sites),
+        &sites,
+        UNPLANNED,
+    );
+
+    let original = "f <- function() \"requireNamespace('pkg')\"";
+    let sites = [site(original, "requireNamespace('pkg')", "TRUE")];
+    reject(
+        &mut worker,
+        original,
+        &splice(original, &sites),
+        &sites,
+        NOT_A_SITE,
+    );
+
+    let original = "f <- function(x) pkg::g(x)";
+    let sites = [site(original, "pkg::g", "base::get(\"g\", envir = e)")];
+    let deparsed = worker.normalize(&splice(original, &sites));
+    assert!(deparsed.contains("(base::get(\"g\", envir = e))(x)"));
+    reject(&mut worker, original, &deparsed, &sites, UNPLANNED);
+
+    reject(
+        &mut worker,
+        "f <- function(x) x + 1",
+        "f <- function(x) x + 2",
+        &[],
+        UNPLANNED,
+    );
+    worker.shutdown();
+}
+
+#[test]
+fn relocation_verifier_rejects_a_malformed_rewrite() {
+    let r_home = discover_r_home().expect("selected R installation");
+    let mut worker = WorkerProbe::start(&r_home, Vec::new()).expect("worker");
+    let original = "f <- function() x <- \"pkg\"";
+    let sites = [appending(
+        site(original, "\"pkg\"", "\"pkg\""),
+        "lib.loc",
+        "NULL",
+    )];
+    let rewritten = splice(original, &sites);
+    assert!(!worker.parses(&rewritten));
+    assert!(worker.verify(original, &rewritten, &sites).is_err());
+    worker.shutdown();
+}
+
+const UNPLANNED: &str = "differs from the original code with its planned replacements";
+const NOT_A_SITE: &str = "whole expression";
+
+fn reject(
+    worker: &mut WorkerProbe,
+    original: &str,
+    rewritten: &str,
+    sites: &[RelocationSiteSpec],
+    reason: &str,
+) {
+    assert!(
+        worker.parses(rewritten),
+        "target R parses the rewrite: {rewritten}"
+    );
+    let rejection = worker
+        .verify(original, rewritten, sites)
+        .expect_err("unplanned rewrite accepted");
+    assert!(
+        rejection.contains(reason),
+        "rejected for another reason than `{reason}`: {rejection}"
+    );
+}
+
+fn site(source: &str, needle: &str, replacement: &str) -> RelocationSiteSpec {
+    site_in(source, needle, needle, replacement)
+}
+
+fn site_in(source: &str, context: &str, needle: &str, replacement: &str) -> RelocationSiteSpec {
+    let start = source.find(context).expect("context in source")
+        + context.find(needle).expect("site in context");
+    RelocationSiteSpec {
+        start,
+        end: start + needle.len(),
+        replacement: replacement.into(),
+        appended_argument: None,
+    }
+}
+
+fn appending(site: RelocationSiteSpec, name: &str, value: &str) -> RelocationSiteSpec {
+    RelocationSiteSpec {
+        appended_argument: Some(AppendedArgumentSpec {
+            name: name.into(),
+            value: value.into(),
+        }),
+        ..site
+    }
+}
+
+fn splice(original: &str, sites: &[RelocationSiteSpec]) -> String {
+    let mut ordered = sites.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|site| std::cmp::Reverse(site.start));
+    let mut source = original.to_owned();
+    for site in ordered {
+        let text = match &site.appended_argument {
+            None => site.replacement.clone(),
+            Some(argument) => format!(
+                "{}, {} = {}",
+                site.replacement, argument.name, argument.value
+            ),
+        };
+        source.replace_range(site.start..site.end, &text);
+    }
+    source
 }
 
 struct WorkerProbe {
@@ -112,6 +301,71 @@ impl WorkerProbe {
         }
     }
 
+    fn verify(
+        &mut self,
+        original: &str,
+        rewritten: &str,
+        sites: &[RelocationSiteSpec],
+    ) -> Result<(), String> {
+        let request_id = next_request();
+        match self
+            .exchange(&WorkerRequest::VerifyRelocation {
+                request_id,
+                original: original.into(),
+                rewritten: rewritten.into(),
+                sites: sites.to_vec(),
+            })
+            .expect("relocation verification response")
+        {
+            WorkerResponse::SyntaxValidation {
+                request_id: response,
+                accepted: true,
+                ..
+            } if response == request_id => Ok(()),
+            WorkerResponse::SyntaxValidation {
+                request_id: response,
+                accepted: false,
+                message,
+            } if response == request_id => Err(message.expect("rejection message")),
+            response => panic!("unexpected relocation verification response: {response:?}"),
+        }
+    }
+
+    fn parses(&mut self, source: &str) -> bool {
+        let request_id = next_request();
+        match self
+            .exchange(&WorkerRequest::ValidateSyntax {
+                request_id,
+                source: source.into(),
+            })
+            .expect("syntax validation response")
+        {
+            WorkerResponse::SyntaxValidation {
+                request_id: response,
+                accepted,
+                ..
+            } if response == request_id => accepted,
+            response => panic!("unexpected syntax validation response: {response:?}"),
+        }
+    }
+
+    fn normalize(&mut self, source: &str) -> String {
+        let request_id = next_request();
+        match self
+            .exchange(&WorkerRequest::NormalizeSyntax {
+                request_id,
+                source: source.into(),
+            })
+            .expect("syntax normalization response")
+        {
+            WorkerResponse::NormalizedSyntax {
+                request_id: response,
+                source,
+            } if response == request_id => source,
+            response => panic!("unexpected syntax normalization response: {response:?}"),
+        }
+    }
+
     fn shutdown(mut self) {
         let _ = self.exchange(&WorkerRequest::Shutdown);
         let _ = self.child.wait();
@@ -186,4 +440,9 @@ fn unique_temp(label: &str) -> PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+fn next_request() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }

@@ -3,7 +3,7 @@ use crate::analysis::LinkIr;
 use crate::ir::{
     ClosureHome, GenericHome, LinkBindingState, LinkNamespaceState, NamespaceId, ObjectStep,
     PayloadBundleId, PayloadBundleIr, PayloadDependency, ProgramIr, RegisteredNamespace,
-    RelocationTarget, ResourceId, Value,
+    ResourceId, Value,
 };
 use crate::package::PackageId;
 use crate::r_worker::client::WorkerClient;
@@ -17,6 +17,10 @@ use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+mod relocated;
+
+use relocated::RelocatedCode;
 use thiserror::Error;
 
 macro_rules! emit {
@@ -64,6 +68,7 @@ pub struct BuildContext {
 struct FrozenInputs {
     bundles: Vec<CheckedPayloadBundle>,
     resources: BTreeMap<ResourceId, PathBuf>,
+    code: RelocatedCode,
     _directory: TempDir,
 }
 
@@ -117,6 +122,8 @@ impl BuildContext {
                 root: location(package).clone(),
             }
         };
+        let mut worker = self.target_runtime.worker()?;
+        let code = RelocatedCode::verify(program, &mut worker)?;
         let mut bundles = Vec::new();
         if !program.payload_bundles().is_empty() {
             let namespaces = program
@@ -137,13 +144,10 @@ impl BuildContext {
                         .iter()
                         .map(|binding| program.binding(*binding).name.to_string())
                         .collect(),
-                    patches: closure_patches(program, bundle),
+                    patches: closure_patches(program, bundle, &code),
                 })
                 .collect();
-            let serialized = self
-                .target_runtime
-                .worker()?
-                .serialize_payloads(namespaces, specs)?;
+            let serialized = worker.serialize_payloads(namespaces, specs)?;
             bundles = check_payload_bundles(program, serialized)?;
         }
 
@@ -162,6 +166,7 @@ impl BuildContext {
         }
         Ok(FrozenInputs {
             bundles,
+            code,
             resources,
             _directory: directory,
         })
@@ -188,6 +193,8 @@ pub enum BuildContextError {
     Io(#[from] std::io::Error),
     #[error("selected package image changed during the invocation: {0}")]
     TargetUniverseChanged(String),
+    #[error("emitted code failed target-R verification: {0}")]
+    InvalidCode(String),
 }
 
 /// Narrow physical view available only after successful preflight.
@@ -213,6 +220,10 @@ impl MaterializationContext<'_> {
 
     fn resource(&self, resource: ResourceId) -> &Path {
         &self.frozen.resources[&resource]
+    }
+
+    fn code(&self) -> &RelocatedCode {
+        &self.frozen.code
     }
 }
 
@@ -392,9 +403,8 @@ pub fn materialize(
             &checked.bytes,
         )?;
     }
-    let generated = generate_r_source(buildable.program)?;
+    let generated = generate_r_source(buildable.program, materialization.code())?;
     let mut worker = materialization.target_runtime().worker()?;
-    validate_program_code(buildable.program, &mut worker)?;
     validate_r_source(&mut worker, &generated)?;
     fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
     copy_linked_resources(buildable.program, materialization, &package_root)?;
@@ -418,7 +428,10 @@ pub enum MaterializeError {
     Io(#[from] std::io::Error),
 }
 
-fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
+fn generate_r_source(
+    program: &ProgramIr,
+    code: &RelocatedCode,
+) -> Result<String, MaterializeError> {
     let mut out = String::new();
     out.push_str(
         ".slinker_runtime <- base::new.env(parent = base::baseenv())\nbase::local(envir = .slinker_runtime, {\n",
@@ -441,7 +454,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
     let root_on_load = program.root_artifact().on_load;
     let mut root_code = String::new();
     for closure in namespace_closures(program, root) {
-        let source = relocated_source(program, program.closure(closure).code);
+        let source = code.source(program.closure(closure).code);
         if Some(closure) == root_on_load {
             let value_start = program
                 .code(program.closure(closure).code)
@@ -452,7 +465,7 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             root_code.push_str(".slinker_original_on_load <- ");
             root_code.push_str(&source[value_start..]);
         } else {
-            root_code.push_str(&source);
+            root_code.push_str(source);
         }
         root_code.push('\n');
     }
@@ -511,11 +524,11 @@ fn generate_r_source(program: &ProgramIr) -> Result<String, MaterializeError> {
             );
         }
         for closure in namespace_closures(program, namespace) {
-            let source = relocated_source(program, program.closure(closure).code);
+            let source = code.source(program.closure(closure).code);
             emit!(
                 out,
                 "    eval(parse(text = {}), envir = ns)",
-                r_string(&source)
+                r_string(source)
             );
         }
         if let Some(bundle) = payload_bundle(program, namespace) {
@@ -870,13 +883,17 @@ fn render_namespace(program: &ProgramIr) -> String {
     out
 }
 
-fn closure_patches(program: &ProgramIr, bundle: &PayloadBundleIr) -> Vec<ClosurePatchSpec> {
+fn closure_patches(
+    program: &ProgramIr,
+    bundle: &PayloadBundleIr,
+    relocated: &RelocatedCode,
+) -> Vec<ClosurePatchSpec> {
     bundle
         .closure_patches()
         .iter()
         .map(|closure| {
             let code = program.code(closure.code);
-            let source = relocated_source(program, closure.code);
+            let source = relocated.source(closure.code);
             let (root, steps) = match &closure.home {
                 ClosureHome::Namespace => (None, Vec::new()),
                 ClosureHome::Reached { root, steps } => (
@@ -898,78 +915,11 @@ fn closure_patches(program: &ProgramIr, bundle: &PayloadBundleIr) -> Vec<Closure
                 expected_shape: code.normalized_shape().0.clone(),
                 source: code
                     .assigned_value_start()
-                    .map_or(source.as_str(), |start| &source[start..])
+                    .map_or(source, |start| &source[start..])
                     .to_owned(),
             }
         })
         .collect()
-}
-fn relocated_source(program: &ProgramIr, code: crate::ir::CodeId) -> String {
-    let code_ir = program.code(code);
-    let mut source = code_ir.source().to_owned();
-    let mut relocations = program
-        .relocations()
-        .iter()
-        .filter(|relocation| relocation.site.code == code)
-        .collect::<Vec<_>>();
-    relocations.sort_by_key(|relocation| {
-        std::cmp::Reverse(code_ir.occurrence(relocation.site.occurrence).start)
-    });
-    for relocation in relocations {
-        let occurrence = code_ir.occurrence(relocation.site.occurrence);
-        let replacement = match &relocation.target {
-            RelocationTarget::Binding { target, access } => match access {
-                crate::ir::ExternalBindingAccess::Exported => binding_reference(program, *target),
-                crate::ir::ExternalBindingAccess::Internal => namespace_get(program, *target),
-            },
-            RelocationTarget::RequireNamespace { result } => {
-                if *result { "TRUE" } else { "FALSE" }.into()
-            }
-            RelocationTarget::Namespace { package, .. }
-            | RelocationTarget::NamespaceArgument { package } => {
-                namespace_expression(program, *package)
-            }
-            RelocationTarget::LoadedQuery | RelocationTarget::InstalledQuery { check: false } => {
-                "TRUE".into()
-            }
-            RelocationTarget::InstalledQuery { check: true } => "base::invisible(NULL)".into(),
-            RelocationTarget::NativeSymbol {
-                package,
-                component,
-                symbol,
-            } => format!(
-                "base::getNativeSymbolInfo({}, {})",
-                r_string(symbol),
-                native_library(program, *package, component)
-            ),
-            RelocationTarget::NativeLibrary { package, component } => {
-                native_library(program, *package, component)
-            }
-            RelocationTarget::DescriptionArgument { description } => {
-                let package = program.package(program.resource(*description).package);
-                format!(
-                    "{}, lib.loc = base::system.file(\"slinker\", \"resources\", package = {})",
-                    r_string(&package.identity().name),
-                    r_string(&program.package(program.root_package()).identity().name)
-                )
-            }
-            RelocationTarget::PackageVersion { version } => {
-                format!("base::package_version({})", r_string(version))
-            }
-            RelocationTarget::Resource { target } => {
-                let resource = program.resource(*target);
-                let package = program.package(resource.package).identity();
-                format!(
-                    "base::system.file(\"slinker\", \"resources\", {}, {}, package = {})",
-                    r_string(&package.name),
-                    r_string(&resource.path),
-                    r_string(&program.package(program.root_package()).identity().name)
-                )
-            }
-        };
-        source.replace_range(occurrence.start..occurrence.end, &replacement);
-    }
-    source
 }
 
 fn native_library(program: &ProgramIr, package: PackageId, component: &str) -> String {
@@ -990,37 +940,6 @@ fn validate_r_source(worker: &mut WorkerClient, source: &str) -> Result<(), Mate
             "target-R parse/deparse normalization is not stable".into(),
         ))
     }
-}
-
-fn validate_program_code(
-    program: &ProgramIr,
-    worker: &mut WorkerClient,
-) -> Result<(), MaterializeError> {
-    for (code_id, code) in program.indexed_codes() {
-        let emitted = relocated_source(program, code_id);
-        let normalized = worker.normalize_syntax(&emitted)?;
-        let normalized_again = worker.normalize_syntax(&normalized)?;
-        if normalized != normalized_again {
-            return Err(MaterializeError::InvalidR(format!(
-                "CodeIr {code_id:?} is not stable across target-R emission round trip"
-            )));
-        }
-        let relocated = program
-            .relocations()
-            .iter()
-            .any(|relocation| relocation.site.code == code_id);
-        if !relocated {
-            let digest = crate::package::Digest::of(&normalized);
-            if &digest != code.normalized_shape() {
-                return Err(MaterializeError::InvalidR(format!(
-                    "CodeIr {code_id:?} changed normalized shape before emission: expected {}, got {}; normalized source {normalized:?}",
-                    code.normalized_shape().0,
-                    digest.0
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn copy_root_resources(source: &Path, output: &Path) -> Result<(), std::io::Error> {

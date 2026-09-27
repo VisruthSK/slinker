@@ -126,6 +126,36 @@ impl WorkerRuntime {
             .map_err(InspectionError::from)
     }
 
+    fn verify_relocation(
+        &self,
+        original: &str,
+        rewritten: &str,
+        sites: &[protocol::RelocationSiteSpec],
+    ) -> std::result::Result<(), InspectionError> {
+        let column = |field: fn(&protocol::RelocationSiteSpec) -> String| {
+            sites.iter().map(field).collect::<Vec<_>>()
+        };
+        harp::RFunction::new("", ".slinker_verify_relocation")
+            .add(original)
+            .add(rewritten)
+            .add(column(|site| site.start.to_string()))
+            .add(column(|site| site.end.to_string()))
+            .add(column(|site| site.replacement.clone()))
+            .add(column(|site| {
+                site.appended_argument
+                    .as_ref()
+                    .map_or_else(String::new, |argument| argument.name.clone())
+            }))
+            .add(column(|site| {
+                site.appended_argument
+                    .as_ref()
+                    .map_or_else(String::new, |argument| argument.value.clone())
+            }))
+            .call()
+            .map(|_| ())
+            .map_err(InspectionError::from)
+    }
+
     fn target(&self) -> std::result::Result<protocol::WorkerTarget, InspectionError> {
         let string = |code| {
             harp::parse_eval_base(code)
@@ -1493,6 +1523,32 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                         None,
                         None,
                     ),
+                },
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    None,
+                    None,
+                ),
+            },
+            WorkerRequest::VerifyRelocation {
+                request_id,
+                original,
+                rewritten,
+                sites,
+            } => match runtime.as_ref() {
+                Some(runtime) => match runtime.verify_relocation(&original, &rewritten, &sites) {
+                    Ok(()) => WorkerResponse::SyntaxValidation {
+                        request_id,
+                        accepted: true,
+                        message: None,
+                    },
+                    Err(error) => WorkerResponse::SyntaxValidation {
+                        request_id,
+                        accepted: false,
+                        message: Some(error.to_string()),
+                    },
                 },
                 None => worker_failure(
                     Some(request_id),

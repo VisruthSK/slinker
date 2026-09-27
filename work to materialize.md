@@ -74,7 +74,9 @@ Keep passing: `tests/build_materializer.rs` (synthetic fixtures, vendored `prais
 `tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, `qrcode`, and `here`, each run
 against one build with its Linked dependencies absent, installed, and loaded; `pkgcond`, `doubt`,
 `config`, and `voucher` with cli and fs Linked block with their exact unproven behavior until a sound
-rule covers it). Each item adds its own acceptance cases here.
+rule covers it); `tests/harp_runtime.rs` (target-R relocation verification accepts exactly the planned
+replacements and rejects parseable unplanned changes and malformed rewrites). Each item adds its own
+acceptance cases here.
 
 ## Next up
 
@@ -101,8 +103,6 @@ that fails before its fix.
 - Namespace enumeration (`as.list(ns)`, `mget(ls(ns), ns)`, `eapply(ns, ...)`) reads stubs: block it.
 - An unregistered `g.cls` in a Root/Linked namespace is found lexically by dispatch from that
   namespace's code, even for base generics; retain it whenever the namespace calls the generic.
-- Relocated code: compare the reparsed post-rewrite AST with the pre-rewrite AST plus the intended
-  replacements, not only parse stability.
 - Optional `Suggests` availability: reachable behavior that depends on whether an unselected
   Suggests package is installed blocks.
 - Diagnostics: collapse derivative missing-name cascades behind one primary blocker.

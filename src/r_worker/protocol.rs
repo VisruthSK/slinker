@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -71,6 +71,20 @@ pub struct ClosurePatchSpec {
     pub binding: String,
     pub expected_shape: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelocationSiteSpec {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+    pub appended_argument: Option<AppendedArgumentSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppendedArgumentSpec {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,6 +157,12 @@ pub enum WorkerRequest {
     NormalizeSyntax {
         request_id: u64,
         source: String,
+    },
+    VerifyRelocation {
+        request_id: u64,
+        original: String,
+        rewritten: String,
+        sites: Vec<RelocationSiteSpec>,
     },
     Shutdown,
 }

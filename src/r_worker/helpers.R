@@ -146,6 +146,130 @@
   )
 }
 
+.slinker_verify_relocation <- function(original, rewritten, starts, ends,
+                                       replacements, appended_names,
+                                       appended_values) {
+  fail <- function(...) stop(paste0(...), call. = FALSE)
+  parse_tree <- function(text) as.list(parse(text = text, keep.source = FALSE))
+  parse_one <- function(text, role) {
+    tree <- parse_tree(text)
+    if (length(tree) != 1L) {
+      fail(role, " is not exactly one R expression: ", text)
+    }
+    tree
+  }
+  original <- enc2utf8(original)
+  bytes <- charToRaw(original)
+  starts <- as.integer(starts)
+  ends <- as.integer(ends)
+  count <- length(starts)
+  if (length(ends) != count || length(replacements) != count ||
+    length(appended_names) != count || length(appended_values) != count) {
+    fail("relocation site fields have different lengths")
+  }
+  if (anyNA(starts) || anyNA(ends) || any(starts < 0L) || any(ends <= starts) ||
+    any(ends > length(bytes))) {
+    fail("relocation site ranges lie outside the original code")
+  }
+  ordered <- order(starts)
+  if (count > 1L && any(starts[ordered][-1L] < ends[ordered][-count])) {
+    fail("relocation sites overlap")
+  }
+  slice <- function(from, to) {
+    if (to < from) {
+      return("")
+    }
+    text <- rawToChar(bytes[from:to])
+    Encoding(text) <- "UTF-8"
+    text
+  }
+  prefix <- ".slinker_site_"
+  while (grepl(prefix, original, fixed = TRUE)) {
+    prefix <- paste0(prefix, "_")
+  }
+  placeholders <- paste0(prefix, seq_len(count))
+  pieces <- character()
+  cursor <- 1L
+  for (site in ordered) {
+    pieces <- c(pieces, slice(cursor, starts[[site]]), placeholders[[site]])
+    cursor <- ends[[site]] + 1L
+  }
+  template <- paste(c(pieces, slice(cursor, length(bytes))), collapse = "")
+  original_sites <- lapply(seq_len(count), function(site) {
+    parse_one(slice(starts[[site]] + 1L, ends[[site]]), "relocation site")
+  })
+  replacement_sites <- lapply(seq_len(count), function(site) {
+    parse_one(replacements[[site]], "relocation replacement")
+  })
+  appended <- lapply(seq_len(count), function(site) {
+    if (!nzchar(appended_names[[site]])) {
+      return(NULL)
+    }
+    argument <- parse_one(appended_values[[site]], "appended argument")
+    names(argument) <- appended_names[[site]]
+    argument
+  })
+
+  substitute_sites <- function(tree, values, appended) {
+    seen <- integer(count)
+    rebuild <- function(items, kind) {
+      labels <- names(items)
+      out <- list()
+      for (i in seq_along(items)) {
+        label <- if (is.null(labels)) "" else labels[[i]]
+        site <- if (is.symbol(items[[i]])) {
+          match(as.character(items[[i]]), placeholders, nomatch = 0L)
+        } else {
+          0L
+        }
+        if (site > 0L) {
+          seen[[site]] <<- seen[[site]] + 1L
+          out <- c(out, `names<-`(values[[site]], label))
+          if (!is.null(appended[[site]])) {
+            if (kind != "call" || i == 1L) {
+              fail("relocation site ", site, " is not an argument of a call")
+            }
+            out <- c(out, appended[[site]])
+          }
+        } else if (is.call(items[[i]])) {
+          out <- c(out, `names<-`(list(rebuild(as.list(items[[i]]), "call")), label))
+        } else if (is.pairlist(items[[i]]) && length(items[[i]])) {
+          out <- c(out, `names<-`(list(rebuild(as.list(items[[i]]), "pairlist")), label))
+        } else {
+          out <- c(out, items[i])
+        }
+      }
+      if (all(names(out) == "")) {
+        names(out) <- NULL
+      }
+      switch(kind,
+        call = as.call(out),
+        pairlist = as.pairlist(out),
+        expression = out
+      )
+    }
+    rebuilt <- rebuild(tree, "expression")
+    if (any(seen != 1L)) {
+      fail(
+        "relocation site ", which(seen != 1L)[[1L]],
+        " is not one whole expression of the original code"
+      )
+    }
+    rebuilt
+  }
+
+  template_tree <- parse_tree(template)
+  restored <- substitute_sites(template_tree, original_sites, vector("list", count))
+  if (!identical(restored, parse_tree(original))) {
+    fail("relocation sites are not whole expressions of the original code")
+  }
+  expected <- substitute_sites(template_tree, replacement_sites, appended)
+  if (!identical(parse_tree(rewritten), expected)) {
+    fail("rewritten code differs from the original code with its planned replacements")
+  }
+  TRUE
+}
+
 .slinker_closure_home <- function(image, root, kinds, names) {
   if (!length(root)) {
     return(image)
