@@ -65,6 +65,8 @@ impl WorkerClient {
         ] {
             command.env_remove(variable);
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        command.env("LD_LIBRARY_PATH", target_library_path(&r_home)?);
         let mut child = command.spawn().map_err(|source| Error::Io {
             path: executable,
             source,
@@ -335,6 +337,29 @@ impl Drop for WorkerClient {
         let _ = self.input.flush();
         let _ = self.child.wait();
     }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn target_library_path(r_home: &std::path::Path) -> Result<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(". \"${R_HOME}/etc${R_ARCH}/ldpaths\" && printf '%s' \"${LD_LIBRARY_PATH}\"")
+        .env("R_HOME", r_home)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| Error::Io {
+            path: r_home.join("etc").join("ldpaths"),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::Analysis(format!(
+            "target R {} library path configuration failed: {}",
+            r_home.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(std::ffi::OsString::from_vec(output.stdout))
 }
 
 fn next_worker() -> u64 {

@@ -111,6 +111,11 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y libcurl4-openssl-dev libssl-dev libuv1-dev libxml2-dev
 
+      - shell: bash
+        run: |
+          install='install.packages("rlang", lib = .Library)'
+          if [ "$RUNNER_OS" = Windows ]; then Rscript -e "$install"; else sudo Rscript -e "$install"; fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -137,7 +142,7 @@ jobs:
 
       - run: sudo apt-get install -y libcurl4-openssl-dev libssl-dev libuv1-dev libxml2-dev
 
-      - run: Rscript -e 'install.packages(c("rlang", "cli", "testthat"))'
+      - run: sudo Rscript -e 'install.packages(c("rlang", "cli", "testthat"), lib = .Library)'
 
       - uses: dtolnay/rust-toolchain@stable
 
