@@ -10,7 +10,7 @@ Correctness and semantic soundness come before ecosystem coverage and performanc
 
 ## Sources of truth
 
-`README.md` describes behavior implemented now.
+`docs/` describes behavior implemented now; `README.md` indexes it.
 
 `work to materialize.md` describes unfinished work and intended behavior. Do not assume planned behavior already exists.
 

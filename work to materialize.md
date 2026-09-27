@@ -3,7 +3,7 @@
 Updated: 2026-09-26 (America/Los_Angeles)
 
 This file is the forward plan: what remains and how to know each piece is done. It does not
-describe what the code already does (`README.md` documents behavior). Delete finished items instead
+describe what the code already does (`docs/` documents behavior). Delete finished items instead
 of turning them into status notes. Breaking changes are always allowed: any item may delete or
 reshape APIs, IR types, CLI flags, formats, and tests.
 
@@ -28,7 +28,7 @@ missing fact.
   `.packageName`, function printing). Code that turns that name back into a namespace or package
   query is rewritten to the private namespace or blocked.
 - Everything linked code addresses by package name is rewired to the private namespace. Registries
-  keyed by something else stay shared and the residual divergence is documented in the README.
+  keyed by something else stay shared and the residual divergence is documented in `docs/semantics.md`.
 - In-session serialization of Linked-namespace references is documented, not detected.
 - Linked lazy-loaded datasets are carried into the generated package.
 - Root code stays regenerated from installed closures; original comments and layout are not kept.
@@ -64,8 +64,8 @@ missing fact.
 - Linked namespaces reproduce the original name universe and export table; removed bindings are
   stubs that fail loudly.
 - Installation independence: a slinked package behaves identically whether its Linked packages are
-  absent, installed, or loaded. The only allowed exceptions are the residual divergences the README
-  documents.
+  absent, installed, or loaded. The only allowed exceptions are the residual divergences
+  `docs/semantics.md` documents.
 - A failed build publishes nothing that looks complete.
 
 ## Regression corpus
@@ -136,7 +136,7 @@ Minimal code:
   stored but never checked: detect a source tree changed mid-build, or delete it.
 - One shared `r_executable` helper instead of per-module copies.
 - Cache CRAN downloads and harness libraries in CI.
-- Frontend, documented in the README as it lands:
+- Frontend, documented in `docs/usage.md` as it lands:
   - `analyze`, `why`, and `path` accept a source package path (staged exactly as `build` does), an
     installed package name (today's behavior), or an installed package directory, whose parent
     library goes first in the library order;
