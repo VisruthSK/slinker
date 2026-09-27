@@ -152,14 +152,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
             });
         self.plan_relocations(&mut builder, &namespaces.ids, &mut issues);
         let description = self.root_description(&contracts, retained, &mut issues);
-        builder.set_root_artifact(RootArtifactIr {
+        let load = builder.root_load(root_namespace);
+        let program = builder.finish(RootArtifactIr {
             description,
             exports: root_exports,
             native_components: namespaces.root_natives,
             on_load: root_on_load,
-            activated_s3: builder.linked_generic_registrations(root_namespace),
+            load,
         });
-        (builder.finish(), issues)
+        (program, issues)
     }
 
     fn finalize_packages(

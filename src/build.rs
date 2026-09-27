@@ -269,15 +269,9 @@ impl PureRStatic {
             blockers.insert("Root source-package DESCRIPTION plan is missing".into());
         }
         let program = ir.program();
-        for import in &program.root_namespace().imports {
+        for import in program.root_artifact().load.before_bootstrap().imports() {
             let target = program.binding(import.target);
-            let external = matches!(
-                program
-                    .namespace(program.binding_namespace(import.target))
-                    .state,
-                crate::ir::LinkNamespaceState::External { .. }
-            );
-            if external && target.name != import.local {
+            if target.name != import.local {
                 blockers.insert(format!(
                     "Root imports External `{}` as `{}`, which NAMESPACE cannot express",
                     target.name, import.local
@@ -571,20 +565,14 @@ fn generate_r_source(
             }
         );
     }
-    for import in &root.imports {
-        if matches!(
-            program
-                .namespace(program.binding_namespace(import.target))
-                .state,
-            LinkNamespaceState::Linked(_)
-        ) {
-            emit!(
-                out,
-                "  assign({}, {}, envir = parent.env(root))",
-                r_string(&import.local),
-                binding_reference(program, import.target)
-            );
-        }
+    let after_activation = program.root_artifact().load.after_activation();
+    for import in after_activation.imports() {
+        emit!(
+            out,
+            "  assign({}, {}, envir = parent.env(root))",
+            r_string(&import.local),
+            binding_reference(program, import.target)
+        );
     }
     if let Some(bundle) = payload_bundle(program, root) {
         emit!(
@@ -594,7 +582,7 @@ fn generate_r_source(
             external_payload_dependencies(program, bundle)
         );
     }
-    let activated_s3 = &program.root_artifact().activated_s3;
+    let activated_s3 = after_activation.s3_registrations();
     if !activated_s3.is_empty() {
         emit!(
             out,
@@ -813,21 +801,21 @@ fn r_vector<'a>(values: impl Iterator<Item = &'a str>) -> String {
 }
 
 fn render_namespace(program: &ProgramIr) -> String {
-    let root = program.root_namespace();
+    let before_bootstrap = program.root_artifact().load.before_bootstrap();
     let mut out = String::new();
     for binding in program.root_artifact().exports.bindings() {
         emit!(out, "export({})", r_string(&program.binding(*binding).name));
     }
-    for import in &root.imports {
-        let target = program.namespace(program.binding_namespace(import.target));
-        if let LinkNamespaceState::External { package } = target.state {
-            emit!(
-                out,
-                "importFrom({}, {})",
-                r_string(&program.package(package).identity().name),
-                r_string(&program.binding(import.target).name)
-            );
-        }
+    for import in before_bootstrap.imports() {
+        let package = program
+            .namespace(program.binding_namespace(import.target))
+            .package;
+        emit!(
+            out,
+            "importFrom({}, {})",
+            r_string(&program.package(package).identity().name),
+            r_string(&program.binding(import.target).name)
+        );
     }
     for native in &program.root_artifact().native_components {
         let registration = native.registration.iter().map(|fixes| {
@@ -854,11 +842,7 @@ fn render_namespace(program: &ProgramIr) -> String {
                 .join(", ")
         );
     }
-    for registration in root
-        .s3_registrations
-        .iter()
-        .filter(|registration| !program.root_artifact().activated_s3.contains(registration))
-    {
+    for registration in before_bootstrap.s3_registrations() {
         let registration = program.s3_registration(*registration);
         let generic = match &registration.generic.home {
             GenericHome::Program(package) => format!(

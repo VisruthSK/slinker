@@ -445,15 +445,47 @@ impl UnretainedName {
 }
 
 /// Root source-package transformation decided at finalization: the generated `DESCRIPTION`, the
-/// `NAMESPACE` exports and native libraries, and the original Root `.onLoad` that the generated
-/// wrapper calls last.
-#[derive(Clone, Debug, Default)]
+/// `NAMESPACE` exports and native libraries, the Root load work on each side of Linked
+/// activation, and the original Root `.onLoad` that the generated wrapper calls last.
+#[derive(Clone, Debug)]
 pub struct RootArtifactIr {
     pub description: Option<Arc<str>>,
     pub exports: ExportTable,
     pub native_components: Vec<crate::package::NativeComponent>,
     pub on_load: Option<ClosureId>,
-    pub activated_s3: Vec<S3RegistrationId>,
+    pub load: RootLoadIr,
+}
+
+#[derive(Clone, Debug)]
+pub struct RootLoadIr {
+    before_bootstrap: RootLoadStage,
+    after_activation: RootLoadStage,
+}
+
+impl RootLoadIr {
+    pub fn before_bootstrap(&self) -> &RootLoadStage {
+        &self.before_bootstrap
+    }
+
+    pub fn after_activation(&self) -> &RootLoadStage {
+        &self.after_activation
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RootLoadStage {
+    imports: Vec<ImportBindingIr>,
+    s3_registrations: Vec<S3RegistrationId>,
+}
+
+impl RootLoadStage {
+    pub fn imports(&self) -> &[ImportBindingIr] {
+        &self.imports
+    }
+
+    pub fn s3_registrations(&self) -> &[S3RegistrationId] {
+        &self.s3_registrations
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -696,7 +728,6 @@ pub struct ProgramBuilder {
     resources: Vec<ResourceIr>,
     payload_bundles: Vec<PayloadBundleIr>,
     relocations: Vec<Relocation>,
-    root_artifact: RootArtifactIr,
     root_package: PackageId,
 }
 
@@ -746,7 +777,6 @@ impl ProgramBuilder {
             resources: Vec::new(),
             payload_bundles: Vec::new(),
             relocations: Vec::new(),
-            root_artifact: RootArtifactIr::default(),
             root_package: root,
         }
     }
@@ -964,34 +994,71 @@ impl ProgramBuilder {
         registration
     }
 
-    pub fn linked_generic_registrations(&self, namespace: NamespaceId) -> Vec<S3RegistrationId> {
-        let owner = &self.namespaces[namespace.index()];
-        owner
-            .s3_registrations
-            .iter()
-            .copied()
-            .filter(|&id| {
-                let generic = &self.s3_registrations[id.index()].generic;
-                match &generic.home {
-                    GenericHome::Program(package) => {
-                        matches!(self.packages[package], PackageIr::Linked { .. })
+    pub fn root_load(&self, root: NamespaceId) -> RootLoadIr {
+        let owner = &self.namespaces[root.index()];
+        let mut load = RootLoadIr {
+            before_bootstrap: RootLoadStage::default(),
+            after_activation: RootLoadStage::default(),
+        };
+        for import in &owner.imports {
+            let stage = if self.is_linked_binding(import.target) {
+                &mut load.after_activation
+            } else {
+                &mut load.before_bootstrap
+            };
+            stage.imports.push(import.clone());
+        }
+        for &id in &owner.s3_registrations {
+            let registration = &self.s3_registrations[id.index()];
+            let generic_bound = match &registration.generic.home {
+                GenericHome::Program(package) => match self.packages[package] {
+                    PackageIr::Root { .. } => {
+                        self.bound_before_bootstrap(root, &registration.generic.name)
                     }
-                    GenericHome::Optional(_) => false,
-                    GenericHome::Lexical => {
-                        !owner.bindings.contains_key(generic.name.as_str())
-                            && self.visible_binding(namespace, &generic.name).is_some_and(
-                                |binding| {
-                                    matches!(
-                                        self.namespaces[self.binding_namespace(binding).index()]
-                                            .state,
-                                        LinkNamespaceState::Linked(_)
-                                    )
-                                },
-                            )
-                    }
+                    PackageIr::Linked { .. } => false,
+                    PackageIr::External { .. } => true,
+                },
+                GenericHome::Optional(_) => true,
+                GenericHome::Lexical => {
+                    self.bound_before_bootstrap(root, &registration.generic.name)
                 }
-            })
-            .collect()
+            };
+            let stage = if generic_bound
+                && self.bound_before_bootstrap(root, self.binding_name(registration.method))
+            {
+                &mut load.before_bootstrap
+            } else {
+                &mut load.after_activation
+            };
+            stage.s3_registrations.push(id);
+        }
+        load
+    }
+
+    fn bound_before_bootstrap(&self, root: NamespaceId, name: &str) -> bool {
+        let owner = &self.namespaces[root.index()];
+        match owner
+            .bindings
+            .get(name)
+            .map(|binding| &self.bindings[binding.index()].state)
+        {
+            Some(LinkBindingState::Materialized {
+                initial: InitialBindingState::Value(value),
+                ..
+            }) => matches!(self.values[value.index()], Value::Closure(_)),
+            _ => owner
+                .imports
+                .iter()
+                .find(|import| import.local == name)
+                .is_none_or(|import| !self.is_linked_binding(import.target)),
+        }
+    }
+
+    fn is_linked_binding(&self, binding: BindingId) -> bool {
+        matches!(
+            self.namespaces[self.binding_namespace(binding).index()].state,
+            LinkNamespaceState::Linked(_)
+        )
     }
 
     /// The binding a namespace sees under `name`: its own slot, else an import.
@@ -1168,11 +1235,7 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn set_root_artifact(&mut self, root_artifact: RootArtifactIr) {
-        self.root_artifact = root_artifact;
-    }
-
-    pub fn finish(self) -> ProgramIr {
+    pub fn finish(self, root_artifact: RootArtifactIr) -> ProgramIr {
         ProgramIr {
             target: self.target,
             root_package: self.root_package,
@@ -1188,8 +1251,7 @@ impl ProgramBuilder {
             resources: self.resources,
             payload_bundles: self.payload_bundles,
             relocations: self.relocations,
-
-            root_artifact: self.root_artifact,
+            root_artifact,
         }
     }
 }

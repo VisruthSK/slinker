@@ -1139,6 +1139,68 @@ fn s3_registrations_on_linked_generics_reach_the_private_namespace() {
 }
 
 #[test]
+fn root_registrations_resolve_linked_bindings_only_after_activation() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let linked_source = fixture.path().join("tinyfmt");
+    write_package(
+        &linked_source,
+        "tinyfmt",
+        "",
+        "export(fmt, describe)\n",
+        "fmt <- function(x, ...) 'linked'\ndescribe <- function(x) UseMethod('describe')\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &linked_source, &build_library);
+
+    let root_source = fixture.path().join("preroot");
+    write_package(
+        &root_source,
+        "preroot",
+        "Imports: tinyfmt\n",
+        "S3method(format, foo)\nS3method(describe, bar)\nS3method(format, plain)\nS3method(format, late)\nexport(describe)\n",
+        "format.foo <- tinyfmt::fmt\ndescribe <- tinyfmt::describe\ndescribe.bar <- function(x) 'bar'\nformat.plain <- function(x, ...) 'plain'\nformat.late <- function(x, ...) paste0('late:', tinyfmt::fmt(x))\n",
+    );
+    let output = fixture.path().join("generated-preroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run pre-bootstrap registration build");
+    assert_success(&result, "slinker build pre-bootstrap registration fixture");
+    let namespace = fs::read_to_string(output.join("NAMESPACE")).expect("generated NAMESPACE");
+    assert!(namespace.contains("S3method(\"format\", \"plain\", \"format.plain\")"));
+    assert!(namespace.contains("S3method(\"format\", \"late\", \"format.late\")"));
+
+    let behavior = "withCallingHandlers(library(preroot), warning = function(w) stop(w)); formatted <- vapply(c('foo', 'plain', 'late'), function(cls) format(structure(1, class = cls)), ''); stopifnot(identical(unname(formatted), c('linked', 'plain', 'late:linked')), identical(tryCatch(describe(structure(1, class = 'bar')), error = conditionMessage), \"no applicable method for 'describe' applied to an object of class \\\"bar\\\"\"), exists('describe.bar', envir = asNamespace('preroot')[['.__S3MethodsTable__.']], inherits = FALSE))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &linked_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+
+    let private = format!("{behavior}; stopifnot(!isNamespaceLoaded('tinyfmt'))");
+    let absent = fixture.path().join("absent");
+    fs::create_dir(&absent).expect("library without the real Linked package");
+    install_package(&r_home, &output, &absent);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &linked_source, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, &private);
+    run_r(&r_home, &installed, &private);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('tinyfmt'); {behavior}"),
+    );
+}
+
+#[test]
 fn delayed_registrations_on_suggested_generics_reach_the_real_package() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");
