@@ -186,96 +186,44 @@ do not finish. callr and processx start child R processes that load packages by 
 them needs its own design. Reporters are R6. Done when a package's suite runs against a slinked
 testthat with every testthat dependency Linked.
 
-## Track H: Performance
+## Track H: Concurrent fixed-point performance
 
-Cold analysis is the priority because it sets the worst-case CI and first-run cost. Warm-cache and
-edit-and-rerun performance must use the same architecture rather than a separate fast path. No
-optimization may weaken analysis, change reachable semantics, or make output depend on scheduling.
+Cold analysis is the priority because it sets worst-case CI and first-run cost. Warm-cache and edit-and-rerun performance must use the same query architecture. No optimization may weaken analysis or make program semantics depend on scheduling.
 
-Baseline on `slinker analyze rlang` on 2026-09-26: about 41 s wall time. The current profiler reports
-nested/inclusive timings, so its durations are not additive, but the call counts identify the hot
-work: about 323k `evaluate_installed_function`, 833k `resolve_lexical_name`, 107k `parsed_source`,
-7.1k `binding_image`, and 1.7k construction evaluations.
+Baseline on `slinker analyze rlang` on 2026-09-26: about 41 s wall time. Current hot counts are about 323k `evaluate_installed_function`, 833k `resolve_lexical_name`, 107k `parsed_source`, 7.1k `binding_image`, and 1.7k construction evaluations.
 
-Scheduler and fixed point:
-- Replace global analysis frontiers with a concurrent monotone worklist on Rayon's work-stealing
-  runtime. A stable `WorkKey` executes once; every causal/provenance edge is still recorded even
-  when its target work already exists.
-- Workers publish `AnalysisDelta`s instead of mutating one locked `AnalyzerState`. Keep the hot path
-  lock-free where practical: atomic task states/counters, immutable snapshots, worker-local buffers,
-  and deterministic merge/finalization. Do not replace the frontier with `Arc<Mutex<AnalyzerState>>`.
-- Model soundness-critical ordering as readiness dependencies, not global barriers. Package
-  activation facts, including namespace changes established by `.onLoad`, gate only work whose
-  interpretation depends on them. Facts that only improve precision may arrive later without
-  invalidating soundness.
-- Quiescence is exact: no queued/running semantic work and no in-flight package-worker request.
-  Count newly scheduled children before completing their parent so zero cannot be observed early.
-- Scheduling order is semantically invisible. Use stable semantic keys and canonical sorting so
-  `LinkIr`, diagnostics, and provenance are deterministic across runs and `--jobs` values.
+Semantic model and scheduler:
+- Make analysis an explicit least-fixed-point computation over finite monotone domains. Add a real bottom/no-information state distinct from `Unknown`/top. Concurrently published semantic facts merge with associative, commutative, idempotent joins. Use bounded exact domains and explicit widening where needed.
+- Facts based on absence or completion are not published until their dependencies are sealed. `.onLoad` and other soundness-critical package activation facts become local readiness dependencies, not global barriers.
+- Replace global frontiers with a concurrent dependency-aware worklist on Rayon's work-stealing runtime. Stable semantic `WorkKey`s deduplicate work, but a transfer may run again when an input fact grows. Coalesce updates and propagate only newly learned deltas.
+- Solve recursive regions with SCC/local fixed-point iteration. Do not seed recursion with semantic `Unknown` or repeatedly reevaluate an entire recursive region when only one fact changed.
+- Workers publish mergeable `AnalysisDelta`s instead of mutating one locked `AnalyzerState`. Keep worker-local buffers, immutable snapshots, atomic scheduling state, and exact quiescence accounting. Do not replace the frontier with `Arc<Mutex<AnalyzerState>>`.
+- Scheduling order is semantically invisible. Different schedules and `--jobs` values must produce the same `ProgramIr` semantics modulo invocation-local IDs, the same diagnostics, and the same provenance graph after canonicalization. Raw numeric IDs, internal table order, and nonsemantic `LinkIr` metrics are not cross-run identities.
 
-Remove repeated semantic work before adding more threads:
-- Intern names and environment identities used by the analyzer; lexical resolution should chase
-  typed/interned IDs rather than allocate, format, parse, and hash environment strings.
-- Build immutable lookup indexes for package bindings, imports, native bindings, and other hot
-  membership queries. Do not linearly scan installed-package vectors on each name resolution.
-- Memoize lexical resolution, parsed-source lookup, and parse contexts with explicit semantic
-  epochs/dependencies so a cache entry is reused only while its inputs are unchanged.
-- Split construction evaluation from call-site provenance. Memoize an installed function summary by
-  function identity, abstract arguments, and semantic context; instantiate fresh allocation effects
-  and attach provenance at each call site. A provenance `NodeId` must not prevent reuse of otherwise
-  identical semantic evaluation.
-- Solve recursive function summaries by local SCC/fixed-point iteration and propagate only newly
-  learned facts. Do not repeatedly reevaluate an entire recursive region when one abstract fact
-  grows.
-- Prefer bounded exact domains such as finite string/callable/class sets before `Unknown` where they
-  improve both precision and work reduction. Domains stay finite and widening/top behavior remains
-  explicit and sound.
+Remove repeated semantic work:
+- Intern analyzer names and environment identities. Build immutable indexes for package bindings, imports, native bindings, mutations, and other hot membership queries.
+- Memoize lexical resolution, parsed-source work, parse contexts, and installed-function construction summaries by semantic inputs and epochs. `NodeId` and call-site provenance must never prevent semantic reuse.
+- Separate semantic construction summaries from call-site effects and provenance. Instantiate fresh allocation effects where required.
+- Record query dependencies on the cold path. Recomputed queries whose semantic result is unchanged must stop invalidation propagation. Support stable result fingerprints/backdating and durability so edits to the Root do not force validation of unchanged installed-package work.
+- Persist only reusable semantic summaries keyed by exact source/package inputs, target R identity, analyzer/schema versions, and every semantic context input. Never persist worker-local R object identities.
 
 R/package inspection:
-- Replace one-request-per-binding and one-request-per-normalization protocol traffic with batched
-  requests. Perform both syntax-normalization passes inside one batch request while preserving the
-  idempotence check.
-- Use several R workers for cold analysis, with stable package affinity so all inspection of one
-  installed package stays in one worker/epoch and private-environment identity remains valid.
-  CPU analysis remains freely stealable across packages.
-- Instrument and remove accidental copy-on-write or full-structure cloning on the package-image hot
-  path. Immutable package indexes and analyzer-owned discovered facts should be separate structures.
-
-Incremental and persistent reuse:
-- Record query dependencies while implementing the cold-path query engine so edit-and-rerun can
-  invalidate only transitive dependents. Do not bolt a second incremental engine onto the analyzer.
-- Persist reusable parse/semantic summaries under keys that include the exact package/source digest,
-  target R identity, analysis schema/tool versions, and every semantic context input that affects the
-  result. Worker-local object identities are never persisted.
-- A source edit invalidates the changed query and its semantic dependents, not the whole package
-  universe. A cold run pays only small dependency-recording overhead and never requires prior cache
-  state.
+- Batch binding inspection and syntax-normalization traffic.
+- Use a reusable R worker pool with stable package affinity so one installed package stays on one worker during an inspection epoch and private-environment identity remains valid. Reuse initialized workers across analysis/build phases where their target identity permits it.
+- Keep expensive package inspection demand-driven. Instrument package hashing, bytes read, R startup count, protocol bytes, and accidental full-structure cloning so semantic speedups do not merely expose a new I/O bottleneck.
 
 Profiling and benchmarks:
-- Replace ad-hoc profiler prints with an opt-in runtime profiler. `SLINKER_PROFILE=1` prints one
-  deterministic human-readable summary to stderr; `SLINKER_PROFILE=trace` may add detailed query and
-  scheduler statistics. An optional JSON output path may be provided for benchmark tooling. With the
-  variable unset, profiling is effectively free and produces no output.
-- Report inclusive and exclusive wall/CPU time separately, call counts, unique query keys,
-  memo/cache hit rates, queue depth and steals, worker utilization, R requests by opcode, batched
-  request sizes, bytes moved, and the top semantic callees by evaluations and exclusive time.
-- Add separate benchmarks for cold analysis/build with all persistent analysis caches disabled,
-  warm unchanged rerun, and edit-one-source incremental rerun. Keep the benchmark rules above and
-  record before/after numbers in performance PRs; do not add a fixed pass/fail time budget.
+- `SLINKER_PROFILE=1` prints deterministic inclusive/exclusive timings, calls versus unique query keys, memo/cache hits, lattice growth/SCC iterations, queue depth/steals, worker utilization, R requests/batch sizes/bytes, package bytes hashed, and R startup count. Detailed tracing remains opt-in.
+- Benchmark cold analysis/build with persistent analysis caches disabled, warm unchanged rerun, and one-source edit rerun. Record before/after numbers; do not add a fixed time threshold.
 
 Done when:
-- the global frontier/preparse-frontier scheduler is gone;
-- correctness and diagnostics are identical across one worker and many workers after canonical
-  ordering, with stress tests for races, cycles, repeated scheduling, `.onLoad`, and private
-  environments;
-- cold `rlang` analysis has materially lower wall time from both fewer semantic evaluations and real
-  CPU/R-worker overlap, not merely different profiler accounting;
-- warm and one-file edit reruns reuse the same query/dependency machinery and invalidate only what
-  changed;
-- profiling is opt-in through the environment and is useful enough to identify regressions without
-  recompilation;
-- the existing soundness, three-way installation, and build-materializer regression corpus remains
-  unchanged.
+- the global frontier/preparse-frontier scheduler is gone and semantic work uses the monotone query/worklist model;
+- lattice and delta merge laws are tested, including order/permutation tests;
+- adversarial scheduler tests cover cycles, lost wakeups, repeated scheduling, `.onLoad` readiness, private environments, construction recursion, and several `--jobs` values;
+- those schedules produce semantically equivalent `ProgramIr`, diagnostics, and provenance without requiring identical invocation-local IDs;
+- cold `rlang` analysis is materially faster from fewer semantic evaluations plus real CPU/R-worker overlap;
+- warm and one-file edit reruns use the same dependency graph, prune propagation when recomputation is unchanged, and invalidate only semantic dependents;
+- the existing soundness, three-way installation, and build-materializer corpus remains unchanged.
 
 ---
 
