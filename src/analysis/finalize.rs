@@ -6,7 +6,7 @@ use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
     BindingId, BindingName, ClosureHome, CodeId, ExportTable, ExternalBindingAccess,
-    ExternalPackageContract, FinalizedNamespace, GenericHome, ImportSlotIr,
+    ExternalPackageContract, FinalizedNamespace, GenericHome, ImportRecordIr, ImportSlotIr,
     InvalidPayloadDependency, InvalidRelocation, MaterializedRole, MaterializedSlot,
     MaterializedSlotSource, NamespaceId, ObjectStep, PackageRole as LinkedPackageRole,
     PayloadDependency, ProgramBuilder, ProgramIr, RelocationTarget, RemovedImportIr,
@@ -363,8 +363,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             let package_name = self.packages.name(package);
             let owner = namespace_ids[package_name].namespace;
-            let names = match self.namespace_imports[&package].names() {
-                Ok(names) => names,
+            let table = &self.namespace_imports[&package];
+            let (names, records) = match table
+                .names()
+                .and_then(|names| Ok((names, table.records()?)))
+            {
+                Ok(resolved) => resolved,
                 Err(unknown) => {
                     issues.push(FinalizationIssue::UnknownImportAll {
                         package: package_name.to_owned(),
@@ -405,7 +409,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some((BindingName::from(local), slot))
                 })
                 .collect();
-            builder.set_imports(owner, imports);
+            let import_records = records
+                .into_iter()
+                .map(|record| ImportRecordIr {
+                    package: record.package.into(),
+                    names: record
+                        .names
+                        .into_iter()
+                        .map(|(local, remote)| (local.into(), remote.into()))
+                        .collect(),
+                })
+                .collect();
+            builder.set_imports(owner, imports, import_records);
         }
         namespace_dependencies
     }

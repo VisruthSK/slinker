@@ -79,13 +79,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for import in &image.index.imports {
             match import {
                 ImportSpec::From { package, bindings } => {
-                    for binding in bindings {
-                        imports.add_import_from(
-                            binding.local.as_str(),
-                            package.as_str(),
-                            binding.remote.as_str(),
-                        );
-                    }
+                    imports.add_import_from(
+                        package.as_str(),
+                        bindings
+                            .iter()
+                            .map(|binding| (binding.local.to_string(), binding.remote.to_string())),
+                    );
                 }
                 ImportSpec::All {
                     package: package_name,

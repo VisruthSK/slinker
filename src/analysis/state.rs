@@ -1123,6 +1123,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.record_non_reflective_namespace_uses(expression);
             self.process_calls(site, parsed, expression)?;
             self.process_namespace_info_reads(site, expression);
+            self.process_namespace_enumerations(site, expression);
             self.process_effects(site, expression)?;
         }
         Ok(())
@@ -1392,6 +1393,33 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         read.span.clone(),
                     );
                 }
+            }
+        }
+    }
+
+    fn process_namespace_enumerations(
+        &mut self,
+        site: ParsedSite<'_>,
+        expression: &ParsedExpression,
+    ) {
+        for enumeration in &expression.namespace_enumerations {
+            let linked = self
+                .known_package(&enumeration.package)
+                .is_some_and(|package| {
+                    self.packages.role(package) == crate::package::PackageRole::Linked
+                });
+            if linked {
+                self.diagnostic(
+                    site.node,
+                    site.package,
+                    Some(site.binding),
+                    RejectCode::UnsupportedRootTransformation,
+                    format!(
+                        "{}() reads every binding of the synthetic `{}` namespace, which holds stubs for bindings the build never reached",
+                        enumeration.callee, enumeration.package
+                    ),
+                    Some(enumeration.span.clone()),
+                );
             }
         }
     }
@@ -2404,19 +2432,17 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         Ok(())
     }
 
-    fn namespace_metadata_query(
+    fn namespace_info_query(
         &mut self,
         from: NodeId,
         current: PackageId,
         binding: &str,
         call: &CallSite,
     ) -> Result<()> {
-        if call.callee == "getNamespaceInfo"
-            && !matches!(
-                matched_static_arg(call, &["ns", "which"], "which"),
-                Some(StaticArg::String(field)) if matches!(field.as_str(), "imports" | "path" | "dynlibs" | "S3methods")
-            )
-        {
+        if !matches!(
+            matched_static_arg(call, &["ns", "which"], "which"),
+            Some(StaticArg::String(field)) if field == "path"
+        ) {
             return self.namespace_argument(from, current, binding, call, &["ns", "which"], "ns");
         }
         match matched_static_arg(call, &["ns", "which"], "ns") {
@@ -2429,7 +2455,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                         current,
                         Some(binding),
                         RejectCode::UnsupportedRootTransformation,
-                        format!("{}() reads metadata that the synthetic `{name}` namespace does not reproduce", call.callee),
+                        format!("{}() reads the installed path, which the synthetic `{name}` namespace does not have", call.callee),
                         Some(call.span.clone()),
                     );
                 }
@@ -3072,8 +3098,11 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     NamespaceCall::Operation(NamespaceOperation::As),
                 )?;
             }
-            "getNamespaceImports" | "getNamespaceInfo" => {
-                self.namespace_metadata_query(from, current, binding, call)?;
+            "getNamespaceImports" => {
+                self.namespace_argument(from, current, binding, call, &["ns"], "ns")?;
+            }
+            "getNamespaceInfo" => {
+                self.namespace_info_query(from, current, binding, call)?;
             }
             "getExportedValue" => {
                 self.namespace_argument(from, current, binding, call, &["ns", "name"], "ns")?;
@@ -3784,9 +3813,12 @@ pub(super) fn is_r_constant(name: &str) -> bool {
 }
 
 /// Whether reading `field` of a `.__NAMESPACE__.` environment observes what a synthetic Linked
-/// namespace reproduces: its spec and its export table.
+/// namespace reproduces: its spec, export table, imports, dynlibs, and S3 methods.
 fn reproduces_namespace_info(field: Option<&str>) -> bool {
-    matches!(field, Some("exports" | "spec"))
+    matches!(
+        field,
+        Some("exports" | "spec" | "imports" | "dynlibs" | "S3methods")
+    )
 }
 
 /// The run-time name a base binding-creation call can bind, when `call` is one.

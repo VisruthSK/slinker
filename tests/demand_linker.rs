@@ -1592,6 +1592,7 @@ fn registered_native_symbol_is_not_an_unresolved_r_binding() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: Some(NativeRegistration {
                 prefix: "c".into(),
                 suffix: String::new(),
@@ -1623,6 +1624,7 @@ fn registered_native_symbol_is_not_an_unresolved_r_binding() {
 fn opaque_registered_component() -> NativeComponent {
     NativeComponent {
         name: "root".into(),
+        alias: String::new(),
         registration: Some(NativeRegistration {
             prefix: String::new(),
             suffix: String::new(),
@@ -1792,6 +1794,7 @@ fn named_opaque_native_selector_is_matched_by_formal_name() {
 fn string_native_selector_matches_routine_symbol_not_r_binding() {
     let component = NativeComponent {
         name: "root".into(),
+        alias: String::new(),
         registration: Some(NativeRegistration {
             prefix: "c".into(),
             suffix: String::new(),
@@ -1840,6 +1843,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: None,
             symbols: vec![NativeSymbolBinding {
                 binding: "croot_f".into(),
@@ -1879,6 +1883,7 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: Some(NativeRegistration {
                 prefix: "c".into(),
                 suffix: String::new(),
@@ -1928,6 +1933,7 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: Some(NativeRegistration {
                 prefix: String::new(),
                 suffix: String::new(),
@@ -1975,6 +1981,7 @@ fn native_activation_keeps_component_without_widening_r_bindings() {
         Vec::new(),
         vec![NativeComponent {
             name: "foo".into(),
+            alias: String::new(),
             registration: None,
             symbols: Vec::new(),
             library: NativeLibrary::Missing,
@@ -2011,6 +2018,7 @@ fn known_native_callback_adds_binding_edge() {
         Vec::new(),
         vec![NativeComponent {
             name: "foo".into(),
+            alias: String::new(),
             registration: None,
             symbols: Vec::new(),
             library: NativeLibrary::Missing,
@@ -2055,6 +2063,7 @@ fn declared_callables_link_a_native_callback_parameter() {
             Vec::new(),
             vec![NativeComponent {
                 name: "root".into(),
+                alias: String::new(),
                 registration: Some(NativeRegistration {
                     prefix: String::new(),
                     suffix: String::new(),
@@ -2109,6 +2118,7 @@ fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: Some(NativeRegistration {
                 prefix: String::new(),
                 suffix: String::new(),
@@ -2167,6 +2177,7 @@ fn native_summary_accepts_oak_proven_local_closure_callback() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: Some(NativeRegistration {
                 prefix: String::new(),
                 suffix: String::new(),
@@ -2226,6 +2237,7 @@ fn native_callback_positions_ignore_named_package_and_match_named_selector() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: Some(NativeRegistration {
                 prefix: String::new(),
                 suffix: String::new(),
@@ -2268,6 +2280,7 @@ fn summarized_native_callbacks_are_not_global_component_roots() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: Some(NativeRegistration {
                 prefix: String::new(),
                 suffix: String::new(),
@@ -2301,6 +2314,7 @@ fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
         Vec::new(),
         vec![NativeComponent {
             name: "root".into(),
+            alias: String::new(),
             registration: Some(NativeRegistration {
                 prefix: String::new(),
                 suffix: String::new(),
@@ -2345,6 +2359,7 @@ fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
         Vec::new(),
         vec![NativeComponent {
             name: "foo".into(),
+            alias: String::new(),
             registration: None,
             symbols: Vec::new(),
             library: NativeLibrary::Missing,
@@ -2496,7 +2511,11 @@ fn synthetic_namespace_metadata_reads_block_for_linked_packages() {
     assert!(blocked(&analyze(
         "f <- function() { dep::x(); getNamespaceInfo('dep', 'path') }"
     )));
-    assert!(blocked(&analyze(
+    for field in ["imports", "dynlibs", "S3methods"] {
+        let source = format!("f <- function() {{ dep::x(); getNamespaceInfo('dep', '{field}') }}");
+        assert!(!blocked(&analyze(&source)), "{field}");
+    }
+    assert!(!blocked(&analyze(
         "f <- function() { dep::x(); getNamespaceImports('dep') }"
     )));
     assert!(!blocked(&analyze(
@@ -2895,6 +2914,9 @@ fn namespace_info_reads_accept_only_reproduced_fields() {
         .to_vec()
     };
     for accepted in [
+        "f <- function() asNamespace('dep')$.__NAMESPACE__.$imports",
+        "f <- function() .__NAMESPACE__.$dynlibs",
+        "f <- function(ns) ns$.__NAMESPACE__.$S3methods",
         "f <- function() asNamespace('dep')$.__NAMESPACE__.$exports",
         "f <- function() .__NAMESPACE__.$exports",
         "f <- function() .__NAMESPACE__.$spec",
@@ -2904,9 +2926,8 @@ fn namespace_info_reads_accept_only_reproduced_fields() {
         assert!(blockers.is_empty(), "{accepted}: {blockers:?}");
     }
     for blocked in [
-        "f <- function() asNamespace('dep')$.__NAMESPACE__.$imports",
-        "f <- function() .__NAMESPACE__.$imports",
-        "f <- function(ns) ns$.__NAMESPACE__.$imports",
+        "f <- function() asNamespace('dep')$.__NAMESPACE__.$path",
+        "f <- function() .__NAMESPACE__.$path",
         "f <- function(ns) ns[['.__NAMESPACE__.']]$path",
     ] {
         let blockers = linked(blocked);
@@ -5168,4 +5189,53 @@ fn rlang_package_queries_on_a_linked_package_are_rewritten() {
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
     );
+}
+
+#[test]
+fn enumerating_a_linked_namespace_blocks_but_targeted_lookup_does_not() {
+    let analyze = |source: &str| {
+        let root = package("root", &[("f", Some(source))]);
+        let dep = package(
+            "dep",
+            &[
+                ("x", Some("x <- function() 1")),
+                ("unused", Some("unused <- function() 2")),
+            ],
+        );
+        Linker::new(FakeProvider::new(vec![root, dep]), 1)
+            .analyze("root")
+            .unwrap()
+    };
+    let enumeration_blocked = |source: &str| {
+        analyze(source).blockers().iter().any(|diagnostic| {
+            diagnostic.code == RejectCode::UnsupportedRootTransformation
+                && diagnostic.message.contains("reads every binding")
+        })
+    };
+
+    for blocked in [
+        "f <- function() as.list(asNamespace('dep'))",
+        "f <- function() as.list(x = base::getNamespace('dep'))",
+        "f <- function() as.list.environment(asNamespace('dep'), all.names = TRUE)",
+        "f <- function() mget(ls(asNamespace('dep')), asNamespace('dep'))",
+        "f <- function() mget(c('x', 'unused'), envir = asNamespace('dep'))",
+        "f <- function() eapply(asNamespace('dep'), identity)",
+        "f <- function() eapply(FUN = identity, env = asNamespace('dep'))",
+        "f <- function() { ns <- asNamespace('dep'); as.list(ns) }",
+        "f <- function() { ns <- asNamespace('dep'); mget(ls(ns), ns) }",
+        "f <- function() { ns <- asNamespace('dep'); eapply(ns, identity) }",
+    ] {
+        assert!(enumeration_blocked(blocked), "{blocked}");
+    }
+    for accepted in [
+        "f <- function() asNamespace('dep')$x()",
+        "f <- function() { dep::x(); get('x', envir = asNamespace('dep'))() }",
+        "f <- function() as.list(asNamespace('dep')$x)",
+        "f <- function() as.list(ls(asNamespace('dep')))",
+        "f <- function() as.list(c(1, 2))",
+        "f <- function(env) { dep::x(); as.list(env) }",
+        "f <- function() { dep::x(); mget('a', envir = environment()) }",
+    ] {
+        assert!(!enumeration_blocked(accepted), "{accepted}");
+    }
 }

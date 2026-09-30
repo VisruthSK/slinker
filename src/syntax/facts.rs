@@ -291,6 +291,8 @@ pub struct ParsedExpression {
     pub construction: Vec<ConstructionExpr>,
     #[serde(default)]
     pub namespace_info_reads: Vec<NamespaceInfoRead>,
+    #[serde(default)]
+    pub namespace_enumerations: Vec<NamespaceEnumeration>,
 }
 
 /// A read of a namespace's `.__NAMESPACE__.` information environment, with the field extracted
@@ -299,6 +301,13 @@ pub struct ParsedExpression {
 pub struct NamespaceInfoRead {
     pub receiver: NamespaceInfoReceiver,
     pub field: Option<String>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceEnumeration {
+    pub package: String,
+    pub callee: String,
     pub span: Span,
 }
 

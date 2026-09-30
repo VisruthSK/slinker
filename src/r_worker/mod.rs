@@ -661,9 +661,12 @@ fn worker_package_index(
 
     let native_routines = field(&namespace, "nativeRoutines")?;
     let root = string_field(context, "root")?;
-    let dynlibs = strings_field(&namespace, "dynlibs")?
+    let installed_dynlibs = field(&namespace, "dynlibs")?;
+    let aliases = names(installed_dynlibs.sexp);
+    let dynlibs = Vec::<String>::try_from(&installed_dynlibs)?
         .into_iter()
-        .map(|name| {
+        .enumerate()
+        .map(|(position, name)| {
             let compiled = harp::RFunction::new("", ".slinker_native_library")
                 .add(root.as_str())
                 .add(name.as_str())
@@ -693,6 +696,7 @@ fn worker_package_index(
                 bindings.clone_from(&symbols);
             }
             Ok(NativeComponent {
+                alias: aliases.get(position).cloned().unwrap_or_default(),
                 name,
                 registration: registered.then(|| NativeRegistration {
                     prefix: fixes.first().cloned().unwrap_or_default(),

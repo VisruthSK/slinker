@@ -85,6 +85,7 @@ pub struct NativeSymbolBinding {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeComponent {
     pub name: String,
+    pub alias: String,
     pub registration: Option<NativeRegistration>,
     pub symbols: Vec<NativeSymbolBinding>,
     pub library: NativeLibrary,

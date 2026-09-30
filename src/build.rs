@@ -510,12 +510,18 @@ fn generate_r_source(
                 .join(", ");
             emit!(
                 out,
-                "    .slinker_load_native(ns, {}, {}, {}, c({symbols}))",
+                "    .slinker_load_native(ns, {}, {}, {}, {}, c({symbols}))",
                 r_string(name),
                 r_string(&native.name),
+                r_string(&native.alias),
                 r_string(library)
             );
         }
+        emit!(
+            out,
+            "    setNamespaceInfo(ns, \"imports\", {})",
+            imports_info(namespace)
+        );
         for (local, slot) in &namespace.imports {
             match slot {
                 ImportSlotIr::Bound(target) => emit!(
@@ -549,9 +555,10 @@ fn generate_r_source(
         }
         emit!(
             out,
-            "    .slinker_activate(ns, {}, {}, {}, {})\n  }})",
+            "    .slinker_activate(ns, {}, {}, {}, {}, {})\n  }})",
             r_vector(activation.exports.names().iter().map(BindingName::as_str)),
-            s3_matrix(program, &namespace.s3_registrations),
+            s3_matrix(program, &namespace.s3_registrations, S3Column4::Registry),
+            s3_matrix(program, &namespace.s3_registrations, S3Column4::Original),
             r_vector(activation.removed_bindings.iter().map(BindingName::as_str)),
             if activation.on_load.is_some() {
                 "TRUE"
@@ -581,9 +588,9 @@ fn generate_r_source(
     if !activated_s3.is_empty() {
         emit!(
             out,
-            "  registerS3methods({}, {}, root)",
-            s3_matrix(program, activated_s3),
-            r_string(&program.package(root.package).identity().name)
+            "  .slinker_register_s3(root, {}, {})",
+            s3_matrix(program, activated_s3, S3Column4::Registry),
+            s3_matrix(program, activated_s3, S3Column4::Original)
         );
     }
     out.push_str("  .slinker_unregister()\n");
@@ -764,7 +771,17 @@ fn namespace_expression(program: &ProgramIr, package: PackageId) -> String {
     }
 }
 
-fn s3_matrix(program: &ProgramIr, registrations: &[crate::ir::S3RegistrationId]) -> String {
+#[derive(Clone, Copy)]
+enum S3Column4 {
+    Registry,
+    Original,
+}
+
+fn s3_matrix(
+    program: &ProgramIr,
+    registrations: &[crate::ir::S3RegistrationId],
+    column4: S3Column4,
+) -> String {
     let rows = registrations
         .iter()
         .map(|registration| program.s3_registration(*registration))
@@ -779,13 +796,43 @@ fn s3_matrix(program: &ProgramIr, registrations: &[crate::ir::S3RegistrationId])
         )
         .chain(rows.iter().map(|row| match &row.generic.home {
             GenericHome::Lexical => "NA_character_".to_owned(),
-            GenericHome::Program(package) => {
-                r_string(program.package(*package).registered_namespace().as_str())
-            }
+            GenericHome::Program(package) => match column4 {
+                S3Column4::Registry => {
+                    r_string(program.package(*package).registered_namespace().as_str())
+                }
+                S3Column4::Original => r_string(&program.package(*package).identity().name),
+            },
             GenericHome::Optional(package) => r_string(package),
         }))
         .collect::<Vec<_>>();
     format!("matrix(as.character(c({})), ncol = 4L)", cells.join(", "))
+}
+
+fn imports_info(namespace: &crate::ir::Namespace) -> String {
+    let records = namespace.import_records.iter().map(|record| {
+        let locals = record
+            .names
+            .iter()
+            .map(|(local, _)| local)
+            .map(|local| r_string(local))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remotes = record
+            .names
+            .iter()
+            .map(|(_, remote)| remote)
+            .map(|remote| r_string(remote))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{} = structure(as.character(c({remotes})), names = as.character(c({locals})))",
+            r_string(&record.package)
+        )
+    });
+    let entries = std::iter::once("base = TRUE".to_owned())
+        .chain(records)
+        .collect::<Vec<_>>();
+    format!("list({})", entries.join(", "))
 }
 
 fn r_vector<'a>(values: impl Iterator<Item = &'a str>) -> String {
@@ -1034,19 +1081,20 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
   setNamespaceInfo(namespace, "exports", new.env(hash = TRUE, parent = baseenv()))
   setNamespaceInfo(namespace, "imports", list(base = TRUE))
   setNamespaceInfo(namespace, "path", "")
-  setNamespaceInfo(namespace, "dynlibs", NULL)
+  setNamespaceInfo(namespace, "dynlibs", character())
   setNamespaceInfo(namespace, "DLLs", list())
   setNamespaceInfo(namespace, "S3methods", matrix(NA_character_, 0L, 4L))
   namespace$.__S3MethodsTable__. <- new.env(hash = TRUE, parent = baseenv())
   .Internal(registerNamespace(key, namespace))
   namespace
 }
-.slinker_load_native <- function(namespace, package, component, library, symbols) {
+.slinker_load_native <- function(namespace, package, component, alias, library, symbols) {
   path <- system.file("slinker", "resources", package, library, package = .slinker_root_package, mustWork = TRUE)
   dll <- dyn.load(path, local = TRUE)
   dlls <- getNamespaceInfo(namespace, "DLLs")
   dlls[[component]] <- dll
   setNamespaceInfo(namespace, "DLLs", dlls)
+  setNamespaceInfo(namespace, "dynlibs", c(getNamespaceInfo(namespace, "dynlibs"), structure(component, names = alias)))
   for (binding in names(symbols)) {
     assign(binding, getNativeSymbolInfo(symbols[[binding]], dll), envir = namespace)
   }
@@ -1061,9 +1109,14 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
     stop(sprintf("`%s::%s` was removed by slinker because the build never reached it", package, binding), call. = FALSE)
   }, envir)
 }
-.slinker_activate <- function(namespace, exports, s3, removed, on_load) {
+.slinker_register_s3 <- function(namespace, s3, s3_info) {
+  previous <- getNamespaceInfo(namespace, "S3methods")
+  registerS3methods(s3, unname(getNamespaceName(namespace)), namespace)
+  setNamespaceInfo(namespace, "S3methods", rbind(s3_info, previous))
+}
+.slinker_activate <- function(namespace, exports, s3, s3_info, removed, on_load) {
   name <- unname(getNamespaceName(namespace))
-  if (nrow(s3)) registerS3methods(s3, name, namespace)
+  if (nrow(s3)) .slinker_register_s3(namespace, s3, s3_info)
   if (on_load) get(".onLoad", envir = namespace, inherits = FALSE)("", name)
   for (binding in removed[!vapply(removed, exists, logical(1), envir = namespace, inherits = FALSE)]) {
     .slinker_stub(namespace, binding, name, binding)

@@ -198,8 +198,15 @@ pub struct Namespace {
     pub package: PackageId,
     pub bindings: BTreeMap<BindingName, BindingId>,
     pub imports: BTreeMap<BindingName, ImportSlotIr>,
+    pub import_records: Vec<ImportRecordIr>,
     pub state: LinkNamespaceState,
     pub s3_registrations: Vec<S3RegistrationId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportRecordIr {
+    pub package: PackageName,
+    pub names: Vec<(BindingName, BindingName)>,
 }
 
 /// What one name of a namespace's imports environment holds.
@@ -894,6 +901,7 @@ impl ProgramBuilder {
             package,
             bindings: bindings.clone(),
             imports: BTreeMap::new(),
+            import_records: Vec::new(),
             state: match role {
                 MaterializedRole::Root => LinkNamespaceState::Root(state),
                 MaterializedRole::Linked => LinkNamespaceState::Linked(state),
@@ -928,6 +936,7 @@ impl ProgramBuilder {
             package,
             bindings: slots.clone(),
             imports: BTreeMap::new(),
+            import_records: Vec::new(),
             state: LinkNamespaceState::External { package },
             s3_registrations: Vec::new(),
         });
@@ -1079,8 +1088,11 @@ impl ProgramBuilder {
         &mut self,
         namespace: NamespaceId,
         imports: BTreeMap<BindingName, ImportSlotIr>,
+        import_records: Vec<ImportRecordIr>,
     ) {
-        self.namespaces[namespace.index()].imports = imports;
+        let namespace = &mut self.namespaces[namespace.index()];
+        namespace.imports = imports;
+        namespace.import_records = import_records;
     }
 
     pub fn payload_bundle(&self, namespace: NamespaceId) -> Option<PayloadBundleId> {

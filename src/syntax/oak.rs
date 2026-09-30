@@ -14,9 +14,9 @@ use crate::syntax::facts::{
     ActiveBindingDef, BindingDeclaration, CallSite, CalleeKind, ConstructionArgument,
     ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredCallable,
     DeclaredDomain, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind,
-    NamespaceInfoRead, NamespaceInfoReceiver, PackageGuard, PackageRef, ParsedExpression,
-    ParsedRFile, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg,
-    StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    NamespaceEnumeration, NamespaceInfoRead, NamespaceInfoReceiver, PackageGuard, PackageRef,
+    ParsedExpression, ParsedRFile, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind,
+    StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use crate::{Error, Result};
@@ -83,9 +83,8 @@ const IMPORT_ALL_EXCLUDED: [&str; 10] = [
 #[derive(Debug, Clone)]
 enum NamespaceImport {
     From {
-        local: String,
         package: String,
-        remote: String,
+        bindings: Vec<(String, String)>,
     },
     All {
         package: String,
@@ -109,6 +108,12 @@ pub(crate) struct ImportedBinding {
     pub(crate) binding: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportRecord {
+    pub(crate) package: String,
+    pub(crate) names: Vec<(String, String)>,
+}
+
 /// Immutable NAMESPACE import-resolution table.
 ///
 /// Imports keep their installed order and a later import of a name replaces an
@@ -123,14 +128,12 @@ pub(crate) struct NamespaceImports {
 impl NamespaceImports {
     pub(crate) fn add_import_from(
         &mut self,
-        local: impl Into<String>,
         package: impl Into<String>,
-        remote: impl Into<String>,
+        bindings: impl IntoIterator<Item = (String, String)>,
     ) {
         self.imports.push(NamespaceImport::From {
-            local: local.into(),
             package: package.into(),
-            remote: remote.into(),
+            bindings: bindings.into_iter().collect(),
         });
     }
 
@@ -150,18 +153,17 @@ impl NamespaceImports {
     pub(crate) fn resolve(&self, name: &str) -> NamespaceImportResolution {
         for import in self.imports.iter().rev() {
             match import {
-                NamespaceImport::From {
-                    local,
-                    package,
-                    remote,
-                } if local == name => {
-                    return NamespaceImportResolution::Imported {
-                        package: package.clone(),
-                        binding: remote.clone(),
-                        effect_name: remote.clone(),
-                    };
+                NamespaceImport::From { package, bindings } => {
+                    if let Some((_, remote)) =
+                        bindings.iter().rev().find(|(local, _)| local == name)
+                    {
+                        return NamespaceImportResolution::Imported {
+                            package: package.clone(),
+                            binding: remote.clone(),
+                            effect_name: remote.clone(),
+                        };
+                    }
                 }
-                NamespaceImport::From { .. } => {}
                 NamespaceImport::All {
                     package,
                     exports,
@@ -199,18 +201,16 @@ impl NamespaceImports {
         let mut names = BTreeMap::new();
         for import in &self.imports {
             match import {
-                NamespaceImport::From {
-                    local,
-                    package,
-                    remote,
-                } => {
-                    names.insert(
-                        local.clone(),
-                        ImportedBinding {
-                            package: package.clone(),
-                            binding: remote.clone(),
-                        },
-                    );
+                NamespaceImport::From { package, bindings } => {
+                    for (local, remote) in bindings {
+                        names.insert(
+                            local.clone(),
+                            ImportedBinding {
+                                package: package.clone(),
+                                binding: remote.clone(),
+                            },
+                        );
+                    }
                 }
                 NamespaceImport::All {
                     package,
@@ -233,6 +233,33 @@ impl NamespaceImports {
             }
         }
         Ok(names)
+    }
+
+    pub(crate) fn records(&self) -> std::result::Result<Vec<ImportRecord>, &str> {
+        self.imports
+            .iter()
+            .map(|import| match import {
+                NamespaceImport::From { package, bindings } => Ok(ImportRecord {
+                    package: package.clone(),
+                    names: bindings.clone(),
+                }),
+                NamespaceImport::All {
+                    package,
+                    exports,
+                    except,
+                } => {
+                    let exports = exports.as_ref().ok_or(package.as_str())?;
+                    Ok(ImportRecord {
+                        package: package.clone(),
+                        names: exports
+                            .keys()
+                            .filter(|name| NamespaceImport::imports_from_all(except, name))
+                            .map(|name| (name.clone(), name.clone()))
+                            .collect(),
+                    })
+                }
+            })
+            .collect()
     }
 }
 
@@ -277,7 +304,8 @@ impl OakParseContext {
         package: impl Into<String>,
         remote: impl Into<String>,
     ) {
-        self.imports.add_import_from(local, package, remote);
+        self.imports
+            .add_import_from(package, [(local.into(), remote.into())]);
     }
 
     fn origin(&self, name: &str) -> ExternalNameOrigin {
@@ -933,8 +961,16 @@ fn translate_index(
     guard_regions.extend(hook_regions);
 
     let resource_refs = collect_resources(source, context, &live_calls);
-    let active_bindings =
-        collect_active_bindings(source, text, context, index, &live_calls, &if_regions);
+    let environment_aliases = collect_environment_aliases(text, context, index, &live_calls);
+    let active_bindings = collect_active_bindings(
+        source,
+        context,
+        &live_calls,
+        &environment_aliases,
+        &if_regions,
+    );
+    let namespace_enumerations =
+        collect_namespace_enumerations(source, context, &live_calls, &environment_aliases);
     let (mut effects, suppressed_reference_spans) = collect_superassignments(
         source,
         text,
@@ -967,6 +1003,7 @@ fn translate_index(
             effects,
             construction,
             namespace_info_reads,
+            namespace_enumerations,
         }],
         issues,
         scope_parents: scopes.parents,
@@ -3590,13 +3627,11 @@ fn collect_resources(
 
 fn collect_active_bindings(
     source: SourceId,
-    text: &str,
     context: &OakParseContext,
-    index: &SemanticIndex,
     calls: &[LiveCall],
+    aliases: &BTreeMap<String, StaticEnvironment>,
     if_regions: &[IfRegion],
 ) -> Vec<ActiveBindingDef> {
-    let aliases = collect_environment_aliases(text, context, index, calls);
     let mut bindings = Vec::new();
 
     for call in calls {
@@ -3614,7 +3649,7 @@ fn collect_active_bindings(
         let Some(target_argument) = call.raw.args.get(2) else {
             continue;
         };
-        let target = environment_target(context, calls, target_argument, &aliases);
+        let target = environment_target(context, calls, target_argument, aliases);
         let Some(target) = target else {
             continue;
         };
@@ -3654,25 +3689,20 @@ fn collect_environment_aliases(
             else {
                 continue;
             };
-            let Some(environment_call) = calls.iter().find(|call| {
-                call.site.callee == "environment"
-                    && is_base_call(context, &call.site)
-                    && TextRange::new(value_start, value_end).contains_range(call.site.span.range())
-            }) else {
-                continue;
-            };
-            let Some(StaticArg::Symbol(binding)) = environment_call
-                .raw
-                .args
-                .first()
-                .and_then(|argument| argument.static_arg.as_ref())
+            let value = TextRange::new(value_start, value_end);
+            let Some(target) = calls
+                .iter()
+                .find(|call| {
+                    call.site.callee == "environment"
+                        && is_base_call(context, &call.site)
+                        && value.contains_range(call.site.span.range())
+                })
+                .or_else(|| calls.iter().find(|call| call.site.span.range() == value))
+                .and_then(|call| static_environment(context, call))
             else {
                 continue;
             };
-            aliases.insert(
-                name.to_owned(),
-                StaticEnvironment::ClosureBinding(binding.clone()),
-            );
+            aliases.insert(name.to_owned(), target);
         }
     }
     aliases
@@ -3693,32 +3723,96 @@ fn environment_target(
     let nested = calls
         .iter()
         .find(|call| argument.value.contains_range(call.site.span.range()))?;
-    if nested.site.callee == "asNamespace" && is_base_call(context, &nested.site) {
-        return nested
-            .raw
-            .args
-            .first()
-            .and_then(|argument| match argument.static_arg.as_ref() {
-                Some(StaticArg::String(package)) => {
-                    Some(StaticEnvironment::Namespace(package.clone()))
-                }
-                _ => None,
-            });
-    }
-    if nested.site.callee == "environment" && is_base_call(context, &nested.site) {
-        return nested
-            .raw
-            .args
-            .first()
-            .and_then(|argument| match argument.static_arg.as_ref() {
-                Some(StaticArg::Symbol(binding)) => {
-                    Some(StaticEnvironment::ClosureBinding(binding.clone()))
-                }
-                _ => None,
-            });
-    }
+    static_environment(context, nested)
+}
 
-    None
+fn static_environment(context: &OakParseContext, call: &LiveCall) -> Option<StaticEnvironment> {
+    if !is_base_call(context, &call.site) {
+        return None;
+    }
+    match (
+        call.site.callee.as_str(),
+        call.raw.args.first()?.static_arg.as_ref()?,
+    ) {
+        ("asNamespace" | "getNamespace", StaticArg::String(package)) => {
+            Some(StaticEnvironment::Namespace(package.clone()))
+        }
+        ("environment", StaticArg::Symbol(binding)) => {
+            Some(StaticEnvironment::ClosureBinding(binding.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn enumerated_environment_formals(callee: &str) -> Option<(&'static [&'static str], &'static str)> {
+    match callee {
+        "as.list" | "as.list.environment" => Some((&["x"], "x")),
+        "mget" => Some((&["x", "envir"], "envir")),
+        "eapply" => Some((&["env"], "env")),
+        _ => None,
+    }
+}
+
+fn formal_argument<'a>(
+    call: &'a RawCall,
+    formals: &[&str],
+    target: &str,
+) -> Option<&'a RawArgument> {
+    if let Some(named) = call
+        .args
+        .iter()
+        .find(|argument| argument.name.as_deref() == Some(target))
+    {
+        return Some(named);
+    }
+    let position = formals.iter().position(|formal| *formal == target)?;
+    let earlier_named = formals[..position]
+        .iter()
+        .filter(|formal| {
+            call.args
+                .iter()
+                .any(|argument| argument.name.as_deref() == Some(**formal))
+        })
+        .count();
+    call.args
+        .iter()
+        .filter(|argument| argument.name.is_none())
+        .nth(position - earlier_named)
+}
+
+fn collect_namespace_enumerations(
+    source: SourceId,
+    context: &OakParseContext,
+    calls: &[LiveCall],
+    aliases: &BTreeMap<String, StaticEnvironment>,
+) -> Vec<NamespaceEnumeration> {
+    let mut enumerations = Vec::new();
+    for call in calls {
+        let Some((formals, target)) = enumerated_environment_formals(&call.site.callee) else {
+            continue;
+        };
+        if !is_base_call(context, &call.site) {
+            continue;
+        }
+        let Some(argument) = formal_argument(&call.raw, formals, target) else {
+            continue;
+        };
+        let environment = match &argument.static_arg {
+            Some(StaticArg::Symbol(name)) => aliases.get(name).cloned(),
+            _ => calls
+                .iter()
+                .find(|nested| nested.site.span.range() == argument.value)
+                .and_then(|nested| static_environment(context, nested)),
+        };
+        if let Some(StaticEnvironment::Namespace(package)) = environment {
+            enumerations.push(NamespaceEnumeration {
+                package,
+                callee: call.site.callee.clone(),
+                span: Span::new(source, call.site.span.start, call.site.span.end),
+            });
+        }
+    }
+    enumerations
 }
 
 fn collect_superassignments(
@@ -6059,8 +6153,11 @@ mod tests {
     #[test]
     fn later_import_from_replaces_an_earlier_one() {
         let mut imports = NamespaceImports::default();
-        imports.add_import_from("target", "first", "first_target");
-        imports.add_import_from("target", "second", "second_target");
+        imports.add_import_from("first", [("target".to_owned(), "first_target".to_owned())]);
+        imports.add_import_from(
+            "second",
+            [("target".to_owned(), "second_target".to_owned())],
+        );
 
         assert_eq!(
             imports.resolve("target"),
@@ -6075,7 +6172,7 @@ mod tests {
     #[test]
     fn later_import_all_replaces_an_earlier_import_from() {
         let mut imports = NamespaceImports::default();
-        imports.add_import_from("target", "first", "target");
+        imports.add_import_from("first", [("target".to_owned(), "target".to_owned())]);
         imports.add_import_all(
             "later",
             Some(BTreeMap::from([

@@ -991,8 +991,8 @@ fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
         &linked_source,
         "tinyc",
         "",
-        "useDynLib(tinyc, .registration = TRUE, .fixes = \"C_\")\nexport(by_name, by_symbol, same_copy)\n",
-        "by_name <- function() .Call(\"tinyc_tick\", PACKAGE = \"tinyc\")\nby_symbol <- function() .Call(C_tinyc_tick)\nsame_copy <- function() identical(getNativeSymbolInfo(\"tinyc_tick\", \"tinyc\")$dll[[\"path\"]], C_tinyc_tick$dll[[\"path\"]])\n",
+        "useDynLib(tinyc, .registration = TRUE, .fixes = \"C_\")\nexport(by_name, by_symbol, same_copy, loaded_libraries)\n",
+        "by_name <- function() .Call(\"tinyc_tick\", PACKAGE = \"tinyc\")\nby_symbol <- function() .Call(C_tinyc_tick)\nsame_copy <- function() identical(getNativeSymbolInfo(\"tinyc_tick\", \"tinyc\")$dll[[\"path\"]], C_tinyc_tick$dll[[\"path\"]])\nloaded_libraries <- function() getNamespaceInfo('tinyc', 'dynlibs')\n",
     );
     fs::create_dir_all(linked_source.join("src")).expect("src directory");
     fs::write(
@@ -1009,7 +1009,7 @@ fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
         &root_source,
         "nativeroot",
         "Imports: tinyc\n",
-        "importFrom(tinyc, by_name, by_symbol, same_copy)\nexport(ticks, same_copy)\n",
+        "importFrom(tinyc, by_name, by_symbol, same_copy, loaded_libraries)\nexport(ticks, same_copy, loaded_libraries)\n",
         "ticks <- function() c(by_name(), by_symbol(), by_name())\n",
     );
     let output = fixture.path().join("generated-nativeroot");
@@ -1047,7 +1047,7 @@ fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
     .expect("audited native summary: tinyc.c makes no R callbacks");
     assert_success(&build(Some(&summaries)), "slinker build native fixture");
 
-    let behavior = "library(nativeroot); stopifnot(identical(ticks(), 1:3), isTRUE(same_copy()))";
+    let behavior = "library(nativeroot); stopifnot(identical(ticks(), 1:3), isTRUE(same_copy()), identical(loaded_libraries(), structure('tinyc', names = '')))";
     let original = fixture.path().join("original");
     fs::create_dir(&original).expect("original library");
     install_package(&r_home, &linked_source, &original);
@@ -1069,7 +1069,7 @@ fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
         &r_home,
         &installed,
         &format!(
-            "library(nativeroot); loadNamespace('tinyc'); {tick_real}; stopifnot(identical(ticks(), 1:3), isTRUE(same_copy()))"
+            "library(nativeroot); loadNamespace('tinyc'); {tick_real}; stopifnot(identical(ticks(), 1:3), isTRUE(same_copy()), identical(loaded_libraries(), structure('tinyc', names = '')))"
         ),
     );
 }
@@ -1440,4 +1440,147 @@ fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &s
     .expect("DESCRIPTION");
     fs::write(root.join("NAMESPACE"), namespace).expect("NAMESPACE");
     fs::write(root.join("R/code.R"), code).expect("R code");
+}
+
+#[test]
+fn linked_namespace_information_reports_the_original_imports_and_s3_methods() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let generic_source = fixture.path().join("infogen");
+    write_package(
+        &generic_source,
+        "infogen",
+        "",
+        "export(gen)\n",
+        "gen <- function(x) UseMethod('gen')\n",
+    );
+    let dependency_source = fixture.path().join("infodep");
+    write_package(
+        &dependency_source,
+        "infodep",
+        "Imports: infogen\n",
+        "import(infogen)\nimportFrom(stats, setNames, median)\nimportFrom(utils, head)\nS3method(gen, eager)\nS3method(infogen::gen, delayed)\nS3method(print, infodep)\nexport(report)\n",
+        "gen.eager <- function(x) 'eager'\ngen.delayed <- function(x) 'delayed'\nprint.infodep <- function(x, ...) invisible(x)\nreport <- function() {\n  gen(structure(1, class = c('eager', 'delayed')))\n  list(imports = getNamespaceInfo('infodep', 'imports'), same = identical(getNamespaceImports('infodep'), getNamespaceInfo('infodep', 'imports')), s3 = getNamespaceInfo('infodep', 'S3methods'), dynlibs = getNamespaceInfo('infodep', 'dynlibs'), lexical = .__NAMESPACE__.$imports)\n}\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &generic_source, &build_library);
+    install_package(&r_home, &dependency_source, &build_library);
+    let root_source = fixture.path().join("inforoot");
+    write_package(
+        &root_source,
+        "inforoot",
+        "Imports: infodep\n",
+        "importFrom(infodep, report)\nexport(check)\n",
+        "check <- function() report()\n",
+    );
+    let output = fixture.path().join("generated-inforoot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run namespace information build");
+    assert_success(&result, "slinker build namespace information fixture");
+
+    let expected = fixture.path().join("expected.rds");
+    let expected = expected
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &generic_source, &original);
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(
+        &r_home,
+        &original,
+        &format!("library(inforoot); saveRDS(check(), '{expected}')"),
+    );
+
+    let behavior = format!(
+        "library(inforoot); actual <- check(); expected <- readRDS('{expected}'); stopifnot(isTRUE(actual$same), identical(actual$imports, expected$imports), identical(actual$lexical, expected$imports), identical(actual$dynlibs, expected$dynlibs), identical(actual$s3, expected$s3))"
+    );
+    let absent = fixture.path().join("absent");
+    fs::create_dir(&absent).expect("library without the real Linked packages");
+    install_package(&r_home, &output, &absent);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked packages");
+    install_package(&r_home, &generic_source, &installed);
+    install_package(&r_home, &dependency_source, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, &behavior);
+    run_r(&r_home, &installed, &behavior);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('infodep'); {behavior}"),
+    );
+}
+
+#[test]
+fn enumerating_a_linked_namespace_blocks_the_build() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("enumdep");
+    write_package(
+        &dependency_source,
+        "enumdep",
+        "",
+        "export(kept)\n",
+        "kept <- function() 1\nunreached <- function() 2\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+    let build = |name: &str, code: &str| {
+        let root_source = fixture.path().join(name);
+        write_package(
+            &root_source,
+            name,
+            "Imports: enumdep\n",
+            "importFrom(enumdep, kept)\nexport(f)\n",
+            code,
+        );
+        let output = fixture.path().join(format!("generated-{name}"));
+        let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+            .args(["build", "--lib"])
+            .arg(&build_library)
+            .arg("--output")
+            .arg(&output)
+            .arg(&root_source)
+            .output()
+            .expect("run enumeration build");
+        (result, output)
+    };
+
+    for (name, code) in [
+        (
+            "aslist",
+            "f <- function() { kept(); as.list(asNamespace('enumdep')) }\n",
+        ),
+        (
+            "mgetls",
+            "f <- function() { kept(); ns <- asNamespace('enumdep'); mget(ls(ns), ns) }\n",
+        ),
+        (
+            "eapplyns",
+            "f <- function() { kept(); eapply(asNamespace('enumdep'), class) }\n",
+        ),
+    ] {
+        let (result, output) = build(name, code);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains("reads every binding"), "{name}: {stderr}");
+        assert!(!output.exists(), "{name}");
+    }
+
+    let (result, output) = build(
+        "targeted",
+        "f <- function() kept() + asNamespace('enumdep')$kept()\n",
+    );
+    assert_success(&result, "slinker build targeted namespace lookup");
+    assert!(output.exists());
 }
