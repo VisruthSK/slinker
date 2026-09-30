@@ -48,17 +48,12 @@ impl std::fmt::Display for GenericSpec {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeFacts {
-    /// Statically named R bindings called by the component regardless of call
-    /// site. Retained for summaries that truly have fixed callbacks.
     pub callbacks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeRoutineSummary {
-    /// Registered R-side binding or native routine symbol used as the selector.
     pub selector: String,
-    /// One-based native routine argument positions that are invoked as R
-    /// callables. The `.Call`/`.External` selector itself is not counted.
     pub callback_arguments: Vec<usize>,
 }
 
@@ -92,7 +87,6 @@ pub struct NativeComponent {
     pub safety: NativeSafety,
 }
 
-/// The installed compiled library of a native component as the worker found it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum NativeLibrary {
     Missing,
@@ -215,8 +209,6 @@ pub struct PackageIndex {
     pub lifecycle: LifecycleMetadata,
     pub binding_names: Vec<BindingName>,
     pub datasets: Vec<String>,
-    /// Installed package-relative files/directories. These are metadata for
-    /// resolving resource operations; they are not retained semantic resources.
     pub files: Vec<String>,
     pub has_sysdata: bool,
 }

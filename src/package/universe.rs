@@ -7,7 +7,6 @@ use crate::{Error, Result, TargetEnvironment};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-/// Frozen package-name answer for one invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageAvailability {
     Root(PackageId),
@@ -25,7 +24,6 @@ impl PackageAvailability {
     }
 }
 
-/// Invocation-local owner of package resolution, handles, absence, and role policy.
 pub struct TargetUniverse<P: PackageProvider> {
     store: P,
     root: String,
@@ -53,7 +51,6 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.store.target_environment()
     }
 
-    /// Resolve a package name once; later calls return the frozen answer, including absence.
     pub fn resolve(&mut self, name: &str) -> Result<Option<PackageId>> {
         if let Some(availability) = self.availability.get(name) {
             return Ok(availability.package());
@@ -113,7 +110,6 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.role(id) == PackageRole::External
     }
 
-    /// Whether the package belongs to the selected R platform rather than a third party.
     pub fn is_platform(&self, id: PackageId) -> bool {
         is_platform(self.package(id))
     }
@@ -143,7 +139,6 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.store.canonical_syntax(source)
     }
 
-    /// Freeze the selected physical images of the given packages for build orchestration.
     pub fn sources(&self, ids: impl IntoIterator<Item = PackageId>) -> PackageSources {
         PackageSources(
             ids.into_iter()
@@ -163,7 +158,6 @@ fn is_platform(package: &InstalledPackage) -> bool {
     )
 }
 
-/// Exact installed image and physical location selected for each finalized package.
 #[derive(Clone, Debug, Default)]
 pub struct PackageSources(BTreeMap<PackageId, (PackageIdentity, PackageLocation)>);
 
@@ -180,11 +174,6 @@ impl PackageSources {
             .map(|(id, (identity, location))| (*id, identity, location))
     }
 
-    /// Re-fingerprint every frozen image and return the first one whose bytes changed.
-    ///
-    /// # Errors
-    ///
-    /// Fails when an image directory can no longer be read.
     pub fn changed(&self) -> Result<Option<&PackageIdentity>> {
         for (identity, location) in self.0.values() {
             if fingerprint_image(&location.root)? != identity.image_fingerprint {

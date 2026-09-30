@@ -207,9 +207,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
 
-        // New needs discovered while this frontier is processed are deferred
-        // to the next frontier. Every item was already justified by a semantic
-        // edge; batching changes scheduling only, never reachability.
         self.preparse_frontier_bindings(frontier)?;
 
         for _ in 0..frontier {
@@ -1048,8 +1045,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
             helper_shadowed(helper, image)
         }) {
-            // The probe itself is shadowed by a package/importFrom binding, so
-            // the static availability interpretation is not sound.
             return Ok(true);
         }
 
@@ -1072,8 +1067,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             match guard {
                 PackageGuard::Selected(_) => return Ok(false),
                 PackageGuard::Loaded(_) => {
-                    // Imports are activated before `.onLoad`; ambient installed
-                    // packages are not assumed to be loaded.
                     if !imported {
                         return Ok(false);
                     }
@@ -1690,9 +1683,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let index = Arc::new(image.index.clone());
         let node = self.need_node(&Need::Activation { package: id });
 
-        // Dependency declarations are lookup metadata, not reachability roots.
-        // A retained binding that resolves through an import will demand the
-        // exact foreign activation/binding. Unused Imports/Depends stay cold.
         for registration in &index.s3 {
             if let Some(package_name) = registration.generic.package.as_deref()
                 && self.package_is_suggested_only(id, package_name)?
@@ -1807,9 +1797,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         let _ = self.image(id)?;
         let _present = self.packages.resource_exists(id, resource)?;
-        // An absent system.file() path is a valid result when mustWork is false
-        // (the default). The reference is retained only when the installed
-        // image actually contains the requested path.
         Ok(())
     }
 
@@ -2038,10 +2025,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if self.package_is_suggested_only(current, &reference.package)?
             && !self.optional_package_selected(&reference.package)
         {
-            // Suggests-only packages are deliberately outside the selected
-            // link universe. Leave the optional operation in the retained R
-            // source, but do not discover, inspect, internalize, or rewrite
-            // that package unless the user enables it with --extra-pkgs.
             return Ok(());
         }
         let Some(foreign) = self.packages.resolve(&reference.package)? else {
@@ -2255,8 +2238,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    /// The installed package whose files `system.file(package = name)` must reach through the
-    /// generated package, or `None` when the call already behaves as written.
     fn resource_package(
         &mut self,
         from: NodeId,
@@ -2264,9 +2245,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         resource: &crate::syntax::ResourceRef,
         name: &str,
     ) -> Result<Option<PackageId>> {
-        // The root remains a real installed package. Preserve its own package
-        // path/help/Meta semantics exactly; no synthetic resource rewrite is
-        // required for system.file(..., package = <root>).
         if self.is_root(current) && name == self.packages.name(current) {
             return Ok(None);
         }
@@ -2367,13 +2345,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 if let Some(component) = Self::sole_opaque_registered_native_component(&image.index)
                 {
-                    // With .registration=TRUE the loader creates native-symbol
-                    // variables before .onLoad, but nsInfo.rds does not contain
-                    // the runtime routine table. If native safety is still
-                    // opaque, associate this otherwise-unresolved .onLoad RHS
-                    // with the sole registered DLL. The component remains a
-                    // blocker until native analysis proves its behavior, so
-                    // this cannot turn an unknown symbol into an accepted link.
                     self.require_at(
                         from,
                         Need::Native { package, component: component.to_owned().into() },
@@ -3196,12 +3167,6 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         match call.callee_kind {
             CalleeKind::DefinitelyLexical => return Ok(false),
             CalleeKind::ConditionalFallthrough => {
-                // Oak found at least one reaching lexical definition, but also
-                // a path that falls through to the installed namespace. Slinker
-                // must not apply linker-specific effects unless the callee
-                // identity is path-invariant. If the fallthrough target is the
-                // base primitive/function that slinker specializes, block the
-                // rewrite instead of pretending either branch is definitive.
                 if call.qualified_package.is_none()
                     && Self::is_slinker_semantic_callee(&call.callee)
                     && matches!(
@@ -3438,8 +3403,6 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         Ok(())
     }
 
-    /// A declared value of a computed namespace name reaches the real package at run time, so
-    /// only a name that stays unrewritten as written is accepted.
     fn declared_namespace_name(
         &mut self,
         from: NodeId,
@@ -3823,8 +3786,6 @@ pub(super) fn is_r_constant(name: &str) -> bool {
     )
 }
 
-/// Whether reading `field` of a `.__NAMESPACE__.` environment observes what a synthetic Linked
-/// namespace reproduces: its spec, export table, imports, dynlibs, and S3 methods.
 fn reproduces_namespace_info(field: Option<&str>) -> bool {
     matches!(
         field,
@@ -3832,7 +3793,6 @@ fn reproduces_namespace_info(field: Option<&str>) -> bool {
     )
 }
 
-/// The run-time name a base binding-creation call can bind, when `call` is one.
 fn created_name(call: &CallSite) -> Option<(&'static str, CreatedName)> {
     let (operation, formals, target): (_, &[&str], _) = match call.callee.as_str() {
         "assign" => (

@@ -37,7 +37,6 @@ pub struct PayloadSpec {
     pub patches: Vec<ClosurePatchSpec>,
 }
 
-/// Outcome of serializing each payload bundle in one R operation, in request order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PayloadSerialization {
@@ -53,11 +52,9 @@ pub enum PayloadSerialization {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SerializedPayload {
     pub bytes: Vec<u8>,
-    /// Namespace spec names restoring `bytes` resolves.
     pub namespaces: Vec<String>,
 }
 
-/// A payload binding, by request index and name, from which a shared reference object is reached.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PayloadSite {
     pub payload: usize,

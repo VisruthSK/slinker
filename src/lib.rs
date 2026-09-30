@@ -1,10 +1,3 @@
-//! Demand-driven linker for installed R package images.
-//!
-//! `slinker` analyzes the exact installed package images selected by a target R
-//! library universe. Air supplies syntax and Oak owns R lexical/evaluation
-//! semantics; slinker owns installed-namespace resolution, cross-package
-//! reachability, provenance, optional-package policy, and rewrite planning.
-
 #[derive(Debug)]
 pub enum Error {
     Io {

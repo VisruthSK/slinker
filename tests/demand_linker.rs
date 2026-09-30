@@ -3069,9 +3069,6 @@ fn package_image_is_requested_once_and_binding_is_parsed_once() {
 
 #[test]
 fn air_frontend_failure_is_localized_not_package_fatal() {
-    // Deliberately make Air reject this binding while the fake target-R
-    // validator reports acceptance. This isolates disagreement handling from
-    // any particular real-R grammar edge case.
     let root = package(
         "root",
         &[

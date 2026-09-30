@@ -22,8 +22,6 @@ impl Digest {
     }
 }
 
-/// Invocation-local semantic handle allocated by
-/// [`TargetUniverse`](crate::package::TargetUniverse). It has no meaning across invocations.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PackageId(u32);
 
@@ -37,7 +35,6 @@ impl PackageId {
     }
 }
 
-/// Exact installed image selected for one invocation, independent of where its bytes live.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PackageIdentity {
     pub name: PackageName,
@@ -51,14 +48,12 @@ impl fmt::Display for PackageIdentity {
     }
 }
 
-/// Build-time physical location of an installed image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageLocation {
     pub library: PathBuf,
     pub root: PathBuf,
 }
 
-/// An installed image found by the physical package locator.
 #[derive(Clone, Debug)]
 pub struct InstalledPackage {
     pub identity: PackageIdentity,
@@ -66,7 +61,6 @@ pub struct InstalledPackage {
     pub description: Description,
 }
 
-/// How a package participates in the generated artifact.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PackageRole {
     Root,

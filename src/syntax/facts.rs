@@ -1,10 +1,3 @@
-//! Linker-facing semantic facts.
-//!
-//! Oak owns lexical semantics. These are slinker transport types only: they
-//! describe semantic uses that Oak has already classified as live and capable
-//! of escaping local lexical scopes, plus linker-specific package/resource
-//! effects layered on those live sites.
-
 use crate::syntax::source::Span;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -23,10 +16,6 @@ pub enum BindingCertainty {
     Possible,
 }
 
-/// Whether an Oak-live use can escape the syntax file's lexical scopes.
-///
-/// `NameRef` values are emitted only for the two fallthrough cases. A use that
-/// Oak proves locally bound never reaches the linker name resolver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NameRefKind {
@@ -76,7 +65,6 @@ pub struct PackageRef {
     pub span: Span,
 }
 
-/// Oak's lexical classification for a live callee use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CalleeKind {
@@ -89,17 +77,12 @@ pub enum CalleeKind {
 pub struct CallSite {
     pub callee: String,
     pub callee_kind: CalleeKind,
-    /// `Some(package)` only for an explicitly namespace-qualified callee. Bare
-    /// callees are resolved by the linker against the installed namespace.
     pub qualified_package: Option<String>,
     pub args: Vec<Option<StaticArg>>,
-    /// Syntactic argument names aligned with `args`; `None` denotes a positional argument.
     #[serde(default)]
     pub arg_names: Vec<Option<String>>,
-    /// Source extents aligned with `args`; omitted arguments have no extent.
     #[serde(default)]
     pub arg_spans: Vec<Option<Span>>,
-    /// Whether Oak proves the aligned symbol argument is a locally assigned closure.
     #[serde(default)]
     pub local_closure_args: Vec<bool>,
     #[serde(default)]
@@ -121,11 +104,9 @@ pub struct ResourceRef {
     pub span: Span,
 }
 
-/// The `package` argument of a `system.file()` call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourcePackage {
     Literal(String),
-    /// A computed value, with the lexical binding it names when it is a bare symbol.
     Computed(Option<LexicalBindingId>),
 }
 
@@ -295,8 +276,6 @@ pub struct ParsedExpression {
     pub namespace_enumerations: Vec<NamespaceEnumeration>,
 }
 
-/// A read of a namespace's `.__NAMESPACE__.` information environment, with the field extracted
-/// from it by `$` or `[[`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceInfoRead {
     pub receiver: NamespaceInfoReceiver,
@@ -313,9 +292,7 @@ pub struct NamespaceEnumeration {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NamespaceInfoReceiver {
-    /// The `.__NAMESPACE__.` binding visible where the code runs.
     Lexical,
-    /// `asNamespace("pkg")` or `getNamespace("pkg")`.
     Namespace(String),
     Computed,
 }
@@ -358,8 +335,6 @@ pub struct BindingDeclaration {
     pub span: Span,
 }
 
-/// The exact values a declared binding can hold: alternative S3 class vectors, strings, or
-/// functions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeclaredDomain {
     Classes(Vec<Vec<String>>),
@@ -367,7 +342,6 @@ pub enum DeclaredDomain {
     Callables(BTreeSet<DeclaredCallable>),
 }
 
-/// A function named as `pkg::f`, `pkg:::f`, or a bare `f` resolved where it is used.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DeclaredCallable {
     pub package: Option<String>,
@@ -404,8 +378,6 @@ impl ParsedRFile {
             .map(|declaration| &declaration.domain)
     }
 
-    /// The S3 class vectors `binding` can have at `use_scope`, narrowed by every visible
-    /// declaration.
     pub fn class_domain_for(
         &self,
         binding: &LexicalBindingId,
@@ -424,7 +396,6 @@ impl ParsedRFile {
             })
     }
 
-    /// The strings `binding` can hold at `use_scope`, narrowed by every visible declaration.
     pub fn string_domain_for(
         &self,
         binding: &LexicalBindingId,
@@ -438,7 +409,6 @@ impl ParsedRFile {
             .reduce(|domain, strings| domain.intersection(&strings).cloned().collect())
     }
 
-    /// The functions `binding` can hold at `use_scope`, narrowed by every visible declaration.
     pub fn callable_domain_for(
         &self,
         binding: &LexicalBindingId,

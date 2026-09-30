@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use thiserror::Error;
 
-/// Immutable files captured from one source-package tree.
 #[derive(Debug)]
 pub struct FrozenSourceFiles {
     root: PathBuf,
@@ -16,13 +15,11 @@ pub struct FrozenSourceFiles {
 }
 
 impl FrozenSourceFiles {
-    /// Return the frozen source-package root.
     pub fn root(&self) -> &Path {
         &self.root
     }
 }
 
-/// One invocation-local immutable source-package input.
 #[derive(Debug)]
 pub struct SourcePackageSnapshot {
     original_root: PathBuf,
@@ -36,7 +33,6 @@ pub struct SourcePackageSnapshot {
 }
 
 impl SourcePackageSnapshot {
-    /// Discover, validate, and freeze a source package before target-R staging.
     pub fn capture(path: impl AsRef<Path>) -> Result<Self, SourcePackageError> {
         let source = dunce::canonicalize(path.as_ref()).map_err(|source_error| {
             SourcePackageError::Canonicalize {
@@ -102,42 +98,34 @@ impl SourcePackageSnapshot {
         })
     }
 
-    /// Canonical original source root used only to select the default output directory.
     pub fn original_root(&self) -> &Path {
         &self.original_root
     }
 
-    /// Source package name from the frozen DESCRIPTION.
     pub fn package(&self) -> &str {
         &self.package
     }
 
-    /// Source package version from the frozen DESCRIPTION.
     pub fn version(&self) -> &Version {
         &self.version
     }
 
-    /// SHA-256 identity of the complete frozen source tree.
     pub fn source_digest(&self) -> &Digest {
         &self.source_digest
     }
 
-    /// Parsed frozen DESCRIPTION metadata.
     pub fn description(&self) -> &Description {
         &self.description
     }
 
-    /// Frozen DESCRIPTION source bytes interpreted as UTF-8.
     pub fn description_source(&self) -> &str {
         &self.description_source
     }
 
-    /// Frozen NAMESPACE source.
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
 
-    /// Frozen physical files used by staging and materialization.
     pub fn files(&self) -> &FrozenSourceFiles {
         &self.files
     }

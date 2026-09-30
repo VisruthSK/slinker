@@ -22,8 +22,6 @@ pub struct TargetEnvironment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetEnvironmentRequest {
     pub r_home: PathBuf,
-    /// Ordered non-base library paths. Harp asks the selected runtime to append
-    /// its own site and base libraries.
     pub libraries: Vec<PathBuf>,
 }
 

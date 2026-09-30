@@ -11,8 +11,6 @@ use crate::syntax::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-/// Analysis-only outcome of resolving one name: a single exact target, or a typed reason the
-/// target is open. Finalization lowers every static answer, so none survives into `ProgramIr`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Resolution<T> {
     Static(T),
@@ -28,7 +26,6 @@ pub(super) enum OpenReason {
     },
 }
 
-/// What a lexical, imported, or qualified name denotes inside the analyzed universe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum BindingTarget {
     Local,
@@ -216,8 +213,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             for (name, binding) in &private.bindings {
                 private_shadowed.insert(name.to_string());
                 shadowed.insert(name.to_string());
-                // Walk inner-to-outer. The first binding is the one lexical
-                // lookup can actually reach from this closure.
                 visible_private.entry(name.clone()).or_insert(binding);
             }
             environment = private.parent.clone();
@@ -225,13 +220,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
         let imports = self.namespace_imports(package, image)?;
         let mut non_returning = self.inferred_non_returning_bindings(package, image, &imports);
-        // A visible private binding masks a package-namespace helper with the
-        // same name, so do not inherit the package summary through it.
         non_returning.retain(|name| !private_shadowed.contains(name));
 
-        // Propagate NeverReturns through the visible private lexical chain.
-        // This is a source-only fixed point; it does not parse unrelated
-        // package bindings or introduce a second lexical resolver.
         loop {
             let context = OakParseContext::with_imports(
                 shadowed.clone(),

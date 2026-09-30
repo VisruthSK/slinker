@@ -639,8 +639,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         ))
     }
 
-    /// Attach every foreign namespace the payload bundles refer to, returning the Linked ones as
-    /// activation-order edges from the bundle owner.
     fn attach_payload_dependencies(
         &self,
         builder: &mut ProgramBuilder,
@@ -1019,27 +1017,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
 }
 
 impl LinkIr {
-    /// Immutable semantic construction authority produced by finalization.
     pub fn program(&self) -> &ProgramIr {
         &self.program
     }
 
-    /// Successful typed derivations used only by explanation/query consumers.
     pub fn provenance(&self) -> &crate::ir::ProvenanceIr {
         &self.provenance
     }
 
-    /// Every independent semantic blocker, sorted deterministically.
     pub fn blockers(&self) -> &[Diagnostic] {
         &self.blockers
     }
 
-    /// Exact selected installed image and build-time location of every finalized package.
     pub fn package_sources(&self) -> &crate::package::PackageSources {
         &self.packages
     }
 
-    /// Diagnostic source map retained for provenance rendering only.
     pub fn sources(&self) -> &Sources {
         &self.sources
     }

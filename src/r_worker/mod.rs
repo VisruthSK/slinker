@@ -1,8 +1,3 @@
-//! Hidden target-R worker boundary.
-//!
-//! The process protocol contains only owned Rust/serde data; Harp objects and
-//! raw SEXPs never cross the process boundary.
-
 pub(crate) mod client;
 pub mod protocol;
 
@@ -430,7 +425,6 @@ impl WorkerRuntime {
         Ok(protocol::PayloadSerialization::Serialized { bundles })
     }
 
-    /// The first binding of `payload` whose serialization reaches `reference`.
     fn payload_site(
         &mut self,
         payload: &protocol::PayloadSpec,

@@ -197,8 +197,6 @@ pub enum CanonicalSyntax {
     Unstable,
 }
 
-/// Physical installed-image service. Package roles and name policy belong to
-/// [`TargetUniverse`](crate::package::TargetUniverse).
 pub trait PackageProvider {
     fn target_environment(&self) -> &TargetEnvironment;
     fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>>;
@@ -397,8 +395,6 @@ impl PackageStore {
     }
 }
 
-/// Worker private-environment labels identify objects only within one inspection epoch, so a
-/// fragment that mentions them must never be merged with fragments inspected in another epoch.
 fn is_epoch_independent(binding: &WorkerBinding) -> bool {
     let image = &binding.binding;
     binding.private_environments.is_empty()

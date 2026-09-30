@@ -51,8 +51,6 @@ pub enum InstalledObject {
     Atom,
 }
 
-/// Mutable analysis view of one package's persistent objects: the installed image facts plus
-/// every environment, write, and closure the analyzer derives from them.
 #[derive(Clone, Debug, Default)]
 pub struct ObjectGraph {
     namespace_bindings: BTreeMap<String, ObjectId>,
@@ -105,8 +103,6 @@ impl ObjectGraph {
         }
     }
 
-    /// Merge newly demanded installed bindings without renumbering existing or derived
-    /// object identities.
     pub fn merge_image(&mut self, image: &PackageImage) {
         let namespace_label = format!("namespace:{}", image.index.identity.name);
         let mut labels = BTreeSet::from([namespace_label.clone()]);
@@ -278,8 +274,6 @@ impl ObjectGraph {
         self.push_object(InstalledObject::Closure(id))
     }
 
-    /// Create a bounded runtime environment with a stable identity, an explicit lexical parent,
-    /// and no unknown fields until a caller records an imprecise write.
     pub fn derive_environment(&mut self, parent: Option<EnvironmentId>) -> EnvironmentId {
         let label = (self.environments.len()..)
             .map(|sequence| format!("derived:{sequence}"))
@@ -288,7 +282,6 @@ impl ObjectGraph {
         self.add_environment(label, parent, true)
     }
 
-    /// Return the first-class object for an environment so every reference shares one identity.
     pub fn environment_object(&mut self, environment: EnvironmentId) -> ObjectId {
         match self.environment_objects.get(&environment) {
             Some(object) => *object,
@@ -296,13 +289,10 @@ impl ObjectGraph {
         }
     }
 
-    /// Allocate an opaque value for a binding whose name is known but whose value is outside the
-    /// bounded object interpreter.
     pub fn abstract_value(&mut self) -> ObjectId {
         self.push_object(InstalledObject::Atom)
     }
 
-    /// Record a statically known environment write such as `$<-`, `[[<-`, or `assign()`.
     pub fn set_environment_binding(
         &mut self,
         environment: EnvironmentId,
@@ -314,13 +304,10 @@ impl ObjectGraph {
             .insert(name.into(), value);
     }
 
-    /// Record a write whose field name cannot be bounded. Known fields remain visible, but
-    /// absence from this environment no longer proves lookup continues to its parent.
     pub fn mark_environment_unknown_fields(&mut self, environment: EnvironmentId) {
         self.environments[environment.0].unknown_fields = true;
     }
 
-    /// Model `environment(f) <- env` as a new closure that shares code with the original.
     pub fn reenclose_closure(&mut self, closure: ClosureId, enclosure: EnvironmentId) -> ObjectId {
         let original = self.closure(closure).clone();
         self.push_closure(ClosureObject {
@@ -331,8 +318,6 @@ impl ObjectGraph {
         })
     }
 
-    /// Recursively re-enclose closures stored in a structured value. Other identities are shared,
-    /// and a memo preserves aliasing when one structured object is reached twice.
     pub fn reenclose_structured_closures(
         &mut self,
         object: ObjectId,
@@ -373,9 +358,6 @@ impl ObjectGraph {
         transform(self, object, enclosure, &mut HashMap::new())
     }
 
-    /// Populate an environment from a list-like object when element names are statically known,
-    /// the object-layer primitive behind bounded `list2env`. Missing elements become opaque
-    /// values; an imprecise name vector marks the environment as having unknown fields.
     pub fn populate_environment_from_structured(
         &mut self,
         environment: EnvironmentId,
@@ -418,8 +400,6 @@ impl ObjectGraph {
         }
     }
 
-    /// Bounded `list2env`: populate `envir` when supplied (ignoring `parent`, as R does),
-    /// otherwise create a derived environment whose parent is `parent`.
     pub fn list2env(
         &mut self,
         object: ObjectId,
@@ -432,8 +412,6 @@ impl ObjectGraph {
         environment
     }
 
-    /// Resolve a field through an environment chain. `None` means either no binding exists or an
-    /// unknown-field environment makes continuing unsound; the boolean distinguishes the two.
     pub fn lookup_environment_binding(
         &self,
         mut environment: EnvironmentId,
@@ -459,7 +437,6 @@ impl ObjectGraph {
     }
 }
 
-/// Every package's [`ObjectGraph`], keyed by the analyzer's package handle.
 #[derive(Debug, Default)]
 pub struct ObjectWorld {
     graphs: HashMap<PackageId, ObjectGraph>,
@@ -486,8 +463,6 @@ impl ObjectWorld {
     }
 }
 
-/// Environment labels reachable from the named namespace bindings through closure enclosures,
-/// embedded objects, and private environments with their parents and bindings.
 pub(super) fn reachable_environment_labels<'a>(
     image: &PackageImage,
     names: impl IntoIterator<Item = &'a str>,

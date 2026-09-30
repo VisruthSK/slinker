@@ -30,7 +30,6 @@ macro_rules! emit {
     }};
 }
 
-/// Selected target-R physical handle available to staging and materialization.
 #[derive(Debug)]
 pub struct TargetRuntimeHandle {
     r_home: PathBuf,
@@ -55,7 +54,6 @@ impl TargetRuntimeHandle {
     }
 }
 
-/// Frozen physical inputs used to orchestrate preflight, never passed wholesale to materialization.
 #[derive(Debug)]
 pub struct BuildContext {
     source: SourcePackageSnapshot,
@@ -63,7 +61,6 @@ pub struct BuildContext {
     target_runtime: TargetRuntimeHandle,
 }
 
-/// Exact installed bytes redeemed from the selected images before preflight.
 #[derive(Debug)]
 struct FrozenInputs {
     bundles: Vec<CheckedPayloadBundle>,
@@ -72,8 +69,6 @@ struct FrozenInputs {
     _directory: TempDir,
 }
 
-/// One payload bundle serialized by the target R whose namespace references match its IR
-/// dependencies and whose reference objects are reached from no other bundle.
 #[derive(Debug)]
 struct CheckedPayloadBundle {
     bundle: PayloadBundleId,
@@ -94,14 +89,6 @@ impl BuildContext {
         }
     }
 
-    /// Redeem every physical input `ProgramIr` needs, then prove that no selected image changed
-    /// since analysis fingerprinted it.
-    ///
-    /// # Errors
-    ///
-    /// Blocks when a serialized payload bundle diverges from its IR entity. Fails when payload
-    /// serialization or resource copying fails, or with
-    /// [`BuildContextError::TargetUniverseChanged`] when a selected image no longer matches.
     fn freeze(&self, ir: &LinkIr) -> Result<FrozenInputs, PreflightError> {
         let program = ir.program();
         let sources = ir.package_sources();
@@ -197,7 +184,6 @@ pub enum BuildContextError {
     InvalidCode(String),
 }
 
-/// Narrow physical view available only after successful preflight.
 #[derive(Clone, Copy)]
 pub struct MaterializationContext<'a> {
     source_files: &'a FrozenSourceFiles,
@@ -227,10 +213,8 @@ impl MaterializationContext<'_> {
     }
 }
 
-/// First exact source-package materialization profile.
 pub enum PureRStatic {}
 
-/// Opaque capability proving full preflight succeeded for one profile.
 pub struct BuildableProgram<'a, Profile> {
     program: &'a ProgramIr,
     description: &'a str,
@@ -240,12 +224,6 @@ pub struct BuildableProgram<'a, Profile> {
 }
 
 impl PureRStatic {
-    /// Check every analysis blocker and profile capability, then freeze the physical inputs of an
-    /// eligible program.
-    ///
-    /// # Errors
-    ///
-    /// Returns one deterministic report of every blocker, or the failure to freeze inputs.
     pub fn check<'a>(
         ir: &'a LinkIr,
         context: &'a BuildContext,
@@ -312,7 +290,6 @@ impl From<std::io::Error> for PreflightError {
     }
 }
 
-/// Deterministic complete build-preflight failure report.
 #[derive(Clone, Debug, Error)]
 #[error("build preflight failed:\n{rendered}")]
 pub struct BuildReport {
@@ -335,7 +312,6 @@ impl BuildReport {
     }
 }
 
-/// Completed generated source-package artifact.
 #[derive(Debug)]
 pub struct GeneratedPackage {
     path: PathBuf,
@@ -347,7 +323,6 @@ impl GeneratedPackage {
     }
 }
 
-/// Materialize a preflight-approved ProgramIr into a generated R source package.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "consuming the preflight capability makes each approved program materialize once"
@@ -653,9 +628,6 @@ fn registered_name(program: &ProgramIr, namespace: NamespaceId) -> &str {
         .as_str()
 }
 
-/// Accept the target-R serialization of every IR payload bundle only when no reference object
-/// is shared between bundles and each bundle resolves exactly the namespaces its IR entity
-/// depends on.
 fn check_payload_bundles(
     program: &ProgramIr,
     serialization: PayloadSerialization,

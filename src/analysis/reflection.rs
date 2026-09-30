@@ -10,8 +10,6 @@ pub(super) struct ReflectionFacts {
     computed_namespace_info_reads: Vec<ComputedNamespaceInfoRead>,
 }
 
-/// A read of an unreproduced `.__NAMESPACE__.` field from a namespace chosen at run time, which
-/// diverges only when that namespace can be a synthetic Linked one.
 pub(super) struct ComputedNamespaceInfoRead {
     pub(super) node: NodeId,
     pub(super) package: PackageId,
