@@ -106,13 +106,9 @@ jobs:
           r-version: ${{ matrix.r }}
           use-public-rspm: true
 
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y libcurl4-openssl-dev libssl-dev libuv1-dev libxml2-dev
-
-      - shell: bash
-        run: |
-          install='install.packages("rlang", lib = .Library, repos = "https://cloud.r-project.org")'
-          if [ "$RUNNER_OS" = Windows ]; then Rscript -e "$install"; else sudo Rscript -e "$install"; fi
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: any::rlang
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -138,9 +134,9 @@ jobs:
           r-version: release
           use-public-rspm: true
 
-      - run: sudo apt-get install -y libcurl4-openssl-dev libssl-dev libuv1-dev libxml2-dev
-
-      - run: sudo Rscript -e 'install.packages(c("rlang", "cli", "testthat"), lib = .Library, repos = "https://cloud.r-project.org")'
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: any::rlang, any::cli, any::testthat
 
       - uses: dtolnay/rust-toolchain@stable
 
