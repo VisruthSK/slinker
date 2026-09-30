@@ -4888,11 +4888,19 @@ fn find_for_regions(text: &str) -> Vec<ForRegion> {
 }
 
 fn find_if_regions(text: &str) -> Vec<IfRegion> {
+    scan_if_regions(text, usize::MAX)
+}
+
+fn first_if_region(text: &str) -> Option<IfRegion> {
+    scan_if_regions(text, 1).into_iter().next()
+}
+
+fn scan_if_regions(text: &str, limit: usize) -> Vec<IfRegion> {
     let mut regions = Vec::new();
     let bytes = text.as_bytes();
     let mut cursor = 0;
     let mut quote = None;
-    while cursor < bytes.len() {
+    while cursor < bytes.len() && regions.len() < limit {
         let byte = bytes[cursor];
         if let Some(delimiter) = quote {
             if byte == b'\\' {
@@ -4965,14 +4973,12 @@ fn expression_end(text: &str, start: usize) -> usize {
     }
     if text.get(start..).is_some_and(|rest| rest.starts_with("if"))
         && word_boundary_after(text, start + 2)
+        && let Some(region) = first_if_region(&text[start..])
     {
-        let regions = find_if_regions(&text[start..]);
-        if let Some(region) = regions.first() {
-            return start
-                + region
-                    .else_branch
-                    .map_or(region.then_branch.end, |branch| branch.end);
-        }
+        return start
+            + region
+                .else_branch
+                .map_or(region.then_branch.end, |branch| branch.end);
     }
 
     let mut cursor = start;
