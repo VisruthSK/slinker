@@ -66,6 +66,14 @@ pub(super) struct NativeCallbackContext<'a> {
     pub(super) call: &'a CallSite,
 }
 
+pub(super) struct AnalysisOptions {
+    pub(super) jobs: usize,
+    pub(super) provenance: bool,
+    pub(super) extra_packages: HashSet<String>,
+    pub(super) explicit_external_packages: HashSet<String>,
+    pub(super) root_description: Option<Arc<str>>,
+}
+
 pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) packages: TargetUniverse<P>,
     pub(super) extra_packages: HashSet<String>,
@@ -105,12 +113,16 @@ pub(super) struct NativeCallTarget {
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    pub(super) fn new(packages: P, jobs: usize) -> Self {
+    pub(super) fn new(packages: P, root: &str, options: AnalysisOptions) -> Self {
         Self {
-            packages: TargetUniverse::new(packages),
-            extra_packages: HashSet::new(),
-            explicit_external_packages: HashSet::new(),
-            jobs: jobs.max(1),
+            packages: TargetUniverse::new(
+                packages,
+                root,
+                options.explicit_external_packages.clone(),
+            ),
+            extra_packages: options.extra_packages,
+            explicit_external_packages: options.explicit_external_packages,
+            jobs: options.jobs.max(1),
             parse_pool: None,
             graph: Graph::default(),
             roots: Vec::new(),
@@ -130,24 +142,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
             dynamic_names: DynamicNames::default(),
             external_bindings: BTreeMap::new(),
             dependencies: HashMap::new(),
-            provenance: true,
+            provenance: options.provenance,
             root: None,
             declared_dependencies: HashMap::new(),
             namespace_imports: HashMap::new(),
             non_returning_bindings: HashMap::new(),
             namespace_builders: HashMap::new(),
-            root_description: None,
+            root_description: options.root_description,
         }
     }
 
-    pub(super) fn run(mut self, root_name: &str) -> Result<Self> {
-        if self.explicit_external_packages.contains(root_name) {
+    pub(super) fn run(mut self) -> Result<Self> {
+        let root_name = self.packages.root_name().to_owned();
+        if self.explicit_external_packages.contains(&root_name) {
             return Err(Error::Analysis(format!(
                 "root package `{root_name}` cannot be External"
             )));
         }
-        self.packages.set_root(root_name);
-        let root = self.packages.require(root_name)?;
+        let root = self.packages.require(&root_name)?;
         self.root = Some(root);
         self.encountered.insert(root);
         let root_image = self.image(root)?;
