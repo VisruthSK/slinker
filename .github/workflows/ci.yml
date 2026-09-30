@@ -106,6 +106,9 @@ jobs:
           r-version: ${{ matrix.r }}
           use-public-rspm: true
 
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y libuv1-dev
+
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           packages: any::rlang

@@ -24,3 +24,11 @@ pub fn main(run: fn()) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| Error::Analysis("benchmark failed".into()))?;
     Ok(())
 }
+
+pub fn target_request(r_home: &Path) -> slinker::TargetEnvironmentRequest {
+    let mut request = slinker::TargetEnvironmentRequest::new(r_home.to_path_buf());
+    if let Some(libraries) = std::env::var_os("R_LIBS_USER") {
+        request.libraries = std::env::split_paths(&libraries).collect();
+    }
+    request
+}

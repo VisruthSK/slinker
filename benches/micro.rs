@@ -12,7 +12,7 @@ use slinker::package::{
     PackageStore, SyntaxValidation,
 };
 use slinker::syntax::{OakParseContext, OakParser, SourceKey, Sources};
-use slinker::{Description, Result, Target, TargetEnvironment, TargetEnvironmentRequest};
+use slinker::{Description, Result, Target, TargetEnvironment};
 use std::collections::{BTreeSet, HashMap};
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -232,7 +232,7 @@ fn construction_interpreter(criterion: &mut Criterion) {
 
 fn installed_target() -> (PathBuf, TargetEnvironment) {
     let r_home = common::discover_r_home();
-    let target = TargetEnvironmentRequest::new(r_home.clone())
+    let target = support::target_request(&r_home)
         .capture()
         .expect("capture the target R library universe");
     (r_home, target)
