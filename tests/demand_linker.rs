@@ -4,11 +4,11 @@ use slinker::analysis::{
     EdgeKind, ExplanationDag, GraphEdgeReasonExport, Linker, NodeKind, RejectCode,
 };
 use slinker::package::{
-    BindingImage, BindingOrigin, ClosureSource, Digest, EmbeddedClosureSource, ExportMap,
-    ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts,
-    NativeLibrary, NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding,
-    ObjectIssue, ObjectKind, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
-    PackageProvider, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
+    BindingImage, BindingOrigin, CanonicalSyntax, ClosureSource, Digest, EmbeddedClosureSource,
+    ExportMap, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent,
+    NativeFacts, NativeLibrary, NativeRegistration, NativeRoutineSummary, NativeSafety,
+    NativeSymbolBinding, ObjectIssue, ObjectKind, PackageIdentity, PackageImage, PackageIndex,
+    PackageLocation, PackageProvider, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
     SyntaxValidation,
 };
 use slinker::{Description, Error, Result, Target, TargetEnvironment};
@@ -179,8 +179,8 @@ impl PackageProvider for FakeProvider {
         Ok(self.validation.clone())
     }
 
-    fn normalize_syntax(&mut self, source: &str) -> Result<String> {
-        Ok(source.to_owned())
+    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+        Ok(CanonicalSyntax::Stable(source.to_owned()))
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::metadata::Priority;
 use crate::package::{
-    InstalledPackage, PackageId, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
-    PackageProvider, PackageRole, SyntaxValidation, fingerprint_image,
+    CanonicalSyntax, InstalledPackage, PackageId, PackageIdentity, PackageImage, PackageIndex,
+    PackageLocation, PackageProvider, PackageRole, SyntaxValidation, fingerprint_image,
 };
 use crate::{Error, Result, TargetEnvironment};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -151,8 +151,8 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.store.validate_syntax(source)
     }
 
-    pub fn normalize_syntax(&mut self, source: &str) -> Result<String> {
-        self.store.normalize_syntax(source)
+    pub fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+        self.store.canonical_syntax(source)
     }
 
     /// Freeze the selected physical images of the given packages for build orchestration.
@@ -246,8 +246,8 @@ mod tests {
             unreachable!("resolution never validates syntax")
         }
 
-        fn normalize_syntax(&mut self, _source: &str) -> Result<String> {
-            unreachable!("resolution never normalizes syntax")
+        fn canonical_syntax(&mut self, _source: &str) -> Result<CanonicalSyntax> {
+            unreachable!("resolution never canonicalizes syntax")
         }
     }
 

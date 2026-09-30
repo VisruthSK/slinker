@@ -21,9 +21,10 @@ use crate::ir::ExternalBindingAccess;
 use crate::ir::NamespaceOperation;
 use crate::metadata::{RelationField, relations};
 use crate::package::{
-    BindingImage, BindingName, BindingRepresentation, ClosureSource, ComponentName, Digest,
-    ImportSpec, NativeLibrary, NativeSafety, ObjectKind, PackageId, PackageImage, PackageProvider,
-    PrivateBindingImage, ResourcePath, SyntaxValidation, TargetUniverse,
+    BindingImage, BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource,
+    ComponentName, Digest, ImportSpec, NativeLibrary, NativeSafety, ObjectKind, PackageId,
+    PackageImage, PackageProvider, PrivateBindingImage, ResourcePath, SyntaxValidation,
+    TargetUniverse,
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, NamespaceInfoReceiver,
@@ -1551,9 +1552,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let source = self
             .parses
             .register(key.clone(), self.packages.name(id), text);
-        let normalized = self.packages.normalize_syntax(text)?;
-        let normalized_again = self.packages.normalize_syntax(&normalized)?;
-        if normalized != normalized_again {
+        let CanonicalSyntax::Stable(normalized) = self.packages.canonical_syntax(text)? else {
             self.diagnostic(
                 owner_node,
                 id,
@@ -1566,7 +1565,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             self.parses.block(key);
             return Ok(None);
-        }
+        };
         self.parses.record_shape(key, Digest::of(&normalized));
         Ok(Some(source))
     }

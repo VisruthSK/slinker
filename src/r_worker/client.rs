@@ -1,4 +1,4 @@
-use crate::package::InstalledPackage;
+use crate::package::{CanonicalSyntax, InstalledPackage};
 use crate::r_worker::protocol::{
     NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization, PayloadSite,
     PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
@@ -214,7 +214,7 @@ impl WorkerClient {
         syntax_verdict(request_id, response, "relocation verification")
     }
 
-    pub(crate) fn normalize_syntax(&mut self, source: &str) -> Result<String> {
+    pub(crate) fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
         let request_id = self.request_id();
         match self.exchange(&WorkerRequest::NormalizeSyntax {
             request_id,
@@ -223,7 +223,12 @@ impl WorkerClient {
             WorkerResponse::NormalizedSyntax {
                 request_id: response_id,
                 source,
-            } if response_id == request_id => Ok(source),
+                stable,
+            } if response_id == request_id => Ok(if stable {
+                CanonicalSyntax::Stable(source)
+            } else {
+                CanonicalSyntax::Unstable
+            }),
             response => Err(worker_error("syntax normalization", response)),
         }
     }

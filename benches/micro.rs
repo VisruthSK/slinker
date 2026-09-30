@@ -6,9 +6,10 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group};
 use slinker::analysis::Linker;
 use slinker::cache::CacheLocation;
 use slinker::package::{
-    BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClosureSource, Digest,
-    ExportMap, InstalledPackage, LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage,
-    PackageIndex, PackageLocation, PackageLocator, PackageProvider, PackageStore, SyntaxValidation,
+    BindingImage, BindingName, BindingOrigin, BindingRepresentation, CanonicalSyntax,
+    ClosureSource, Digest, ExportMap, InstalledPackage, LifecycleMetadata, ObjectKind,
+    PackageIdentity, PackageImage, PackageIndex, PackageLocation, PackageLocator, PackageProvider,
+    PackageStore, SyntaxValidation,
 };
 use slinker::syntax::{OakParseContext, OakParser, SourceKey, Sources};
 use slinker::{Description, Result, Target, TargetEnvironment, TargetEnvironmentRequest};
@@ -103,8 +104,8 @@ impl PackageProvider for MemoryProvider {
         Ok(SyntaxValidation::Accepted)
     }
 
-    fn normalize_syntax(&mut self, source: &str) -> Result<String> {
-        Ok(source.to_owned())
+    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+        Ok(CanonicalSyntax::Stable(source.to_owned()))
     }
 }
 

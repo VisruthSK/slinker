@@ -5,7 +5,7 @@ use crate::ir::{
     NamespaceId, ObjectStep, PayloadBundleId, PayloadBundleIr, PayloadDependency, ProgramIr,
     RegisteredNamespace, RemovedImportIr, ResourceId, Value,
 };
-use crate::package::PackageId;
+use crate::package::{CanonicalSyntax, PackageId};
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{
     ClosurePatchSpec, NamespaceImageSpec, ObjectStepSpec, PackageSpec, PayloadSerialization,
@@ -957,14 +957,11 @@ fn native_library(program: &ProgramIr, package: PackageId, component: &str) -> S
 }
 
 fn validate_r_source(worker: &mut WorkerClient, source: &str) -> Result<(), MaterializeError> {
-    let normalized = worker.normalize_syntax(source)?;
-    let normalized_again = worker.normalize_syntax(&normalized)?;
-    if normalized == normalized_again {
-        Ok(())
-    } else {
-        Err(MaterializeError::InvalidR(
+    match worker.canonical_syntax(source)? {
+        CanonicalSyntax::Stable(_) => Ok(()),
+        CanonicalSyntax::Unstable => Err(MaterializeError::InvalidR(
             "target-R parse/deparse normalization is not stable".into(),
-        ))
+        )),
     }
 }
 

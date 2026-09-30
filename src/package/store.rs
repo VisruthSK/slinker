@@ -191,6 +191,12 @@ pub enum SyntaxValidation {
     Rejected(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalSyntax {
+    Stable(String),
+    Unstable,
+}
+
 /// Physical installed-image service. Package roles and name policy belong to
 /// [`TargetUniverse`](crate::package::TargetUniverse).
 pub trait PackageProvider {
@@ -210,7 +216,7 @@ pub trait PackageProvider {
             .any(|candidate| candidate == path))
     }
     fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation>;
-    fn normalize_syntax(&mut self, source: &str) -> Result<String>;
+    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax>;
 }
 
 pub struct PackageStore {
@@ -502,8 +508,8 @@ impl PackageProvider for PackageStore {
         self.worker()?.validate_syntax(source)
     }
 
-    fn normalize_syntax(&mut self, source: &str) -> Result<String> {
-        self.worker()?.normalize_syntax(source)
+    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+        self.worker()?.canonical_syntax(source)
     }
 }
 

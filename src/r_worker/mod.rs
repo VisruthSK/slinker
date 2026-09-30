@@ -38,6 +38,7 @@ impl std::fmt::Display for InspectionEpoch {
 
 struct PackageImageContext {
     image: harp::object::RObject,
+    index: WorkerPackageIndex,
     epoch: InspectionEpoch,
     private_ids: HashMap<libr::SEXP, String>,
 }
@@ -126,6 +127,15 @@ impl WorkerRuntime {
             .map_err(InspectionError::from)
     }
 
+    fn canonical_syntax(
+        &self,
+        source: &str,
+    ) -> std::result::Result<(String, bool), InspectionError> {
+        let normalized = self.normalize_syntax(source)?;
+        let stable = self.normalize_syntax(&normalized)? == normalized;
+        Ok((normalized, stable))
+    }
+
     fn verify_relocation(
         &self,
         original: &str,
@@ -181,10 +191,10 @@ impl WorkerRuntime {
         })
     }
 
-    fn package_index(
+    fn context(
         &mut self,
         package: &protocol::PackageSpec,
-    ) -> std::result::Result<WorkerPackageIndex, InspectionError> {
+    ) -> std::result::Result<&mut PackageImageContext, InspectionError> {
         let key = package.root.to_string_lossy().into_owned();
         if !self.contexts.contains_key(&key) {
             if !package.root.is_dir() {
@@ -194,7 +204,7 @@ impl WorkerRuntime {
                 )
                 .into());
             }
-            let context = harp::RFunction::new("", ".slinker_package_context")
+            let image = harp::RFunction::new("", ".slinker_package_context")
                 .add(package.root.to_string_lossy().into_owned())
                 .add(package.name.clone())
                 .call()
@@ -204,10 +214,12 @@ impl WorkerRuntime {
                         package.name
                     )
                 })?;
+            let index = worker_package_index(&image)?;
             self.contexts.insert(
                 key.clone(),
                 PackageImageContext {
-                    image: context,
+                    image,
+                    index,
                     epoch: InspectionEpoch {
                         worker: self.worker,
                         context: self.contexts.len() + 1,
@@ -216,13 +228,17 @@ impl WorkerRuntime {
                 },
             );
         }
-        let context = self
+        Ok(self
             .contexts
-            .get(&key)
-            .expect("package image context inserted")
-            .image
-            .clone();
-        let mut index = worker_package_index(&context)?;
+            .get_mut(&key)
+            .expect("package image context inserted"))
+    }
+
+    fn package_index(
+        &mut self,
+        package: &protocol::PackageSpec,
+    ) -> std::result::Result<WorkerPackageIndex, InspectionError> {
+        let mut index = self.context(package)?.index.clone();
         index
             .image_fingerprint
             .clone_from(&package.image_fingerprint);
@@ -234,14 +250,9 @@ impl WorkerRuntime {
         package: &protocol::PackageSpec,
         name: &str,
     ) -> std::result::Result<protocol::WorkerBinding, WorkerOperationError> {
-        let index = self
-            .package_index(package)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
-        let key = package.root.to_string_lossy();
         let context = self
-            .contexts
-            .get(key.as_ref())
-            .expect("package context created by index request");
+            .context(package)
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let image_environment = field(&context.image, "image_env")
             .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         if !harp::environment::Environment::new(image_environment).exists(name) {
@@ -249,7 +260,7 @@ impl WorkerRuntime {
                 format!("installed image has no binding {name}").into(),
             ));
         }
-        self.binding_value(package, name, &index)
+        self.binding_value(package, name)
             .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
     }
 
@@ -257,13 +268,8 @@ impl WorkerRuntime {
         &mut self,
         package: &protocol::PackageSpec,
         name: &str,
-        index: &WorkerPackageIndex,
     ) -> std::result::Result<protocol::WorkerBinding, InspectionError> {
-        let key = package.root.to_string_lossy();
-        let context = self
-            .contexts
-            .get_mut(key.as_ref())
-            .expect("package context created by index request");
+        let context = self.context(package)?;
         let image_environment = harp::RObjectExt::elt(&context.image, "image_env")
             .map_err(|error| format!("installed image has no image environment: {error}"))?;
         let environment = harp::environment::Environment::new(image_environment);
@@ -285,7 +291,10 @@ impl WorkerRuntime {
         );
         let binding = scanner.top_binding(name, origin, binding.value)?;
         context.private_ids.clone_from(&scanner.private_ids);
-        if binding.name != name || index.name != package.name || index.version != package.version {
+        if binding.name != name
+            || context.index.name != package.name
+            || context.index.version != package.version
+        {
             return Err(format!(
                 "installed binding identity changed while inspecting {}::{name}",
                 package.name
@@ -467,12 +476,9 @@ impl WorkerRuntime {
         &mut self,
         package: &protocol::PackageSpec,
     ) -> std::result::Result<harp::object::RObject, WorkerOperationError> {
-        self.package_index(package)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let context = self
-            .contexts
-            .get(package.root.to_string_lossy().as_ref())
-            .expect("package context created by index request");
+            .context(package)
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         field(&context.image, "image_env")
             .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))
     }
@@ -1519,8 +1525,12 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                 ),
             },
             WorkerRequest::NormalizeSyntax { request_id, source } => match runtime.as_ref() {
-                Some(runtime) => match runtime.normalize_syntax(&source) {
-                    Ok(source) => WorkerResponse::NormalizedSyntax { request_id, source },
+                Some(runtime) => match runtime.canonical_syntax(&source) {
+                    Ok((source, stable)) => WorkerResponse::NormalizedSyntax {
+                        request_id,
+                        source,
+                        stable,
+                    },
                     Err(error) => operation_failure(
                         Some(request_id),
                         WorkerOperationError::with(WorkerErrorCode::TargetSyntaxRejection)(error),

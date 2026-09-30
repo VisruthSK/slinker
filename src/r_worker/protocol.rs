@@ -195,6 +195,7 @@ pub enum WorkerResponse {
     NormalizedSyntax {
         request_id: u64,
         source: String,
+        stable: bool,
     },
     Error {
         error: WorkerFailure,
