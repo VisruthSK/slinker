@@ -94,8 +94,8 @@ fn here_suite_passes_with_rprojroot_linked() {
             Check::Testthat,
             Check::Script(
                 r#"
-                project <- normalizePath(file.path(tempdir(), "project"), winslash = "/", mustWork = FALSE)
-                dir.create(file.path(project, "analysis"), recursive = TRUE)
+                dir.create(file.path(tempdir(), "project", "analysis"), recursive = TRUE)
+                project <- normalizePath(file.path(tempdir(), "project"), winslash = "/")
                 file.create(file.path(project, ".here"))
                 writeLines("", file.path(project, "analysis", "report.R"))
                 setwd(file.path(project, "analysis"))

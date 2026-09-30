@@ -111,7 +111,7 @@ jobs:
 
       - shell: bash
         run: |
-          install='install.packages("rlang", lib = .Library)'
+          install='install.packages("rlang", lib = .Library, repos = "https://cloud.r-project.org")'
           if [ "$RUNNER_OS" = Windows ]; then Rscript -e "$install"; else sudo Rscript -e "$install"; fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -140,7 +140,7 @@ jobs:
 
       - run: sudo apt-get install -y libcurl4-openssl-dev libssl-dev libuv1-dev libxml2-dev
 
-      - run: sudo Rscript -e 'install.packages(c("rlang", "cli", "testthat"), lib = .Library)'
+      - run: sudo Rscript -e 'install.packages(c("rlang", "cli", "testthat"), lib = .Library, repos = "https://cloud.r-project.org")'
 
       - uses: dtolnay/rust-toolchain@stable
 
