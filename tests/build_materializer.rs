@@ -1201,6 +1201,84 @@ fn root_registrations_resolve_linked_bindings_only_after_activation() {
 }
 
 #[test]
+fn imports_environments_keep_every_original_import_name() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let source_package = fixture.path().join("impsrc");
+    write_package(
+        &source_package,
+        "impsrc",
+        "",
+        "export(used, unused, reexp, file_ext, gen, gen2)\n",
+        "used <- function() 'used'\nunused <- function() 'unused'\nreexp <- function() 'reexp'\nfile_ext <- function(x) 'impsrc'\ngen <- function(x) UseMethod('gen')\ngen2 <- function(x) UseMethod('gen2')\n",
+    );
+    let middle_package = fixture.path().join("impmid");
+    write_package(
+        &middle_package,
+        "impmid",
+        "Imports: impsrc, tools\n",
+        "importFrom(tools, file_ext)\nimportFrom(impsrc, used, unused, reexp, file_ext, gen, gen2)\nexport(run, reexp)\nS3method(gen, mid)\nS3method(gen2, mid)\n",
+        "run <- function() c(used(), file_ext('a.b'), gen(structure(1, class = 'mid')))\ngen.mid <- function(x) 'mid'\ngen2.mid <- function(x) 'mid2'\n",
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &source_package, &build_library);
+    install_package(&r_home, &middle_package, &build_library);
+
+    let root_source = fixture.path().join("improot");
+    write_package(
+        &root_source,
+        "improot",
+        "Imports: impmid\n",
+        "importFrom(impmid, run, reexp)\nexport(check)\n",
+        "check <- function() run()\n",
+    );
+    let output = fixture.path().join("generated-improot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run imports environment build");
+    assert_success(&result, "slinker build imports environment fixture");
+
+    let behavior = "library(improot); stopifnot(identical(check(), c('used', 'impsrc', 'mid'))); ns <- environment(get('run', envir = asNamespace('improot'))); imports <- parent.env(ns); root_imports <- parent.env(asNamespace('improot')); stopifnot(identical(sort(ls(imports, all.names = TRUE)), sort(c('file_ext', 'gen', 'gen2', 'reexp', 'unused', 'used'))), identical(sort(ls(root_imports, all.names = TRUE)), c('reexp', 'run')), identical(sort(getNamespaceExports(ns)), c('reexp', 'run')), identical(get('used', envir = imports)(), 'used'))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &source_package, &original);
+    install_package(&r_home, &middle_package, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(
+        &r_home,
+        &original,
+        &format!(
+            "{behavior}; stopifnot(identical(get('unused', envir = imports)(), 'unused'), identical(getExportedValue(ns, 'reexp')(), 'reexp'))"
+        ),
+    );
+
+    let generated = format!(
+        "{behavior}; removed <- function(read) tryCatch({{ read(); 'read' }}, error = conditionMessage); stopifnot(identical(removed(function() get('unused', envir = imports)), '`impsrc::unused` was removed by slinker because the build never reached it'), identical(removed(function() getExportedValue(ns, 'reexp')), '`impsrc::reexp` was removed by slinker because the build never reached it'), identical(removed(function() get('reexp', envir = root_imports)), '`impmid::reexp` was removed by slinker because the build never reached it'), !isNamespaceLoaded('impsrc'), !isNamespaceLoaded('impmid'))"
+    );
+    let absent = fixture.path().join("absent");
+    fs::create_dir(&absent).expect("library without the real Linked packages");
+    install_package(&r_home, &output, &absent);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked packages");
+    install_package(&r_home, &source_package, &installed);
+    install_package(&r_home, &middle_package, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, &generated);
+    run_r(&r_home, &installed, &generated);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('impmid'); {behavior}"),
+    );
+}
+
+#[test]
 fn delayed_registrations_on_suggested_generics_reach_the_real_package() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

@@ -67,25 +67,57 @@ pub(crate) enum NamespaceImportResolution {
     BaseFallback,
 }
 
+const IMPORT_ALL_EXCLUDED: [&str; 10] = [
+    ".__NAMESPACE__.",
+    ".__S3MethodsTable__.",
+    ".packageName",
+    ".First.lib",
+    ".Last.lib",
+    ".onLoad",
+    ".onAttach",
+    ".onDetach",
+    ".conflicts.OK",
+    ".noGenerics",
+];
+
 #[derive(Debug, Clone)]
-struct ImportAllNamespace {
-    package: String,
-    /// Exported name -> installed binding name. `None` means the imported
-    /// namespace was unavailable while constructing the resolver table.
-    exports: Option<BTreeMap<String, String>>,
-    except: BTreeSet<String>,
+enum NamespaceImport {
+    From {
+        local: String,
+        package: String,
+        remote: String,
+    },
+    All {
+        package: String,
+        /// Exported name -> installed binding name. `None` means the imported
+        /// namespace was unavailable while constructing the resolver table.
+        exports: Option<BTreeMap<String, String>>,
+        except: BTreeSet<String>,
+    },
+}
+
+impl NamespaceImport {
+    fn imports_from_all(except: &BTreeSet<String>, name: &str) -> bool {
+        !except.contains(name) && !IMPORT_ALL_EXCLUDED.contains(&name)
+    }
+}
+
+/// The installed binding one imports-environment name is copied from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportedBinding {
+    pub(crate) package: String,
+    pub(crate) binding: String,
 }
 
 /// Immutable NAMESPACE import-resolution table.
 ///
-/// `importFrom()` has precedence over import-all, matching slinker's existing
-/// resolution contract. Import-all entries retain source order. A missing
-/// import-all only makes names ambiguous once resolution actually reaches that
-/// entry; it does not erase an earlier package that already exported the name.
+/// Imports keep their installed order and a later import of a name replaces an
+/// earlier one, as R fills a namespace's imports environment. A missing
+/// import-all only makes a name ambiguous once resolution actually reaches
+/// that entry; it does not erase a later package that provides the name.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct NamespaceImports {
-    imported_names: BTreeMap<String, (String, String)>,
-    import_all: Vec<ImportAllNamespace>,
+    imports: Vec<NamespaceImport>,
 }
 
 impl NamespaceImports {
@@ -95,9 +127,11 @@ impl NamespaceImports {
         package: impl Into<String>,
         remote: impl Into<String>,
     ) {
-        self.imported_names
-            .entry(local.into())
-            .or_insert_with(|| (package.into(), remote.into()));
+        self.imports.push(NamespaceImport::From {
+            local: local.into(),
+            package: package.into(),
+            remote: remote.into(),
+        });
     }
 
     pub(crate) fn add_import_all(
@@ -106,7 +140,7 @@ impl NamespaceImports {
         exports: Option<BTreeMap<String, String>>,
         except: impl IntoIterator<Item = String>,
     ) {
-        self.import_all.push(ImportAllNamespace {
+        self.imports.push(NamespaceImport::All {
             package: package.into(),
             exports,
             except: except.into_iter().collect(),
@@ -114,37 +148,91 @@ impl NamespaceImports {
     }
 
     pub(crate) fn resolve(&self, name: &str) -> NamespaceImportResolution {
-        if let Some((package, remote)) = self.imported_names.get(name) {
-            return NamespaceImportResolution::Imported {
-                package: package.clone(),
-                binding: remote.clone(),
-                effect_name: remote.clone(),
-            };
-        }
-
-        for import in &self.import_all {
-            if import.except.contains(name) {
-                continue;
+        for import in self.imports.iter().rev() {
+            match import {
+                NamespaceImport::From {
+                    local,
+                    package,
+                    remote,
+                } if local == name => {
+                    return NamespaceImportResolution::Imported {
+                        package: package.clone(),
+                        binding: remote.clone(),
+                        effect_name: remote.clone(),
+                    };
+                }
+                NamespaceImport::From { .. } => {}
+                NamespaceImport::All {
+                    package,
+                    exports,
+                    except,
+                } => {
+                    if !NamespaceImport::imports_from_all(except, name) {
+                        continue;
+                    }
+                    let Some(exports) = exports else {
+                        return NamespaceImportResolution::MissingImportAll {
+                            package: package.clone(),
+                            binding: name.to_owned(),
+                        };
+                    };
+                    let Some(binding) = exports.get(name) else {
+                        continue;
+                    };
+                    return NamespaceImportResolution::Imported {
+                        package: package.clone(),
+                        binding: binding.clone(),
+                        // Effects are attached to the package's exported function
+                        // name, while the linker retains the installed binding name.
+                        effect_name: name.to_owned(),
+                    };
+                }
             }
-            let Some(exports) = &import.exports else {
-                return NamespaceImportResolution::MissingImportAll {
-                    package: import.package.clone(),
-                    binding: name.to_owned(),
-                };
-            };
-            let Some(binding) = exports.get(name) else {
-                continue;
-            };
-            return NamespaceImportResolution::Imported {
-                package: import.package.clone(),
-                binding: binding.clone(),
-                // Effects are attached to the package's exported function
-                // name, while the linker retains the installed binding name.
-                effect_name: name.to_owned(),
-            };
         }
 
         NamespaceImportResolution::BaseFallback
+    }
+
+    /// Every name the imports environment holds, with the binding `resolve` answers for it,
+    /// or the package of an import-all whose exports are unknown.
+    pub(crate) fn names(&self) -> std::result::Result<BTreeMap<String, ImportedBinding>, &str> {
+        let mut names = BTreeMap::new();
+        for import in &self.imports {
+            match import {
+                NamespaceImport::From {
+                    local,
+                    package,
+                    remote,
+                } => {
+                    names.insert(
+                        local.clone(),
+                        ImportedBinding {
+                            package: package.clone(),
+                            binding: remote.clone(),
+                        },
+                    );
+                }
+                NamespaceImport::All {
+                    package,
+                    exports,
+                    except,
+                } => {
+                    let exports = exports.as_ref().ok_or(package.as_str())?;
+                    for (name, binding) in exports {
+                        if NamespaceImport::imports_from_all(except, name) {
+                            names.insert(
+                                name.clone(),
+                                ImportedBinding {
+                                    package: package.clone(),
+                                    binding: binding.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(names)
     }
 }
 
@@ -5969,7 +6057,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_import_from_preserves_first_namespace_precedence() {
+    fn later_import_from_replaces_an_earlier_one() {
         let mut imports = NamespaceImports::default();
         imports.add_import_from("target", "first", "first_target");
         imports.add_import_from("target", "second", "second_target");
@@ -5977,38 +6065,48 @@ mod tests {
         assert_eq!(
             imports.resolve("target"),
             NamespaceImportResolution::Imported {
-                package: "first".to_owned(),
-                binding: "first_target".to_owned(),
-                effect_name: "first_target".to_owned(),
+                package: "second".to_owned(),
+                binding: "second_target".to_owned(),
+                effect_name: "second_target".to_owned(),
             }
         );
     }
 
     #[test]
-    fn import_all_resolution_stops_at_first_exporting_namespace() {
+    fn later_import_all_replaces_an_earlier_import_from() {
         let mut imports = NamespaceImports::default();
+        imports.add_import_from("target", "first", "target");
         imports.add_import_all(
-            "first",
-            Some(BTreeMap::from([(
-                "target".to_owned(),
-                "target_impl".to_owned(),
-            )])),
+            "later",
+            Some(BTreeMap::from([
+                ("target".to_owned(), "target_impl".to_owned()),
+                (".onLoad".to_owned(), ".onLoad".to_owned()),
+            ])),
             Vec::<String>::new(),
         );
-        imports.add_import_all("missing", None, Vec::<String>::new());
 
         assert_eq!(
             imports.resolve("target"),
             NamespaceImportResolution::Imported {
-                package: "first".to_owned(),
+                package: "later".to_owned(),
                 binding: "target_impl".to_owned(),
                 effect_name: "target".to_owned(),
             }
         );
+        assert_eq!(
+            imports.resolve(".onLoad"),
+            NamespaceImportResolution::BaseFallback
+        );
+        assert_eq!(
+            imports
+                .names()
+                .map(|names| names.into_keys().collect::<Vec<_>>()),
+            Ok(vec!["target".to_owned()])
+        );
     }
 
     #[test]
-    fn missing_import_all_blocks_only_after_resolution_reaches_it() {
+    fn missing_import_all_blocks_only_names_no_later_import_provides() {
         let mut imports = NamespaceImports::default();
         imports.add_import_all("missing", None, Vec::<String>::new());
         imports.add_import_all(
@@ -6019,10 +6117,19 @@ mod tests {
 
         assert_eq!(
             imports.resolve("target"),
-            NamespaceImportResolution::MissingImportAll {
-                package: "missing".to_owned(),
+            NamespaceImportResolution::Imported {
+                package: "later".to_owned(),
                 binding: "target".to_owned(),
+                effect_name: "target".to_owned(),
             }
         );
+        assert_eq!(
+            imports.resolve("other"),
+            NamespaceImportResolution::MissingImportAll {
+                package: "missing".to_owned(),
+                binding: "other".to_owned(),
+            }
+        );
+        assert_eq!(imports.names(), Err("missing"));
     }
 }

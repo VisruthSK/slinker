@@ -6,18 +6,17 @@ use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
     BindingId, BindingName, ClosureHome, CodeId, ExportTable, ExternalBindingAccess,
-    ExternalPackageContract, FinalizedNamespace, GenericHome, InvalidPayloadDependency,
-    InvalidRelocation, MaterializedRole, MaterializedSlot, MaterializedSlotSource, NamespaceId,
-    ObjectStep, PackageRole as LinkedPackageRole, PayloadDependency, ProgramBuilder, ProgramIr,
-    RelocationTarget, RootArtifactIr, TargetContract, UnretainedName,
+    ExternalPackageContract, FinalizedNamespace, GenericHome, ImportSlotIr,
+    InvalidPayloadDependency, InvalidRelocation, MaterializedRole, MaterializedSlot,
+    MaterializedSlotSource, NamespaceId, ObjectStep, PackageRole as LinkedPackageRole,
+    PayloadDependency, ProgramBuilder, ProgramIr, RelocationTarget, RemovedImportIr,
+    RootArtifactIr, TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
-use crate::package::{
-    ImportSpec, NativeComponent, PackageAvailability, PackageId, PackageProvider,
-};
+use crate::package::{NativeComponent, PackageAvailability, PackageId, PackageProvider};
 use crate::source::generated_description;
 use crate::syntax::{SourceKey, SourceOrigin, Sources};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -107,9 +106,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let mut issues = Vec::new();
         let contracts = self.finalize_packages(&mut builder, &ordered, retained, &mut issues);
         let mut namespaces = self.finalize_namespaces(&mut builder, ordered, retained, &mut issues);
-        let mut dependencies = self.attach_imports(&mut builder, retained, &namespaces.ids);
-        let (root_exports, mut linked_contents) =
-            self.export_contents(&builder, retained, &namespaces.ids);
+        let mut dependencies =
+            self.attach_imports(&mut builder, retained, &namespaces.ids, &mut issues);
+        let (root_exports, mut linked_contents) = self.export_contents(retained, &namespaces.ids);
         for (owner, dependency) in self
             .activation_time_dependencies(&namespaces.ids)
             .into_iter()
@@ -125,7 +124,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         for namespace in activation_order(&namespaces.linked, &dependencies, &mut issues) {
-            let (exports, unretained) = linked_contents
+            let (exports, removed_bindings) = linked_contents
                 .remove(&namespace)
                 .expect("every Linked namespace has activation contents");
             builder.add_activation(crate::ir::NamespaceActivationIr {
@@ -136,7 +135,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .remove(&namespace)
                     .unwrap_or_default(),
                 exports,
-                unretained,
+                removed_bindings,
             });
         }
         let root_namespace = namespaces.ids[self.packages.name(root)].namespace;
@@ -355,89 +354,64 @@ impl<P: PackageProvider> AnalyzerState<P> {
         builder: &mut ProgramBuilder,
         retained: &BTreeSet<PackageId>,
         namespace_ids: &HashMap<String, FinalizedNamespace>,
+        issues: &mut Vec<FinalizationIssue>,
     ) -> HashMap<NamespaceId, BTreeSet<NamespaceId>> {
         let mut namespace_dependencies = HashMap::<NamespaceId, BTreeSet<NamespaceId>>::new();
         for &package in retained {
             if self.packages.is_external(package) {
                 continue;
             }
-            let Some(image) = self.images.get(&package) else {
-                continue;
-            };
-            let owner = namespace_ids[self.packages.name(package)].namespace;
-            for import in &image.index.imports {
-                let (target_name, pairs) = match import {
-                    ImportSpec::From {
-                        package: target,
-                        bindings,
-                    } => (
-                        target,
-                        bindings
-                            .iter()
-                            .map(|binding| (binding.local.clone(), binding.remote.clone()))
-                            .collect::<Vec<_>>(),
-                    ),
-                    ImportSpec::All {
-                        package: target,
-                        except,
-                    } => {
-                        let exported = self
-                            .packages
-                            .availability(target)
-                            .and_then(PackageAvailability::package)
-                            .filter(|package| retained.contains(package))
-                            .and_then(|package| self.images.get(&package))
-                            .map_or_else(
-                                || {
-                                    self.external_bindings
-                                        .keys()
-                                        .filter(|(owner, _)| {
-                                            self.packages.name(*owner) == target.as_str()
-                                        })
-                                        .map(|(_, name)| name.to_string())
-                                        .collect()
-                                },
-                                |image| {
-                                    image
-                                        .index
-                                        .exports
-                                        .values()
-                                        .map(ToString::to_string)
-                                        .collect::<Vec<_>>()
-                                },
-                            );
-                        (
-                            target,
-                            exported
-                                .into_iter()
-                                .filter(|name| !except.iter().any(|excluded| excluded == name))
-                                .map(|name| {
-                                    (BindingName::from(name.as_str()), BindingName::from(name))
-                                })
-                                .collect(),
-                        )
-                    }
-                };
-                let Some(target) = namespace_ids.get(target_name.as_str()) else {
+            let package_name = self.packages.name(package);
+            let owner = namespace_ids[package_name].namespace;
+            let names = match self.namespace_imports[&package].names() {
+                Ok(names) => names,
+                Err(unknown) => {
+                    issues.push(FinalizationIssue::UnknownImportAll {
+                        package: package_name.to_owned(),
+                        import: unknown.to_owned(),
+                    });
                     continue;
-                };
-                for (local, remote) in pairs {
-                    if let Some(&binding) = target.bindings.get(remote.as_str()) {
-                        builder.attach_import(owner, local, binding);
-                        namespace_dependencies
-                            .entry(owner)
-                            .or_default()
-                            .insert(builder.binding_namespace(binding));
-                    }
                 }
-            }
+            };
+            let imports = names
+                .into_iter()
+                .filter_map(|(local, imported)| {
+                    let bound = namespace_ids
+                        .get(imported.package.as_str())
+                        .and_then(|target| target.bindings.get(imported.binding.as_str()));
+                    let slot = match bound {
+                        Some(&binding) => {
+                            namespace_dependencies
+                                .entry(owner)
+                                .or_default()
+                                .insert(builder.binding_namespace(binding));
+                            ImportSlotIr::Bound(binding)
+                        }
+                        None => {
+                            let linked =
+                                self.known_package(&imported.package)
+                                    .is_some_and(|package| {
+                                        self.packages.role(package) == LinkedPackageRole::Linked
+                                    });
+                            if !linked {
+                                return None;
+                            }
+                            ImportSlotIr::Removed(RemovedImportIr {
+                                package: imported.package.into(),
+                                binding: imported.binding.into(),
+                            })
+                        }
+                    };
+                    Some((BindingName::from(local), slot))
+                })
+                .collect();
+            builder.set_imports(owner, imports);
         }
         namespace_dependencies
     }
 
     fn export_contents(
         &self,
-        builder: &ProgramBuilder,
         retained: &BTreeSet<PackageId>,
         namespace_ids: &HashMap<String, FinalizedNamespace>,
     ) -> (ExportTable, HashMap<NamespaceId, LinkedActivationContents>) {
@@ -447,35 +421,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if self.packages.is_external(package) {
                 continue;
             }
-            let namespace = namespace_ids[self.packages.name(package)].namespace;
-            let exports = self.images[&package]
-                .index
-                .exports
-                .values()
-                .filter_map(|name| builder.visible_binding(namespace, name))
-                .collect();
+            let index = &self.images[&package].index;
+            let exports = ExportTable::new(index.exports.values().cloned().collect());
+            let finalized = &namespace_ids[self.packages.name(package)];
             if self.packages.role(package) == LinkedPackageRole::Linked {
-                let index = &self.images[&package].index;
-                let kept = &namespace_ids[self.packages.name(package)].bindings;
-                let mut unretained = index
+                let removed_bindings = index
                     .binding_names
                     .iter()
-                    .filter(|name| !kept.contains_key(name.as_str()))
-                    .map(|name| (name.to_string(), UnretainedName::Stub))
-                    .collect::<BTreeMap<_, _>>();
-                for name in index
-                    .exports
-                    .values()
-                    .filter(|name| !kept.contains_key(name.as_str()))
-                {
-                    unretained
-                        .entry(name.to_string())
-                        .and_modify(|state| *state = UnretainedName::ExportedStub)
-                        .or_insert(UnretainedName::ExportedByActivation);
-                }
-                linked_contents.insert(namespace, (ExportTable::new(exports), unretained));
+                    .filter(|name| !finalized.bindings.contains_key(name.as_str()))
+                    .cloned()
+                    .collect();
+                linked_contents.insert(finalized.namespace, (exports, removed_bindings));
             } else {
-                root_exports = ExportTable::new(exports);
+                root_exports = exports;
             }
         }
         (root_exports, linked_contents)
@@ -1099,6 +1057,10 @@ pub(super) enum FinalizationIssue {
         namespace: String,
     },
     PayloadRefersToRoot(String),
+    UnknownImportAll {
+        package: String,
+        import: String,
+    },
 }
 
 impl FinalizationIssue {
@@ -1130,6 +1092,10 @@ impl std::fmt::Display for FinalizationIssue {
                 "payload bindings of Linked `{package}` refer to the Root namespace, which activates after them"
             ),
 
+            Self::UnknownImportAll { package, import } => write!(
+                f,
+                "`{package}` imports every export of `{import}`, whose exports are unknown, so its imports environment cannot be reproduced"
+            ),
             Self::RootOnLoadNotRelocatable => f.write_str(
                 "the Root `.onLoad` is not relocatable source, so the generated wrapper cannot call it",
             ),
@@ -1153,7 +1119,7 @@ impl std::fmt::Display for FinalizationIssue {
     }
 }
 
-type LinkedActivationContents = (ExportTable, BTreeMap<String, UnretainedName>);
+type LinkedActivationContents = (ExportTable, Vec<BindingName>);
 
 #[derive(Default)]
 struct FinalizedNamespaces {

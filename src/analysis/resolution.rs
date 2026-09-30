@@ -77,39 +77,36 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
         let mut imports = NamespaceImports::default();
         for import in &image.index.imports {
-            if let ImportSpec::From { package, bindings } = import {
-                for binding in bindings {
-                    imports.add_import_from(
-                        binding.local.as_str(),
-                        package.as_str(),
-                        binding.remote.as_str(),
+            match import {
+                ImportSpec::From { package, bindings } => {
+                    for binding in bindings {
+                        imports.add_import_from(
+                            binding.local.as_str(),
+                            package.as_str(),
+                            binding.remote.as_str(),
+                        );
+                    }
+                }
+                ImportSpec::All {
+                    package: package_name,
+                    except,
+                } => {
+                    let exports = match self.packages.resolve(package_name)? {
+                        Some(foreign) => Some(self.packages.index(foreign)?.exports.clone()),
+                        None => None,
+                    };
+                    imports.add_import_all(
+                        package_name.as_str(),
+                        exports.map(|exports| {
+                            exports
+                                .into_iter()
+                                .map(|(export, binding)| (export, binding.into_string()))
+                                .collect()
+                        }),
+                        except.iter().map(ToString::to_string),
                     );
                 }
             }
-        }
-
-        for import in &image.index.imports {
-            let ImportSpec::All {
-                package: package_name,
-                except,
-            } = import
-            else {
-                continue;
-            };
-            let exports = match self.packages.resolve(package_name)? {
-                Some(foreign) => Some(self.packages.index(foreign)?.exports.clone()),
-                None => None,
-            };
-            imports.add_import_all(
-                package_name.as_str(),
-                exports.map(|exports| {
-                    exports
-                        .into_iter()
-                        .map(|(export, binding)| (export, binding.into_string()))
-                        .collect()
-                }),
-                except.iter().map(ToString::to_string),
-            );
         }
 
         self.namespace_imports.insert(package, imports.clone());

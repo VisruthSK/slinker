@@ -1,9 +1,9 @@
 use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
 use crate::ir::{
-    ClosureHome, GenericHome, LinkBindingState, LinkNamespaceState, NamespaceId, ObjectStep,
-    PayloadBundleId, PayloadBundleIr, PayloadDependency, ProgramIr, RegisteredNamespace,
-    ResourceId, Value,
+    BindingName, ClosureHome, GenericHome, ImportSlotIr, LinkBindingState, LinkNamespaceState,
+    NamespaceId, ObjectStep, PayloadBundleId, PayloadBundleIr, PayloadDependency, ProgramIr,
+    RegisteredNamespace, RemovedImportIr, ResourceId, Value,
 };
 use crate::package::PackageId;
 use crate::r_worker::client::WorkerClient;
@@ -466,6 +466,13 @@ fn generate_r_source(
 
     out.push_str("bootstrap <- function(root, libname, pkgname) {\n  .slinker_check_target()\n");
     out.push_str("  on.exit(.slinker_unregister(), add = TRUE)\n");
+    for (local, removed) in program.root_artifact().load.removed_imports() {
+        emit!(
+            out,
+            "  .slinker_stub(parent.env(root), {})",
+            removed_import(local, removed)
+        );
+    }
     for activation in program.activations() {
         let package = program.package(program.namespace(activation.namespace).package);
         let identity = package.identity();
@@ -509,13 +516,20 @@ fn generate_r_source(
                 r_string(library)
             );
         }
-        for import in &namespace.imports {
-            emit!(
-                out,
-                "    assign({}, {}, envir = imports)",
-                r_string(&import.local),
-                binding_reference(program, import.target)
-            );
+        for (local, slot) in &namespace.imports {
+            match slot {
+                ImportSlotIr::Bound(target) => emit!(
+                    out,
+                    "    assign({}, {}, envir = imports)",
+                    r_string(local),
+                    binding_reference(program, *target)
+                ),
+                ImportSlotIr::Removed(removed) => emit!(
+                    out,
+                    "    .slinker_stub(imports, {})",
+                    removed_import(local, removed)
+                ),
+            }
         }
         for closure in namespace_closures(program, namespace) {
             let source = code.source(program.closure(closure).code);
@@ -536,28 +550,9 @@ fn generate_r_source(
         emit!(
             out,
             "    .slinker_activate(ns, {}, {}, {}, {})\n  }})",
-            r_vector(
-                activation
-                    .exports
-                    .bindings()
-                    .iter()
-                    .map(|binding| program.binding(*binding).name.as_str())
-                    .chain(
-                        activation
-                            .unretained
-                            .iter()
-                            .filter(|(_, state)| state.is_exported())
-                            .map(|(name, _)| name.as_str()),
-                    )
-            ),
+            r_vector(activation.exports.names().iter().map(BindingName::as_str)),
             s3_matrix(program, &namespace.s3_registrations),
-            r_vector(
-                activation
-                    .unretained
-                    .iter()
-                    .filter(|(_, state)| state.is_stub())
-                    .map(|(name, _)| name.as_str()),
-            ),
+            r_vector(activation.removed_bindings.iter().map(BindingName::as_str)),
             if activation.on_load.is_some() {
                 "TRUE"
             } else {
@@ -803,8 +798,8 @@ fn r_vector<'a>(values: impl Iterator<Item = &'a str>) -> String {
 fn render_namespace(program: &ProgramIr) -> String {
     let before_bootstrap = program.root_artifact().load.before_bootstrap();
     let mut out = String::new();
-    for binding in program.root_artifact().exports.bindings() {
-        emit!(out, "export({})", r_string(&program.binding(*binding).name));
+    for name in program.root_artifact().exports.names() {
+        emit!(out, "export({})", r_string(name));
     }
     for import in before_bootstrap.imports() {
         let package = program
@@ -974,6 +969,15 @@ fn copy_entry(source: &Path, target: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn removed_import(local: &str, removed: &RemovedImportIr) -> String {
+    format!(
+        "{}, {}, {}",
+        r_string(local),
+        r_string(&removed.package),
+        r_string(&removed.binding)
+    )
+}
+
 fn r_string(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -1052,19 +1056,18 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
   bundle <- system.file("slinker", "payload", paste0(package, ".rds"), package = .slinker_root_package, mustWork = TRUE)
   invisible(list2env(readRDS(bundle), envir = namespace))
 }
-.slinker_stub <- function(namespace, package, binding) {
-  makeActiveBinding(binding, function(value) {
+.slinker_stub <- function(envir, name, package, binding) {
+  makeActiveBinding(name, function(value) {
     stop(sprintf("`%s::%s` was removed by slinker because the build never reached it", package, binding), call. = FALSE)
-  }, namespace)
+  }, envir)
 }
 .slinker_activate <- function(namespace, exports, s3, removed, on_load) {
   name <- unname(getNamespaceName(namespace))
   if (nrow(s3)) registerS3methods(s3, name, namespace)
   if (on_load) get(".onLoad", envir = namespace, inherits = FALSE)("", name)
   for (binding in removed[!vapply(removed, exists, logical(1), envir = namespace, inherits = FALSE)]) {
-    .slinker_stub(namespace, name, binding)
+    .slinker_stub(namespace, binding, name, binding)
   }
-  exports <- exports[vapply(exports, exists, logical(1), envir = namespace)]
   if (length(exports)) namespaceExport(namespace, exports)
   lockEnvironment(namespace, TRUE)
   lockEnvironment(parent.env(namespace), TRUE)

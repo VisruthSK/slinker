@@ -95,8 +95,6 @@ that fails before its fix.
   reachable datasets, copy them into a lazy-load database under the generated package, attach them
   as the package's lazy data environment for `::`, and relocate `data(x, package = )`. A dataset
   reached only dynamically blocks.
-- Imports environments: wire every original import name (unretained ones as stubs) so a dropped
-  re-exported import is still exported and lookups through imports answer as the original.
 - Namespace info: fill `imports`, `dynlibs`, and `S3methods` truthfully; `path` stays blocked.
 - Namespace enumeration (`as.list(ns)`, `mget(ls(ns), ns)`, `eapply(ns, ...)`) reads stubs: block it.
 - An unregistered `g.cls` in a Root/Linked namespace is found lexically by dispatch from that

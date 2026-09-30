@@ -175,6 +175,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         while !self.needs.is_empty() {
             self.process_frontier()?;
         }
+        let materialized = self
+            .encountered
+            .iter()
+            .copied()
+            .filter(|package| !self.packages.is_external(*package))
+            .collect::<Vec<_>>();
+        for package in materialized {
+            let image = self.image(package)?;
+            self.namespace_imports(package, &image)?;
+        }
         Ok(self)
     }
 
@@ -1817,26 +1827,43 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 registration.method
             ),
         );
-        if registration.generic.package.is_none()
-            && self
-                .image(id)?
-                .index
-                .binding_names
-                .iter()
-                .any(|name| name == registration.generic.name.as_str())
-        {
-            self.require(
-                node,
-                Need::Binding {
-                    package: id,
-                    binding: BindingName::from(registration.generic.name.as_str()),
-                },
-                EdgeKind::S3Registration,
-                format!(
-                    "registering `{}` looks up its generic in the namespace",
-                    registration.method
-                ),
+        if registration.generic.package.is_none() {
+            let image = self.image(id)?;
+            let reason = format!(
+                "registering `{}` looks up its generic in the namespace",
+                registration.method
             );
+            match self.resolve_name(id, &image, &registration.generic.name)? {
+                Resolution::Static(
+                    BindingTarget::Namespace { package, binding }
+                    | BindingTarget::Imported { package, binding },
+                ) => {
+                    if package != id {
+                        self.require(
+                            node,
+                            Need::Activation { package },
+                            EdgeKind::S3Registration,
+                            reason.clone(),
+                        );
+                    }
+                    self.require(
+                        node,
+                        Need::Binding { package, binding },
+                        EdgeKind::S3Registration,
+                        reason,
+                    );
+                }
+                Resolution::Static(BindingTarget::External { package, binding }) => {
+                    let external = self.external_binding(
+                        package,
+                        &binding,
+                        ExternalBindingAccess::Exported,
+                        None,
+                    );
+                    self.depend(node, external, EdgeKind::S3Registration, reason, None);
+                }
+                _ => {}
+            }
         }
         Ok(())
     }

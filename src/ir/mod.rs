@@ -154,21 +154,21 @@ pub enum ExternalBindingAccess {
     Internal,
 }
 
-/// Canonically ordered final export membership.
+/// Canonically ordered names of the original export table.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExportTable {
-    bindings: Vec<BindingId>,
+    names: Vec<BindingName>,
 }
 
 impl ExportTable {
-    pub fn new(mut bindings: Vec<BindingId>) -> Self {
-        bindings.sort();
-        bindings.dedup();
-        Self { bindings }
+    pub fn new(mut names: Vec<BindingName>) -> Self {
+        names.sort();
+        names.dedup();
+        Self { names }
     }
 
-    pub fn bindings(&self) -> &[BindingId] {
-        &self.bindings
+    pub fn names(&self) -> &[BindingName] {
+        &self.names
     }
 }
 
@@ -197,9 +197,24 @@ pub enum MaterializedRole {
 pub struct Namespace {
     pub package: PackageId,
     pub bindings: BTreeMap<BindingName, BindingId>,
-    pub imports: Vec<ImportBindingIr>,
+    pub imports: BTreeMap<BindingName, ImportSlotIr>,
     pub state: LinkNamespaceState,
     pub s3_registrations: Vec<S3RegistrationId>,
+}
+
+/// What one name of a namespace's imports environment holds.
+#[derive(Clone, Debug)]
+pub enum ImportSlotIr {
+    Bound(BindingId),
+    Removed(RemovedImportIr),
+}
+
+/// An original import whose binding the build never reached. Its name stays in the imports
+/// environment and fails loudly when read.
+#[derive(Clone, Debug)]
+pub struct RemovedImportIr {
+    pub package: PackageName,
+    pub binding: BindingName,
 }
 
 #[derive(Clone, Debug)]
@@ -424,24 +439,7 @@ pub struct NamespaceActivationIr {
     pub on_load: Option<BindingId>,
     pub native_components: Vec<crate::package::NativeComponent>,
     pub exports: ExportTable,
-    pub unretained: BTreeMap<String, UnretainedName>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UnretainedName {
-    Stub,
-    ExportedStub,
-    ExportedByActivation,
-}
-
-impl UnretainedName {
-    pub fn is_stub(self) -> bool {
-        matches!(self, Self::Stub | Self::ExportedStub)
-    }
-
-    pub fn is_exported(self) -> bool {
-        matches!(self, Self::ExportedStub | Self::ExportedByActivation)
-    }
+    pub removed_bindings: Vec<BindingName>,
 }
 
 /// Root source-package transformation decided at finalization: the generated `DESCRIPTION`, the
@@ -458,11 +456,16 @@ pub struct RootArtifactIr {
 
 #[derive(Clone, Debug)]
 pub struct RootLoadIr {
+    removed_imports: BTreeMap<BindingName, RemovedImportIr>,
     before_bootstrap: RootLoadStage,
     after_activation: RootLoadStage,
 }
 
 impl RootLoadIr {
+    pub fn removed_imports(&self) -> &BTreeMap<BindingName, RemovedImportIr> {
+        &self.removed_imports
+    }
+
     pub fn before_bootstrap(&self) -> &RootLoadStage {
         &self.before_bootstrap
     }
@@ -890,7 +893,7 @@ impl ProgramBuilder {
         let id = self.add_namespace(Namespace {
             package,
             bindings: bindings.clone(),
-            imports: Vec::new(),
+            imports: BTreeMap::new(),
             state: match role {
                 MaterializedRole::Root => LinkNamespaceState::Root(state),
                 MaterializedRole::Linked => LinkNamespaceState::Linked(state),
@@ -924,7 +927,7 @@ impl ProgramBuilder {
         let id = self.add_namespace(Namespace {
             package,
             bindings: slots.clone(),
-            imports: Vec::new(),
+            imports: BTreeMap::new(),
             state: LinkNamespaceState::External { package },
             s3_registrations: Vec::new(),
         });
@@ -997,16 +1000,27 @@ impl ProgramBuilder {
     pub fn root_load(&self, root: NamespaceId) -> RootLoadIr {
         let owner = &self.namespaces[root.index()];
         let mut load = RootLoadIr {
+            removed_imports: BTreeMap::new(),
             before_bootstrap: RootLoadStage::default(),
             after_activation: RootLoadStage::default(),
         };
-        for import in &owner.imports {
-            let stage = if self.is_linked_binding(import.target) {
-                &mut load.after_activation
-            } else {
-                &mut load.before_bootstrap
-            };
-            stage.imports.push(import.clone());
+        for (local, slot) in &owner.imports {
+            match slot {
+                ImportSlotIr::Bound(target) => {
+                    let stage = if self.is_linked_binding(*target) {
+                        &mut load.after_activation
+                    } else {
+                        &mut load.before_bootstrap
+                    };
+                    stage.imports.push(ImportBindingIr {
+                        local: local.clone(),
+                        target: *target,
+                    });
+                }
+                ImportSlotIr::Removed(removed) => {
+                    load.removed_imports.insert(local.clone(), removed.clone());
+                }
+            }
         }
         for &id in &owner.s3_registrations {
             let registration = &self.s3_registrations[id.index()];
@@ -1046,11 +1060,11 @@ impl ProgramBuilder {
                 initial: InitialBindingState::Value(value),
                 ..
             }) => matches!(self.values[value.index()], Value::Closure(_)),
-            _ => owner
-                .imports
-                .iter()
-                .find(|import| import.local == name)
-                .is_none_or(|import| !self.is_linked_binding(import.target)),
+            _ => match owner.imports.get(name) {
+                None => true,
+                Some(ImportSlotIr::Bound(target)) => !self.is_linked_binding(*target),
+                Some(ImportSlotIr::Removed(_)) => false,
+            },
         }
     }
 
@@ -1061,22 +1075,12 @@ impl ProgramBuilder {
         )
     }
 
-    /// The binding a namespace sees under `name`: its own slot, else an import.
-    pub fn visible_binding(&self, namespace: NamespaceId, name: &str) -> Option<BindingId> {
-        let namespace = &self.namespaces[namespace.index()];
-        namespace.bindings.get(name).copied().or_else(|| {
-            namespace
-                .imports
-                .iter()
-                .find(|import| import.local == name)
-                .map(|import| import.target)
-        })
-    }
-
-    pub fn attach_import(&mut self, namespace: NamespaceId, local: BindingName, target: BindingId) {
-        self.namespaces[namespace.index()]
-            .imports
-            .push(ImportBindingIr { local, target });
+    pub fn set_imports(
+        &mut self,
+        namespace: NamespaceId,
+        imports: BTreeMap<BindingName, ImportSlotIr>,
+    ) {
+        self.namespaces[namespace.index()].imports = imports;
     }
 
     pub fn payload_bundle(&self, namespace: NamespaceId) -> Option<PayloadBundleId> {
