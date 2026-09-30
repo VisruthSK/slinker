@@ -45,7 +45,7 @@ missing fact.
   heuristic.
 - Delete a replaced API, representation, flag, or format in the same change. Keep tests that prove
   semantic invariants; rewrite tests that pin obsolete details.
-- `PROTOCOL_VERSION` stays `1`. Discover R with `R RHOME` (through `PATHEXT`), `R_HOME` only as a
+- `PROTOCOL_VERSION` stays `3`. Discover R with `R RHOME` (through `PATHEXT`), `R_HOME` only as a
   fallback, and never pass `R_HOME` to an R frontend.
 - Benchmarks never run in parallel, never use `target-cpu=native` or other `RUSTFLAGS`, and disable
   the analysis cache unless the benchmark is explicitly the warm-cache case.
@@ -103,22 +103,17 @@ that fails before its fix.
 
 ## Track C: Rust cleanup, types, and performance
 
-Why: about 23k lines of Rust carry invariants in comments, strings, and `unreachable!`.
-
 Performance:
-- Profile with `cargo bench` before optimizing. Measured: Air plus Oak grows about quadratically
-  with closure size (400 statements 346 ms, 1000 statements 2.1 s); warm rlang analysis takes 18 s
-  of its 31 s cold time, and its roughly 3,500 `normalize_syntax` round trips (two per parsed
-  closure) cost about 4.6 s before the response-polling fix. Unmeasured candidates: one JSON worker
-  round trip per binding (batch per package), a single R worker (several worker processes can
-  inspect different packages in parallel), and string-keyed maps in the analyzer (interning).
+- Measured on cold `slinker analyze rlang` (2026-09-30, Windows): about 55 s, of which the R worker accounts for about 4 s of binding inspection and about 3 s of syntax normalization. The remaining Rust-side analysis is the Track H target (repeated `evaluate_installed_function` and `resolve_lexical_name`).
+- Unmeasured candidates: batching binding requests per package (IPC is about 2 ms per round trip, so at most a few seconds), several worker processes inspecting different packages in parallel, and string-keyed maps in the analyzer. The Oak benchmark is now dominated by Air and Oak themselves (about 50 ms of 155 ms at 400 statements).
 
 Invariants into types:
-- Intern the name newtypes so they hash and compare as integers, but only if a profile shows name
-  hashing matters.
+- Intern the name newtypes so they hash and compare as integers, but only if a profile shows name hashing matters.
+- Replace the remaining `.expect()` invariants in analysis: `root: Option<PackageId>` (finalize), `namespace_builders` and `images` looked up by `PackageId` after `image()` initialized them, and the object graph lookups in `ObjectWorld`.
+- Split `PackageProvider` so a resolution-only provider cannot be asked for images (removes the `unreachable!` in the `universe.rs` test store).
 
 Minimal code:
-- Audit the 544 `.clone()` calls on hot paths once names are interned.
+- Audit the `.clone()` calls on hot paths once names are interned.
 - Prune tests that pin obsolete details as each area is reworked (`tests/` is about 5,600 lines).
 
 ## Track D: Build infrastructure and frontend
@@ -234,7 +229,6 @@ Done when:
 
 ## Traps
 
-- `TargetUniverse::set_root` and `set_explicit_external` must run before any resolution.
 - Root staging library first, then `--lib` paths or, without `--lib`, the default `.libPaths()`.
   Never drop the user library.
 - Explicit `--external` on a Suggests package is selected optional behavior; its contract is
