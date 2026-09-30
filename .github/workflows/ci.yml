@@ -107,7 +107,7 @@ jobs:
           use-public-rspm: true
 
       - if: runner.os == 'Linux'
-        run: sudo apt-get install -y libuv1-dev
+        run: sudo apt-get install -y libuv1-dev libpng-dev
 
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:

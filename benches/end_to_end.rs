@@ -81,7 +81,7 @@ fn provision(r_home: &Path, package: &str) -> (PathBuf, PathBuf) {
             if (length(missing)) install.packages(missing, lib = {library}, dependencies = FALSE)
             absent <- setdiff(required, rownames(installed.packages({library}, noCache = TRUE)))
             if (length(absent)) stop("could not install: ", toString(absent))
-            if (!dir.exists({source})) {{
+            if (!file.exists(file.path({source}, "DESCRIPTION"))) {{
               tarball <- download.packages(package, tempdir(), type = "source")[1, 2]
               untar(tarball, exdir = dirname({source}))
             }}

@@ -395,7 +395,7 @@ impl LinkedSuite<'_> {
                 provide({dependencies}, hard)
                 provide({runtime_library}, runtime)
                 provide({testing_library}, setdiff(testing, linked), setdiff(closure(usable), c(runtime, testing, linked)))
-                if (!dir.exists({source})) {{
+                if (!file.exists(file.path({source}, "DESCRIPTION"))) {{
                   tarball <- download.packages(package, tempdir(), type = "source")[1, 2]
                   untar(tarball, exdir = dirname({source}))
                 }}
