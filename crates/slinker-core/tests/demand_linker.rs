@@ -2266,6 +2266,28 @@ fn defaulted_resource_package_is_static_only_when_no_invocation_supplies_it() {
 }
 
 #[test]
+fn do_call_with_a_literal_list_is_a_typed_invocation() {
+    let foo = || package("foo", &[("h", Some("h <- function() 1"))]);
+    let defaults_hold = |call: &str| {
+        let root = root_with_private_helper(&format!(
+            "main <- function(args, ...) {{ foo::h(); {call} }}"
+        ));
+        let plan = analyze_images(vec![root, foo()]);
+        plan.blockers().iter().all(|diagnostic| {
+            diagnostic.binding.as_deref() != Some("helper")
+                || !diagnostic.message.contains("defaults to")
+        })
+    };
+
+    assert!(defaults_hold("do.call(helper, list(1))"));
+    assert!(defaults_hold("do.call(helper, list(x = 1))"));
+    assert!(!defaults_hold("do.call(helper, list(1, 'foo'))"));
+    assert!(!defaults_hold("do.call(helper, list(1, package = 'foo'))"));
+    assert!(!defaults_hold("do.call(helper, list(...))"));
+    assert!(!defaults_hold("do.call(helper, args)"));
+}
+
+#[test]
 fn base_resource_lookup_is_not_a_package_resource() {
     let root = package(
         "root",

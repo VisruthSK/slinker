@@ -200,6 +200,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         function_span: &Span,
     ) -> Result<Option<Invocation>> {
         for call in &expression.calls {
+            if call.callee == "do.call" {
+                if let Some(invocation) =
+                    self.do_call_invocation(site, parsed, expression, call, function_span)?
+                {
+                    return Ok(Some(invocation));
+                }
+                continue;
+            }
             let Some(family) = apply_family(&call.callee) else {
                 continue;
             };
@@ -245,6 +253,46 @@ impl<P: PackageProvider> AnalyzerState<P> {
             )));
         }
         Ok(None)
+    }
+
+    fn do_call_invocation(
+        &mut self,
+        site: ParsedSite<'_>,
+        parsed: &ParsedRFile,
+        expression: &ParsedExpression,
+        call: &CallSite,
+        function_span: &Span,
+    ) -> Result<Option<Invocation>> {
+        let formals = ["what", "args", "quote", "envir"];
+        let span_of = |formal: &str| {
+            let index = matched_arg_index(call, &formals, formal)?;
+            call.arg_spans.get(index)?.as_ref()
+        };
+        if span_of("what") != Some(function_span) {
+            return Ok(None);
+        }
+        let Some(args_span) = span_of("args") else {
+            return Ok(None);
+        };
+        let Some(list) = expression
+            .calls
+            .iter()
+            .find(|candidate| candidate.callee == "list" && candidate.span == *args_span)
+        else {
+            return Ok(None);
+        };
+        let resolves_to_base = |state: &mut Self, call: &CallSite| {
+            state.call_resolves_definitely_to_base(
+                site.package,
+                site.image,
+                site.lexical_environment,
+                call,
+            )
+        };
+        if !resolves_to_base(self, call)? || !resolves_to_base(self, list)? {
+            return Ok(None);
+        }
+        Ok(Some(Invocation::from_call(parsed, list)))
     }
 }
 
@@ -307,10 +355,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             let invocation = match call.arg_spans.get(function).and_then(Option::as_ref) {
-                Some(span) if call.callee != "do.call" => {
-                    self.base_apply_invocation(site, parsed, expression, span)?
-                }
-                _ => None,
+                Some(span) => self.base_apply_invocation(site, parsed, expression, span)?,
+                None => None,
             };
             for callable in callables {
                 let resolution = self.declared_callable_resolution(
