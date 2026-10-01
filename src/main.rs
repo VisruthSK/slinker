@@ -515,13 +515,10 @@ fn absolute_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn discover_r_home() -> io::Result<PathBuf> {
-    if let Ok(r) = which::which("R")
-        && let Ok(output) = ProcessCommand::new(r).arg("RHOME").output()
-        && output.status.success()
-        && let Some(home) = parse_r_home(&String::from_utf8_lossy(&output.stdout))
-    {
-        return dunce::canonicalize(home);
-    }
+    let failure = match r_home_from_command() {
+        Ok(home) => return dunce::canonicalize(home),
+        Err(failure) => failure,
+    };
     if let Some(home) = env::var_os("R_HOME")
         && !home.is_empty()
     {
@@ -529,8 +526,27 @@ fn discover_r_home() -> io::Result<PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "could not select R: `R RHOME` failed and R_HOME is unset",
+        format!("could not select R: `R RHOME` failed ({failure}) and R_HOME is unset"),
     ))
+}
+
+fn r_home_from_command() -> Result<String, String> {
+    let r = which::which("R").map_err(|error| format!("`R` not found on PATH: {error}"))?;
+    let output = ProcessCommand::new(&r)
+        .arg("RHOME")
+        .output()
+        .map_err(|error| format!("could not start {}: {error}", r.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} RHOME exited with {}: {}",
+            r.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_r_home(&String::from_utf8_lossy(&output.stdout))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{} RHOME printed no path", r.display()))
 }
 
 fn parse_r_home(stdout: &str) -> Option<&str> {

@@ -9,7 +9,7 @@ use slinker::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, CanonicalSyntax,
     ClosureSource, Digest, DispatchSubject, ExportMap, GenericName, InstalledPackage,
     LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
-    PackageLocator, PackageProvider, PackageStore, SyntaxValidation,
+    PackageLocator, PackageProvider, PackageResolver, PackageStore, SyntaxValidation,
 };
 use slinker::syntax::{OakParseContext, OakParser, SourceKey, Sources};
 use slinker::{Description, Result, Target, TargetEnvironment};
@@ -79,7 +79,7 @@ impl MemoryProvider {
     }
 }
 
-impl PackageProvider for MemoryProvider {
+impl PackageResolver for MemoryProvider {
     fn target_environment(&self) -> &TargetEnvironment {
         &self.target
     }
@@ -87,7 +87,9 @@ impl PackageProvider for MemoryProvider {
     fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
         Ok((self.image.index.identity.name == name).then(|| self.installed()))
     }
+}
 
+impl PackageProvider for MemoryProvider {
     fn index(&mut self, _package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         Ok(Arc::clone(&self.image.index))
     }

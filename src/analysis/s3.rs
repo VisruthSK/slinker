@@ -372,7 +372,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn retained_namespaces(&self) -> Vec<PackageId> {
         let mut namespaces = self
-            .images
+            .loaded
             .keys()
             .copied()
             .filter(|package| !self.packages.is_external(*package))
@@ -404,7 +404,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let image = self.image(package)?;
         let prefix = format!("{generic}.");
         let wanted = |class: &str| classes.is_none_or(|classes| classes.contains(class));
-        let registered = self.namespace_builders[&package]
+        let registered = self
+            .loaded(package)?
+            .namespace
             .registrations
             .iter()
             .filter(|registration| {
