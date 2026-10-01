@@ -1,3 +1,4 @@
+use crate::r_executable;
 use crate::source::SourcePackageSnapshot;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -87,14 +88,4 @@ pub enum StagingError {
     MissingInstalledRoot(PathBuf),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-
-fn r_executable(r_home: &Path) -> Option<PathBuf> {
-    [
-        r_home.join("bin/x64/R.exe"),
-        r_home.join("bin/R.exe"),
-        r_home.join("bin/R"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
 }

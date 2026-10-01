@@ -82,14 +82,7 @@ pub fn discover_r_home() -> PathBuf {
 }
 
 pub fn r_executable(r_home: &Path) -> PathBuf {
-    [
-        r_home.join("bin/x64/R.exe"),
-        r_home.join("bin/R.exe"),
-        r_home.join("bin/R"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .expect("target R executable")
+    slinker::r_executable(r_home).expect("target R executable")
 }
 
 pub fn assert_success(output: &Output, operation: &str) {

@@ -59,4 +59,6 @@ pub mod source;
 pub mod syntax;
 
 pub use metadata::{Description, Relation, RelationField, Version};
-pub use target_env::{Target, TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest};
+pub use target_env::{
+    Target, TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest, r_executable,
+};
