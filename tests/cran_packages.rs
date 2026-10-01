@@ -127,7 +127,6 @@ fn voucher_blocks_on_unproven_cli_and_fs_behavior() {
     .assert_blocks(&[
         "DynamicLookup in cli::find_function_symbol: exists() looks up a name that is not a static string",
         "DynamicLookup in fs::register_s3_method: get() looks up a name that is not a static string",
-        "DynamicLookup in voucher: dynamic system.file() package can name a Linked package",
         "asNamespace() with a dynamic namespace name",
         "getNamespaceVersion() with a dynamic package name can name a Linked package",
         "ObjectSystem in fs::compare.fs_path: NextMethod is not inside a registered method",

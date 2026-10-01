@@ -7,6 +7,7 @@ pub mod explain;
 pub mod export;
 mod finalize;
 pub mod graph;
+mod invocation;
 mod namespace;
 mod native;
 pub mod need;

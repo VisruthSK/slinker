@@ -6,13 +6,14 @@ use super::arguments::{
 use super::diagnostic::{Cause, DiagnosticSink, Evidence};
 use super::dynamic_names::{CreatedName, DynamicNames, NameCreator};
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
+use super::invocation::{InvocationModel, PinnedUse};
 use super::namespace::{NamespaceBuilder, OptionalRegistration};
 use super::need::{NeedQueue, Popped};
 use super::object_world::{ClosureId, ObjectId, ObjectWorld};
 use super::parse_cache::{ParseCache, ParseKey, ParseState};
 use super::reflection::ReflectionFacts;
 use super::relocation::{NamespaceCall, PendingRelocation, RelocationPlan, SyntaxObservation};
-use super::resolution::{BindingTarget, OpenReason, Resolution};
+use super::resolution::{BindingTarget, OpenReason, ReferenceUse, Resolution};
 use super::s3::{CallableId, S3Model, callable_target};
 use crate::analysis::{
     Diagnostic, EdgeKind, GenericId, Graph, LifecycleHook, Need, NodeId, NodeKind, RejectCode, S3Id,
@@ -92,6 +93,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) diagnostics: DiagnosticSink,
     pub(super) relocations: RelocationPlan,
     pub(super) s3: S3Model,
+    pub(super) invocations: InvocationModel,
     pub(super) value_closures: HashSet<NodeId>,
     pub(super) construction_calls: HashMap<ConstructionCallKey, AbstractValue>,
     pub(super) construction_evaluations: usize,
@@ -147,6 +149,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             diagnostics: DiagnosticSink::default(),
             relocations: RelocationPlan::default(),
             s3: S3Model::default(),
+            invocations: InvocationModel::default(),
             value_closures: HashSet::new(),
             construction_calls: HashMap::new(),
             construction_evaluations: 0,
@@ -182,10 +185,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
         entry_bindings.sort();
         entry_bindings.dedup();
         for binding in entry_bindings {
-            self.require_root(Need::Binding {
+            let exported = root_image
+                .index
+                .exports
+                .values()
+                .any(|target| target == &binding);
+            let need = Need::Binding {
                 package: root,
                 binding,
-            });
+            };
+            if exported {
+                self.require_root(need);
+            } else {
+                self.require_internal_root(need);
+            }
         }
 
         while !self.needs.is_empty() {
@@ -1167,16 +1180,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
             )?;
             self.register_active_bindings(site, expression)?;
             let consumed_native_selectors = self.consumed_native_selectors(site, expression)?;
-            self.process_references(site, expression, &consumed_native_selectors)?;
+            self.process_references(site, parsed, expression, &consumed_native_selectors)?;
             self.process_package_refs(site, expression)?;
             for resource in &expression.resource_refs {
                 if !self.guards_active(site, &resource.guards, &resource.span)? {
                     continue;
                 }
-                self.resource_access(node, package, parsed, resource)?;
+                self.resource_access(site, parsed, expression, resource)?;
             }
             self.record_non_reflective_namespace_uses(expression);
             self.process_calls(site, parsed, expression)?;
+            self.process_declared_callable_calls(site, parsed, expression)?;
             self.process_namespace_info_reads(site, expression);
             self.process_namespace_enumerations(site, expression);
             self.process_effects(site, expression)?;
@@ -1274,6 +1288,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn process_references(
         &mut self,
         site: ParsedSite<'_>,
+        parsed: &ParsedRFile,
         expression: &ParsedExpression,
         consumed_native_selectors: &[Span],
     ) -> Result<()> {
@@ -1324,7 +1339,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     call.qualified_package.is_none() && call.span.start == reference.span.start
                 })
             {
-                self.record_escape(callable)?;
+                let invocation =
+                    self.base_apply_invocation(site, parsed, expression, &reference.span)?;
+                self.record_use(callable, invocation)?;
             }
             self.require_resolved(
                 site.node,
@@ -1332,6 +1349,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Some(site.binding),
                 resolved,
                 reference.span.clone(),
+                ReferenceUse::Recorded,
             );
         }
         Ok(())
@@ -2194,24 +2212,52 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn resource_access(
         &mut self,
-        from: NodeId,
-        current: PackageId,
+        site: ParsedSite<'_>,
         parsed: &ParsedRFile,
+        expression: &ParsedExpression,
         resource: &crate::syntax::ResourceRef,
     ) -> Result<()> {
+        let (from, current) = (site.node, site.package);
         let package_name = match &resource.package {
-            ResourcePackage::Literal(name) => name,
+            ResourcePackage::Literal(name) => name.clone(),
             ResourcePackage::Computed(binding) => {
                 let declared = binding
                     .as_ref()
                     .and_then(|binding| parsed.string_domain_for(binding, resource.scope));
                 let Some(names) = declared else {
-                    self.relocations.defer_dynamic_resource_lookup(
-                        from,
-                        current,
-                        resource.span.clone(),
-                    );
-                    return Ok(());
+                    let pinned = binding.as_ref().and_then(|binding| {
+                        expression
+                            .pinned_defaults
+                            .iter()
+                            .find(|pinned| pinned.name == binding.name)
+                    });
+                    let Some(pinned) = pinned else {
+                        self.relocations.defer_dynamic_resource_lookup(
+                            from,
+                            current,
+                            resource.span.clone(),
+                        );
+                        return Ok(());
+                    };
+                    self.invocations.pin_default(PinnedUse {
+                        node: from,
+                        package: current,
+                        callable: CallableId {
+                            package: current,
+                            binding: site.binding.into(),
+                        },
+                        formals: expression.parameters.clone(),
+                        formal: pinned.name.clone(),
+                        value: pinned.value.clone(),
+                        span: resource.span.clone(),
+                    });
+                    let names_linked = self.known_package(&pinned.value).is_some_and(|package| {
+                        self.packages.role(package) == crate::package::PackageRole::Linked
+                    });
+                    if !names_linked {
+                        return Ok(());
+                    }
+                    return self.literal_resource_access(from, current, resource, &pinned.value);
                 };
                 for name in names {
                     let linked = self
@@ -2235,6 +2281,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 return Ok(());
             }
         };
+        self.literal_resource_access(from, current, resource, &package_name)
+    }
+
+    fn literal_resource_access(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        resource: &crate::syntax::ResourceRef,
+        package_name: &str,
+    ) -> Result<()> {
         let Some(foreign) = self.resource_package(from, current, resource, package_name)? else {
             return Ok(());
         };
@@ -2415,10 +2471,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         Some(binding),
                         resolved,
                         effect.span.clone(),
+                        ReferenceUse::Unrecorded,
                     );
                 }
             } else {
-                self.require_resolved(from, package, Some(binding), resolved, effect.span.clone());
+                self.require_resolved(
+                    from,
+                    package,
+                    Some(binding),
+                    resolved,
+                    effect.span.clone(),
+                    ReferenceUse::Unrecorded,
+                );
             }
         }
 
@@ -2999,7 +3063,14 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         if matches!(resolved, Resolution::OpenDynamic(OpenReason::Unresolved(_))) {
             return Ok(());
         }
-        self.require_resolved(from, current, None, resolved, span.clone());
+        self.require_resolved(
+            from,
+            current,
+            None,
+            resolved,
+            span.clone(),
+            ReferenceUse::Unrecorded,
+        );
         Ok(())
     }
 
@@ -3643,6 +3714,11 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     }
 
     pub(super) fn require_root(&mut self, need: Need) {
+        self.record_unclassified(&need);
+        self.require_internal_root(need);
+    }
+
+    pub(super) fn require_internal_root(&mut self, need: Need) {
         self.encountered.insert(need.package());
         let node = self.need_node(&need);
         if !self.roots.contains(&node) {
@@ -3662,6 +3738,27 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     }
 
     pub(super) fn require_at(
+        &mut self,
+        from: NodeId,
+        need: Need,
+        kind: EdgeKind,
+        reason: impl Into<String>,
+        span: Option<Span>,
+    ) {
+        self.record_unclassified(&need);
+        self.require_classified_at(from, need, kind, reason, span);
+    }
+
+    pub(super) fn record_unclassified(&mut self, need: &Need) {
+        if let Need::Binding { package, binding } = need {
+            self.invocations.record_unclassified(CallableId {
+                package: *package,
+                binding: binding.clone(),
+            });
+        }
+    }
+
+    pub(super) fn require_classified_at(
         &mut self,
         from: NodeId,
         need: Need,

@@ -3,8 +3,8 @@ use crate::syntax::facts::{
     ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredCallable,
     DeclaredDomain, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind,
     NamespaceEnumeration, NamespaceInfoRead, NamespaceInfoReceiver, PackageGuard, PackageRef,
-    ParsedExpression, ParsedRFile, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind,
-    StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    ParsedExpression, ParsedRFile, PinnedDefault, ResourcePackage, ResourceRef, SemanticIssue,
+    SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use crate::{Error, Result};
@@ -532,6 +532,85 @@ fn used_parameters(index: &SemanticIndex) -> Vec<String> {
     used.into_iter().collect()
 }
 
+const FRAME_REBINDING_CALLEES: &[&str] = &[
+    "assign",
+    "delayedAssign",
+    "makeActiveBinding",
+    "list2env",
+    "eval",
+    "evalq",
+    "local",
+    "with",
+    "within",
+    "rm",
+    "environment",
+    "sys.frame",
+    "sys.frames",
+    "sys.function",
+    "parent.frame",
+    "as.environment",
+    "pos.to.env",
+    "environment<-",
+];
+
+fn pinned_defaults(
+    text: &str,
+    root: &RRoot,
+    index: &SemanticIndex,
+    calls: &[CallSite],
+    effects: &[SyntaxEffect],
+) -> Vec<PinnedDefault> {
+    let Some(function) = root
+        .expressions()
+        .iter()
+        .find_map(|expression| outer_function(&expression))
+    else {
+        return Vec::new();
+    };
+    if calls
+        .iter()
+        .any(|call| FRAME_REBINDING_CALLEES.contains(&call.callee.as_str()))
+    {
+        return Vec::new();
+    }
+    let Ok(parameters) = function.parameters() else {
+        return Vec::new();
+    };
+    parameters
+        .items()
+        .iter()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|parameter| {
+            let name = ast_text(text, &parameter.name().ok()?);
+            let default = parameter.default()?.value().ok()?;
+            let Some(StaticArg::String(value)) = static_arg(&ast_text(text, &default)) else {
+                return None;
+            };
+            let rebound = effects.iter().any(|effect| {
+                effect.kind == SyntaxEffectKind::SuperAssignment
+                    && effect.target.as_deref() == Some(name.as_str())
+            });
+            (!rebound && definition_count(index, &name) == 1)
+                .then_some(PinnedDefault { name, value })
+        })
+        .collect()
+}
+
+fn definition_count(index: &SemanticIndex, name: &str) -> usize {
+    index
+        .scope_ids()
+        .map(|scope| {
+            index
+                .definitions(scope)
+                .iter()
+                .filter(|(_, definition)| {
+                    index.symbols(scope).symbol(definition.symbol()).name() == name
+                })
+                .count()
+        })
+        .sum()
+}
+
 fn is_frame_intrinsic(name: &str) -> bool {
     matches!(
         name,
@@ -934,16 +1013,18 @@ fn translate_index(
 
     let (parameters, construction) = collect_construction(source, text, root, &live_calls);
     let namespace_info_reads = collect_namespace_info_reads(source, text, root, &declarations);
-    let calls = live_calls.into_iter().map(|call| call.site).collect();
+    let calls: Vec<CallSite> = live_calls.into_iter().map(|call| call.site).collect();
     let mut issues = translate_diagnostics(source, index);
     issues.extend(declarations.issues);
 
     let used_parameters = used_parameters(index);
+    let pinned_defaults = pinned_defaults(text, root, index, &calls, &effects);
     ParsedRFile {
         expressions: vec![ParsedExpression {
             span: Span::new(source, 0, text.len()),
             parameters,
             used_parameters,
+            pinned_defaults,
             definitions: Vec::new(),
             references,
             package_refs,
