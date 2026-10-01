@@ -2,8 +2,8 @@ use super::MaterializeError;
 use super::relocated::RelocatedCode;
 use crate::ir::{
     BindingId, BindingName, ClosureId, ExternalBindingAccess, GenericHome, ImportSlotIr,
-    InitialBindingState, LinkBindingState, LinkNamespaceState, Namespace, PackageId,
-    PayloadBundleIr, PayloadDependency, ProgramIr, RegisteredNamespace, RemovedImportIr,
+    InitialBindingState, LinkBindingState, LinkNamespaceState, Namespace, NamespaceActivationIr,
+    PackageId, PayloadBundleIr, PayloadDependency, ProgramIr, RegisteredNamespace, RemovedImportIr,
     S3RegistrationId, Value, ValueId,
 };
 
@@ -37,26 +37,43 @@ pub(super) fn generate_r_source(
         ".slinker_root_package <- {}",
         r_string(&program.package(program.root_package()).identity().name)
     );
-    let root = program.root_namespace();
+    emit_bootstrap(&mut out, program, code);
+    out.push_str("})\n");
+    out.push_str(&root_closures_source(program, code)?);
+    out.push_str(
+        ".onLoad <- function(libname, pkgname) {\n  .slinker_runtime[[\"bootstrap\"]](base::asNamespace(pkgname), libname, pkgname)\n}\n",
+    );
+    Ok(out)
+}
+
+fn root_closures_source(
+    program: &ProgramIr,
+    code: &RelocatedCode,
+) -> Result<String, MaterializeError> {
     let root_on_load = program.root_artifact().on_load;
-    let mut root_code = String::new();
-    for closure in namespace_closures(program, root) {
-        let source = code.source(program.closure(closure).code);
+    let mut source = String::new();
+    for closure in namespace_closures(program, program.root_namespace()) {
+        let code_id = program.closure(closure).code;
+        let text = code.source(code_id);
         if Some(closure) == root_on_load {
             let value_start = program
-                .code(program.closure(closure).code)
+                .code(code_id)
                 .assigned_value_start()
                 .ok_or_else(|| {
                     MaterializeError::InvalidR("Root .onLoad code is not an assignment".into())
                 })?;
-            root_code.push_str(".slinker_original_on_load <- ");
-            root_code.push_str(&source[value_start..]);
+            source.push_str(".slinker_original_on_load <- ");
+            source.push_str(&text[value_start..]);
         } else {
-            root_code.push_str(source);
+            source.push_str(text);
         }
-        root_code.push('\n');
+        source.push('\n');
     }
+    Ok(source)
+}
 
+fn emit_bootstrap(out: &mut String, program: &ProgramIr, code: &RelocatedCode) {
+    let root = program.root_namespace();
     out.push_str("bootstrap <- function(root, libname, pkgname) {\n  .slinker_check_target()\n");
     out.push_str("  on.exit(.slinker_unregister(), add = TRUE)\n");
     for (local, removed) in program.root_artifact().load.removed_imports() {
@@ -78,93 +95,7 @@ pub(super) fn generate_r_source(
         );
     }
     for activation in program.activations() {
-        let namespace = program.namespace(activation.namespace);
-        let package = program.package(namespace.package);
-        let name = &package.identity().name;
-        emit!(
-            out,
-            "  local({{\n    ns <- namespaces[[{}]]\n    imports <- parent.env(ns)",
-            r_string(package.registered_namespace().as_str())
-        );
-        for native in &activation.native_components {
-            let Some(library) = native.library.path() else {
-                continue;
-            };
-            let symbols = native
-                .bindings()
-                .map(|symbol| {
-                    format!(
-                        "{} = {}",
-                        r_string(&symbol.binding),
-                        r_string(&symbol.symbol)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            emit!(
-                out,
-                "    .slinker_load_native(ns, {}, {}, {}, {}, c({symbols}))",
-                r_string(name),
-                r_string(&native.name),
-                r_string(&native.alias),
-                r_string(library)
-            );
-        }
-        if program
-            .dataset_libraries()
-            .any(|(library, _)| library == namespace.package)
-        {
-            emit!(out, "    .slinker_lazydata(ns, {})", r_string(name));
-        }
-        emit!(
-            out,
-            "    setNamespaceInfo(ns, \"imports\", {})",
-            imports_info(namespace)
-        );
-        for (local, slot) in &namespace.imports {
-            match slot {
-                ImportSlotIr::Bound(target) => emit!(
-                    out,
-                    "    assign({}, {}, envir = imports)",
-                    r_string(local),
-                    binding_reference(program, *target)
-                ),
-                ImportSlotIr::Removed(removed) => emit!(
-                    out,
-                    "    .slinker_stub(imports, {})",
-                    removed_import(local, removed)
-                ),
-            }
-        }
-        for closure in namespace_closures(program, namespace) {
-            let source = code.source(program.closure(closure).code);
-            emit!(
-                out,
-                "    eval(parse(text = {}), envir = ns)",
-                r_string(source)
-            );
-        }
-        if let Some(bundle) = payload_bundle(program, namespace) {
-            emit!(
-                out,
-                "    .slinker_populate(ns, {}, {})",
-                r_string(name),
-                external_payload_dependencies(program, bundle)
-            );
-        }
-        emit!(
-            out,
-            "    .slinker_activate(ns, {}, {}, {}, {}, {})\n  }})",
-            r_vector(activation.exports.names().iter().map(BindingName::as_str)),
-            s3_matrix(program, &namespace.s3_registrations, S3Column4::Registry),
-            s3_matrix(program, &namespace.s3_registrations, S3Column4::Original),
-            r_vector(activation.removed_bindings.iter().map(BindingName::as_str)),
-            if activation.on_load.is_some() {
-                "TRUE"
-            } else {
-                "FALSE"
-            }
-        );
+        emit_activation(out, program, code, activation);
     }
     let after_activation = program.root_artifact().load.after_activation();
     for import in after_activation.imports() {
@@ -193,17 +124,107 @@ pub(super) fn generate_r_source(
         );
     }
     out.push_str("  .slinker_unregister()\n");
-    if root_on_load.is_some() {
+    if program.root_artifact().on_load.is_some() {
         out.push_str(
             "  get(\".slinker_original_on_load\", envir = root, inherits = FALSE)(libname, pkgname)\n",
         );
     }
-    out.push_str("}\n})\n");
-    out.push_str(&root_code);
-    out.push_str(
-        ".onLoad <- function(libname, pkgname) {\n  .slinker_runtime[[\"bootstrap\"]](base::asNamespace(pkgname), libname, pkgname)\n}\n",
+    out.push_str("}\n");
+}
+
+fn emit_activation(
+    out: &mut String,
+    program: &ProgramIr,
+    code: &RelocatedCode,
+    activation: &NamespaceActivationIr,
+) {
+    let namespace = program.namespace(activation.namespace);
+    let package = program.package(namespace.package);
+    let name = &package.identity().name;
+    emit!(
+        out,
+        "  local({{\n    ns <- namespaces[[{}]]\n    imports <- parent.env(ns)",
+        r_string(package.registered_namespace().as_str())
     );
-    Ok(out)
+    for native in &activation.native_components {
+        let Some(library) = native.library.path() else {
+            continue;
+        };
+        let symbols = native
+            .bindings()
+            .map(|symbol| {
+                format!(
+                    "{} = {}",
+                    r_string(&symbol.binding),
+                    r_string(&symbol.symbol)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        emit!(
+            out,
+            "    .slinker_load_native(ns, {}, {}, {}, {}, c({symbols}))",
+            r_string(name),
+            r_string(&native.name),
+            r_string(&native.alias),
+            r_string(library)
+        );
+    }
+    if program
+        .dataset_libraries()
+        .any(|(library, _)| library == namespace.package)
+    {
+        emit!(out, "    .slinker_lazydata(ns, {})", r_string(name));
+    }
+    emit!(
+        out,
+        "    setNamespaceInfo(ns, \"imports\", {})",
+        imports_info(namespace)
+    );
+    for (local, slot) in &namespace.imports {
+        match slot {
+            ImportSlotIr::Bound(target) => emit!(
+                out,
+                "    assign({}, {}, envir = imports)",
+                r_string(local),
+                binding_reference(program, *target)
+            ),
+            ImportSlotIr::Removed(removed) => emit!(
+                out,
+                "    .slinker_stub(imports, {})",
+                removed_import(local, removed)
+            ),
+        }
+    }
+    for closure in namespace_closures(program, namespace) {
+        let source = code.source(program.closure(closure).code);
+        emit!(
+            out,
+            "    eval(parse(text = {}), envir = ns)",
+            r_string(source)
+        );
+    }
+    if let Some(bundle) = payload_bundle(program, namespace) {
+        emit!(
+            out,
+            "    .slinker_populate(ns, {}, {})",
+            r_string(name),
+            external_payload_dependencies(program, bundle)
+        );
+    }
+    emit!(
+        out,
+        "    .slinker_activate(ns, {}, {}, {}, {}, {})\n  }})",
+        r_vector(activation.exports.names().iter().map(BindingName::as_str)),
+        s3_matrix(program, &namespace.s3_registrations, S3Column4::Registry),
+        s3_matrix(program, &namespace.s3_registrations, S3Column4::Original),
+        r_vector(activation.removed_bindings.iter().map(BindingName::as_str)),
+        if activation.on_load.is_some() {
+            "TRUE"
+        } else {
+            "FALSE"
+        }
+    );
 }
 
 fn namespace_closures(
