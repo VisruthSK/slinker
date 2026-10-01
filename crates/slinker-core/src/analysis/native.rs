@@ -25,14 +25,14 @@ struct CallbackSite<'a> {
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    pub(super) fn native_selector(call: &CallSite) -> Option<&str> {
+    fn native_selector(call: &CallSite) -> Option<&str> {
         let index = matched_arg_index(call, &[".NAME"], ".NAME")?;
         match call.args.get(index)?.as_ref()? {
             StaticArg::Symbol(name) | StaticArg::String(name) => Some(name.as_str()),
         }
     }
 
-    pub(super) fn native_summary_for_selector<'a>(
+    fn native_summary_for_selector<'a>(
         native: &'a NativeComponent,
         selector: &str,
         summaries: &'a [NativeRoutineSummary],

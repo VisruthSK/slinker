@@ -115,7 +115,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(imports)
     }
 
-    pub(super) fn inferred_non_returning_bindings(
+    fn inferred_non_returning_bindings(
         &mut self,
         package: PackageId,
         image: &PackageImage,

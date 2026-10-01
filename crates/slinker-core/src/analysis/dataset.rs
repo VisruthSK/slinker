@@ -1,5 +1,6 @@
+use super::discovery::Discovered;
 use super::resolution::{OpenReason, Resolution};
-use super::state::{AnalyzerState, Discovered};
+use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::package::{DatasetName, PackageId, PackageImage, PackageProvider};

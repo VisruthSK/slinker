@@ -1,9 +1,10 @@
 use super::arguments::{
     matched_arg_index, namespace_formals, namespace_target, reflective_name_formals,
 };
+use super::guards::GuardVerdict;
 use super::object_world::{ClosureId, EnvironmentId, InstalledObject, ObjectId};
 use super::resolution::{BindingTarget, Resolution};
-use super::state::{AnalyzerState, GuardVerdict, ParseRequest};
+use super::state::{AnalyzerState, ParseRequest};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId};
 use crate::package::{PackageId, PackageImage, PackageProvider};
@@ -158,7 +159,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn evaluate_construction(
+    fn evaluate_construction(
         &mut self,
         context: ExecutionContext<'_>,
         state: &mut ExecutionState,
@@ -256,7 +257,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    pub(super) fn construction_symbol(
+    fn construction_symbol(
         &mut self,
         context: ExecutionContext<'_>,
         state: &ExecutionState,
@@ -301,7 +302,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(object.map_or(AbstractValue::Unknown, AbstractValue::Object))
     }
 
-    pub(super) fn construction_member(
+    fn construction_member(
         &mut self,
         context: ExecutionContext<'_>,
         object: AbstractValue,
@@ -367,7 +368,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             })
     }
 
-    pub(super) fn construction_index(
+    fn construction_index(
         &mut self,
         context: ExecutionContext<'_>,
         object: AbstractValue,
@@ -404,7 +405,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .map_or(AbstractValue::Unknown, AbstractValue::Object)
     }
 
-    pub(super) fn assign_construction(
+    fn assign_construction(
         &mut self,
         context: ExecutionContext<'_>,
         state: &mut ExecutionState,
@@ -479,7 +480,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn schedule_executable_object(
+    fn schedule_executable_object(
         &mut self,
         context: ExecutionContext<'_>,
         object: ObjectId,
@@ -499,7 +500,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    pub(super) fn evaluate_construction_call(
+    fn evaluate_construction_call(
         &mut self,
         context: ExecutionContext<'_>,
         state: &mut ExecutionState,
@@ -564,7 +565,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    pub(super) fn evaluate_inline_function(
+    fn evaluate_inline_function(
         &mut self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
@@ -585,7 +586,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         )
     }
 
-    pub(super) fn evaluate_installed_function(
+    fn evaluate_installed_function(
         &mut self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
@@ -673,7 +674,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(ExecutionOutcome::value(value))
     }
 
-    pub(super) fn evaluate_base_construction_call(
+    fn evaluate_base_construction_call(
         &mut self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
@@ -935,7 +936,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(AbstractValue::Unknown)
     }
 
-    pub(super) fn abstract_environment(
+    fn abstract_environment(
         &self,
         context: ExecutionContext<'_>,
         value: &AbstractValue,
@@ -946,7 +947,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.objects.graph(context.package).environment_of(*object)
     }
 
-    pub(super) fn abstract_closure(
+    fn abstract_closure(
         &self,
         context: ExecutionContext<'_>,
         value: &AbstractValue,
@@ -957,11 +958,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.objects.graph(context.package).closure_of(*object)
     }
 
-    pub(super) fn abstract_length(
-        &self,
-        context: ExecutionContext<'_>,
-        value: &AbstractValue,
-    ) -> Option<i64> {
+    fn abstract_length(&self, context: ExecutionContext<'_>, value: &AbstractValue) -> Option<i64> {
         match value {
             AbstractValue::Null => Some(0),
             AbstractValue::String(_) => Some(1),
@@ -975,7 +972,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    pub(super) fn abstract_names(
+    fn abstract_names(
         &self,
         context: ExecutionContext<'_>,
         value: &AbstractValue,
@@ -995,7 +992,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Some(names)
     }
 
-    pub(super) fn evaluate_reenclosing_lapply(
+    fn evaluate_reenclosing_lapply(
         &mut self,
         context: ExecutionContext<'_>,
         arguments: &[AbstractValue],
@@ -1013,7 +1010,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         )
     }
 
-    pub(super) fn reenclosure_callback(
+    fn reenclosure_callback(
         &self,
         context: ExecutionContext<'_>,
         function: &AbstractValue,
@@ -1087,7 +1084,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.abstract_environment(context, value)
     }
 
-    pub(super) fn schedule_environment_closures(
+    fn schedule_environment_closures(
         &mut self,
         context: ExecutionContext<'_>,
         environment: EnvironmentId,
@@ -1119,7 +1116,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 }
 
-pub(super) fn fold_paste0(arguments: &[AbstractValue]) -> AbstractValue {
+fn fold_paste0(arguments: &[AbstractValue]) -> AbstractValue {
     let mut columns = Vec::with_capacity(arguments.len());
     let mut width = 1usize;
     for argument in arguments {
@@ -1170,7 +1167,7 @@ pub(super) fn fold_paste0(arguments: &[AbstractValue]) -> AbstractValue {
     }
 }
 
-pub(super) fn fold_strsplit(call: &ConstructionCall, arguments: &[AbstractValue]) -> AbstractValue {
+fn fold_strsplit(call: &ConstructionCall, arguments: &[AbstractValue]) -> AbstractValue {
     let formals = &["x", "split", "fixed", "perl", "useBytes"];
     let (Some(input), Some(AbstractValue::String(separator)), Some(AbstractValue::Logical(true))) = (
         construction_argument(call, arguments, formals, "x"),
@@ -1218,7 +1215,7 @@ pub(super) fn fold_strsplit(call: &ConstructionCall, arguments: &[AbstractValue]
     )
 }
 
-pub(super) fn fold_switch(call: &ConstructionCall, arguments: &[AbstractValue]) -> AbstractValue {
+fn fold_switch(call: &ConstructionCall, arguments: &[AbstractValue]) -> AbstractValue {
     let Some(AbstractValue::String(selector)) = arguments.first() else {
         return AbstractValue::Unknown;
     };
@@ -1233,7 +1230,7 @@ pub(super) fn fold_switch(call: &ConstructionCall, arguments: &[AbstractValue]) 
     default.unwrap_or(AbstractValue::Null)
 }
 
-pub(super) fn construction_argument<'a>(
+fn construction_argument<'a>(
     call: &ConstructionCall,
     values: &'a [AbstractValue],
     formals: &[&str],
@@ -1243,7 +1240,7 @@ pub(super) fn construction_argument<'a>(
     values.get(index)
 }
 
-pub(super) fn bind_construction_arguments(
+fn bind_construction_arguments(
     state: &mut ExecutionState,
     parameters: &[String],
     call: &ConstructionCall,

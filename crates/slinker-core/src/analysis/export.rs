@@ -150,7 +150,7 @@ pub(crate) fn blockers(plan: &LinkIr, node_ids: &[String]) -> Vec<GraphBlockerEx
     blockers
 }
 
-pub(crate) fn semantic_node_id(node: &Node) -> String {
+fn semantic_node_id(node: &Node) -> String {
     match &node.kind {
         NodeKind::Binding { name } | NodeKind::ExternalBinding { name } => {
             format!("{}::{name}", node.package)

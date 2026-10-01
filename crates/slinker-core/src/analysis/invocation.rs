@@ -28,7 +28,7 @@ impl Invocation {
         Self::from_call_arguments(parsed, call, |_| true)
     }
 
-    pub(super) fn from_call_arguments(
+    fn from_call_arguments(
         parsed: &ParsedRFile,
         call: &CallSite,
         keep: impl Fn(usize) -> bool,
@@ -55,7 +55,7 @@ impl Invocation {
         Self { arguments }
     }
 
-    pub(super) fn through_apply(forwarded: Self, positional_elements: usize) -> Self {
+    fn through_apply(forwarded: Self, positional_elements: usize) -> Self {
         let elements = (0..positional_elements).map(|_| InvocationArgument {
             name: None,
             classes: None,
@@ -66,7 +66,7 @@ impl Invocation {
         }
     }
 
-    pub(super) fn may_supply(&self, formals: &[String], formal: &str) -> bool {
+    fn may_supply(&self, formals: &[String], formal: &str) -> bool {
         if self.arguments.iter().any(|argument| argument.forwards_dots) {
             return true;
         }
@@ -117,7 +117,7 @@ impl InvocationModel {
         self.unclassified.insert(callable);
     }
 
-    pub(super) fn is_unclassified(&self, callable: &CallableId) -> bool {
+    fn is_unclassified(&self, callable: &CallableId) -> bool {
         self.unclassified.contains(callable)
     }
 
@@ -125,12 +125,7 @@ impl InvocationModel {
         self.uses.get(callable).map_or(&[], Vec::as_slice)
     }
 
-    pub(super) fn may_supply(
-        &self,
-        callable: &CallableId,
-        formals: &[String],
-        formal: &str,
-    ) -> bool {
+    fn may_supply(&self, callable: &CallableId, formals: &[String], formal: &str) -> bool {
         self.uses(callable).iter().any(|usage| {
             usage
                 .as_ref()

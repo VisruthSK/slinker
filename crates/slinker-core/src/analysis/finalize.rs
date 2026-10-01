@@ -123,7 +123,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         })
     }
 
-    pub(super) fn finalize_program(
+    fn finalize_program(
         &self,
         retained: &BTreeSet<PackageId>,
     ) -> Result<(ProgramIr, Vec<FinalizationIssue>)> {
@@ -1071,7 +1071,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    pub(super) fn finalize_syntax_observations(&mut self) {
+    fn finalize_syntax_observations(&mut self) {
         for observation in self.relocations.observations_of_rewritten_syntax() {
             self.diagnostic(
                 observation.node,
