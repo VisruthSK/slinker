@@ -239,9 +239,7 @@ impl WorkerRuntime {
         objects: &[String],
         sets: &BTreeMap<String, Vec<String>>,
     ) -> OperationResult<protocol::DataLibraryFiles> {
-        let forced = |error: InspectionError| {
-            WorkerOperationError::with(WorkerErrorCode::BindingForce)(error)
-        };
+        let forced = WorkerOperationError::with(WorkerErrorCode::BindingForce);
         let root = self
             .context(package)
             .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?
@@ -281,18 +279,16 @@ impl WorkerRuntime {
         package: Option<&protocol::PackageSpec>,
         name: &str,
     ) -> OperationResult<Vec<String>> {
-        let metadata = |error: InspectionError| {
-            WorkerOperationError::with(WorkerErrorCode::PackageMetadata)(error)
-        };
+        let metadata = WorkerOperationError::with(WorkerErrorCode::PackageMetadata);
         let environment = match package {
             Some(package) => {
-                let context = self.context(package).map_err(&metadata)?;
-                field(&context.image, "image_env").map_err(&metadata)?
+                let context = self.context(package).map_err(metadata)?;
+                field(&context.image, "image_env").map_err(metadata)?
             }
             None => harp::RFunction::new("base", "baseenv")
                 .call()
                 .map_err(InspectionError::from)
-                .map_err(&metadata)?,
+                .map_err(metadata)?,
         };
         if !harp::environment::Environment::new(environment.clone()).exists(name) {
             return Err(WorkerOperationError::with(WorkerErrorCode::MissingBinding)(

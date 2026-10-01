@@ -244,7 +244,7 @@ pub struct WorkerPackageIdentity {
     pub image_fingerprint: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerErrorCode {
     Protocol,

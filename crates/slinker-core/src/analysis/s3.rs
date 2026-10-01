@@ -401,7 +401,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .index
             .binding_names
             .iter()
-            .filter(|name| name.strip_prefix(&prefix).is_some_and(&wanted))
+            .filter(|name| name.strip_prefix(&prefix).is_some_and(wanted))
             .map(|name| (name.clone(), EdgeKind::Lexical))
             .chain(registered)
             .collect::<BTreeMap<_, _>>();

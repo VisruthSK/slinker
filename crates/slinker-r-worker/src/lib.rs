@@ -43,7 +43,7 @@ struct WorkerOperationError {
 }
 
 impl WorkerOperationError {
-    fn with(code: WorkerErrorCode) -> impl FnOnce(InspectionError) -> Self {
+    fn with(code: WorkerErrorCode) -> impl Fn(InspectionError) -> Self + Copy {
         move |error| Self { code, error }
     }
 }

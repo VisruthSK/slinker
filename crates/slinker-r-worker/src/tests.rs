@@ -38,22 +38,22 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
     let r_home = test_r_home().expect("selected R installation");
     #[cfg(all(unix, not(target_os = "macos")))]
     if std::env::var_os("SLINKER_EMBEDDED_R_TEST").is_none() {
-        let output = std::process::Command::new(
-            std::env::current_exe().expect("current test executable"),
-        )
-        .args([
-            "--exact",
-            "r_worker::tests::harp_inspection_preserves_lazy_active_altrep_and_private_state",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env("SLINKER_EMBEDDED_R_TEST", "1")
-        .env(
-            "LD_LIBRARY_PATH",
-            super::client::target_library_path(&r_home).expect("target R library path"),
-        )
-        .output()
-        .expect("run the test under the target R library path");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "tests::harp_inspection_preserves_lazy_active_altrep_and_private_state",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("SLINKER_EMBEDDED_R_TEST", "1")
+                .env(
+                    "LD_LIBRARY_PATH",
+                    slinker_core::worker::target_library_path(&r_home)
+                        .expect("target R library path"),
+                )
+                .output()
+                .expect("run the test under the target R library path");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success() && stdout.contains("test result: ok. 1 passed"),

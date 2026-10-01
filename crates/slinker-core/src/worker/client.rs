@@ -414,7 +414,7 @@ impl Drop for WorkerClient {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) fn target_library_path(r_home: &std::path::Path) -> Result<std::ffi::OsString> {
+pub fn target_library_path(r_home: &std::path::Path) -> Result<std::ffi::OsString> {
     use std::os::unix::ffi::OsStringExt;
     let output = Command::new("sh")
         .arg("-c")
