@@ -3,7 +3,9 @@ use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
-use crate::package::{BindingName, ClassName, GenericName, PackageId, PackageProvider};
+use crate::package::{
+    BindingName, ClassName, DispatchCallee, GenericName, ImportSpec, PackageId, PackageProvider,
+};
 use crate::syntax::{CallSite, ParsedRFile, Span, StaticArg};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -58,6 +60,7 @@ pub(super) struct S3Model {
     callable_generics: HashMap<CallableId, BTreeSet<S3GenericKey>>,
     invocations: HashMap<CallableId, Vec<Option<Invocation>>>,
     closed_methods: HashSet<(PackageId, BindingName)>,
+    lexical_demands: HashSet<(PackageId, GenericName)>,
     next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
 }
 
@@ -196,6 +199,10 @@ impl S3Model {
 
     pub(super) fn take_next_method_calls(&mut self) -> Vec<(NodeId, PackageId, String, Span)> {
         std::mem::take(&mut self.next_method_calls)
+    }
+
+    fn first_lexical_demand(&mut self, package: PackageId, generic: &GenericName) -> bool {
+        self.lexical_demands.insert((package, generic.clone()))
     }
 
     pub(super) fn is_closed_method(&self, package: PackageId, binding: &str) -> bool {
@@ -488,6 +495,128 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 lexical_environment,
                 &call.callee,
             )?)),
+        }
+    }
+}
+
+impl<P: PackageProvider> AnalyzerState<P> {
+    pub(super) fn retain_lexical_s3_methods(
+        &mut self,
+        site: ParsedSite<'_>,
+        call: &CallSite,
+    ) -> Result<()> {
+        let Some(owner) = self.dispatching_callee(site, call)? else {
+            return Ok(());
+        };
+        let generics = self.packages.dispatch_generics(owner.as_callee())?;
+        for generic in generics {
+            if self.s3.first_lexical_demand(site.package, &generic) {
+                self.retain_s3_methods(site.node, site.package, &generic, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatching_callee(
+        &mut self,
+        site: ParsedSite<'_>,
+        call: &CallSite,
+    ) -> Result<Option<DispatchOwner>> {
+        let target = match call.qualified_package.as_deref() {
+            Some("base") => Resolution::Static(BindingTarget::Base),
+            Some(package) => match self.known_package(package) {
+                Some(package) => Resolution::Static(BindingTarget::External {
+                    package,
+                    binding: call.callee.clone().into(),
+                }),
+                None => return Ok(None),
+            },
+            None if call.callee_kind == crate::syntax::CalleeKind::DefinitelyLexical => {
+                return Ok(None);
+            }
+            None => self.resolve_lexical_name(
+                site.package,
+                site.image,
+                site.lexical_environment,
+                &call.callee,
+            )?,
+        };
+        match target {
+            Resolution::Static(BindingTarget::Base) => {
+                Ok(Some(DispatchOwner::Base(call.callee.clone().into())))
+            }
+            Resolution::Static(BindingTarget::External { package, binding })
+                if self.packages.is_external(package) =>
+            {
+                self.defining_namespace(package, binding)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn defining_namespace(
+        &mut self,
+        mut package: PackageId,
+        mut binding: BindingName,
+    ) -> Result<Option<DispatchOwner>> {
+        let mut visited = HashSet::new();
+        while visited.insert((package, binding.clone())) {
+            let index = self.packages.index(package)?;
+            if let Some(exported) = index.exports.get(binding.as_str()) {
+                binding = exported.clone();
+            }
+            if index.binding_names.contains(&binding) {
+                return Ok(Some(DispatchOwner::Package { package, binding }));
+            }
+            if let Some((source, remote)) = index.import_from(&binding) {
+                let Some(next) = self.packages.resolve(source)? else {
+                    return Ok(None);
+                };
+                (package, binding) = (next, remote.into());
+                continue;
+            }
+            let mut provider = None;
+            for import in &index.imports {
+                if let ImportSpec::All {
+                    package: source,
+                    except,
+                } = import
+                    && !except.contains(&binding)
+                    && let Some(next) = self.packages.resolve(source)?
+                    && self
+                        .packages
+                        .index(next)?
+                        .exports
+                        .contains_key(binding.as_str())
+                {
+                    provider = Some(next);
+                }
+            }
+            match provider {
+                Some(next) => package = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+}
+
+enum DispatchOwner {
+    Base(BindingName),
+    Package {
+        package: PackageId,
+        binding: BindingName,
+    },
+}
+
+impl DispatchOwner {
+    fn as_callee(&self) -> DispatchCallee<'_> {
+        match self {
+            Self::Base(binding) => DispatchCallee::Base { binding },
+            Self::Package { package, binding } => DispatchCallee::Package {
+                package: *package,
+                binding,
+            },
         }
     }
 }

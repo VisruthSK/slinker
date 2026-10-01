@@ -1,10 +1,11 @@
 use crate::metadata::Priority;
 use crate::package::{
-    CanonicalSyntax, InstalledPackage, PackageId, PackageIdentity, PackageImage, PackageIndex,
-    PackageLocation, PackageProvider, PackageRole, SyntaxValidation, fingerprint_image,
+    CanonicalSyntax, DispatchSubject, GenericName, InstalledPackage, PackageId, PackageIdentity,
+    PackageImage, PackageIndex, PackageLocation, PackageProvider, PackageRole, SyntaxValidation,
+    fingerprint_image,
 };
 use crate::{Error, Result, TargetEnvironment};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +23,17 @@ impl PackageAvailability {
             Self::Absent => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DispatchCallee<'a> {
+    Base {
+        binding: &'a str,
+    },
+    Package {
+        package: PackageId,
+        binding: &'a str,
+    },
 }
 
 pub struct TargetUniverse<P: PackageProvider> {
@@ -126,6 +138,19 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.store.binding_image(&self.packages[id.index()].0, name)
     }
 
+    pub fn dispatch_generics(
+        &mut self,
+        callee: DispatchCallee<'_>,
+    ) -> Result<BTreeSet<GenericName>> {
+        self.store.dispatch_generics(match callee {
+            DispatchCallee::Base { binding } => DispatchSubject::Base { binding },
+            DispatchCallee::Package { package, binding } => DispatchSubject::Installed {
+                package: &self.packages[package.index()].0,
+                binding,
+            },
+        })
+    }
+
     pub fn resource_exists(&mut self, id: PackageId, path: &str) -> Result<bool> {
         self.store
             .resource_exists(&self.packages[id.index()].0, path)
@@ -217,6 +242,13 @@ mod tests {
             _name: &str,
         ) -> Result<Arc<PackageImage>> {
             unreachable!("resolution never inspects images")
+        }
+
+        fn dispatch_generics(
+            &mut self,
+            _subject: DispatchSubject<'_>,
+        ) -> Result<BTreeSet<GenericName>> {
+            unreachable!("resolution never queries dispatch")
         }
 
         fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {

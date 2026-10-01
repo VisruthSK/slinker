@@ -1343,6 +1343,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 self.record_invocation(parsed, callable, call)?;
             }
+            self.retain_lexical_s3_methods(site, call)?;
             if matches!(call.callee.as_str(), "UseMethod" | "NextMethod")
                 && call.qualified_package.is_none()
                 && matches!(

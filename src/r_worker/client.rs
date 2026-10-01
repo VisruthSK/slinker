@@ -149,6 +149,25 @@ impl WorkerClient {
         }
     }
 
+    pub(crate) fn dispatch_generics(
+        &mut self,
+        package: Option<&InstalledPackage>,
+        name: &str,
+    ) -> Result<Vec<String>> {
+        let request_id = self.request_id();
+        match self.exchange(&WorkerRequest::DispatchGenerics {
+            request_id,
+            package: package.map(package_spec),
+            name: name.to_owned(),
+        })? {
+            WorkerResponse::DispatchGenerics {
+                request_id: response_id,
+                generics,
+            } if response_id == request_id => Ok(generics),
+            response => Err(worker_error("dispatch generics", response)),
+        }
+    }
+
     pub(crate) fn serialize_payloads(
         &mut self,
         namespaces: Vec<NamespaceImageSpec>,
@@ -301,6 +320,16 @@ fn request_context(request: &WorkerRequest) -> String {
         } => format!(
             "request {request_id} binding {}::{name} {} {}",
             package.name, package.version, package.image_fingerprint
+        ),
+        WorkerRequest::DispatchGenerics {
+            request_id,
+            package,
+            name,
+        } => format!(
+            "request {request_id} dispatch generics of {}::{name}",
+            package
+                .as_ref()
+                .map_or("base", |package| package.name.as_str())
         ),
         WorkerRequest::SerializePayloads {
             request_id,

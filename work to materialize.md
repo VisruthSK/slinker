@@ -95,8 +95,9 @@ that fails before its fix.
   reachable datasets, copy them into a lazy-load database under the generated package, attach them
   as the package's lazy data environment for `::`, and relocate `data(x, package = )`. A dataset
   reached only dynamically blocks.
-- An unregistered `g.cls` in a Root/Linked namespace is found lexically by dispatch from that
-  namespace's code, even for base generics; retain it whenever the namespace calls the generic.
+- Lexical S3 retention reaches calls and binary operators only. Dispatch through unary operators,
+  `[`, `[[`, `$`, `@`, and replacement forms (`names(x) <- v`) needs Oak call facts for those
+  syntax forms; until then a method reached only that way is a stub that fails loudly.
 - Optional `Suggests` availability: reachable behavior that depends on whether an unselected
   Suggests package is installed blocks.
 - Diagnostics: collapse derivative missing-name cascades behind one primary blocker.

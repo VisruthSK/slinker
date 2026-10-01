@@ -399,3 +399,59 @@
   unserialize(bytes)
   unique(found)
 }
+
+.slinker_s3_groups <- list(
+  Math = c(
+    "abs", "sign", "sqrt", "floor", "ceiling", "trunc", "round", "signif",
+    "exp", "log", "expm1", "log1p", "cos", "sin", "tan", "cospi", "sinpi",
+    "tanpi", "acos", "asin", "atan", "cosh", "sinh", "tanh", "acosh", "asinh",
+    "atanh", "lgamma", "gamma", "digamma", "trigamma", "cumsum", "cumprod",
+    "cummax", "cummin", "log2", "log10"
+  ),
+  Ops = c(
+    "+", "-", "*", "/", "^", "%%", "%/%", "&", "|", "!", "==", "!=", "<", "<=",
+    ">=", ">"
+  ),
+  matrixOps = "%*%",
+  Summary = c("all", "any", "sum", "prod", "min", "max", "range"),
+  Complex = c("Arg", "Conj", "Im", "Mod", "Re")
+)
+
+.slinker_s3_aliases <- list(as.numeric = "as.double", seq.int = "seq")
+
+.slinker_use_method_generics <- function(expression) {
+  generics <- character()
+  visit <- function(call) {
+    head <- call[[1L]]
+    is_use_method <- identical(head, quote(UseMethod)) ||
+      identical(head, quote(base::UseMethod))
+    if (
+      is_use_method &&
+        length(call) >= 2L &&
+        is.character(call[[2L]]) &&
+        length(call[[2L]]) == 1L
+    ) {
+      generics <<- c(generics, call[[2L]])
+    }
+    for (index in seq_along(call)) {
+      if (is.call(call[[index]])) visit(call[[index]])
+    }
+  }
+  if (is.call(expression)) visit(expression)
+  unique(generics)
+}
+
+.slinker_dispatch_generics <- function(environment, name) {
+  value <- get(name, envir = environment, inherits = FALSE)
+  if (!is.function(value)) {
+    return(character())
+  }
+  if (is.primitive(value)) {
+    groups <- names(Filter(function(members) name %in% members, .slinker_s3_groups))
+    return(unique(c(name, groups, .slinker_s3_aliases[[name]])))
+  }
+  unique(c(
+    .slinker_use_method_generics(body(value)),
+    if (name %in% .internalGenerics) name
+  ))
+}

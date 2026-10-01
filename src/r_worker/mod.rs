@@ -259,6 +259,38 @@ impl WorkerRuntime {
             .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
     }
 
+    fn dispatch_generics(
+        &mut self,
+        package: Option<&protocol::PackageSpec>,
+        name: &str,
+    ) -> std::result::Result<Vec<String>, WorkerOperationError> {
+        let metadata = |error: InspectionError| {
+            WorkerOperationError::with(WorkerErrorCode::PackageMetadata)(error)
+        };
+        let environment = match package {
+            Some(package) => {
+                let context = self.context(package).map_err(&metadata)?;
+                field(&context.image, "image_env").map_err(&metadata)?
+            }
+            None => harp::RFunction::new("base", "baseenv")
+                .call()
+                .map_err(InspectionError::from)
+                .map_err(&metadata)?,
+        };
+        if !harp::environment::Environment::new(environment.clone()).exists(name) {
+            return Err(WorkerOperationError::with(WorkerErrorCode::MissingBinding)(
+                format!("installed image has no binding {name}").into(),
+            ));
+        }
+        harp::RFunction::new("", ".slinker_dispatch_generics")
+            .add(environment)
+            .add(name)
+            .call()
+            .and_then(Vec::<String>::try_from)
+            .map_err(InspectionError::from)
+            .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
+    }
+
     fn binding_value(
         &mut self,
         package: &protocol::PackageSpec,
@@ -1606,6 +1638,28 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                     WorkerErrorCode::RuntimeStartup,
                     "Harp worker must receive hello before semantic requests",
                     Some(&package),
+                    Some(name),
+                ),
+            },
+            WorkerRequest::DispatchGenerics {
+                request_id,
+                package,
+                name,
+            } => match runtime.as_mut() {
+                Some(runtime) => match runtime.dispatch_generics(package.as_ref(), &name) {
+                    Ok(generics) => WorkerResponse::DispatchGenerics {
+                        request_id,
+                        generics,
+                    },
+                    Err(error) => {
+                        operation_failure(Some(request_id), error, package.as_ref(), Some(name))
+                    }
+                },
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    package.as_ref(),
                     Some(name),
                 ),
             },

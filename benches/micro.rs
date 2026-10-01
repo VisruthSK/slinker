@@ -7,9 +7,9 @@ use slinker::analysis::Linker;
 use slinker::cache::CacheLocation;
 use slinker::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, CanonicalSyntax,
-    ClosureSource, Digest, ExportMap, InstalledPackage, LifecycleMetadata, ObjectKind,
-    PackageIdentity, PackageImage, PackageIndex, PackageLocation, PackageLocator, PackageProvider,
-    PackageStore, SyntaxValidation,
+    ClosureSource, Digest, DispatchSubject, ExportMap, GenericName, InstalledPackage,
+    LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
+    PackageLocator, PackageProvider, PackageStore, SyntaxValidation,
 };
 use slinker::syntax::{OakParseContext, OakParser, SourceKey, Sources};
 use slinker::{Description, Result, Target, TargetEnvironment};
@@ -98,6 +98,13 @@ impl PackageProvider for MemoryProvider {
         _name: &str,
     ) -> Result<Arc<PackageImage>> {
         Ok(Arc::clone(&self.image))
+    }
+
+    fn dispatch_generics(
+        &mut self,
+        _subject: DispatchSubject<'_>,
+    ) -> Result<BTreeSet<GenericName>> {
+        Ok(BTreeSet::new())
     }
 
     fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {

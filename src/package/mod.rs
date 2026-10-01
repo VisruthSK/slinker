@@ -22,7 +22,9 @@ pub use index::{
 };
 pub use locator::PackageLocator;
 pub(crate) use locator::fingerprint_image;
-pub use store::{CanonicalSyntax, PackageProvider, PackageStore, SyntaxValidation};
-pub use universe::{PackageAvailability, PackageSources, TargetUniverse};
+pub use store::{
+    CanonicalSyntax, DispatchSubject, PackageProvider, PackageStore, SyntaxValidation,
+};
+pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUniverse};
 
 pub use names::{BindingName, ClassName, ComponentName, GenericName, PackageName, ResourcePath};

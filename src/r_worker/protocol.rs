@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -142,6 +142,11 @@ pub enum WorkerRequest {
         package: PackageSpec,
         name: String,
     },
+    DispatchGenerics {
+        request_id: u64,
+        package: Option<PackageSpec>,
+        name: String,
+    },
     SerializePayloads {
         request_id: u64,
         namespaces: Vec<NamespaceImageSpec>,
@@ -179,6 +184,10 @@ pub enum WorkerResponse {
     Binding {
         request_id: u64,
         binding: WorkerBinding,
+    },
+    DispatchGenerics {
+        request_id: u64,
+        generics: Vec<String>,
     },
     Payloads {
         request_id: u64,

@@ -107,6 +107,85 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
 }
 
 #[test]
+fn unregistered_lexical_methods_dispatch_from_linked_code_as_in_the_original() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("lexlinked");
+    write_package(
+        &dependency_source,
+        "lexlinked",
+        "Imports: stats\n",
+        "export(show_format, show_add, show_median, show_print, show_summary_name)\nS3method(print, registered)\n",
+        concat!(
+            "show_format <- function(x) format(x)\n",
+            "show_add <- function(a, b) a + b\n",
+            "show_median <- function(x) stats::median(x)\n",
+            "show_print <- function(x) print(x)\n",
+            "show_summary_name <- function() 'summary.lexical'\n",
+            "format.lexical <- function(x, ...) 'lexical-format'\n",
+            "`+.lexical` <- function(e1, e2) 'lexical-plus'\n",
+            "median.lexical <- function(x, na.rm = FALSE, ...) 'lexical-median'\n",
+            "print.registered <- function(x, ...) cat('registered\n')\n",
+            "print.lexical <- function(x, ...) cat('lexical-print\n')\n",
+            "summary.lexical <- function(object, ...) 'never dispatched'\n",
+        ),
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+
+    let root_source = fixture.path().join("lexroot");
+    write_package(
+        &root_source,
+        "lexroot",
+        "Imports: lexlinked\n",
+        "importFrom(lexlinked, show_format, show_add, show_median, show_print)\nexport(go)\n",
+        concat!(
+            "go <- function() {\n",
+            "  lexical <- structure(1, class = 'lexical')\n",
+            "  registered <- structure(1, class = 'registered')\n",
+            "  list(\n",
+            "    format = show_format(lexical),\n",
+            "    plus = show_add(lexical, lexical),\n",
+            "    median = show_median(lexical),\n",
+            "    lexical_print = utils::capture.output(show_print(lexical)),\n",
+            "    registered_print = utils::capture.output(show_print(registered))\n",
+            "  )\n",
+            "}\n",
+        ),
+    );
+    let output = fixture.path().join("generated-lexroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run lexical dispatch build");
+    assert_success(&result, "slinker build lexical dispatch fixture");
+
+    let behavior = "library(lexroot); stopifnot(identical(go(), list(format = 'lexical-format', plus = 'lexical-plus', median = 'lexical-median', lexical_print = 'lexical-print', registered_print = 'registered')))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &output, &validation);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency_source, &installed);
+    install_package(&r_home, &output, &installed);
+    let demand_driven = "imports <- parent.env(asNamespace('lexroot')); linked <- environment(get('show_format', envir = imports)); stopifnot(is.function(get('format.lexical', envir = linked)), is.function(get('print.lexical', envir = linked))); message <- tryCatch(get('summary.lexical', envir = linked), error = conditionMessage); stopifnot(grepl('`lexlinked::summary.lexical` was removed by slinker', message, fixed = TRUE))";
+    for library in [&validation, &installed] {
+        run_r(&r_home, library, &format!("{behavior}; {demand_driven}"));
+    }
+}
+
+#[test]
 fn linked_on_load_outside_the_namespace_environment_still_runs() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

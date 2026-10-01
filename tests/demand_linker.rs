@@ -4,15 +4,15 @@ use slinker::analysis::{
     EdgeKind, ExplanationDag, GraphEdgeReasonExport, Linker, NodeKind, RejectCode,
 };
 use slinker::package::{
-    BindingImage, BindingOrigin, CanonicalSyntax, ClosureSource, Digest, EmbeddedClosureSource,
-    ExportMap, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent,
-    NativeFacts, NativeLibrary, NativeRegistration, NativeRoutineSummary, NativeSafety,
-    NativeSymbolBinding, ObjectIssue, ObjectKind, PackageIdentity, PackageImage, PackageIndex,
-    PackageLocation, PackageProvider, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
-    SyntaxValidation,
+    BindingImage, BindingOrigin, CanonicalSyntax, ClosureSource, Digest, DispatchSubject,
+    EmbeddedClosureSource, ExportMap, GenericName, ImportBinding, ImportSpec, InstalledPackage,
+    LifecycleMetadata, NativeComponent, NativeFacts, NativeLibrary, NativeRegistration,
+    NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectIssue, ObjectKind,
+    PackageIdentity, PackageImage, PackageIndex, PackageLocation, PackageProvider,
+    PrivateBindingImage, PrivateEnvironmentImage, S3Registration, SyntaxValidation,
 };
 use slinker::{Description, Error, Result, Target, TargetEnvironment};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +22,7 @@ struct FakeProvider {
     target_environment: TargetEnvironment,
     image_counts: Arc<Mutex<HashMap<String, usize>>>,
     optional_locate_counts: Arc<Mutex<HashMap<String, usize>>>,
+    dispatch: HashMap<(Option<String>, String), BTreeSet<GenericName>>,
     validation: SyntaxValidation,
 }
 
@@ -35,6 +36,7 @@ impl FakeProvider {
             image_counts: Arc::new(Mutex::new(HashMap::new())),
             optional_locate_counts: Arc::new(Mutex::new(HashMap::new())),
             validation: SyntaxValidation::Accepted,
+            dispatch: HashMap::new(),
             target_environment: TargetEnvironment {
                 r_home: PathBuf::from("/opt/R"),
                 target: Target {
@@ -130,6 +132,14 @@ impl FakeProvider {
         Arc::clone(&self.optional_locate_counts)
     }
 
+    fn dispatching(mut self, package: Option<&str>, binding: &str, generics: &[&str]) -> Self {
+        self.dispatch.insert(
+            (package.map(str::to_owned), binding.to_owned()),
+            generics.iter().copied().map(GenericName::from).collect(),
+        );
+        self
+    }
+
     fn validation(mut self, validation: SyntaxValidation) -> Self {
         self.validation = validation;
         self
@@ -173,6 +183,16 @@ impl PackageProvider for FakeProvider {
             .get(package.identity.name.as_str())
             .cloned()
             .ok_or_else(|| Error::Analysis(format!("missing fake image {}", package.identity.name)))
+    }
+
+    fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
+        let key = match subject {
+            DispatchSubject::Base { binding } => (None, binding.to_owned()),
+            DispatchSubject::Installed { package, binding } => {
+                (Some(package.identity.name.to_string()), binding.to_owned())
+            }
+        };
+        Ok(self.dispatch.get(&key).cloned().unwrap_or_default())
     }
 
     fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {
@@ -5235,4 +5255,201 @@ fn enumerating_a_linked_namespace_blocks_but_targeted_lookup_does_not() {
     ] {
         assert!(!enumeration_blocked(accepted), "{accepted}");
     }
+}
+
+fn lexical_method_namespace(
+    entry: &str,
+    methods: &[(&str, &str)],
+    s3: Vec<S3Registration>,
+) -> PackageImage {
+    let mut bindings = vec![("run", Some(entry))];
+    bindings.extend(methods.iter().map(|(name, source)| (*name, Some(*source))));
+    package_with!(
+        "foo",
+        &bindings,
+        Vec::new(),
+        export("run"),
+        s3,
+        Vec::new(),
+        Vec::new(),
+        "",
+    )
+}
+
+fn lexical_root() -> PackageImage {
+    package("root", &[("f", Some("f <- function(x) foo::run(x)"))])
+}
+
+fn node_count(plan: &slinker::analysis::LinkIr, package: &str, binding: &str) -> usize {
+    plan.provenance()
+        .nodes()
+        .iter()
+        .filter(|node| {
+            node.package == package
+                && matches!(&node.kind, NodeKind::Binding { name } if name == binding)
+        })
+        .count()
+}
+
+#[test]
+fn unregistered_lexical_method_is_retained_when_its_namespace_calls_a_base_generic() {
+    let foo = lexical_method_namespace(
+        "run <- function(x) print(x)",
+        &[
+            ("print.cls", "print.cls <- function(x, ...) 1"),
+            ("other.cls", "other.cls <- function(x, ...) 2"),
+            ("helper.fn", "helper.fn <- function(x) 3"),
+        ],
+        Vec::new(),
+    );
+    let provider =
+        FakeProvider::new(vec![lexical_root(), foo]).dispatching(None, "print", &["print"]);
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert!(retained_binding(&plan, "foo", "print.cls"));
+    assert!(!retained_binding(&plan, "foo", "other.cls"));
+    assert!(!retained_binding(&plan, "foo", "helper.fn"));
+}
+
+#[test]
+fn method_shaped_binding_is_not_retained_when_the_callee_is_not_a_generic() {
+    let foo = lexical_method_namespace(
+        "run <- function(x) print(x)",
+        &[("print.cls", "print.cls <- function(x, ...) 1")],
+        Vec::new(),
+    );
+    let plan = Linker::new(FakeProvider::new(vec![lexical_root(), foo]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(!retained_binding(&plan, "foo", "print.cls"));
+}
+
+#[test]
+fn lexical_method_demand_comes_from_the_namespace_that_calls_the_generic() {
+    let foo = lexical_method_namespace(
+        "run <- function(x) x",
+        &[("print.cls", "print.cls <- function(x, ...) 1")],
+        Vec::new(),
+    );
+    let root = package(
+        "root",
+        &[("f", Some("f <- function(x) { foo::run(x); print(x) }"))],
+    );
+    let provider = FakeProvider::new(vec![root, foo]).dispatching(None, "print", &["print"]);
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert!(!retained_binding(&plan, "foo", "print.cls"));
+}
+
+#[test]
+fn unregistered_lexical_method_is_retained_for_a_generic_of_an_external_package() {
+    let foo = lexical_method_namespace(
+        "run <- function(x) ext::gen(x)",
+        &[("gen.cls", "gen.cls <- function(x, ...) 1")],
+        Vec::new(),
+    );
+    let ext = package("ext", &[("gen", None)]);
+    let provider =
+        FakeProvider::new(vec![lexical_root(), foo, ext]).dispatching(Some("ext"), "gen", &["gen"]);
+    let plan = Linker::new(provider, 1)
+        .with_external_packages(["ext".into()])
+        .analyze("root")
+        .unwrap();
+
+    assert!(retained_binding(&plan, "foo", "gen.cls"));
+}
+
+#[test]
+fn lexical_method_follows_an_external_reexport_to_the_defining_namespace() {
+    let foo = lexical_method_namespace(
+        "run <- function(x) mid::gen(x)",
+        &[("gen.cls", "gen.cls <- function(x, ...) 1")],
+        Vec::new(),
+    );
+    let ext = package("ext", &[("gen", None)]);
+    let mid = package_with!(
+        "mid",
+        &[],
+        vec![ImportSpec::From {
+            package: "ext".into(),
+            bindings: vec![ImportBinding {
+                local: "gen".into(),
+                remote: "gen".into(),
+            }],
+        }],
+        export("gen"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Imports: ext\n",
+    );
+    let provider = FakeProvider::new(vec![lexical_root(), foo, ext, mid]).dispatching(
+        Some("ext"),
+        "gen",
+        &["gen"],
+    );
+    let plan = Linker::new(provider, 1)
+        .with_external_packages(["ext".into(), "mid".into()])
+        .analyze("root")
+        .unwrap();
+
+    assert!(retained_binding(&plan, "foo", "gen.cls"));
+}
+
+#[test]
+fn group_generic_operator_retains_the_group_and_member_methods_only() {
+    let foo = lexical_method_namespace(
+        "run <- function(x) x + x",
+        &[
+            ("Ops.cls", "Ops.cls <- function(e1, e2) 1"),
+            ("+.cls", "`+.cls` <- function(e1, e2) 2"),
+            ("-.cls", "`-.cls` <- function(e1, e2) 3"),
+        ],
+        Vec::new(),
+    );
+    let provider =
+        FakeProvider::new(vec![lexical_root(), foo]).dispatching(None, "+", &["+", "Ops"]);
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert!(retained_binding(&plan, "foo", "Ops.cls"));
+    assert!(retained_binding(&plan, "foo", "+.cls"));
+    assert!(!retained_binding(&plan, "foo", "-.cls"));
+}
+
+#[test]
+fn lexical_retention_does_not_duplicate_a_registered_method() {
+    let foo = lexical_method_namespace(
+        "run <- function(x) print(x)",
+        &[
+            ("print.reg", "print.reg <- function(x, ...) 1"),
+            ("print.cls", "print.cls <- function(x, ...) 2"),
+        ],
+        vec![S3Registration {
+            generic: slinker::package::GenericSpec {
+                package: None,
+                name: "print".into(),
+            },
+            class: "reg".into(),
+            method: "print.reg".into(),
+        }],
+    );
+    let provider =
+        FakeProvider::new(vec![lexical_root(), foo]).dispatching(None, "print", &["print"]);
+    let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert!(retained_binding(&plan, "foo", "print.cls"));
+    assert_eq!(node_count(&plan, "foo", "print.reg"), 1);
+    assert!(program_has_s3_registration(
+        &plan,
+        "foo",
+        None,
+        "print",
+        "reg",
+        "print.reg"
+    ));
+    assert!(
+        !program_has_s3_registration(&plan, "foo", None, "print", "cls", "print.cls"),
+        "an unregistered lexical method must not gain a registration"
+    );
 }

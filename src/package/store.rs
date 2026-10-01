@@ -1,14 +1,15 @@
 use crate::cache::{Cache, CacheLocation};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary,
-    NativeSafety, PackageIdentity, PackageImage, PackageIndex, PackageLocator,
+    BindingName, GenericName, InstalledPackage, LifecycleMetadata, NativeFacts,
+    NativeRoutineSummary, NativeSafety, PackageIdentity, PackageImage, PackageIndex,
+    PackageLocator,
 };
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{WorkerBinding, WorkerPackageIndex};
 use crate::{Error, Result, TargetEnvironment};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -197,6 +198,17 @@ pub enum CanonicalSyntax {
     Unstable,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum DispatchSubject<'a> {
+    Base {
+        binding: &'a str,
+    },
+    Installed {
+        package: &'a InstalledPackage,
+        binding: &'a str,
+    },
+}
+
 pub trait PackageProvider {
     fn target_environment(&self) -> &TargetEnvironment;
     fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>>;
@@ -213,6 +225,7 @@ pub trait PackageProvider {
             .iter()
             .any(|candidate| candidate == path))
     }
+    fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>>;
     fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation>;
     fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax>;
 }
@@ -221,6 +234,7 @@ pub struct PackageStore {
     locator: PackageLocator,
     indexes: HashMap<PackageIdentity, Arc<PackageIndex>>,
     bindings: HashMap<(PackageIdentity, String), Arc<PackageImage>>,
+    dispatch: HashMap<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
     cache: Cache,
     r_home: PathBuf,
     target_fingerprint: String,
@@ -248,6 +262,7 @@ impl PackageStore {
             locator: PackageLocator::new(target),
             indexes: HashMap::new(),
             bindings: HashMap::new(),
+            dispatch: HashMap::new(),
             cache: Cache::new(cache, ANALYSIS_SCHEMA)?,
             r_home,
             target_fingerprint,
@@ -498,6 +513,28 @@ impl PackageProvider for PackageStore {
             return Ok(false);
         }
         Ok(package.location.root.join(relative).exists())
+    }
+
+    fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
+        let (package, binding) = match subject {
+            DispatchSubject::Base { binding } => (None, binding),
+            DispatchSubject::Installed { package, binding } => (Some(package), binding),
+        };
+        let key = (
+            package.map(|package| package.identity.clone()),
+            binding.to_owned(),
+        );
+        if let Some(generics) = self.dispatch.get(&key) {
+            return Ok(generics.clone());
+        }
+        let generics = self
+            .worker()?
+            .dispatch_generics(package, binding)?
+            .into_iter()
+            .map(GenericName::from)
+            .collect::<BTreeSet<_>>();
+        self.dispatch.insert(key, generics.clone());
+        Ok(generics)
     }
 
     fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation> {
