@@ -35,6 +35,7 @@ use crate::syntax::{
 use crate::{Error, Result};
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -86,7 +87,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) encountered: HashSet<PackageId>,
     pub(super) external: HashSet<PackageId>,
     pub(super) parses: ParseCache,
-    pub(super) images: HashMap<PackageId, Arc<PackageImage>>,
+    pub(super) loaded: HashMap<PackageId, LoadedPackage>,
     pub(super) objects: ObjectWorld,
     pub(super) diagnostics: DiagnosticSink,
     pub(super) relocations: RelocationPlan,
@@ -99,12 +100,16 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) external_bindings: BTreeMap<(PackageId, BindingName), ExternalBindingAccess>,
     pub(super) dependencies: HashMap<NodeId, HashSet<NodeId>>,
     pub(super) provenance: bool,
-    pub(super) root: Option<PackageId>,
+    pub(super) root: PackageId,
     declared_dependencies: HashMap<PackageId, DeclaredDependencies>,
     pub(super) namespace_imports: HashMap<PackageId, NamespaceImports>,
     pub(super) non_returning_bindings: HashMap<PackageId, BTreeSet<String>>,
-    pub(super) namespace_builders: HashMap<PackageId, NamespaceBuilder>,
     pub(super) root_description: Option<Arc<str>>,
+}
+
+pub(super) struct LoadedPackage {
+    pub(super) image: Arc<PackageImage>,
+    pub(super) namespace: NamespaceBuilder,
 }
 
 pub(super) struct NativeCallTarget {
@@ -113,13 +118,20 @@ pub(super) struct NativeCallTarget {
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    pub(super) fn new(packages: P, root: &str, options: AnalysisOptions) -> Self {
-        Self {
-            packages: TargetUniverse::new(
-                packages,
-                root,
-                options.explicit_external_packages.clone(),
-            ),
+    pub(super) fn new(packages: P, root_name: &str, options: AnalysisOptions) -> Result<Self> {
+        if options.explicit_external_packages.contains(root_name) {
+            return Err(Error::Analysis(format!(
+                "root package `{root_name}` cannot be External"
+            )));
+        }
+        let mut packages = TargetUniverse::new(
+            packages,
+            root_name,
+            options.explicit_external_packages.clone(),
+        );
+        let root = packages.require(root_name)?;
+        Ok(Self {
+            packages,
             extra_packages: options.extra_packages,
             explicit_external_packages: options.explicit_external_packages,
             jobs: options.jobs.max(1),
@@ -127,10 +139,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
             graph: Graph::default(),
             roots: Vec::new(),
             needs: NeedQueue::default(),
-            encountered: HashSet::new(),
+            encountered: HashSet::from([root]),
             external: HashSet::new(),
             parses: ParseCache::default(),
-            images: HashMap::new(),
+            loaded: HashMap::new(),
             objects: ObjectWorld::default(),
             diagnostics: DiagnosticSink::default(),
             relocations: RelocationPlan::default(),
@@ -143,25 +155,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
             external_bindings: BTreeMap::new(),
             dependencies: HashMap::new(),
             provenance: options.provenance,
-            root: None,
+            root,
             declared_dependencies: HashMap::new(),
             namespace_imports: HashMap::new(),
             non_returning_bindings: HashMap::new(),
-            namespace_builders: HashMap::new(),
             root_description: options.root_description,
-        }
+        })
     }
 
     pub(super) fn run(mut self) -> Result<Self> {
-        let root_name = self.packages.root_name().to_owned();
-        if self.explicit_external_packages.contains(&root_name) {
-            return Err(Error::Analysis(format!(
-                "root package `{root_name}` cannot be External"
-            )));
-        }
-        let root = self.packages.require(&root_name)?;
-        self.root = Some(root);
-        self.encountered.insert(root);
+        let root = self.root;
         let root_image = self.image(root)?;
 
         self.require_root(Need::Activation { package: root });
@@ -219,21 +222,27 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn image(&mut self, package: PackageId) -> Result<Arc<PackageImage>> {
-        if let Some(image) = self.images.get(&package) {
-            return Ok(Arc::clone(image));
+    pub(super) fn loaded(&mut self, package: PackageId) -> Result<&mut LoadedPackage> {
+        match self.loaded.entry(package) {
+            Entry::Occupied(entry) => Ok(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let index = self.packages.index(package)?;
+                let image = Arc::new(PackageImage {
+                    index: Arc::clone(&index),
+                    bindings: HashMap::new(),
+                    private_environments: HashMap::new(),
+                });
+                self.objects.merge(package, &image);
+                Ok(entry.insert(LoadedPackage {
+                    image,
+                    namespace: NamespaceBuilder::new(&index),
+                }))
+            }
         }
-        let index = self.packages.index(package)?;
-        let image = Arc::new(PackageImage {
-            index: Arc::clone(&index),
-            bindings: HashMap::new(),
-            private_environments: HashMap::new(),
-        });
-        self.namespace_builders
-            .insert(package, NamespaceBuilder::new(&index));
-        self.objects.merge(package, &image);
-        self.images.insert(package, Arc::clone(&image));
-        Ok(image)
+    }
+
+    pub(super) fn image(&mut self, package: PackageId) -> Result<Arc<PackageImage>> {
+        Ok(Arc::clone(&self.loaded(package)?.image))
     }
 
     pub(super) fn binding_image(
@@ -249,11 +258,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         let partial = self.packages.binding_image(package, binding)?;
         self.objects.merge(package, &partial);
-        let image = Arc::make_mut(
-            self.images
-                .get_mut(&package)
-                .expect("package image initialized with index"),
-        );
+        drop(image);
+        let loaded = self.loaded(package)?;
+        let image = Arc::make_mut(&mut loaded.image);
         image.bindings.extend(
             partial
                 .bindings
@@ -274,9 +281,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 })
                 .or_insert_with(|| environment.clone());
         }
-        Ok(Arc::clone(
-            self.images.get(&package).expect("merged package image"),
-        ))
+        Ok(Arc::clone(&loaded.image))
     }
 
     pub(super) fn parse_pool(&mut self) -> Result<Option<Arc<rayon::ThreadPool>>> {
@@ -601,9 +606,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.ensure_on_load_analyzed(id)?;
         }
         if self
-            .namespace_builders
+            .loaded
             .get(&id)
-            .is_some_and(|namespace| namespace.contains(binding))
+            .is_some_and(|loaded| loaded.namespace.contains(binding))
             && !image.index.binding_names.iter().any(|name| name == binding)
         {
             let lifecycle = self.need_node(&Need::Lifecycle {
@@ -1217,9 +1222,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 site.lexical_environment,
                 active,
             )? && self
-                .namespace_builders
-                .get_mut(&site.package)
-                .expect("namespace builder initialized")
+                .loaded(site.package)?
+                .namespace
                 .add_binding(active.name.clone().into())
             {
                 self.non_returning_bindings.remove(&site.package);
@@ -1735,9 +1739,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 && self.package_is_suggested_only(id, package_name)?
                 && !self.optional_package_selected(package_name)
             {
-                self.namespace_builders
-                    .get_mut(&id)
-                    .expect("namespace builder initialized")
+                self.loaded(id)?
+                    .namespace
                     .optional_registrations
                     .push(OptionalRegistration {
                         package: package_name.into(),
@@ -1787,9 +1790,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 class: registration.class.clone(),
                 method: registration.method.clone(),
             };
-            self.namespace_builders
-                .get_mut(&id)
-                .expect("namespace builder initialized")
+            self.loaded(id)?
+                .namespace
                 .registrations
                 .push(registration_id.clone());
             self.require(
@@ -2344,7 +2346,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn declared_dependencies(&mut self, package: PackageId) -> Result<&DeclaredDependencies> {
         if !self.declared_dependencies.contains_key(&package) {
-            let index = Arc::clone(&self.images[&package].index);
+            let index = Arc::clone(&self.image(package)?.index);
             let mut required = HashSet::new();
             for import in &index.imports {
                 let package = match import {
@@ -2619,7 +2621,8 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             self.dynamic_package_name(from, current, binding, call);
             return Ok(());
         };
-        let imported = self.images[&current]
+        let imported = self
+            .image(current)?
             .index
             .imports
             .iter()
@@ -2877,6 +2880,8 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
         call: &CallSite,
+        formals: &[&str],
+        target: &str,
     ) -> Result<()> {
         let ParsedSite {
             node: from,
@@ -2897,8 +2902,6 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         {
             return Ok(());
         }
-        let (formals, target) = reflective_name_formals(&call.callee)
-            .expect("reflective lookup is dispatched only for reflective callees");
         let computed_environment = call
             .arg_names
             .iter()
@@ -3082,8 +3085,8 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 name,
             });
         }
-        if reflective_name_formals(&call.callee).is_some() {
-            return self.reflective_lookup(site, parsed, call);
+        if let Some((formals, target)) = reflective_name_formals(&call.callee) {
+            return self.reflective_lookup(site, parsed, call, formals, target);
         }
         match call.callee.as_str() {
             "library" | "require" => {
@@ -3796,7 +3799,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     }
 
     pub(super) fn is_root(&self, id: PackageId) -> bool {
-        self.root == Some(id)
+        self.root == id
     }
 
     pub(super) fn record_missing_package(

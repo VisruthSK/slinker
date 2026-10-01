@@ -19,7 +19,8 @@ missing fact.
 
 - Soundness first. Coverage work waits until known ways a successful build can diverge are closed.
 - Work is organized as tracks, not a global stage order. "Next up" below is the current pick. Every
-  change in any track also leaves the code it touches cleaner.
+  change in any track also leaves the code it touches cleaner, including pruning tests that pin
+  obsolete details of the area it reworks.
 - Retained non-source objects stay R-serialized payload bundles; the IR describes and bounds them
   instead of modeling their object graphs.
 - Linked namespaces are registered under private names, so a slinked package never occupies or
@@ -80,24 +81,7 @@ acceptance cases here.
 
 ## Next up
 
-1. Track C: the type and cleanup items.
-
 ---
-
-## Track C: Rust cleanup, types, and performance
-
-Performance:
-- Measured on cold `slinker analyze rlang` (2026-09-30, Windows): about 55 s, of which the R worker accounts for about 4 s of binding inspection and about 3 s of syntax normalization. The remaining Rust-side analysis is the Track H target (repeated `evaluate_installed_function` and `resolve_lexical_name`).
-- Unmeasured candidates: batching binding requests per package (IPC is about 2 ms per round trip, so at most a few seconds), several worker processes inspecting different packages in parallel, and string-keyed maps in the analyzer. The Oak benchmark is now dominated by Air and Oak themselves (about 50 ms of 155 ms at 400 statements).
-
-Invariants into types:
-- Intern the name newtypes so they hash and compare as integers, but only if a profile shows name hashing matters.
-- Replace the remaining `.expect()` invariants in analysis: `root: Option<PackageId>` (finalize), `namespace_builders` and `images` looked up by `PackageId` after `image()` initialized them, and the object graph lookups in `ObjectWorld`.
-- Split `PackageProvider` so a resolution-only provider cannot be asked for images (removes the `unreachable!` in the `universe.rs` test store).
-
-Minimal code:
-- Audit the `.clone()` calls on hot paths once names are interned.
-- Prune tests that pin obsolete details as each area is reworked (`tests/` is about 5,600 lines).
 
 ## Track D: Build infrastructure and frontend
 
@@ -163,7 +147,7 @@ testthat with every testthat dependency Linked.
 
 Cold analysis is the priority because it sets worst-case CI and first-run cost. Warm-cache and edit-and-rerun performance must use the same query architecture. No optimization may weaken analysis or make program semantics depend on scheduling.
 
-Baseline on `slinker analyze rlang` on 2026-09-26: about 41 s wall time. Current hot counts are about 323k `evaluate_installed_function`, 833k `resolve_lexical_name`, 107k `parsed_source`, 7.1k `binding_image`, and 1.7k construction evaluations.
+Baseline on `slinker analyze rlang` on 2026-09-26: about 41 s wall time. Current hot counts are about 323k `evaluate_installed_function`, 833k `resolve_lexical_name`, 107k `parsed_source`, 7.1k `binding_image`, and 1.7k construction evaluations. A cold run on 2026-09-30 (Windows) took about 55 s, of which the R worker accounts for about 4 s of binding inspection and about 3 s of syntax normalization, so the target is the Rust-side repeated `evaluate_installed_function` and `resolve_lexical_name`. The Oak parser benchmark is dominated by Air and Oak themselves (about 50 ms of 155 ms at 400 statements).
 
 Semantic model and scheduler:
 - Make analysis an explicit least-fixed-point computation over finite monotone domains. Add a real bottom/no-information state distinct from `Unknown`/top. Concurrently published semantic facts merge with associative, commutative, idempotent joins. Use bounded exact domains and explicit widening where needed.
@@ -174,14 +158,14 @@ Semantic model and scheduler:
 - Scheduling order is semantically invisible. Different schedules and `--jobs` values must produce the same `ProgramIr` semantics modulo invocation-local IDs, the same diagnostics, and the same provenance graph after canonicalization. Raw numeric IDs, internal table order, and nonsemantic `LinkIr` metrics are not cross-run identities.
 
 Remove repeated semantic work:
-- Intern analyzer names and environment identities. Build immutable indexes for package bindings, imports, native bindings, mutations, and other hot membership queries.
+- Intern analyzer names and environment identities. Build immutable indexes for package bindings, imports, native bindings, mutations, and other hot membership queries. Interning pays only if a profile shows name hashing matters; once names are interned, audit the `.clone()` calls on hot paths. Tie each closure id to its package's object graph so `need_node` needs no `expect` for a closure-execution need.
 - Memoize lexical resolution, parsed-source work, parse contexts, and installed-function construction summaries by semantic inputs and epochs. `NodeId` and call-site provenance must never prevent semantic reuse.
 - Separate semantic construction summaries from call-site effects and provenance. Instantiate fresh allocation effects where required.
 - Record query dependencies on the cold path. Recomputed queries whose semantic result is unchanged must stop invalidation propagation. Support stable result fingerprints/backdating and durability so edits to the Root do not force validation of unchanged installed-package work.
 - Persist only reusable semantic summaries keyed by exact source/package inputs, target R identity, analyzer/schema versions, and every semantic context input. Never persist worker-local R object identities.
 
 R/package inspection:
-- Batch binding inspection and syntax-normalization traffic.
+- Batch binding inspection and syntax-normalization traffic (IPC is about 2 ms per round trip, so batching alone saves at most a few seconds; several worker processes inspecting different packages in parallel are the larger unmeasured candidate).
 - Use a reusable R worker pool with stable package affinity so one installed package stays on one worker during an inspection epoch and private-environment identity remains valid. Reuse initialized workers across analysis/build phases where their target identity permits it.
 - Keep expensive package inspection demand-driven. Instrument package hashing, bytes read, R startup count, protocol bytes, and accidental full-structure cloning so semantic speedups do not merely expose a new I/O bottleneck.
 

@@ -85,8 +85,8 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     pub fn analyze(self, root: &str) -> Result<LinkIr> {
-        Ok(AnalyzerState::new(self.packages, root, self.options)
+        AnalyzerState::new(self.packages, root, self.options)?
             .run()?
-            .finalize())
+            .finalize()
     }
 }

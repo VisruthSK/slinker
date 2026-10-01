@@ -256,9 +256,10 @@ impl ObjectGraph {
     }
 
     fn add_closure(&mut self, closure: &ClosureSource, provenance: ObjectProvenance) -> ObjectId {
-        let enclosure = self
-            .environment_id(&closure.environment)
-            .expect("closure enclosure collected before object construction");
+        let enclosure = match self.environment_id(&closure.environment) {
+            Some(enclosure) => enclosure,
+            None => self.add_environment(closure.environment.clone(), None, false),
+        };
         self.push_closure(ClosureObject {
             object: ObjectId(self.objects.len()),
             enclosure,
@@ -275,10 +276,14 @@ impl ObjectGraph {
     }
 
     pub fn derive_environment(&mut self, parent: Option<EnvironmentId>) -> EnvironmentId {
-        let label = (self.environments.len()..)
-            .map(|sequence| format!("derived:{sequence}"))
-            .find(|label| !self.environment_by_label.contains_key(label))
-            .expect("an unused derived label exists");
+        let mut sequence = self.environments.len();
+        let label = loop {
+            let label = format!("derived:{sequence}");
+            if !self.environment_by_label.contains_key(&label) {
+                break label;
+            }
+            sequence += 1;
+        };
         self.add_environment(label, parent, true)
     }
 
@@ -440,6 +445,7 @@ impl ObjectGraph {
 #[derive(Debug, Default)]
 pub struct ObjectWorld {
     graphs: HashMap<PackageId, ObjectGraph>,
+    unmerged: ObjectGraph,
 }
 
 impl ObjectWorld {
@@ -452,14 +458,11 @@ impl ObjectWorld {
     }
 
     pub fn graph(&self, package: PackageId) -> &ObjectGraph {
-        self.get(package)
-            .expect("object graph is created with the package image")
+        self.get(package).unwrap_or(&self.unmerged)
     }
 
     pub fn graph_mut(&mut self, package: PackageId) -> &mut ObjectGraph {
-        self.graphs
-            .get_mut(&package)
-            .expect("object graph is created with the package image")
+        self.graphs.entry(package).or_default()
     }
 }
 

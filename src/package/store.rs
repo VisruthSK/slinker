@@ -209,9 +209,12 @@ pub enum DispatchSubject<'a> {
     },
 }
 
-pub trait PackageProvider {
+pub trait PackageResolver {
     fn target_environment(&self) -> &TargetEnvironment;
     fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>>;
+}
+
+pub trait PackageProvider: PackageResolver {
     fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>>;
     fn binding_image(
         &mut self,
@@ -377,11 +380,13 @@ impl PackageStore {
     }
 
     fn worker(&mut self) -> Result<&mut WorkerClient> {
-        if self.worker.is_none() {
-            let target = self.locator.target().clone();
-            self.worker = Some(WorkerClient::spawn(self.r_home.clone(), &target)?);
+        match &mut self.worker {
+            Some(worker) => Ok(worker),
+            empty => {
+                let target = self.locator.target();
+                Ok(empty.insert(WorkerClient::spawn(self.r_home.clone(), target)?))
+            }
         }
-        Ok(self.worker.as_mut().expect("Harp worker initialized"))
     }
 
     fn load_cached_index(&self, package: &InstalledPackage) -> Option<Arc<PackageIndex>> {
@@ -442,7 +447,7 @@ fn is_epoch_independent(binding: &WorkerBinding) -> bool {
             .all(|label| !label.starts_with("private:"))
 }
 
-impl PackageProvider for PackageStore {
+impl PackageResolver for PackageStore {
     fn target_environment(&self) -> &TargetEnvironment {
         self.locator.target()
     }
@@ -450,7 +455,9 @@ impl PackageProvider for PackageStore {
     fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
         self.locator.locate(name)
     }
+}
 
+impl PackageProvider for PackageStore {
     fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         if let Some(index) = self.indexes.get(&package.identity) {
             return Ok(Arc::clone(index));

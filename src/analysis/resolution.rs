@@ -114,15 +114,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         image: &PackageImage,
         imports: &NamespaceImports,
-    ) -> BTreeSet<String> {
+    ) -> Result<BTreeSet<String>> {
         if let Some(bindings) = self.non_returning_bindings.get(&package) {
-            return bindings.clone();
+            return Ok(bindings.clone());
         }
 
         let mut namespace_shadowed = BTreeSet::<String>::new();
         namespace_shadowed.extend(image.bindings.keys().map(ToString::to_string));
         namespace_shadowed.extend(
-            self.namespace_builders[&package]
+            self.loaded(package)?
+                .namespace
                 .bindings
                 .iter()
                 .map(ToString::to_string),
@@ -160,7 +161,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
 
         self.non_returning_bindings.insert(package, proven.clone());
-        proven
+        Ok(proven)
     }
 
     pub(super) fn oak_parse_context(
@@ -172,7 +173,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let mut shadowed = BTreeSet::new();
         shadowed.extend(image.index.binding_names.iter().map(ToString::to_string));
         shadowed.extend(
-            self.namespace_builders[&package]
+            self.loaded(package)?
+                .namespace
                 .bindings
                 .iter()
                 .map(ToString::to_string),
@@ -219,7 +221,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
 
         let imports = self.namespace_imports(package, image)?;
-        let mut non_returning = self.inferred_non_returning_bindings(package, image, &imports);
+        let mut non_returning = self.inferred_non_returning_bindings(package, image, &imports)?;
         non_returning.retain(|name| !private_shadowed.contains(name));
 
         loop {
@@ -420,9 +422,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .iter()
             .any(|binding| binding == name)
             || self
-                .namespace_builders
+                .loaded
                 .get(&current)
-                .is_some_and(|namespace| namespace.contains(name))
+                .is_some_and(|loaded| loaded.namespace.contains(name))
         {
             return Ok(Resolution::Static(BindingTarget::Namespace {
                 package: current,

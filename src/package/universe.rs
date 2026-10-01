@@ -1,8 +1,8 @@
 use crate::metadata::Priority;
 use crate::package::{
     CanonicalSyntax, DispatchSubject, GenericName, InstalledPackage, PackageId, PackageIdentity,
-    PackageImage, PackageIndex, PackageLocation, PackageProvider, PackageRole, SyntaxValidation,
-    fingerprint_image,
+    PackageImage, PackageIndex, PackageLocation, PackageProvider, PackageResolver, PackageRole,
+    SyntaxValidation, fingerprint_image,
 };
 use crate::{Error, Result, TargetEnvironment};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -36,7 +36,7 @@ pub enum DispatchCallee<'a> {
     },
 }
 
-pub struct TargetUniverse<P: PackageProvider> {
+pub struct TargetUniverse<P: PackageResolver> {
     store: P,
     root: String,
     explicit_external: HashSet<String>,
@@ -44,7 +44,7 @@ pub struct TargetUniverse<P: PackageProvider> {
     packages: Vec<(InstalledPackage, PackageRole)>,
 }
 
-impl<P: PackageProvider> TargetUniverse<P> {
+impl<P: PackageResolver> TargetUniverse<P> {
     pub fn new(store: P, root: impl Into<String>, explicit_external: HashSet<String>) -> Self {
         Self {
             store,
@@ -130,6 +130,19 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.target_environment().base_bindings.contains(name)
     }
 
+    pub fn sources(&self, ids: impl IntoIterator<Item = PackageId>) -> PackageSources {
+        PackageSources(
+            ids.into_iter()
+                .map(|id| {
+                    let package = self.package(id);
+                    (id, (package.identity.clone(), package.location.clone()))
+                })
+                .collect(),
+        )
+    }
+}
+
+impl<P: PackageProvider> TargetUniverse<P> {
     pub fn index(&mut self, id: PackageId) -> Result<Arc<PackageIndex>> {
         self.store.index(&self.packages[id.index()].0)
     }
@@ -162,17 +175,6 @@ impl<P: PackageProvider> TargetUniverse<P> {
 
     pub fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
         self.store.canonical_syntax(source)
-    }
-
-    pub fn sources(&self, ids: impl IntoIterator<Item = PackageId>) -> PackageSources {
-        PackageSources(
-            ids.into_iter()
-                .map(|id| {
-                    let package = self.package(id);
-                    (id, (package.identity.clone(), package.location.clone()))
-                })
-                .collect(),
-        )
     }
 }
 
@@ -222,7 +224,7 @@ mod tests {
         located: Vec<String>,
     }
 
-    impl PackageProvider for CountingStore {
+    impl PackageResolver for CountingStore {
         fn target_environment(&self) -> &TargetEnvironment {
             self.locator.target()
         }
@@ -230,33 +232,6 @@ mod tests {
         fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
             self.located.push(name.to_owned());
             self.locator.locate(name)
-        }
-
-        fn index(&mut self, _package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
-            unreachable!("resolution never inspects images")
-        }
-
-        fn binding_image(
-            &mut self,
-            _package: &InstalledPackage,
-            _name: &str,
-        ) -> Result<Arc<PackageImage>> {
-            unreachable!("resolution never inspects images")
-        }
-
-        fn dispatch_generics(
-            &mut self,
-            _subject: DispatchSubject<'_>,
-        ) -> Result<BTreeSet<GenericName>> {
-            unreachable!("resolution never queries dispatch")
-        }
-
-        fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {
-            unreachable!("resolution never validates syntax")
-        }
-
-        fn canonical_syntax(&mut self, _source: &str) -> Result<CanonicalSyntax> {
-            unreachable!("resolution never canonicalizes syntax")
         }
     }
 

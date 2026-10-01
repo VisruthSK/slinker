@@ -2,7 +2,7 @@ use super::diagnostic::{Cause, Evidence};
 use super::dynamic_names::{CreatedName, NameCreator};
 use super::object_world::reachable_environment_labels;
 use super::relocation::PendingRelocation;
-use super::state::AnalyzerState;
+use super::state::{AnalyzerState, LoadedPackage};
 use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
@@ -17,6 +17,7 @@ use crate::metadata::{Relation, RelationField, intersect_requirements, relations
 use crate::package::{NativeComponent, PackageAvailability, PackageId, PackageProvider};
 use crate::source::generated_description;
 use crate::syntax::{SourceKey, SourceOrigin, Sources};
+use crate::{Error, Result};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -31,15 +32,24 @@ pub struct LinkIr {
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    pub(super) fn finalize(mut self) -> LinkIr {
+    fn loaded_ref(&self, package: PackageId) -> Result<&LoadedPackage> {
+        self.loaded.get(&package).ok_or_else(|| {
+            Error::Analysis(format!(
+                "package `{}` was retained without being loaded",
+                self.packages.name(package)
+            ))
+        })
+    }
+
+    pub(super) fn finalize(mut self) -> Result<LinkIr> {
         self.finalize_syntax_observations();
-        let root = self.root.expect("root package established before analysis");
+        let root = self.root;
         let retained = self
             .encountered
             .union(&self.external)
             .copied()
             .collect::<BTreeSet<_>>();
-        let (program, issues) = self.finalize_program(&retained);
+        let (program, issues) = self.finalize_program(&retained)?;
         let node = self.need_node(&Need::Activation { package: root });
         for issue in issues {
             self.diagnostic(node, root, None, issue.code(), issue.to_string(), None);
@@ -75,22 +85,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.finalize_s3_dispatch(&retained);
         self.finalize_unresolved_names();
         let blockers = self.diagnostics.into_sorted();
-        LinkIr {
+        Ok(LinkIr {
             program,
             provenance: crate::ir::ProvenanceIr::from_analysis(self.graph, self.roots),
             blockers,
             sources: self.parses.into_sources(),
             packages: self.packages.sources(retained),
             construction_evaluations: self.construction_evaluations,
-        }
+        })
     }
 
     pub(super) fn finalize_program(
         &self,
         retained: &BTreeSet<PackageId>,
-    ) -> (ProgramIr, Vec<FinalizationIssue>) {
+    ) -> Result<(ProgramIr, Vec<FinalizationIssue>)> {
         let target = &self.packages.target_environment().target;
-        let root = self.root.expect("root package established before analysis");
+        let root = self.root;
         let mut builder = ProgramIr::builder(
             TargetContract {
                 r_version: target.r_version.clone(),
@@ -105,11 +115,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .map(|package| (*package, self.packages.role(*package)))
             .collect::<Vec<_>>();
         let mut issues = Vec::new();
-        let contracts = self.finalize_packages(&mut builder, &ordered, retained, &mut issues);
-        let mut namespaces = self.finalize_namespaces(&mut builder, ordered, retained, &mut issues);
+        let contracts = self.finalize_packages(&mut builder, &ordered, retained, &mut issues)?;
+        let mut namespaces =
+            self.finalize_namespaces(&mut builder, ordered, retained, &mut issues)?;
         let mut dependencies =
             self.attach_imports(&mut builder, retained, &namespaces.ids, &mut issues);
-        let (root_exports, mut linked_contents) = self.export_contents(retained, &namespaces.ids);
+        let (root_exports, linked_contents) = self.export_contents(retained, &namespaces.ids)?;
         for (owner, dependency) in self
             .activation_time_dependencies(&namespaces.ids)
             .into_iter()
@@ -124,10 +135,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 dependencies.entry(owner).or_default().insert(dependency);
             }
         }
-        for namespace in activation_order(&namespaces.linked, &dependencies, &mut issues) {
-            let (exports, removed_bindings) = linked_contents
-                .remove(&namespace)
-                .expect("every Linked namespace has activation contents");
+        for (namespace, (exports, removed_bindings)) in
+            activation_order(linked_contents, &dependencies, &mut issues)
+        {
             builder.add_activation(crate::ir::NamespaceActivationIr {
                 namespace,
                 on_load: namespaces.on_load.get(&namespace).copied(),
@@ -150,7 +160,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 closure
             });
-        self.plan_relocations(&mut builder, &namespaces.ids, &mut issues);
+        self.plan_relocations(&mut builder, &namespaces.ids, &mut issues)?;
         let description = self.root_description(&contracts, retained, &mut issues);
         let load = builder.root_load(root_namespace);
         let program = builder.finish(RootArtifactIr {
@@ -160,7 +170,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             on_load: root_on_load,
             load,
         });
-        (program, issues)
+        Ok((program, issues))
     }
 
     fn finalize_packages(
@@ -169,9 +179,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         ordered: &[(PackageId, LinkedPackageRole)],
         retained: &BTreeSet<PackageId>,
         issues: &mut Vec<FinalizationIssue>,
-    ) -> Vec<ExternalPackageContract> {
+    ) -> Result<Vec<ExternalPackageContract>> {
         let mut contracts = Vec::new();
-        let mut declared = self.declared_external_requirements(ordered);
+        let mut declared = self.declared_external_requirements(ordered)?;
         for (package, role) in ordered {
             let identity = self.packages.identity(*package).clone();
             match role {
@@ -205,7 +215,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .into_iter()
                 .map(|name| FinalizationIssue::UnreachedExternal(name.clone())),
         );
-        contracts
+        Ok(contracts)
     }
 
     fn finalize_namespaces(
@@ -214,7 +224,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         ordered: Vec<(PackageId, LinkedPackageRole)>,
         retained: &BTreeSet<PackageId>,
         issues: &mut Vec<FinalizationIssue>,
-    ) -> FinalizedNamespaces {
+    ) -> Result<FinalizedNamespaces> {
         let mut retained_bindings = HashMap::<PackageId, BTreeSet<BindingName>>::new();
         for need in self.needs.started() {
             if let Need::Binding { package, binding } = need {
@@ -241,14 +251,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     continue;
                 }
             };
-            let image = self
-                .images
-                .get(&package)
-                .expect("Root/Linked package has an initialized image");
-            let namespace_builder = self
-                .namespace_builders
-                .get(&package)
-                .expect("Root/Linked namespace builder");
+            let LoadedPackage {
+                image,
+                namespace: namespace_builder,
+            } = self.loaded_ref(package)?;
             let namespace_label = format!("namespace:{package_name}");
             let mut names = retained_bindings.remove(&package).unwrap_or_default();
             names.extend(
@@ -342,12 +348,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     });
                 }
             }
-            if role == LinkedPackageRole::Linked {
-                namespaces.linked.push(namespace.namespace);
-            }
             namespaces.ids.insert(package_name.to_owned(), namespace);
         }
-        namespaces
+        Ok(namespaces)
     }
 
     fn attach_imports(
@@ -430,14 +433,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &self,
         retained: &BTreeSet<PackageId>,
         namespace_ids: &HashMap<String, FinalizedNamespace>,
-    ) -> (ExportTable, HashMap<NamespaceId, LinkedActivationContents>) {
+    ) -> Result<(ExportTable, HashMap<NamespaceId, LinkedActivationContents>)> {
         let mut root_exports = ExportTable::default();
         let mut linked_contents = HashMap::new();
         for &package in retained {
             if self.packages.is_external(package) {
                 continue;
             }
-            let index = &self.images[&package].index;
+            let index = &self.loaded_ref(package)?.image.index;
             let exports = ExportTable::new(index.exports.values().cloned().collect());
             let finalized = &namespace_ids[self.packages.name(package)];
             if self.packages.role(package) == LinkedPackageRole::Linked {
@@ -452,7 +455,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 root_exports = exports;
             }
         }
-        (root_exports, linked_contents)
+        Ok((root_exports, linked_contents))
     }
 
     fn plan_relocations(
@@ -460,7 +463,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         builder: &mut ProgramBuilder,
         namespace_ids: &HashMap<String, FinalizedNamespace>,
         issues: &mut Vec<FinalizationIssue>,
-    ) {
+    ) -> Result<()> {
         let emitted_code = |builder: &ProgramBuilder, origin: &SourceOrigin| {
             origin
                 .key
@@ -584,7 +587,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }
                 }
                 PendingRelocation::DataArgument { package, sets, .. } => {
-                    let data = &self.images[package].index.data;
+                    let data = &self.loaded_ref(*package)?.image.index.data;
                     let carried = sets.iter().try_for_each(|set| {
                         let objects = data.set(set).unwrap_or_default().to_vec();
                         builder.carry_data_set(*package, set.clone(), objects)
@@ -608,6 +611,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 issues.push(FinalizationIssue::InvalidRelocation(invalid));
             }
         }
+        Ok(())
     }
 
     fn payload_closure(
@@ -617,7 +621,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         origin: &SourceOrigin,
     ) -> Option<CodeId> {
         let package = self.known_package(&origin.package)?;
-        let image = self.images.get(&package)?;
+        let image = &self.loaded.get(&package)?.image;
         let shape = self.parses.shape(&(package, origin.key.clone()))?.clone();
         let bundle = builder.payload_bundle(namespace_ids[origin.package.as_str()].namespace)?;
         let (home, binding, closure) = match &origin.key {
@@ -677,7 +681,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let owner = &namespace_ids[name];
             let (Some(bundle), Some(image)) = (
                 builder.payload_bundle(owner.namespace),
-                self.images.get(&package),
+                self.loaded.get(&package).map(|loaded| &loaded.image),
             ) else {
                 continue;
             };
@@ -795,7 +799,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn declared_external_requirements(
         &self,
         ordered: &[(PackageId, LinkedPackageRole)],
-    ) -> HashMap<&str, Vec<Relation>> {
+    ) -> Result<HashMap<&str, Vec<Relation>>> {
         let mut declared = HashMap::<&str, Vec<Relation>>::new();
         for (package, role) in ordered {
             if *role == LinkedPackageRole::External {
@@ -806,7 +810,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if *role == LinkedPackageRole::External {
                 continue;
             }
-            let description = &self.images[package].index.description;
+            let description = &self.loaded_ref(*package)?.image.index.description;
             let suggested = relations(description, RelationField::Suggests)
                 .unwrap_or_default()
                 .into_iter()
@@ -821,7 +825,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
         }
-        declared
+        Ok(declared)
     }
 
     fn external_contract(
@@ -948,15 +952,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         for (node, package, binding, span) in self.s3.take_next_method_calls() {
-            let registered = self
-                .namespace_builders
-                .get(&package)
-                .is_some_and(|namespace| {
-                    namespace
-                        .registrations
-                        .iter()
-                        .any(|registration| registration.method == binding)
-                });
+            let registered = self.loaded.get(&package).is_some_and(|loaded| {
+                loaded
+                    .namespace
+                    .registrations
+                    .iter()
+                    .any(|registration| registration.method == binding)
+            });
             if !registered && !self.s3.is_closed_method(package, &binding) {
                 self.diagnostic(
                     node,
@@ -972,10 +974,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn finalize_unresolved_names(&mut self) {
         let unknown_registrations = self
-            .images
+            .loaded
             .iter()
-            .flat_map(|(&package, image)| {
-                image
+            .flat_map(|(&package, loaded)| {
+                loaded
+                    .image
                     .index
                     .dynlibs
                     .iter()
@@ -1177,37 +1180,34 @@ type LinkedActivationContents = (ExportTable, Vec<BindingName>);
 #[derive(Default)]
 struct FinalizedNamespaces {
     ids: HashMap<String, FinalizedNamespace>,
-    linked: Vec<NamespaceId>,
     on_load: HashMap<NamespaceId, BindingId>,
     root_natives: Vec<NativeComponent>,
     linked_natives: HashMap<NamespaceId, Vec<NativeComponent>>,
 }
 
-fn activation_order(
-    linked: &[NamespaceId],
+fn activation_order<C>(
+    linked: HashMap<NamespaceId, C>,
     dependencies: &HashMap<NamespaceId, BTreeSet<NamespaceId>>,
     issues: &mut Vec<FinalizationIssue>,
-) -> Vec<NamespaceId> {
-    let linked_set = linked.iter().copied().collect::<BTreeSet<_>>();
-    let mut remaining = linked_set.clone();
-    let mut order = Vec::new();
+) -> Vec<(NamespaceId, C)> {
+    let mut remaining = linked.into_iter().collect::<Vec<_>>();
+    remaining.sort_unstable_by_key(|(namespace, _)| *namespace);
+    let mut order = Vec::with_capacity(remaining.len());
     while !remaining.is_empty() {
         let next = remaining
             .iter()
-            .copied()
-            .find(|namespace| {
+            .position(|(namespace, _)| {
                 dependencies.get(namespace).is_none_or(|dependencies| {
                     dependencies.iter().all(|dependency| {
-                        !linked_set.contains(dependency) || !remaining.contains(dependency)
+                        remaining.iter().all(|(waiting, _)| waiting != dependency)
                     })
                 })
             })
             .unwrap_or_else(|| {
                 issues.push(FinalizationIssue::CyclicLinkedImports);
-                *remaining.iter().next().expect("remaining namespace")
+                0
             });
-        remaining.remove(&next);
-        order.push(next);
+        order.push(remaining.remove(next));
     }
     order
 }

@@ -9,7 +9,7 @@ use slinker::package::{
     InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeLibrary,
     NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectIssue,
     ObjectKind, PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
-    PackageProvider, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
+    PackageProvider, PackageResolver, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
     SyntaxValidation,
 };
 use slinker::{Description, Error, Result, Target, TargetEnvironment};
@@ -148,7 +148,7 @@ impl FakeProvider {
     }
 }
 
-impl PackageProvider for FakeProvider {
+impl PackageResolver for FakeProvider {
     fn target_environment(&self) -> &TargetEnvironment {
         &self.target_environment
     }
@@ -162,7 +162,9 @@ impl PackageProvider for FakeProvider {
             .or_default() += 1;
         Ok(self.packages.get(name).map(|image| installed(&image.index)))
     }
+}
 
+impl PackageProvider for FakeProvider {
     fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         self.packages
             .get(package.identity.name.as_str())
