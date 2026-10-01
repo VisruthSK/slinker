@@ -490,18 +490,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
         binding: Option<&str>,
         resolved: Resolution<BindingTarget>,
         span: Span,
+        use_kind: ReferenceUse,
     ) {
         match resolved {
-            Resolution::Static(BindingTarget::Namespace { package, binding }) => self.require_at(
-                from,
-                Need::Binding {
-                    package,
-                    binding: binding.clone(),
-                },
-                EdgeKind::Lexical,
-                format!("lexical reference `{binding}`"),
-                Some(span),
-            ),
+            Resolution::Static(BindingTarget::Namespace { package, binding }) => self
+                .require_binding_at(
+                    from,
+                    Need::Binding {
+                        package,
+                        binding: binding.clone(),
+                    },
+                    EdgeKind::Lexical,
+                    format!("lexical reference `{binding}`"),
+                    Some(span),
+                    use_kind,
+                ),
             Resolution::Static(BindingTarget::Private {
                 package,
                 environment,
@@ -546,7 +549,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     "imported binding requires namespace activation",
                     Some(span.clone()),
                 );
-                self.require_at(
+                self.require_binding_at(
                     from,
                     Need::Binding {
                         package,
@@ -555,6 +558,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     EdgeKind::Import,
                     format!("imported binding `{binding}`"),
                     Some(span),
+                    use_kind,
                 );
             }
             Resolution::Static(BindingTarget::External { package, binding }) => {
@@ -621,6 +625,29 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     span,
                 });
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReferenceUse {
+    Recorded,
+    Unrecorded,
+}
+
+impl<P: PackageProvider> AnalyzerState<P> {
+    fn require_binding_at(
+        &mut self,
+        from: NodeId,
+        need: Need,
+        kind: EdgeKind,
+        reason: String,
+        span: Option<Span>,
+        use_kind: ReferenceUse,
+    ) {
+        match use_kind {
+            ReferenceUse::Recorded => self.require_classified_at(from, need, kind, reason, span),
+            ReferenceUse::Unrecorded => self.require_at(from, need, kind, reason, span),
         }
     }
 }

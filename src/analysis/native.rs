@@ -159,7 +159,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    fn declared_callable_resolution(
+    pub(super) fn declared_callable_resolution(
         &mut self,
         current: PackageId,
         image: &PackageImage,

@@ -261,6 +261,8 @@ pub struct ParsedExpression {
     pub parameters: Vec<String>,
     #[serde(default)]
     pub used_parameters: Vec<String>,
+    #[serde(default)]
+    pub pinned_defaults: Vec<PinnedDefault>,
     pub definitions: Vec<BindingDef>,
     pub references: Vec<NameRef>,
     pub package_refs: Vec<PackageRef>,
@@ -274,6 +276,12 @@ pub struct ParsedExpression {
     pub namespace_info_reads: Vec<NamespaceInfoRead>,
     #[serde(default)]
     pub namespace_enumerations: Vec<NamespaceEnumeration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedDefault {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

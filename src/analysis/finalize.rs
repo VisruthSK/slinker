@@ -71,6 +71,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(read.span),
                 );
             }
+            for pin in self.invocations.violated_pins() {
+                self.diagnostic(
+                    pin.node,
+                    pin.package,
+                    Some(&pin.callable.binding),
+                    RejectCode::DynamicLookup,
+                    format!(
+                        "system.file() package `{}` defaults to \"{}\" but a caller of `{}` can supply it, naming a Linked package whose installation is removed",
+                        pin.formal, pin.value, pin.callable.binding
+                    ),
+                    Some(pin.span),
+                );
+            }
             for (node, package, span) in self.relocations.take_dynamic_resource_lookups() {
                 self.diagnostic(
                     node,

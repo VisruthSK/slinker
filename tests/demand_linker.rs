@@ -2129,6 +2129,36 @@ fn declared_callables_link_a_native_callback_parameter() {
 }
 
 #[test]
+fn declared_callables_are_retained_where_the_binding_is_applied() {
+    for application in ["lapply(1, fun)", "do.call(fun, list(1))"] {
+        let root = package(
+            "root",
+            &[(
+                "main",
+                Some(&format!(
+                    "main <- function(fun) {{ declare(slinker(fun = callables(dep::used))); {application} }}"
+                )),
+            )],
+        );
+        let dep = package(
+            "dep",
+            &[
+                ("used", Some("used <- function(x) x")),
+                ("unrelated", Some("unrelated <- function() 3")),
+            ],
+        );
+        let plan = Linker::new(FakeProvider::new(vec![root, dep]), 1)
+            .analyze("root")
+            .unwrap();
+        assert!(retained_binding(&plan, "dep", "used"), "{application}");
+        assert!(
+            !retained_binding(&plan, "dep", "unrelated"),
+            "{application}"
+        );
+    }
+}
+
+#[test]
 fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
     let dep = package_with!(
         "dep",
@@ -2497,9 +2527,62 @@ fn dynamic_resource_package_blocks_only_when_an_installation_is_removed() {
         .analyze("root")
         .unwrap();
     assert!(linked.blockers().iter().any(|diagnostic| {
-        diagnostic.binding.is_none()
+        diagnostic.binding.as_deref() == Some("f")
             && diagnostic.code == RejectCode::DynamicLookup
             && diagnostic.message.contains("system.file")
+    }));
+}
+
+fn root_with_private_helper(main: &str) -> PackageImage {
+    package_with!(
+        "root",
+        &[
+            ("main", Some(main)),
+            (
+                "helper",
+                Some(
+                    "helper <- function(x, package = 'root') system.file('data', package = package)"
+                ),
+            ),
+        ],
+        Vec::new(),
+        ExportMap::from([("main".to_owned(), "main".into())]),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "",
+    )
+}
+
+#[test]
+fn defaulted_resource_package_is_static_only_when_no_invocation_supplies_it() {
+    let foo = || package("foo", &[("h", Some("h <- function() 1"))]);
+    let applied = root_with_private_helper("main <- function(xs) { foo::h(); lapply(xs, helper) }");
+    let plan = Linker::new(FakeProvider::new(vec![applied, foo()]), 1)
+        .analyze("root")
+        .unwrap();
+    assert!(plan.blockers().is_empty());
+
+    let supplied = root_with_private_helper(
+        "main <- function(xs) { foo::h(); lapply(xs, helper); helper(1, 'foo') }",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![supplied, foo()]), 1)
+        .analyze("root")
+        .unwrap();
+    assert!(plan.blockers().iter().any(|diagnostic| {
+        diagnostic.binding.as_deref() == Some("helper")
+            && diagnostic.code == RejectCode::DynamicLookup
+            && diagnostic.message.contains("defaults to")
+    }));
+
+    let forwarded =
+        root_with_private_helper("main <- function(xs, ...) { foo::h(); lapply(xs, helper, ...) }");
+    let plan = Linker::new(FakeProvider::new(vec![forwarded, foo()]), 1)
+        .analyze("root")
+        .unwrap();
+    assert!(plan.blockers().iter().any(|diagnostic| {
+        diagnostic.binding.as_deref() == Some("helper")
+            && diagnostic.message.contains("defaults to")
     }));
 }
 

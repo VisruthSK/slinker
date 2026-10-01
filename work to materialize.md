@@ -91,16 +91,16 @@ acceptance cases here.
 
 ## Track E: Retire heuristics
 
-- Invocation model: record every way a retained function is invoked, with its arguments: direct
-  calls; `FUN` of base `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` with the call's forwarded
-  `...`; `do.call`; S3 dispatch, including methods found lexically; lifecycle hooks; native
-  callbacks; condition handlers, `on.exit`, and finalizers. Owned by analysis state, never derived
-  from provenance edge kinds. Both items below need it to prove what callers pass.
-- Default-argument specialization: a formal defaulting to a constant that no invocation supplies
-  and the body never rebinds is static (voucher's `find_vouch_workflow_template(action, package =
-  "voucher")`, whose only caller is `vapply(actions, find_vouch_workflow_template, character(1))`).
-- `callables()` for a function-valued binding passed to `do.call` or `lapply`: record an invocation
-  of each declared callable instead of an escape, so a closed S3 generic stays closed.
+- Invocation model: `InvocationModel` records direct calls and base
+  `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` `FUN` uses with their forwarded `...`; any
+  other retention of a binding (exports, S3 registrations and dispatch, lifecycle hooks, native
+  callbacks, reflective names, namespace member access) marks it unclassified, and value
+  references are escapes. Still to record as invocations with their arguments: `do.call` with
+  literal `list()` arguments (which would keep a closed S3 generic closed, including through
+  `callables()`), S3 dispatch to methods, lifecycle hooks, native callbacks, and condition
+  handlers, `on.exit`, and finalizers. Narrowing unclassified retention to these typed
+  invocations is what lets default-argument specialization cover more than directly called and
+  applied functions.
 
 ## Track F: S3 completion
 

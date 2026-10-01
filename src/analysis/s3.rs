@@ -1,4 +1,5 @@
 use super::arguments::declared_strings;
+use super::invocation::{ClassDomain, Invocation, InvocationModel};
 use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParsedSite};
 use crate::Result;
@@ -19,13 +20,6 @@ pub(super) struct S3GenericKey {
 pub(super) struct CallableId {
     pub(super) package: PackageId,
     pub(super) binding: BindingName,
-}
-
-type ClassDomain = Option<Vec<Vec<String>>>;
-
-#[derive(Clone, Debug)]
-pub(super) struct Invocation {
-    arguments: Vec<(Option<String>, ClassDomain)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -58,7 +52,6 @@ pub(super) enum DispatchChange {
 pub(super) struct S3Model {
     generics: BTreeMap<S3GenericKey, S3Generic>,
     callable_generics: HashMap<CallableId, BTreeSet<S3GenericKey>>,
-    invocations: HashMap<CallableId, Vec<Option<Invocation>>>,
     closed_methods: HashSet<(PackageId, BindingName)>,
     lexical_demands: HashSet<(PackageId, GenericName)>,
     next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
@@ -88,21 +81,11 @@ impl S3Model {
         }
     }
 
-    fn record_invocation(
-        &mut self,
-        callable: CallableId,
-        invocation: Option<Invocation>,
-    ) -> BTreeSet<S3GenericKey> {
-        let generics = self
-            .callable_generics
-            .get(&callable)
+    fn generics_of(&self, callable: &CallableId) -> BTreeSet<S3GenericKey> {
+        self.callable_generics
+            .get(callable)
             .cloned()
-            .unwrap_or_default();
-        self.invocations
-            .entry(callable)
-            .or_default()
-            .push(invocation);
-        generics
+            .unwrap_or_default()
     }
 
     fn callable_to_check(&self, key: &S3GenericKey) -> Option<&CallableId> {
@@ -114,7 +97,12 @@ impl S3Model {
         }
     }
 
-    fn refresh(&mut self, key: &S3GenericKey, callable_is_external: bool) -> DispatchChange {
+    fn refresh(
+        &mut self,
+        key: &S3GenericKey,
+        callable_is_external: bool,
+        invocations: &InvocationModel,
+    ) -> DispatchChange {
         let Some(generic) = self.generics.get_mut(key) else {
             return DispatchChange::Unchanged;
         };
@@ -122,11 +110,9 @@ impl S3Model {
             return DispatchChange::Unchanged;
         }
         let classes = match (&generic.callable, &generic.selector) {
-            (Some(callable), Some(selector)) if !callable_is_external => self
-                .invocations
-                .get(callable)
-                .into_iter()
-                .flatten()
+            (Some(callable), Some(selector)) if !callable_is_external => invocations
+                .uses(callable)
+                .iter()
                 .map(|invocation| {
                     invocation
                         .as_ref()
@@ -314,28 +300,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
         callable: CallableId,
         call: &CallSite,
     ) -> Result<()> {
-        let arguments = call
-            .arg_names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                let domain = call
-                    .arg_bindings
-                    .get(index)
-                    .and_then(Option::as_ref)
-                    .and_then(|binding| parsed.class_domain_for(binding, call.scope));
-
-                (name.clone(), domain)
-            })
-            .collect();
-        let generics = self
-            .s3
-            .record_invocation(callable, Some(Invocation { arguments }));
-        self.refresh_generics(generics)
+        self.record_use(callable, Some(Invocation::from_call(parsed, call)))
     }
 
     pub(super) fn record_escape(&mut self, callable: CallableId) -> Result<()> {
-        let generics = self.s3.record_invocation(callable, None);
+        self.record_use(callable, None)
+    }
+
+    pub(super) fn record_use(
+        &mut self,
+        callable: CallableId,
+        invocation: Option<Invocation>,
+    ) -> Result<()> {
+        let generics = self.s3.generics_of(&callable);
+        self.invocations.record(callable, invocation);
         self.refresh_generics(generics)
     }
 
@@ -349,7 +327,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Some(callable) => self.is_externally_callable(&callable)?,
             None => false,
         };
-        let (from, classes) = match self.s3.refresh(key, callable_is_external) {
+        let (from, classes) = match self
+            .s3
+            .refresh(key, callable_is_external, &self.invocations)
+        {
             DispatchChange::Unchanged => return Ok(()),
             DispatchChange::Opened { from } => (from, None),
             DispatchChange::Added { from, classes } => (from, Some(classes)),
@@ -438,17 +419,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
 }
 
 fn selector_domain(invocation: &Invocation, selector: &str, generic: &S3Generic) -> ClassDomain {
-    if let Some((_, domain)) = invocation
+    if let Some(argument) = invocation
         .arguments
         .iter()
-        .find(|(name, _)| name.as_deref() == Some(selector))
+        .find(|argument| argument.name.as_deref() == Some(selector))
     {
-        return domain.clone();
+        return argument.classes.clone();
     }
     let named = invocation
         .arguments
         .iter()
-        .filter_map(|(name, _)| name.as_deref())
+        .filter_map(|argument| argument.name.as_deref())
         .collect::<BTreeSet<_>>();
     let position = generic
         .formals
@@ -458,9 +439,9 @@ fn selector_domain(invocation: &Invocation, selector: &str, generic: &S3Generic)
     invocation
         .arguments
         .iter()
-        .filter(|(name, _)| name.is_none())
+        .filter(|argument| argument.name.is_none())
         .nth(position)
-        .and_then(|(_, domain)| domain.clone())
+        .and_then(|argument| argument.classes.clone())
 }
 
 pub(super) fn callable_target(resolved: &Resolution<BindingTarget>) -> Option<CallableId> {

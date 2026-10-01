@@ -7,7 +7,7 @@ pub use facts::{
     ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
     ConstructionTarget, DeclaredCallable, DeclaredDomain, EvalPhase, LexicalBindingId,
     LexicalScopeId, NameRef, NameRefKind, NamespaceEnumeration, NamespaceInfoRead,
-    NamespaceInfoReceiver, PackageGuard, PackageRef, ParsedExpression, ParsedRFile,
+    NamespaceInfoReceiver, PackageGuard, PackageRef, ParsedExpression, ParsedRFile, PinnedDefault,
     ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment,
     SyntaxEffect, SyntaxEffectKind,
 };

@@ -93,7 +93,7 @@ Anything slinker cannot prove blocks the build; there is no mode that accepts a 
 - a dynamic namespace or package name passed to a namespace or package query (`asNamespace`, `requireNamespace`, `getExportedValue`, `isNamespaceLoaded`, `packageDescription`, ...);
 - reachable `requireNamespace()` of an unselected `Suggests` package, and code guarded by whether one is installed or loaded, whose answer would otherwise be frozen or pruned by the build;
 - `get`/`get0`/`exists`/`match.fun`/`do.call` with a computed name or environment;
-- `system.file(package = x)` with a computed `x` while a package is Linked;
+- `system.file(package = x)` with a computed `x` while a package is Linked, unless `x` is a formal of a root-internal function that defaults to a string constant, is never rebound, and no call, base `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` application, or other retention of that function can supply it;
 - `NextMethod()` outside a known method set.
 
 A [declaration](declarations.md) can supply the missing fact where the code is the author's own.
