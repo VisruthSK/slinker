@@ -1,0 +1,27 @@
+[package]
+name = "slinker-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Program IR, analysis, and Air/Oak syntax for linking R package dependencies"
+
+[dependencies]
+air_r_parser.workspace = true
+air_r_syntax.workspace = true
+biome_rowan.workspace = true
+dunce.workspace = true
+oak_semantic.workspace = true
+r-description-parser.workspace = true
+r-metadata.workspace = true
+rayon.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

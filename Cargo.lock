@@ -1373,17 +1373,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "slinker"
+name = "slinker-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "criterion",
+ "dunce",
+ "serde_json",
+ "slinker-core",
+ "slinker-r-worker",
+ "tempfile",
+ "which",
+]
+
+[[package]]
+name = "slinker-core"
 version = "0.1.0"
 dependencies = [
  "air_r_parser",
  "air_r_syntax",
  "biome_rowan",
- "clap",
- "criterion",
  "dunce",
- "harp",
- "libr",
  "oak_semantic",
  "r-description-parser",
  "r-metadata",
@@ -1394,7 +1404,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
- "which",
+]
+
+[[package]]
+name = "slinker-r-worker"
+version = "0.1.0"
+dependencies = [
+ "dunce",
+ "harp",
+ "libr",
+ "serde_json",
+ "slinker-core",
+ "thiserror",
 ]
 
 [[package]]

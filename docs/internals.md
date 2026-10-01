@@ -1,5 +1,11 @@
 # Internals
 
+## Workspace
+
+- `slinker-core`: `ProgramIr`, analysis, Air/Oak syntax, package inspection model, build and materialization, and the worker client and protocol. It links no embedded R runtime.
+- `slinker-r-worker`: the Harp/libr inspection worker. It depends on `slinker-core` for the protocol and installed-image types.
+- `slinker-cli`: the `slinker` binary. The same executable hosts the worker through the hidden `__r-worker` subcommand, which is how `slinker-core` launches it.
+
 ## Target R
 
 Slinker runs `R RHOME` once as a location-only preflight and falls back to `R_HOME` when `R` is unavailable. It then loads that installation's shared runtime through Harp/libr. No R executable participates in target probing or package analysis. On Linux the worker process runs with the `LD_LIBRARY_PATH` that the installation's `etc/ldpaths` establishes, as R's own launcher does, so package shared objects resolve their `libR.so` dependency.
