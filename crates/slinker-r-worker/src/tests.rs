@@ -104,7 +104,7 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
     let good = runtime
         .binding(&package, "good")
         .expect("inspect demanded binding");
-    assert!(good.binding.closure.is_some());
+    assert!(good.binding.object.closure.is_some());
     assert!(!on_load_ran(), "binding inspection executed .onLoad");
     assert_eq!(
         runtime.target().expect("target after inspection").libraries,
@@ -158,8 +158,11 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
     let lazy = scanner
         .top_binding("lazy", BindingOrigin::Code, lazy.value)
         .expect("inspect demanded promise");
-    assert_eq!(lazy.representation, BindingRepresentation::LazyLoadPromise);
-    assert!(lazy.closure.is_some());
+    assert_eq!(
+        lazy.object.representation,
+        BindingRepresentation::LazyLoadPromise
+    );
+    assert!(lazy.object.closure.is_some());
     assert_eq!(
         i32::try_from(image_environment.get("counter").expect("image counter")).expect("integer"),
         0,
@@ -171,28 +174,33 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
     let holder = scanner
         .top_binding("holder", BindingOrigin::Code, holder.value)
         .expect("inspect retained private environment");
-    assert_eq!(holder.embedded_closures.len(), 1);
-    assert!(holder.embedded_closures[0].source.contains("function"));
-    assert_eq!(holder.classes, ["first_class", "second_class"]);
+    assert_eq!(holder.object.embedded_closures.len(), 1);
+    assert!(
+        holder.object.embedded_closures[0]
+            .source
+            .contains("function")
+    );
+    assert_eq!(holder.object.classes, ["first_class", "second_class"]);
     let private = scanner
         .private_environments
         .values()
         .find(|environment| environment.bindings.contains_key("active"))
         .expect("private environment");
     assert_eq!(
-        private.bindings["active"].representation,
+        private.bindings["active"].object.representation,
         BindingRepresentation::ActiveBinding
     );
     assert_eq!(
-        private.bindings["promise"].representation,
+        private.bindings["promise"].object.representation,
         BindingRepresentation::Promise { forced: false }
     );
     assert_eq!(
-        private.bindings["self"].environment.as_deref(),
+        private.bindings["self"].object.environment.as_deref(),
         Some(private.id.as_str())
     );
     assert!(
         private.bindings["handler"]
+            .object
             .closure
             .as_ref()
             .is_some_and(|closure| closure.source.starts_with("handler <- function"))
@@ -232,11 +240,11 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
         .top_binding("altrep", BindingOrigin::Code, altrep.value)
         .expect("classify ALTREP");
     assert!(matches!(
-        altrep.representation,
+        altrep.object.representation,
         BindingRepresentation::Altrep { .. }
     ));
     assert!(
-        altrep.issues.is_empty(),
+        altrep.object.issues.is_empty(),
         "base ALTREP serializes as a plain vector"
     );
 

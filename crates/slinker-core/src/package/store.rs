@@ -428,18 +428,21 @@ fn is_epoch_independent(binding: &WorkerBinding) -> bool {
     let image = &binding.binding;
     binding.private_environments.is_empty()
         && image
+            .object
             .closure
             .iter()
             .map(|closure| closure.environment.as_str())
-            .chain(image.environment.as_deref())
+            .chain(image.object.environment.as_deref())
             .chain(
                 image
+                    .object
                     .embedded_closures
                     .iter()
                     .map(|closure| closure.environment.as_str()),
             )
             .chain(
                 image
+                    .object
                     .embedded_environments
                     .iter()
                     .map(|environment| environment.environment.as_str()),
@@ -568,7 +571,7 @@ mod tests {
     use crate::Description;
     use crate::package::{
         BindingImage, BindingOrigin, BindingRepresentation, ClosureSource, Digest,
-        LifecycleMetadata, NativeComponent, NativeLibrary, ObjectKind,
+        LifecycleMetadata, NativeComponent, NativeLibrary, ObjectImage, ObjectKind,
     };
 
     fn package_index() -> PackageIndex {
@@ -639,17 +642,19 @@ mod tests {
             binding: BindingImage {
                 name: "f".into(),
                 origin: BindingOrigin::Code,
-                representation: BindingRepresentation::Value,
-                classes: Vec::new(),
-                object_kind: ObjectKind::Closure,
-                closure: Some(ClosureSource {
-                    source: "function() 1".into(),
-                    environment: environment.into(),
-                }),
-                environment: None,
-                embedded_closures: Vec::new(),
-                embedded_environments: Vec::new(),
-                issues: Vec::new(),
+                object: ObjectImage {
+                    representation: BindingRepresentation::Value,
+                    classes: Vec::new(),
+                    object_kind: ObjectKind::Closure,
+                    closure: Some(ClosureSource {
+                        source: "function() 1".into(),
+                        environment: environment.into(),
+                    }),
+                    environment: None,
+                    embedded_closures: Vec::new(),
+                    embedded_environments: Vec::new(),
+                    issues: Vec::new(),
+                },
             },
             private_environments: HashMap::new(),
         };

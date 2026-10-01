@@ -599,7 +599,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let Some(closure) = context
                     .image
                     .private_binding(environment, binding)
-                    .and_then(|binding| binding.closure.clone())
+                    .and_then(|binding| binding.object.closure.clone())
                 else {
                     return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
                 };
@@ -609,7 +609,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let Some(closure) = context
                     .image
                     .binding(binding)
-                    .and_then(|binding| binding.closure.clone())
+                    .and_then(|binding| binding.object.closure.clone())
                 else {
                     return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
                 };

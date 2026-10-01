@@ -151,7 +151,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 if proven.contains(name.as_str()) {
                     continue;
                 }
-                let Some(closure) = &binding.closure else {
+                let Some(closure) = &binding.object.closure else {
                     continue;
                 };
                 if closure.environment != namespace_environment {
@@ -241,7 +241,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 if non_returning.contains(name.as_str()) {
                     continue;
                 }
-                let Some(closure) = &binding.closure else {
+                let Some(closure) = &binding.object.closure else {
                     continue;
                 };
                 if closure_definitely_non_returning(closure.source.as_ref(), &context) {

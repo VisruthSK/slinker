@@ -154,17 +154,19 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
                 BindingImage {
                     name: BindingName::from(name.as_str()),
                     origin: BindingOrigin::Code,
-                    representation: BindingRepresentation::Value,
-                    classes: Vec::new(),
-                    object_kind: ObjectKind::Closure,
-                    closure: Some(ClosureSource {
-                        source: Arc::from(source.as_str()),
-                        environment: "namespace:root".into(),
-                    }),
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: Vec::new(),
+                    object: ObjectImage {
+                        representation: BindingRepresentation::Value,
+                        classes: Vec::new(),
+                        object_kind: ObjectKind::Closure,
+                        closure: Some(ClosureSource {
+                            source: Arc::from(source.as_str()),
+                            environment: "namespace:root".into(),
+                        }),
+                        environment: None,
+                        embedded_closures: Vec::new(),
+                        embedded_environments: Vec::new(),
+                        issues: Vec::new(),
+                    },
                 },
             )
         })

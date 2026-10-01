@@ -526,19 +526,19 @@ macro_rules! binding_object_view {
     ($image:ty) => {
         impl BindingObjectView for $image {
             fn object_kind(&self) -> &ObjectKind {
-                &self.object_kind
+                &self.object.object_kind
             }
             fn closure(&self) -> Option<&ClosureSource> {
-                self.closure.as_ref()
+                self.object.closure.as_ref()
             }
             fn environment(&self) -> Option<&str> {
-                self.environment.as_deref()
+                self.object.environment.as_deref()
             }
             fn embedded_closures(&self) -> &[EmbeddedClosureSource] {
-                &self.embedded_closures
+                &self.object.embedded_closures
             }
             fn embedded_environments(&self) -> &[EmbeddedEnvironmentRef] {
-                &self.embedded_environments
+                &self.object.embedded_environments
             }
         }
     };
@@ -565,7 +565,7 @@ mod tests {
     use super::*;
     use crate::Description;
     use crate::package::{
-        BindingOrigin, BindingRepresentation, Digest, LifecycleMetadata, PackageData,
+        BindingOrigin, BindingRepresentation, Digest, LifecycleMetadata, ObjectImage, PackageData,
         PackageIdentity, PackageIndex, PrivateEnvironmentImage,
     };
 
@@ -573,46 +573,37 @@ mod tests {
         BindingImage {
             name: name.into(),
             origin: BindingOrigin::Code,
-            representation: BindingRepresentation::Value,
-            classes: Vec::new(),
-            object_kind: kind,
-            closure: None,
-            environment: None,
-            embedded_closures: Vec::new(),
-            embedded_environments: Vec::new(),
-            issues: Vec::new(),
+            object: ObjectImage::of_kind(BindingRepresentation::Value, kind),
         }
     }
 
     fn function(name: &str, enclosure: &str) -> BindingImage {
-        BindingImage {
-            closure: Some(ClosureSource {
-                source: Arc::from(format!("{name} <- function() x")),
-                environment: enclosure.into(),
-            }),
-            ..value(name, ObjectKind::Closure)
-        }
+        let mut image = value(name, ObjectKind::Closure);
+        image.object.closure = Some(ClosureSource {
+            source: Arc::from(format!("{name} <- function() x")),
+            environment: enclosure.into(),
+        });
+        image
     }
 
     fn list(name: &str, closures: &[&str], environments: &[(&str, &str)]) -> BindingImage {
-        BindingImage {
-            embedded_closures: closures
-                .iter()
-                .map(|path| EmbeddedClosureSource {
-                    path: (*path).into(),
-                    source: Arc::from(".slinker_embedded <- function() 1"),
-                    environment: "namespace:root".into(),
-                })
-                .collect(),
-            embedded_environments: environments
-                .iter()
-                .map(|(path, environment)| EmbeddedEnvironmentRef {
-                    path: (*path).into(),
-                    environment: (*environment).into(),
-                })
-                .collect(),
-            ..value(name, ObjectKind::List)
-        }
+        let mut image = value(name, ObjectKind::List);
+        image.object.embedded_closures = closures
+            .iter()
+            .map(|path| EmbeddedClosureSource {
+                path: (*path).into(),
+                source: Arc::from(".slinker_embedded <- function() 1"),
+                environment: "namespace:root".into(),
+            })
+            .collect();
+        image.object.embedded_environments = environments
+            .iter()
+            .map(|(path, environment)| EmbeddedEnvironmentRef {
+                path: (*path).into(),
+                environment: (*environment).into(),
+            })
+            .collect();
+        image
     }
 
     fn private(id: &str, bindings: Vec<PrivateBindingImage>) -> PrivateEnvironmentImage {
@@ -701,14 +692,16 @@ mod tests {
     fn environment_identity_survives_self_reference_and_nested_aliases() {
         let this = PrivateBindingImage {
             name: "self".into(),
-            representation: BindingRepresentation::Value,
-            classes: Vec::new(),
-            object_kind: ObjectKind::Environment,
-            closure: None,
-            environment: Some("private:1".into()),
-            embedded_closures: Vec::new(),
-            embedded_environments: Vec::new(),
-            issues: Vec::new(),
+            object: ObjectImage {
+                representation: BindingRepresentation::Value,
+                classes: Vec::new(),
+                object_kind: ObjectKind::Environment,
+                closure: None,
+                environment: Some("private:1".into()),
+                embedded_closures: Vec::new(),
+                embedded_environments: Vec::new(),
+                issues: Vec::new(),
+            },
         };
         let graph = graph(&image(
             vec![list("holder", &[], &[("$[[1]]", "private:1")])],

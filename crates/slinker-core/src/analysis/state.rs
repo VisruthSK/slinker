@@ -327,7 +327,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     let Some(binding_image) = image.binding(&binding).cloned() else {
                         continue;
                     };
-                    let Some(closure) = binding_image.closure else {
+                    let Some(closure) = binding_image.object.closure else {
                         continue;
                     };
                     let owner_node = self.need_node(&Need::Binding {
@@ -357,7 +357,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     else {
                         continue;
                     };
-                    let Some(closure) = binding_image.closure else {
+                    let Some(closure) = binding_image.object.closure else {
                         continue;
                     };
                     let owner_node = self.need_node(&Need::PrivateBinding {

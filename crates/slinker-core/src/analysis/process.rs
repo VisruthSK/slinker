@@ -96,7 +96,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.diagnose_binding_object(node, id, binding, &binding_image);
         let object = self.objects.graph(id).namespace_binding(binding);
         self.require_member_closures(node, id, object);
-        if let Some(closure) = &binding_image.closure {
+        if let Some(closure) = &binding_image.object.closure {
             self.process_binding_closure(node, id, &image, binding, &binding_image, closure)?;
         }
         Ok(())
@@ -254,6 +254,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         binding_image: &BindingImage,
     ) {
         let object_issues = binding_image
+            .object
             .issues
             .iter()
             .filter(|issue| {
@@ -272,7 +273,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
         }
         if matches!(
-            binding_image.representation,
+            binding_image.object.representation,
             BindingRepresentation::ActiveBinding
         ) {
             self.diagnostic(
@@ -284,7 +285,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 None,
             );
         }
-        match &binding_image.object_kind {
+        match &binding_image.object.object_kind {
             ObjectKind::Other(kind) => self.diagnostic(
                 node,
                 id,
@@ -427,7 +428,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
         let source_key = Self::private_source_key(environment, binding);
         let source_name = source_key.to_string();
-        if let Some(closure) = &binding_image.closure {
+        if let Some(closure) = &binding_image.object.closure {
             if closure.environment.starts_with("unsupported:") {
                 self.diagnostic(
                     node,
@@ -481,6 +482,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         image: &PrivateBindingImage,
     ) {
         let object_issues = image
+            .object
             .issues
             .iter()
             .filter(|issue| {
@@ -501,7 +503,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 None,
             );
         }
-        if matches!(image.representation, BindingRepresentation::ActiveBinding) {
+        if matches!(
+            image.object.representation,
+            BindingRepresentation::ActiveBinding
+        ) {
             self.diagnostic(
                 node,
                 id,
@@ -513,7 +518,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 None,
             );
         }
-        match &image.object_kind {
+        match &image.object.object_kind {
             ObjectKind::Other(kind) => self.diagnostic(
                 node,
                 id,
@@ -937,7 +942,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package_image: &PackageImage,
         image: &BindingImage,
     ) -> Result<Option<Arc<ParsedRFile>>> {
-        let closure = image.closure.as_ref().ok_or_else(|| {
+        let closure = image.object.closure.as_ref().ok_or_else(|| {
             Error::Analysis(format!(
                 "closure binding {}::{binding} has no source",
                 self.packages.name(id)
@@ -1112,7 +1117,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         binding,
                     }) if owner == package => image
                         .binding(&binding)
-                        .and_then(|binding| binding.closure.as_ref())
+                        .and_then(|binding| binding.object.closure.as_ref())
                         .is_some_and(|closure| closure.environment == expected),
                     Resolution::Static(BindingTarget::Private {
                         package: owner,
@@ -1120,7 +1125,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         binding,
                     }) if owner == package => image
                         .private_binding(&environment, &binding)
-                        .and_then(|binding| binding.closure.as_ref())
+                        .and_then(|binding| binding.object.closure.as_ref())
                         .is_some_and(|closure| closure.environment == expected),
                     _ => false,
                 }

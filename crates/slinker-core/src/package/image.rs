@@ -73,9 +73,7 @@ pub enum BindingRepresentation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BindingImage {
-    pub name: BindingName,
-    pub origin: BindingOrigin,
+pub struct ObjectImage {
     pub representation: BindingRepresentation,
     #[serde(default)]
     pub classes: Vec<ClassName>,
@@ -87,18 +85,34 @@ pub struct BindingImage {
     pub issues: Vec<ObjectIssue>,
 }
 
+impl ObjectImage {
+    pub fn of_kind(representation: BindingRepresentation, object_kind: ObjectKind) -> Self {
+        Self {
+            representation,
+            classes: Vec::new(),
+            object_kind,
+            closure: None,
+            environment: None,
+            embedded_closures: Vec::new(),
+            embedded_environments: Vec::new(),
+            issues: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BindingImage {
+    pub name: BindingName,
+    pub origin: BindingOrigin,
+    #[serde(flatten)]
+    pub object: ObjectImage,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrivateBindingImage {
     pub name: BindingName,
-    pub representation: BindingRepresentation,
-    #[serde(default)]
-    pub classes: Vec<ClassName>,
-    pub object_kind: ObjectKind,
-    pub closure: Option<ClosureSource>,
-    pub environment: Option<String>,
-    pub embedded_closures: Vec<EmbeddedClosureSource>,
-    pub embedded_environments: Vec<EmbeddedEnvironmentRef>,
-    pub issues: Vec<ObjectIssue>,
+    #[serde(flatten)]
+    pub object: ObjectImage,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

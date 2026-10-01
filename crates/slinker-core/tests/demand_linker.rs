@@ -2,7 +2,7 @@ use slinker_core::analysis::{
     EdgeKind, ExplanationDag, GraphEdgeReasonExport, Linker, NodeKind, RejectCode,
 };
 use slinker_core::package::{
-    BindingImage, BindingOrigin, CanonicalSyntax, ClosureSource, DatasetName, Digest,
+    BindingImage, BindingOrigin, CanonicalSyntax, ObjectImage, ClosureSource, DatasetName, Digest,
     DispatchSubject, EmbeddedClosureSource, ExportMap, GenericName, ImportBinding, ImportSpec,
     InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeLibrary,
     NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectIssue,
@@ -316,18 +316,20 @@ fn package_from_fixture(
             BindingImage {
                 name: (*binding).into(),
                 origin: BindingOrigin::Code,
-                representation: slinker_core::package::BindingRepresentation::Value,
-                classes: Vec::new(),
-                object_kind: if closure.is_some() {
-                    ObjectKind::Closure
-                } else {
-                    ObjectKind::Integer
+                object: ObjectImage {
+                    representation: slinker_core::package::BindingRepresentation::Value,
+                    classes: Vec::new(),
+                    object_kind: if closure.is_some() {
+                        ObjectKind::Closure
+                    } else {
+                        ObjectKind::Integer
+                    },
+                    closure,
+                    environment: None,
+                    embedded_closures: Vec::new(),
+                    embedded_environments: Vec::new(),
+                    issues: Vec::new(),
                 },
-                closure,
-                environment: None,
-                embedded_closures: Vec::new(),
-                embedded_environments: Vec::new(),
-                issues: Vec::new(),
             },
         );
     }
@@ -449,17 +451,19 @@ fn program_has_s3_registration(
 fn private_closure(name: &str, environment: &str, source: &str) -> PrivateBindingImage {
     PrivateBindingImage {
         name: name.into(),
-        representation: slinker_core::package::BindingRepresentation::Value,
-        classes: Vec::new(),
-        object_kind: ObjectKind::Closure,
-        closure: Some(ClosureSource {
-            environment: environment.into(),
-            source: Arc::from(source),
-        }),
-        environment: None,
-        embedded_closures: Vec::new(),
-        embedded_environments: Vec::new(),
-        issues: Vec::new(),
+        object: ObjectImage {
+            representation: slinker_core::package::BindingRepresentation::Value,
+            classes: Vec::new(),
+            object_kind: ObjectKind::Closure,
+            closure: Some(ClosureSource {
+                environment: environment.into(),
+                source: Arc::from(source),
+            }),
+            environment: None,
+            embedded_closures: Vec::new(),
+            embedded_environments: Vec::new(),
+            issues: Vec::new(),
+        },
     }
 }
 
@@ -482,12 +486,15 @@ fn retaining_structured_object_executes_nested_closures() {
         "",
     );
     let binding = root.bindings.get_mut("generator_funs").unwrap();
-    binding.object_kind = ObjectKind::List;
-    binding.embedded_closures.push(EmbeddedClosureSource {
-        path: "$[[1]]".into(),
-        source: Arc::from(".slinker_embedded <- function() nested_dependency()"),
-        environment: "namespace:root".into(),
-    });
+    binding.object.object_kind = ObjectKind::List;
+    binding
+        .object
+        .embedded_closures
+        .push(EmbeddedClosureSource {
+            path: "$[[1]]".into(),
+            source: Arc::from(".slinker_embedded <- function() nested_dependency()"),
+            environment: "namespace:root".into(),
+        });
 
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
@@ -519,24 +526,28 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
     root.bindings
         .get_mut("f")
         .unwrap()
+        .object
         .closure
         .as_mut()
         .unwrap()
         .environment = "private:1".into();
     let capsule = root.bindings.get_mut("capsule").unwrap();
-    capsule.object_kind = ObjectKind::Environment;
-    capsule.environment = Some("private:1".into());
+    capsule.object.object_kind = ObjectKind::Environment;
+    capsule.object.environment = Some("private:1".into());
     {
         let templates = root.bindings.get_mut("templates").unwrap();
-        templates.object_kind = ObjectKind::List;
+        templates.object.object_kind = ObjectKind::List;
         for name in ["first", "second"] {
-            templates.embedded_closures.push(EmbeddedClosureSource {
-                path: format!("$${name}"),
-                source: Arc::from(format!(
-                    ".slinker_embedded <- function() {{ self; {name}_dependency() }}"
-                )),
-                environment: "namespace:root".into(),
-            });
+            templates
+                .object
+                .embedded_closures
+                .push(EmbeddedClosureSource {
+                    path: format!("$${name}"),
+                    source: Arc::from(format!(
+                        ".slinker_embedded <- function() {{ self; {name}_dependency() }}"
+                    )),
+                    environment: "namespace:root".into(),
+                });
         }
     }
     for name in ["first", "second"] {
@@ -545,17 +556,19 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
             BindingImage {
                 name: format!("{name}_dependency").into(),
                 origin: BindingOrigin::Code,
-                representation: slinker_core::package::BindingRepresentation::Value,
-                classes: Vec::new(),
-                object_kind: ObjectKind::Closure,
-                closure: Some(ClosureSource {
-                    source: Arc::from(format!("{name}_dependency <- function() 1")),
-                    environment: "namespace:root".into(),
-                }),
-                environment: None,
-                embedded_closures: Vec::new(),
-                embedded_environments: Vec::new(),
-                issues: Vec::new(),
+                object: ObjectImage {
+                    representation: slinker_core::package::BindingRepresentation::Value,
+                    classes: Vec::new(),
+                    object_kind: ObjectKind::Closure,
+                    closure: Some(ClosureSource {
+                        source: Arc::from(format!("{name}_dependency <- function() 1")),
+                        environment: "namespace:root".into(),
+                    }),
+                    environment: None,
+                    embedded_closures: Vec::new(),
+                    embedded_environments: Vec::new(),
+                    issues: Vec::new(),
+                },
             },
         );
     }
@@ -607,6 +620,7 @@ fn unknown_closure_enclosure_reports_root_cause_without_lexical_cascade() {
     root.bindings
         .get_mut("f")
         .unwrap()
+        .object
         .closure
         .as_mut()
         .unwrap()
@@ -704,6 +718,7 @@ fn closure_private_environment_is_inventory_not_a_root_set() {
     root.bindings
         .get_mut("public")
         .unwrap()
+        .object
         .closure
         .as_mut()
         .unwrap()
@@ -753,6 +768,7 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
     root.bindings
         .get_mut("public")
         .unwrap()
+        .object
         .closure
         .as_mut()
         .unwrap()
@@ -814,6 +830,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
     root.bindings
         .get_mut("public")
         .unwrap()
+        .object
         .closure
         .as_mut()
         .unwrap()
@@ -827,18 +844,20 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
                 "bad".into(),
                 PrivateBindingImage {
                     name: "bad".into(),
-                    representation: slinker_core::package::BindingRepresentation::Value,
-                    classes: Vec::new(),
-                    object_kind: ObjectKind::Other("externalptr".into()),
-                    closure: None,
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: vec![ObjectIssue {
-                        path: "$".into(),
-                        kind: "external_pointer".into(),
-                        detail: "external pointer".into(),
-                    }],
+                    object: ObjectImage {
+                        representation: slinker_core::package::BindingRepresentation::Value,
+                        classes: Vec::new(),
+                        object_kind: ObjectKind::Other("externalptr".into()),
+                        closure: None,
+                        environment: None,
+                        embedded_closures: Vec::new(),
+                        embedded_environments: Vec::new(),
+                        issues: vec![ObjectIssue {
+                            path: "$".into(),
+                            kind: "external_pointer".into(),
+                            detail: "external pointer".into(),
+                        }],
+                    },
                 },
             )]),
         },
@@ -4265,6 +4284,7 @@ fn registered_operator_method_is_retained_with_its_dependencies() {
     root.bindings
         .get_mut("criterion")
         .expect("criterion binding")
+        .object
         .classes = vec!["root_criterion".into()];
 
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
@@ -5087,6 +5107,7 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
     root.bindings
         .get_mut("public")
         .unwrap()
+        .object
         .closure
         .as_mut()
         .unwrap()

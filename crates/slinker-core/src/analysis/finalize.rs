@@ -296,7 +296,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     None => MaterializedSlotSource::Unbound,
                     Some(binding) => {
                         match (
-                            &binding.closure,
+                            &binding.object.closure,
                             self.parses
                                 .shape(&(package, SourceKey::Binding(name.to_string()))),
                         ) {
@@ -663,7 +663,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 (
                     ClosureHome::Namespace,
                     BindingName::from(name.as_str()),
-                    image.binding(name)?.closure.as_ref()?,
+                    image.binding(name)?.object.closure.as_ref()?,
                 )
             }
             SourceKey::Private {
@@ -682,6 +682,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     BindingName::from(binding.as_str()),
                     image
                         .private_binding(environment, binding)?
+                        .object
                         .closure
                         .as_ref()?,
                 )
@@ -757,7 +758,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if builder.binding_is_payload(binding)
                 && let Some(environment) = image
                     .binding(name)
-                    .and_then(|binding| binding.environment.as_ref())
+                    .and_then(|binding| binding.object.environment.as_ref())
             {
                 queue.push_back((
                     environment.clone(),
@@ -780,7 +781,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let mut bindings = private.bindings.iter().collect::<Vec<_>>();
             bindings.sort_by(|left, right| left.0.cmp(right.0));
             for (name, binding) in bindings {
-                if let Some(reached) = &binding.environment {
+                if let Some(reached) = &binding.object.environment {
                     let mut through = steps.clone();
                     through.extend([ObjectStep::Binding(name.clone()), ObjectStep::Environment]);
                     queue.push_back((reached.clone(), root.clone(), through));

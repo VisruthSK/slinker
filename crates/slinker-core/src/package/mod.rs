@@ -11,8 +11,8 @@ pub use identity::{
 };
 pub use image::{
     BindingImage, BindingOrigin, BindingRepresentation, ClosureSource, EmbeddedClosureSource,
-    EmbeddedEnvironmentRef, ObjectIssue, ObjectKind, PackageImage, PrivateBindingImage,
-    PrivateEnvironmentImage,
+    EmbeddedEnvironmentRef, ObjectImage, ObjectIssue, ObjectKind, PackageImage,
+    PrivateBindingImage, PrivateEnvironmentImage,
 };
 pub use index::{
     ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NameLookup,
