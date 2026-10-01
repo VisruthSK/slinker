@@ -101,7 +101,6 @@ Minimal code:
 
 ## Track D: Build infrastructure and frontend
 
-- Restore GitHub Actions (billing); until then run the gate in WSL before each push.
 - Linux worker startup: fix `package 'methods' in options("defaultPackages") was not found`;
   export `R_SHARE_DIR`, `R_INCLUDE_DIR`, `R_DOC_DIR` as Ark does.
 - Source snapshot: honor `.Rbuildignore` and skip `.git`, `target/`, `renv/`. `source_digest` is
