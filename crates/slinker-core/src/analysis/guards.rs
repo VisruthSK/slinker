@@ -1,5 +1,5 @@
-use super::state::{AnalyzerState, ParsedSite};
-use crate::analysis::{NodeId, RejectCode};
+use super::state::{AnalyzerState, Caller, ParsedSite};
+use crate::analysis::RejectCode;
 use crate::metadata::{RelationField, relations};
 use crate::package::{ImportSpec, PackageId, PackageImage, PackageName, PackageProvider};
 use crate::syntax::{PackageGuard, Span};
@@ -18,13 +18,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             GuardVerdict::Active => Ok(true),
             GuardVerdict::Pruned => Ok(false),
             GuardVerdict::PrunedByUnselectedOptional(optional) => {
-                self.optional_availability_blocker(
-                    site.node,
-                    site.package,
-                    site.binding,
-                    &optional,
-                    span,
-                );
+                self.optional_availability_blocker(site.caller(), &optional, span);
                 Ok(false)
             }
         }
@@ -32,9 +26,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn optional_availability_blocker(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        Caller {
+            node: from,
+            package: current,
+            binding,
+        }: Caller<'_>,
         optional: &str,
         span: &Span,
     ) {

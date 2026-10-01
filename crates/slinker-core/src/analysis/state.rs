@@ -26,12 +26,29 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
+pub(super) struct Caller<'a> {
+    pub(super) node: NodeId,
+    pub(super) package: PackageId,
+    pub(super) binding: &'a str,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct ParsedSite<'a> {
     pub(super) node: NodeId,
     pub(super) package: PackageId,
     pub(super) image: &'a PackageImage,
     pub(super) binding: &'a str,
     pub(super) lexical_environment: &'a EnvironmentLabel,
+}
+
+impl<'a> ParsedSite<'a> {
+    pub(super) fn caller(&self) -> Caller<'a> {
+        Caller {
+            node: self.node,
+            package: self.package,
+            binding: self.binding,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

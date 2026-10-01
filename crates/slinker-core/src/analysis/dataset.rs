@@ -1,6 +1,6 @@
 use super::discovery::Discovered;
 use super::resolution::{OpenReason, Resolution};
-use super::state::AnalyzerState;
+use super::state::{AnalyzerState, Caller};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::package::EnvironmentLabel;
@@ -48,9 +48,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn data_call(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            binding,
+        }: Caller<'_>,
         call: &CallSite,
     ) -> Result<()> {
         let Some(package_index) = call
@@ -70,7 +72,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         let Some(StaticArg::String(name)) = call.args.get(package_index).and_then(Option::as_ref)
         else {
-            self.dynamic_package_name(from, current, binding, call);
+            self.dynamic_package_name(caller, call);
             return Ok(());
         };
         let name = name.clone();
@@ -83,7 +85,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Ok(())
             }
             Discovered::Optional => {
-                self.optional_availability_blocker(from, current, binding, &name, &call.span);
+                self.optional_availability_blocker(caller, &name, &call.span);
                 Ok(())
             }
             Discovered::Settled => Ok(()),

@@ -6,7 +6,7 @@ use super::discovery::Discovered;
 use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
 use super::relocation::{NamespaceCall, PendingRelocation, SyntaxObservation};
 use super::resolution::{BindingTarget, OpenReason, ReferenceUse, Resolution};
-use super::state::{AnalyzerState, NativeCallbackContext, ParsedSite};
+use super::state::{AnalyzerState, Caller, NativeCallbackContext, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::ir::NamespaceOperation;
@@ -20,16 +20,18 @@ use std::borrow::Cow;
 impl<P: PackageProvider> AnalyzerState<P> {
     fn namespace_info_query(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            binding,
+        }: Caller<'_>,
         call: &CallSite,
     ) -> Result<()> {
         if !matches!(
             matched_static_arg(call, &["ns", "which"], "which"),
             Some(StaticArg::String(field)) if field == "path"
         ) {
-            return self.namespace_argument(from, current, binding, call, &["ns", "which"], "ns");
+            return self.namespace_argument(caller, call, &["ns", "which"], "ns");
         }
         match matched_static_arg(call, &["ns", "which"], "ns") {
             Some(StaticArg::String(name)) => {
@@ -64,9 +66,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn namespace_argument(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            ..
+        }: Caller<'_>,
         call: &CallSite,
         formals: &[&str],
         target: &str,
@@ -75,7 +79,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
-            self.dynamic_package_name(from, current, binding, call);
+            self.dynamic_package_name(caller, call);
             return Ok(());
         };
         let name = name.clone();
@@ -105,9 +109,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn installed_package_query(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            ..
+        }: Caller<'_>,
         call: &CallSite,
         formals: &[&str],
         target: &str,
@@ -116,7 +122,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
-            self.dynamic_package_name(from, current, binding, call);
+            self.dynamic_package_name(caller, call);
             return Ok(());
         };
         let name = name.clone();
@@ -130,9 +136,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn package_description(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            ..
+        }: Caller<'_>,
         call: &CallSite,
     ) -> Result<()> {
         let formals = ["pkg", "lib.loc", "fields", "drop", "encoding"];
@@ -140,7 +148,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
-            self.dynamic_package_name(from, current, binding, call);
+            self.dynamic_package_name(caller, call);
             return Ok(());
         };
         let name = name.clone();
@@ -160,14 +168,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn loaded_query(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            ..
+        }: Caller<'_>,
         call: &CallSite,
         name: Option<&str>,
     ) -> Result<()> {
         let Some(name) = name else {
-            self.dynamic_package_name(from, current, binding, call);
+            self.dynamic_package_name(caller, call);
             return Ok(());
         };
         let imported = self
@@ -264,17 +274,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn rlang_call(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            ..
+        }: Caller<'_>,
         call: &CallSite,
     ) -> Result<()> {
         let (rewritable, formals, target) = match call.callee.as_str() {
             "ns_env" | "ns_imports_env" => {
-                return self.namespace_argument(from, current, binding, call, &["x"], "x");
+                return self.namespace_argument(caller, call, &["x"], "x");
             }
             "ns_exports" => {
-                return self.namespace_argument(from, current, binding, call, &["ns"], "ns");
+                return self.namespace_argument(caller, call, &["ns"], "ns");
             }
             "is_installed" => (&[][..], &["pkg", "...", "version", "compare"][..], "pkg"),
             "check_installed" => (
@@ -290,7 +302,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
-            self.dynamic_package_name(from, current, binding, call);
+            self.dynamic_package_name(caller, call);
             return Ok(());
         };
         let name = name.clone();
@@ -328,42 +340,27 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn utils_call(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            ..
+        }: Caller<'_>,
         call: &CallSite,
     ) -> Result<()> {
         match call.callee.as_str() {
             "packageVersion" => self.identity_query(from, current, call, true),
-            "packageDescription" => self.package_description(from, current, binding, call),
-            "getFromNamespace" => self.namespace_argument(
-                from,
-                current,
-                binding,
-                call,
-                &["x", "ns", "pos", "envir"],
-                "ns",
-            ),
-            "assignInNamespace" => self.namespace_argument(
-                from,
-                current,
-                binding,
-                call,
-                &["x", "value", "ns", "pos", "envir"],
-                "ns",
-            ),
-            "citation" => {
-                self.installed_package_query(from, current, binding, call, &["package"], "package")
+            "packageDescription" => self.package_description(caller, call),
+            "getFromNamespace" => {
+                self.namespace_argument(caller, call, &["x", "ns", "pos", "envir"], "ns")
             }
-            "vignette" | "help" => self.installed_package_query(
-                from,
-                current,
-                binding,
-                call,
-                &["topic", "package"],
-                "package",
-            ),
-            "data" => self.data_call(from, current, binding, call),
+            "assignInNamespace" => {
+                self.namespace_argument(caller, call, &["x", "value", "ns", "pos", "envir"], "ns")
+            }
+            "citation" => self.installed_package_query(caller, call, &["package"], "package"),
+            "vignette" | "help" => {
+                self.installed_package_query(caller, call, &["topic", "package"], "package")
+            }
+            "data" => self.data_call(caller, call),
             _ => Ok(()),
         }
     }
@@ -548,6 +545,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         parsed: &ParsedRFile,
         call: &CallSite,
     ) -> Result<()> {
+        let caller = site.caller();
         let ParsedSite {
             node: from,
             package: current,
@@ -567,12 +565,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 self.external_callee(current, image, lexical_environment, call)?
             {
                 match self.packages.name(package).as_str() {
-                    "utils" => self.utils_call(from, current, binding, call)?,
-                    "rlang" => self.rlang_call(from, current, binding, call)?,
+                    "utils" => self.utils_call(caller, call)?,
+                    "rlang" => self.rlang_call(caller, call)?,
                     _ => {}
                 }
             } else if self.is_search_path_data_call(current, image, lexical_environment, call)? {
-                self.data_call(from, current, binding, call)?;
+                self.data_call(caller, call)?;
             }
             return Ok(());
         }
@@ -593,20 +591,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 self.attachment_call(from, current, call)?;
             }
             "requireNamespace" => {
-                self.namespace_operation(
-                    from,
-                    current,
-                    binding,
-                    parsed,
-                    call,
-                    NamespaceCall::Require,
-                )?;
+                self.namespace_operation(caller, parsed, call, NamespaceCall::Require)?;
             }
             "loadNamespace" => {
                 self.namespace_operation(
-                    from,
-                    current,
-                    binding,
+                    caller,
                     parsed,
                     call,
                     NamespaceCall::Operation(NamespaceOperation::Load),
@@ -614,9 +603,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             "getNamespace" => {
                 self.namespace_operation(
-                    from,
-                    current,
-                    binding,
+                    caller,
                     parsed,
                     call,
                     NamespaceCall::Operation(NamespaceOperation::Get),
@@ -624,62 +611,46 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             "asNamespace" => {
                 self.namespace_operation(
-                    from,
-                    current,
-                    binding,
+                    caller,
                     parsed,
                     call,
                     NamespaceCall::Operation(NamespaceOperation::As),
                 )?;
             }
             "getNamespaceImports" => {
-                self.namespace_argument(from, current, binding, call, &["ns"], "ns")?;
+                self.namespace_argument(caller, call, &["ns"], "ns")?;
             }
             "getNamespaceInfo" => {
-                self.namespace_info_query(from, current, binding, call)?;
+                self.namespace_info_query(caller, call)?;
             }
             "getExportedValue" => {
-                self.namespace_argument(from, current, binding, call, &["ns", "name"], "ns")?;
+                self.namespace_argument(caller, call, &["ns", "name"], "ns")?;
             }
             "getNamespaceExports" | "getNamespaceName" | "getNamespaceVersion" => {
-                self.namespace_argument(from, current, binding, call, &["ns"], "ns")?;
+                self.namespace_argument(caller, call, &["ns"], "ns")?;
             }
             "isNamespaceLoaded" => {
                 let name = match matched_static_arg(call, &["name"], "name") {
                     Some(StaticArg::String(name)) => Some(name.clone()),
                     _ => None,
                 };
-                self.loaded_query(from, current, binding, call, name.as_deref())?;
+                self.loaded_query(caller, call, name.as_deref())?;
             }
             "%in%" => {
                 if let Some(name) =
                     self.loaded_membership(current, image, lexical_environment, call)?
                 {
-                    self.loaded_query(from, current, binding, call, Some(&name))?;
+                    self.loaded_query(caller, call, Some(&name))?;
                 }
             }
             "attachNamespace" | "unloadNamespace" => {
-                self.installed_package_query(from, current, binding, call, &["ns"], "ns")?;
+                self.installed_package_query(caller, call, &["ns"], "ns")?;
             }
             "path.package" => {
-                self.installed_package_query(
-                    from,
-                    current,
-                    binding,
-                    call,
-                    &["package"],
-                    "package",
-                )?;
+                self.installed_package_query(caller, call, &["package"], "package")?;
             }
             "library.dynam" => {
-                self.installed_package_query(
-                    from,
-                    current,
-                    binding,
-                    call,
-                    &["chname", "package"],
-                    "package",
-                )?;
+                self.installed_package_query(caller, call, &["chname", "package"], "package")?;
             }
             "find.package" => self.identity_query(from, current, call, false)?,
             "UseMethod" | "NextMethod" => {
@@ -846,9 +817,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn namespace_operation(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        caller @ Caller {
+            node: from,
+            package: current,
+            binding,
+        }: Caller<'_>,
         parsed: &ParsedRFile,
         call: &CallSite,
         operation: NamespaceCall,
@@ -867,7 +840,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .and_then(|formal| declared_strings(parsed, call, &[formal], formal))
             {
                 for name in names {
-                    self.declared_namespace_name(from, current, binding, call, operation, &name)?;
+                    self.declared_namespace_name(caller, call, operation, &name)?;
                 }
                 return Ok(());
             }
@@ -886,7 +859,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Discovered::Settled => return Ok(()),
             Discovered::Optional => {
                 if operation == NamespaceCall::Require {
-                    self.optional_availability_blocker(from, current, binding, &name, &call.span);
+                    self.optional_availability_blocker(caller, &name, &call.span);
                 }
                 return Ok(());
             }
@@ -961,9 +934,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn declared_namespace_name(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        Caller {
+            node: from,
+            package: current,
+            binding,
+        }: Caller<'_>,
         call: &CallSite,
         operation: NamespaceCall,
         name: &str,

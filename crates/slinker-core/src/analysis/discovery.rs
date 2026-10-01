@@ -1,7 +1,7 @@
 use super::invocation::PinnedUse;
 use super::relocation::PendingRelocation;
 use super::s3::CallableId;
-use super::state::{AnalyzerState, ParsedSite};
+use super::state::{AnalyzerState, Caller, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::ir::ExternalBindingAccess;
@@ -313,9 +313,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn dynamic_package_name(
         &mut self,
-        from: NodeId,
-        current: PackageId,
-        binding: &str,
+        Caller {
+            node: from,
+            package: current,
+            binding,
+        }: Caller<'_>,
         call: &CallSite,
     ) {
         self.diagnostic(
