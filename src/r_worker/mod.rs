@@ -1506,8 +1506,206 @@ fn install_helpers() -> std::result::Result<(), InspectionError> {
         .map_err(|error| format!("failed to initialize installed-image helpers: {error}").into())
 }
 
+#[derive(Default)]
+struct RequestContext {
+    request_id: Option<u64>,
+    package: Option<WorkerPackageIdentity>,
+    binding: Option<String>,
+}
+
+impl RequestContext {
+    fn of(request: &WorkerRequest) -> Self {
+        let (request_id, package, binding) = match request {
+            WorkerRequest::Hello { .. } | WorkerRequest::Shutdown => (None, None, None),
+            WorkerRequest::PackageIndex {
+                request_id,
+                package,
+            }
+            | WorkerRequest::DataLibrary {
+                request_id,
+                package,
+                ..
+            } => (Some(*request_id), Some(package), None),
+            WorkerRequest::Binding {
+                request_id,
+                package,
+                name,
+            } => (Some(*request_id), Some(package), Some(name.clone())),
+            WorkerRequest::DispatchGenerics {
+                request_id,
+                package,
+                name,
+            } => (Some(*request_id), package.as_ref(), Some(name.clone())),
+            WorkerRequest::SerializePayloads { request_id, .. }
+            | WorkerRequest::ValidateSyntax { request_id, .. }
+            | WorkerRequest::NormalizeSyntax { request_id, .. }
+            | WorkerRequest::VerifyRelocation { request_id, .. } => (Some(*request_id), None, None),
+        };
+        Self {
+            request_id,
+            package: package.map(|package| WorkerPackageIdentity {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                image_fingerprint: package.image_fingerprint.clone(),
+            }),
+            binding,
+        }
+    }
+
+    fn failure(self, code: WorkerErrorCode, message: impl Into<String>) -> WorkerResponse {
+        WorkerResponse::Error {
+            error: WorkerFailure {
+                request_id: self.request_id,
+                package: self.package,
+                binding: self.binding,
+                code,
+                message: message.into(),
+                captured_output: Vec::new(),
+            },
+        }
+    }
+}
+
+fn syntax_verdict(
+    request_id: u64,
+    result: std::result::Result<(), InspectionError>,
+) -> WorkerResponse {
+    WorkerResponse::SyntaxValidation {
+        request_id,
+        accepted: result.is_ok(),
+        message: result.err().map(|error| error.to_string()),
+    }
+}
+
+impl WorkerRuntime {
+    fn answer(
+        &mut self,
+        request: WorkerRequest,
+    ) -> std::result::Result<WorkerResponse, WorkerOperationError> {
+        Ok(match request {
+            WorkerRequest::ValidateSyntax { request_id, source } => {
+                syntax_verdict(request_id, self.validate_syntax(&source))
+            }
+            WorkerRequest::NormalizeSyntax { request_id, source } => {
+                let (source, stable) =
+                    self.canonical_syntax(&source)
+                        .map_err(WorkerOperationError::with(
+                            WorkerErrorCode::TargetSyntaxRejection,
+                        ))?;
+                WorkerResponse::NormalizedSyntax {
+                    request_id,
+                    source,
+                    stable,
+                }
+            }
+            WorkerRequest::VerifyRelocation {
+                request_id,
+                original,
+                rewritten,
+                sites,
+            } => syntax_verdict(
+                request_id,
+                self.verify_relocation(&original, &rewritten, &sites),
+            ),
+            WorkerRequest::PackageIndex {
+                request_id,
+                package,
+            } => WorkerResponse::PackageIndex {
+                request_id,
+                index: self
+                    .package_index(&package)
+                    .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?,
+            },
+            WorkerRequest::Binding {
+                request_id,
+                package,
+                name,
+            } => WorkerResponse::Binding {
+                request_id,
+                binding: self.binding(&package, &name)?,
+            },
+            WorkerRequest::DataLibrary {
+                request_id,
+                package,
+                objects,
+                sets,
+            } => WorkerResponse::DataLibrary {
+                request_id,
+                library: self.data_library(&package, &objects, &sets)?,
+            },
+            WorkerRequest::DispatchGenerics {
+                request_id,
+                package,
+                name,
+            } => WorkerResponse::DispatchGenerics {
+                request_id,
+                generics: self.dispatch_generics(package.as_ref(), &name)?,
+            },
+            WorkerRequest::SerializePayloads {
+                request_id,
+                namespaces,
+                payloads,
+            } => WorkerResponse::Payloads {
+                request_id,
+                serialization: self.serialize_payloads(&namespaces, &payloads)?,
+            },
+            WorkerRequest::Hello { .. } | WorkerRequest::Shutdown => {
+                return Err(WorkerOperationError::with(WorkerErrorCode::Protocol)(
+                    "lifecycle request received after worker startup"
+                        .to_owned()
+                        .into(),
+                ));
+            }
+        })
+    }
+}
+
+fn start_runtime(
+    runtime: &mut Option<WorkerRuntime>,
+    protocol: u32,
+    target: &protocol::TargetSpec,
+) -> WorkerResponse {
+    let context = RequestContext::default();
+    if protocol != PROTOCOL_VERSION {
+        return context.failure(
+            WorkerErrorCode::Protocol,
+            format!("unsupported worker protocol {protocol}; expected {PROTOCOL_VERSION}"),
+        );
+    }
+    let started = WorkerRuntime::start(target).and_then(|started| {
+        let target = started.target()?;
+        Ok((started, target))
+    });
+    match started {
+        Ok((started, target)) => {
+            *runtime = Some(started);
+            WorkerResponse::Hello {
+                protocol: PROTOCOL_VERSION,
+                harp_worker: true,
+                target,
+            }
+        }
+        Err(error) => context.failure(WorkerErrorCode::RuntimeStartup, error.to_string()),
+    }
+}
+
+fn respond(runtime: &mut Option<WorkerRuntime>, request: WorkerRequest) -> WorkerResponse {
+    let context = RequestContext::of(&request);
+    if let WorkerRequest::Hello { protocol, target } = &request {
+        return start_runtime(runtime, *protocol, target);
+    }
+    let Some(runtime) = runtime.as_mut() else {
+        return context.failure(
+            WorkerErrorCode::RuntimeStartup,
+            "Harp worker must receive hello before semantic requests",
+        );
+    };
+    runtime
+        .answer(request)
+        .unwrap_or_else(|failure| context.failure(failure.code, failure.error.to_string()))
+}
+
 pub fn run(protocol_path: &std::path::Path) -> Result<()> {
-    let stdin = io::stdin();
     let mut output = OpenOptions::new()
         .append(true)
         .open(protocol_path)
@@ -1517,7 +1715,7 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
         })?;
     let mut runtime = None;
 
-    for line in stdin.lock().lines() {
+    for line in io::stdin().lock().lines() {
         let line = line.map_err(|source| Error::Io {
             path: "<r-worker-stdin>".into(),
             source,
@@ -1525,286 +1723,19 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-
-        let request: WorkerRequest = match serde_json::from_str(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                write_response(
-                    &mut output,
-                    &worker_failure(
-                        None,
-                        WorkerErrorCode::Protocol,
-                        format!("invalid worker request: {error}"),
-                        None,
-                        None,
-                    ),
-                )?;
-                continue;
+        let response = match serde_json::from_str::<WorkerRequest>(&line) {
+            Ok(WorkerRequest::Shutdown) => {
+                return write_response(&mut output, &WorkerResponse::Shutdown);
             }
+            Ok(request) => respond(&mut runtime, request),
+            Err(error) => RequestContext::default().failure(
+                WorkerErrorCode::Protocol,
+                format!("invalid worker request: {error}"),
+            ),
         };
-
-        let response = match request {
-            WorkerRequest::Hello { protocol, target } => {
-                if protocol != PROTOCOL_VERSION {
-                    worker_failure(
-                        None,
-                        WorkerErrorCode::Protocol,
-                        format!(
-                            "unsupported worker protocol {protocol}; expected {PROTOCOL_VERSION}"
-                        ),
-                        None,
-                        None,
-                    )
-                } else {
-                    match WorkerRuntime::start(&target) {
-                        Ok(started) => match started.target() {
-                            Ok(target) => {
-                                runtime = Some(started);
-                                WorkerResponse::Hello {
-                                    protocol: PROTOCOL_VERSION,
-                                    harp_worker: true,
-                                    target,
-                                }
-                            }
-                            Err(error) => operation_failure(
-                                None,
-                                WorkerOperationError::with(WorkerErrorCode::RuntimeStartup)(error),
-                                None,
-                                None,
-                            ),
-                        },
-                        Err(error) => operation_failure(
-                            None,
-                            WorkerOperationError::with(WorkerErrorCode::RuntimeStartup)(error),
-                            None,
-                            None,
-                        ),
-                    }
-                }
-            }
-            WorkerRequest::Shutdown => {
-                write_response(&mut output, &WorkerResponse::Shutdown)?;
-                return Ok(());
-            }
-            WorkerRequest::ValidateSyntax { request_id, source } => match runtime.as_ref() {
-                Some(runtime) => match runtime.validate_syntax(&source) {
-                    Ok(()) => WorkerResponse::SyntaxValidation {
-                        request_id,
-                        accepted: true,
-                        message: None,
-                    },
-                    Err(error) => WorkerResponse::SyntaxValidation {
-                        request_id,
-                        accepted: false,
-                        message: Some(error.to_string()),
-                    },
-                },
-                None => worker_failure(
-                    Some(request_id),
-                    WorkerErrorCode::RuntimeStartup,
-                    "Harp worker must receive hello before semantic requests",
-                    None,
-                    None,
-                ),
-            },
-            WorkerRequest::NormalizeSyntax { request_id, source } => match runtime.as_ref() {
-                Some(runtime) => match runtime.canonical_syntax(&source) {
-                    Ok((source, stable)) => WorkerResponse::NormalizedSyntax {
-                        request_id,
-                        source,
-                        stable,
-                    },
-                    Err(error) => operation_failure(
-                        Some(request_id),
-                        WorkerOperationError::with(WorkerErrorCode::TargetSyntaxRejection)(error),
-                        None,
-                        None,
-                    ),
-                },
-                None => worker_failure(
-                    Some(request_id),
-                    WorkerErrorCode::RuntimeStartup,
-                    "Harp worker must receive hello before semantic requests",
-                    None,
-                    None,
-                ),
-            },
-            WorkerRequest::VerifyRelocation {
-                request_id,
-                original,
-                rewritten,
-                sites,
-            } => match runtime.as_ref() {
-                Some(runtime) => match runtime.verify_relocation(&original, &rewritten, &sites) {
-                    Ok(()) => WorkerResponse::SyntaxValidation {
-                        request_id,
-                        accepted: true,
-                        message: None,
-                    },
-                    Err(error) => WorkerResponse::SyntaxValidation {
-                        request_id,
-                        accepted: false,
-                        message: Some(error.to_string()),
-                    },
-                },
-                None => worker_failure(
-                    Some(request_id),
-                    WorkerErrorCode::RuntimeStartup,
-                    "Harp worker must receive hello before semantic requests",
-                    None,
-                    None,
-                ),
-            },
-            WorkerRequest::PackageIndex {
-                request_id,
-                package,
-            } => match runtime.as_mut() {
-                Some(runtime) => match runtime.package_index(&package) {
-                    Ok(index) => WorkerResponse::PackageIndex { request_id, index },
-                    Err(error) => operation_failure(
-                        Some(request_id),
-                        WorkerOperationError::with(WorkerErrorCode::PackageMetadata)(error),
-                        Some(&package),
-                        None,
-                    ),
-                },
-                None => worker_failure(
-                    Some(request_id),
-                    WorkerErrorCode::RuntimeStartup,
-                    "Harp worker must receive hello before semantic requests",
-                    Some(&package),
-                    None,
-                ),
-            },
-            WorkerRequest::Binding {
-                request_id,
-                package,
-                name,
-            } => match runtime.as_mut() {
-                Some(runtime) => match runtime.binding(&package, &name) {
-                    Ok(binding) => WorkerResponse::Binding {
-                        request_id,
-                        binding,
-                    },
-                    Err(error) => {
-                        operation_failure(Some(request_id), error, Some(&package), Some(name))
-                    }
-                },
-                None => worker_failure(
-                    Some(request_id),
-                    WorkerErrorCode::RuntimeStartup,
-                    "Harp worker must receive hello before semantic requests",
-                    Some(&package),
-                    Some(name),
-                ),
-            },
-            WorkerRequest::DataLibrary {
-                request_id,
-                package,
-                objects,
-                sets,
-            } => match runtime.as_mut() {
-                Some(runtime) => match runtime.data_library(&package, &objects, &sets) {
-                    Ok(library) => WorkerResponse::DataLibrary {
-                        request_id,
-                        library,
-                    },
-                    Err(error) => operation_failure(Some(request_id), error, Some(&package), None),
-                },
-                None => worker_failure(
-                    Some(request_id),
-                    WorkerErrorCode::RuntimeStartup,
-                    "Harp worker must receive hello before semantic requests",
-                    Some(&package),
-                    None,
-                ),
-            },
-            WorkerRequest::DispatchGenerics {
-                request_id,
-                package,
-                name,
-            } => match runtime.as_mut() {
-                Some(runtime) => match runtime.dispatch_generics(package.as_ref(), &name) {
-                    Ok(generics) => WorkerResponse::DispatchGenerics {
-                        request_id,
-                        generics,
-                    },
-                    Err(error) => {
-                        operation_failure(Some(request_id), error, package.as_ref(), Some(name))
-                    }
-                },
-                None => worker_failure(
-                    Some(request_id),
-                    WorkerErrorCode::RuntimeStartup,
-                    "Harp worker must receive hello before semantic requests",
-                    package.as_ref(),
-                    Some(name),
-                ),
-            },
-            WorkerRequest::SerializePayloads {
-                request_id,
-                namespaces,
-                payloads,
-            } => match runtime.as_mut() {
-                Some(runtime) => match runtime.serialize_payloads(&namespaces, &payloads) {
-                    Ok(serialization) => WorkerResponse::Payloads {
-                        request_id,
-                        serialization,
-                    },
-                    Err(error) => operation_failure(Some(request_id), error, None, None),
-                },
-                None => worker_failure(
-                    Some(request_id),
-                    WorkerErrorCode::RuntimeStartup,
-                    "Harp worker must receive hello before semantic requests",
-                    None,
-                    None,
-                ),
-            },
-        };
-
         write_response(&mut output, &response)?;
     }
-
     Ok(())
-}
-
-fn operation_failure(
-    request_id: Option<u64>,
-    error: WorkerOperationError,
-    package: Option<&protocol::PackageSpec>,
-    binding: Option<String>,
-) -> WorkerResponse {
-    worker_failure(
-        request_id,
-        error.code,
-        error.error.to_string(),
-        package,
-        binding,
-    )
-}
-
-fn worker_failure(
-    request_id: Option<u64>,
-    code: WorkerErrorCode,
-    message: impl Into<String>,
-    package: Option<&protocol::PackageSpec>,
-    binding: Option<String>,
-) -> WorkerResponse {
-    WorkerResponse::Error {
-        error: WorkerFailure {
-            request_id,
-            package: package.map(|package| WorkerPackageIdentity {
-                name: package.name.clone(),
-                version: package.version.clone(),
-                image_fingerprint: package.image_fingerprint.clone(),
-            }),
-            binding,
-            code,
-            message: message.into(),
-            captured_output: Vec::new(),
-        },
-    }
 }
 
 fn write_response(writer: &mut impl Write, response: &WorkerResponse) -> Result<()> {
