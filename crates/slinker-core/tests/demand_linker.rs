@@ -6059,7 +6059,7 @@ fn independent_primary_blockers_stay_independent() {
         .map(|primary| (primary.package.clone(), primary.evidence.len()))
         .collect::<Vec<_>>();
     missing.sort();
-    assert_eq!(missing, [("gone".to_owned(), 2), ("other".to_owned(), 2)]);
+    assert_eq!(missing, [("gone".into(), 2), ("other".into(), 2)]);
     assert!(plan.blockers().iter().any(|blocker| {
         blocker.code == RejectCode::DynamicLookup && blocker.binding.as_deref() == Some("r4")
     }));

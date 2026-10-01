@@ -1,4 +1,5 @@
 use crate::analysis::{Diagnostic, LinkIr, RejectCode};
+use crate::package::{BindingName, PackageName};
 use crate::syntax::{SourceLocation, Sources};
 use serde::Serialize;
 use std::fmt;
@@ -6,8 +7,8 @@ use std::fmt;
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct Blocker {
     pub code: Option<RejectCode>,
-    pub package: Option<String>,
-    pub binding: Option<String>,
+    pub package: Option<PackageName>,
+    pub binding: Option<BindingName>,
     pub message: String,
     pub location: Option<SourceLocation>,
     pub reached_from: Option<String>,

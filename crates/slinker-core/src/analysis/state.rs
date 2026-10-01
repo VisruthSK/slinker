@@ -13,8 +13,8 @@ use super::s3::{CallableId, S3Model};
 use crate::analysis::{Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    BindingName, ClosureSource, ComponentName, EnvironmentLabel, PackageId, PackageImage,
-    PackageProvider, TargetUniverse,
+    BindingName, ClosureSource, ComponentName, EnvironmentLabel, GenericLabel, PackageId,
+    PackageImage, PackageName, PackageProvider, TargetUniverse,
 };
 use crate::syntax::{
     CallSite, NamespaceImports, OakParseContext, OakParser, ParsedRFile, SourceId, SourceKey, Span,
@@ -90,7 +90,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) root: PackageId,
     pub(super) declared_dependencies: HashMap<PackageId, DeclaredDependencies>,
     pub(super) namespace_imports: HashMap<PackageId, NamespaceImports>,
-    pub(super) non_returning_bindings: HashMap<PackageId, BTreeSet<String>>,
+    pub(super) non_returning_bindings: HashMap<PackageId, BTreeSet<BindingName>>,
     pub(super) root_description: Option<Arc<str>>,
 }
 
@@ -587,55 +587,55 @@ impl<P: PackageProvider> AnalyzerState<P> {
             *recorded = access;
         }
         self.graph.add_node(
-            self.packages.name(package).to_owned(),
+            self.packages.name(package).clone(),
             NodeKind::ExternalBinding {
-                name: name.to_owned(),
+                name: BindingName::from(name),
             },
             span,
         )
     }
 
     pub(super) fn need_node(&mut self, need: &Need) -> NodeId {
-        let package = self.packages.name(need.package()).to_owned();
+        let package = self.packages.name(need.package()).clone();
         let kind = match need {
             Need::Binding { binding, .. } => NodeKind::Binding {
-                name: binding.to_string(),
+                name: binding.clone(),
             },
             Need::PrivateBinding {
                 environment,
                 binding,
                 ..
             } => NodeKind::PrivateBinding {
-                environment: environment.to_string(),
-                name: binding.to_string(),
+                environment: environment.clone(),
+                name: binding.clone(),
             },
             Need::ClosureExecution { package, closure } => {
                 let execution = self
                     .closure_execution_source(*package, *closure)
                     .expect("closure execution need references the package object graph");
                 NodeKind::ClosureObject {
-                    owner: execution.owner.to_string(),
-                    path: execution.closure.provenance.path.to_string(),
-                    enclosure: execution.environment.to_string(),
+                    owner: execution.owner.clone(),
+                    path: execution.closure.provenance.path.clone(),
+                    enclosure: execution.environment.clone(),
                     derived: execution.closure.derived_from.is_some(),
                 }
             }
             Need::Activation { .. } => NodeKind::Activation,
             Need::Resource { resource, .. } => NodeKind::Resource {
-                path: resource.to_string(),
+                path: resource.clone(),
             },
             Need::Dataset { dataset, .. } => NodeKind::Dataset {
-                name: dataset.to_string(),
+                name: dataset.clone(),
             },
             Need::S3Registration { registration, .. } => NodeKind::S3Registration {
                 generic: self.generic_label(&registration.generic),
-                class: registration.class.to_string(),
+                class: registration.class.clone(),
             },
             Need::Native { component, .. } => NodeKind::NativeComponent {
-                name: component.to_string(),
+                name: component.clone(),
             },
             Need::Lifecycle { hook, .. } => NodeKind::Lifecycle {
-                hook: hook.to_string(),
+                hook: hook.binding(),
             },
         };
         self.graph.add_node(package, kind, None)
@@ -664,8 +664,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         span: Option<Span>,
     ) -> Diagnostic {
         Diagnostic {
-            package: self.packages.name(package).to_owned(),
-            binding: binding.map(str::to_owned),
+            package: self.packages.name(package).clone(),
+            binding: binding.map(BindingName::from),
             code,
             message,
             span,
@@ -674,10 +674,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    pub(super) fn generic_label(&self, generic: &GenericId) -> String {
+    pub(super) fn generic_label(&self, generic: &GenericId) -> GenericLabel {
         match generic.package {
-            Some(package) => format!("{}::{}", self.packages.name(package), generic.name),
-            None => generic.name.to_string(),
+            Some(package) => format!("{}::{}", self.packages.name(package), generic.name).into(),
+            None => generic.name.to_string().into(),
         }
     }
 
@@ -695,9 +695,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         span: Option<Span>,
     ) {
         let reason = reason.into();
-        let node = self
-            .graph
-            .add_node(missing, NodeKind::MissingPackage, span.clone());
+        let node = self.graph.add_node(
+            PackageName::from(missing),
+            NodeKind::MissingPackage,
+            span.clone(),
+        );
         self.graph
             .add_edge(from, node, kind, reason.clone(), span.clone());
         let primary = self.new_diagnostic(
@@ -711,22 +713,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
             None,
         );
         let evidence = Evidence {
-            package: self.packages.name(requester).to_owned(),
+            package: self.packages.name(requester).clone(),
             binding: self.node_binding(from),
             span,
             detail: reason,
         };
         self.diagnostics.record_derived(
-            Cause::MissingPackage(missing.to_owned()),
+            Cause::MissingPackage(PackageName::from(missing)),
             Diagnostic {
-                package: missing.to_owned(),
+                package: PackageName::from(missing),
                 ..primary
             },
             evidence,
         );
     }
 
-    fn node_binding(&self, node: NodeId) -> Option<String> {
+    fn node_binding(&self, node: NodeId) -> Option<BindingName> {
         match &self.graph.nodes[node.0].kind {
             NodeKind::Binding { name } | NodeKind::PrivateBinding { name, .. } => {
                 Some(name.clone())

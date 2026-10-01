@@ -1,10 +1,14 @@
+use crate::package::{BindingName, ExportMap, PackageName};
 use oak_semantic::{EffectsHandlers, ImportsResolver, SourceResolution};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ExternalNameOrigin {
     Base,
-    Imported { package: String, name: String },
+    Imported {
+        package: PackageName,
+        name: BindingName,
+    },
     Shadowed,
     UnknownImportAll,
 }
@@ -12,13 +16,13 @@ pub(super) enum ExternalNameOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NamespaceImportResolution {
     Imported {
-        package: String,
-        binding: String,
-        effect_name: String,
+        package: PackageName,
+        binding: BindingName,
+        effect_name: BindingName,
     },
     MissingImportAll {
-        package: String,
-        binding: String,
+        package: PackageName,
+        binding: BindingName,
     },
     BaseFallback,
 }
@@ -39,32 +43,32 @@ pub(super) const IMPORT_ALL_EXCLUDED: [&str; 10] = [
 #[derive(Debug, Clone)]
 pub(super) enum NamespaceImport {
     From {
-        package: String,
-        bindings: Vec<(String, String)>,
+        package: PackageName,
+        bindings: Vec<(BindingName, BindingName)>,
     },
     All {
-        package: String,
-        exports: Option<BTreeMap<String, String>>,
-        except: BTreeSet<String>,
+        package: PackageName,
+        exports: Option<ExportMap>,
+        except: BTreeSet<BindingName>,
     },
 }
 
 impl NamespaceImport {
-    pub(super) fn imports_from_all(except: &BTreeSet<String>, name: &str) -> bool {
+    pub(super) fn imports_from_all(except: &BTreeSet<BindingName>, name: &str) -> bool {
         !except.contains(name) && !IMPORT_ALL_EXCLUDED.contains(&name)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportedBinding {
-    pub(crate) package: String,
-    pub(crate) binding: String,
+    pub(crate) package: PackageName,
+    pub(crate) binding: BindingName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportRecord {
-    pub(crate) package: String,
-    pub(crate) names: Vec<(String, String)>,
+    pub(crate) package: PackageName,
+    pub(crate) names: Vec<(BindingName, BindingName)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -75,23 +79,23 @@ pub(crate) struct NamespaceImports {
 impl NamespaceImports {
     pub(crate) fn add_import_from(
         &mut self,
-        package: impl Into<String>,
-        bindings: impl IntoIterator<Item = (String, String)>,
+        package: PackageName,
+        bindings: impl IntoIterator<Item = (BindingName, BindingName)>,
     ) {
         self.imports.push(NamespaceImport::From {
-            package: package.into(),
+            package,
             bindings: bindings.into_iter().collect(),
         });
     }
 
     pub(crate) fn add_import_all(
         &mut self,
-        package: impl Into<String>,
-        exports: Option<BTreeMap<String, String>>,
-        except: impl IntoIterator<Item = String>,
+        package: PackageName,
+        exports: Option<ExportMap>,
+        except: impl IntoIterator<Item = BindingName>,
     ) {
         self.imports.push(NamespaceImport::All {
-            package: package.into(),
+            package,
             exports,
             except: except.into_iter().collect(),
         });
@@ -122,7 +126,7 @@ impl NamespaceImports {
                     let Some(exports) = exports else {
                         return NamespaceImportResolution::MissingImportAll {
                             package: package.clone(),
-                            binding: name.to_owned(),
+                            binding: BindingName::from(name),
                         };
                     };
                     let Some(binding) = exports.get(name) else {
@@ -131,7 +135,7 @@ impl NamespaceImports {
                     return NamespaceImportResolution::Imported {
                         package: package.clone(),
                         binding: binding.clone(),
-                        effect_name: name.to_owned(),
+                        effect_name: BindingName::from(name),
                     };
                 }
             }
@@ -140,7 +144,9 @@ impl NamespaceImports {
         NamespaceImportResolution::BaseFallback
     }
 
-    pub(crate) fn names(&self) -> std::result::Result<BTreeMap<String, ImportedBinding>, &str> {
+    pub(crate) fn names(
+        &self,
+    ) -> std::result::Result<BTreeMap<BindingName, ImportedBinding>, &PackageName> {
         let mut names = BTreeMap::new();
         for import in &self.imports {
             match import {
@@ -160,11 +166,11 @@ impl NamespaceImports {
                     exports,
                     except,
                 } => {
-                    let exports = exports.as_ref().ok_or(package.as_str())?;
+                    let exports = exports.as_ref().ok_or(package)?;
                     for (name, binding) in exports {
                         if NamespaceImport::imports_from_all(except, name) {
                             names.insert(
-                                name.clone(),
+                                BindingName::from(name.as_str()),
                                 ImportedBinding {
                                     package: package.clone(),
                                     binding: binding.clone(),
@@ -178,7 +184,7 @@ impl NamespaceImports {
         Ok(names)
     }
 
-    pub(crate) fn records(&self) -> std::result::Result<Vec<ImportRecord>, &str> {
+    pub(crate) fn records(&self) -> std::result::Result<Vec<ImportRecord>, &PackageName> {
         self.imports
             .iter()
             .map(|import| match import {
@@ -191,13 +197,18 @@ impl NamespaceImports {
                     exports,
                     except,
                 } => {
-                    let exports = exports.as_ref().ok_or(package.as_str())?;
+                    let exports = exports.as_ref().ok_or(package)?;
                     Ok(ImportRecord {
                         package: package.clone(),
                         names: exports
                             .keys()
                             .filter(|name| NamespaceImport::imports_from_all(except, name))
-                            .map(|name| (name.clone(), name.clone()))
+                            .map(|name| {
+                                (
+                                    BindingName::from(name.as_str()),
+                                    BindingName::from(name.as_str()),
+                                )
+                            })
                             .collect(),
                     })
                 }
@@ -208,13 +219,13 @@ impl NamespaceImports {
 
 #[derive(Debug, Default, Clone)]
 pub struct OakParseContext {
-    pub(super) shadowed_names: BTreeSet<String>,
+    pub(super) shadowed_names: BTreeSet<BindingName>,
     pub(super) imports: NamespaceImports,
-    pub(super) non_returning_names: BTreeSet<String>,
+    pub(super) non_returning_names: BTreeSet<BindingName>,
 }
 
 impl OakParseContext {
-    pub fn new(shadowed_names: BTreeSet<String>) -> Self {
+    pub fn new(shadowed_names: BTreeSet<BindingName>) -> Self {
         Self {
             shadowed_names,
             imports: NamespaceImports::default(),
@@ -223,9 +234,9 @@ impl OakParseContext {
     }
 
     pub(crate) fn with_imports(
-        shadowed_names: BTreeSet<String>,
+        shadowed_names: BTreeSet<BindingName>,
         imports: NamespaceImports,
-        non_returning_names: BTreeSet<String>,
+        non_returning_names: BTreeSet<BindingName>,
     ) -> Self {
         Self {
             shadowed_names,
@@ -237,12 +248,12 @@ impl OakParseContext {
     #[cfg(test)]
     pub(super) fn add_import_from(
         &mut self,
-        local: impl Into<String>,
-        package: impl Into<String>,
-        remote: impl Into<String>,
+        local: impl Into<BindingName>,
+        package: impl Into<PackageName>,
+        remote: impl Into<BindingName>,
     ) {
         self.imports
-            .add_import_from(package, [(local.into(), remote.into())]);
+            .add_import_from(package.into(), [(local.into(), remote.into())]);
     }
 
     pub(super) fn origin(&self, name: &str) -> ExternalNameOrigin {

@@ -1,5 +1,6 @@
+use crate::analysis::dynamic_names::CreatorOperation;
 use crate::analysis::graph::NodeId;
-use crate::package::PackageId;
+use crate::package::{BindingName, PackageId, PackageName};
 use crate::syntax::source::Span;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -34,8 +35,8 @@ pub enum RejectCode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
-    pub package: String,
-    pub binding: Option<String>,
+    pub package: PackageName,
+    pub binding: Option<BindingName>,
     pub code: RejectCode,
     pub message: String,
     pub span: Option<Span>,
@@ -51,7 +52,7 @@ impl Diagnostic {
         for evidence in &self.evidence {
             let site = match &evidence.binding {
                 Some(binding) => format!("{}::{binding}", evidence.package),
-                None => evidence.package.clone(),
+                None => evidence.package.to_string(),
             };
             if !sites.contains(&site) {
                 sites.push(site);
@@ -71,8 +72,8 @@ impl Diagnostic {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
-    pub package: String,
-    pub binding: Option<String>,
+    pub package: PackageName,
+    pub binding: Option<BindingName>,
     pub span: Option<Span>,
     pub detail: String,
 }
@@ -95,12 +96,12 @@ impl Evidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) enum Cause {
-    MissingPackage(String),
+    MissingPackage(PackageName),
     NameCreator {
         package: PackageId,
-        binding: String,
-        operation: &'static str,
-        created: Option<String>,
+        binding: BindingName,
+        operation: CreatorOperation,
+        created: Option<BindingName>,
     },
 }
 
@@ -164,7 +165,7 @@ mod tests {
                 .iter()
                 .map(|(package, binding)| Evidence {
                     package: (*package).into(),
-                    binding: binding.map(str::to_owned),
+                    binding: binding.map(BindingName::from),
                     span: None,
                     detail: String::new(),
                 })

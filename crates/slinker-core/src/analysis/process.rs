@@ -1,5 +1,5 @@
 use super::arguments::native_selector_span;
-use super::dynamic_names::{CreatedName, NameCreator};
+use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
 use super::execute::ExecutionContext;
 use super::object_world::{ClosureId, ObjectId};
 use super::parse_cache::ParseState;
@@ -641,8 +641,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 self.dynamic_names.observe_creator(NameCreator {
                     node: site.node,
                     package: site.package,
-                    binding: site.binding.to_owned(),
-                    operation: "environment<-",
+                    binding: BindingName::from(site.binding),
+                    operation: CreatorOperation::EnvironmentAssign,
                     name: CreatedName::Any,
                 });
             }
@@ -834,8 +834,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         self.dynamic_names.observe_creator(NameCreator {
                             node: site.node,
                             package: site.package,
-                            binding: site.binding.to_owned(),
-                            operation: "<<-",
+                            binding: BindingName::from(site.binding),
+                            operation: CreatorOperation::SuperAssign,
                             name: CreatedName::Any,
                         });
                         continue;

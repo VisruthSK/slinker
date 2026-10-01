@@ -103,19 +103,18 @@ enum DerivedStep {
 
 fn prove_non_returning<'a>(
     candidates: &(impl Iterator<Item = (&'a BindingName, &'a ClosureSource)> + Clone),
-    shadowed: &BTreeSet<String>,
+    shadowed: &BTreeSet<BindingName>,
     imports: &NamespaceImports,
-    proven: &mut BTreeSet<String>,
+    proven: &mut BTreeSet<BindingName>,
 ) {
     loop {
         let context =
             OakParseContext::with_imports(shadowed.clone(), imports.clone(), proven.clone());
         let before = proven.len();
         for (name, closure) in candidates.clone() {
-            if !proven.contains(name.as_str())
-                && closure_definitely_non_returning(&closure.source, &context)
+            if !proven.contains(name) && closure_definitely_non_returning(&closure.source, &context)
             {
-                proven.insert(name.to_string());
+                proven.insert(name.clone());
             }
         }
         if proven.len() == before {
@@ -137,10 +136,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for import in &image.index.imports {
             match import {
                 ImportSpec::From { package, bindings } => imports.add_import_from(
-                    package.as_str(),
+                    package.clone(),
                     bindings
                         .iter()
-                        .map(|binding| (binding.local.to_string(), binding.remote.to_string())),
+                        .map(|binding| (binding.local.clone(), binding.remote.clone())),
                 ),
                 ImportSpec::All {
                     package: package_name,
@@ -150,18 +149,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         Some(foreign) => Some(self.packages.index(foreign)?.exports.clone()),
                         None => None,
                     };
-                    imports.add_import_all(
-                        package_name.as_str(),
-                        exports.map(|exports| {
-                            exports
-                                .into_iter()
-                                .map(|(export, binding)| {
-                                    (export.into_string(), binding.into_string())
-                                })
-                                .collect()
-                        }),
-                        except.iter().map(ToString::to_string),
-                    );
+                    imports.add_import_all(package_name.clone(), exports, except.iter().cloned());
                 }
             }
         }
@@ -174,22 +162,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         image: &PackageImage,
         indexed: impl Iterator<Item = &'a BindingName>,
-    ) -> Result<BTreeSet<String>> {
-        let mut shadowed = indexed.map(ToString::to_string).collect::<BTreeSet<_>>();
-        shadowed.extend(
-            self.loaded(package)?
-                .namespace
-                .bindings
-                .iter()
-                .map(ToString::to_string),
-        );
+    ) -> Result<BTreeSet<BindingName>> {
+        let mut shadowed = indexed.cloned().collect::<BTreeSet<_>>();
+        shadowed.extend(self.loaded(package)?.namespace.bindings.iter().cloned());
         shadowed.extend(
             image
                 .index
                 .dynlibs
                 .iter()
                 .flat_map(NativeComponent::bindings)
-                .map(|symbol| symbol.binding.to_string()),
+                .map(|symbol| symbol.binding),
         );
         Ok(shadowed)
     }
@@ -199,7 +181,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         image: &PackageImage,
         imports: &NamespaceImports,
-    ) -> Result<BTreeSet<String>> {
+    ) -> Result<BTreeSet<BindingName>> {
         if let Some(bindings) = self.non_returning_bindings.get(&package) {
             return Ok(bindings.clone());
         }
@@ -237,8 +219,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     break;
                 }
                 for name in shape.bindings.keys() {
-                    private_shadowed.insert(name.to_string());
-                    shadowed.insert(name.to_string());
+                    private_shadowed.insert(name.clone());
+                    shadowed.insert(name.clone());
                 }
                 match shape.parent {
                     Some(parent) => environment = parent,
@@ -258,8 +240,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 break;
             };
             for (name, binding) in &private.bindings {
-                private_shadowed.insert(name.to_string());
-                shadowed.insert(name.to_string());
+                private_shadowed.insert(name.clone());
+                shadowed.insert(name.clone());
                 visible_private.entry(name).or_insert(binding);
             }
             current = Some(private.parent.clone());
@@ -436,27 +418,27 @@ impl<P: PackageProvider> AnalyzerState<P> {
             } => {
                 let Some(foreign) = self.packages.resolve(&package_name)? else {
                     return Ok(Resolution::OpenDynamic(OpenReason::MissingPackage {
-                        package: package_name.into(),
-                        binding: Some(binding.into()),
+                        package: package_name,
+                        binding: Some(binding),
                     }));
                 };
                 return Ok(if self.packages.is_external(foreign) {
                     self.external.insert(foreign);
                     Resolution::Static(BindingTarget::External {
                         package: foreign,
-                        binding: binding.into(),
+                        binding,
                     })
                 } else {
                     Resolution::Static(BindingTarget::Imported {
                         package: foreign,
-                        binding: binding.into(),
+                        binding,
                     })
                 });
             }
             NamespaceImportResolution::MissingImportAll { package, binding } => {
                 return Ok(Resolution::OpenDynamic(OpenReason::MissingPackage {
-                    package: package.into(),
-                    binding: Some(binding.into()),
+                    package,
+                    binding: Some(binding),
                 }));
             }
             NamespaceImportResolution::BaseFallback => {}
@@ -567,9 +549,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 binding: metadata,
             }) => {
                 let node = self.graph.add_node(
-                    self.packages.name(package).to_owned(),
+                    self.packages.name(package).clone(),
                     NodeKind::PackageMetadata {
-                        name: metadata.name().to_owned(),
+                        name: BindingName::from(metadata.name()),
                     },
                     Some(span.clone()),
                 );
@@ -611,8 +593,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
                 self.dynamic_names.observe_unresolved(UnresolvedName {
                     package: requester,
-                    binding: binding.map(str::to_owned),
-                    name: name.to_string(),
+                    binding: binding.map(BindingName::from),
+                    name: BindingName::from(name.as_str()),
                     span,
                 });
             }

@@ -3,13 +3,14 @@ use super::arguments::{
     only_package_argument, reflective_name_formals, static_package_arg, static_string_arg,
 };
 use super::discovery::Discovered;
-use super::dynamic_names::{CreatedName, NameCreator};
+use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
 use super::relocation::{NamespaceCall, PendingRelocation, SyntaxObservation};
 use super::resolution::{BindingTarget, OpenReason, ReferenceUse, Resolution};
 use super::state::{AnalyzerState, NativeCallbackContext, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::ir::NamespaceOperation;
+use crate::package::BindingName;
 use crate::package::EnvironmentLabel;
 use crate::package::PackageRole;
 use crate::package::{ImportSpec, PackageId, PackageImage, PackageProvider};
@@ -565,7 +566,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if let Some(package) =
                 self.external_callee(current, image, lexical_environment, call)?
             {
-                match self.packages.name(package) {
+                match self.packages.name(package).as_str() {
                     "utils" => self.utils_call(from, current, binding, call)?,
                     "rlang" => self.rlang_call(from, current, binding, call)?,
                     _ => {}
@@ -579,7 +580,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.dynamic_names.observe_creator(NameCreator {
                 node: site.node,
                 package: current,
-                binding: binding.to_owned(),
+                binding: BindingName::from(binding),
                 operation,
                 name,
             });
@@ -695,7 +696,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     node: from,
                     package: current,
                     span: call.span.clone(),
-                    kind: call.callee.clone(),
+                    callee: BindingName::from(call.callee.as_str()),
                 });
             }
             _ => {}
@@ -1084,24 +1085,28 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 }
 
-pub(super) fn created_name(call: &CallSite) -> Option<(&'static str, CreatedName)> {
+pub(super) fn created_name(call: &CallSite) -> Option<(CreatorOperation, CreatedName)> {
     let (operation, formals, target): (_, &[&str], _) = match call.callee.as_str() {
         "assign" => (
-            "assign",
+            CreatorOperation::Assign,
             &["x", "value", "pos", "envir", "inherits", "immediate"],
             "x",
         ),
         "delayedAssign" => (
-            "delayedAssign",
+            CreatorOperation::DelayedAssign,
             &["x", "value", "eval.env", "assign.env"],
             "x",
         ),
-        "makeActiveBinding" => ("makeActiveBinding", &["sym", "fun", "env"], "sym"),
-        "list2env" => return Some(("list2env", CreatedName::Any)),
+        "makeActiveBinding" => (
+            CreatorOperation::MakeActiveBinding,
+            &["sym", "fun", "env"],
+            "sym",
+        ),
+        "list2env" => return Some((CreatorOperation::List2env, CreatedName::Any)),
         _ => return None,
     };
     let name = match matched_static_arg(call, formals, target) {
-        Some(StaticArg::String(name)) => CreatedName::Named(name.clone()),
+        Some(StaticArg::String(name)) => CreatedName::Named(name.into()),
         Some(StaticArg::Symbol(_)) | None => CreatedName::Any,
     };
     Some((operation, name))

@@ -61,6 +61,24 @@ macro_rules! name_type {
             }
         }
 
+        impl PartialEq<$name> for str {
+            fn eq(&self, other: &$name) -> bool {
+                self == other.0
+            }
+        }
+
+        impl PartialEq<$name> for &str {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+
+        impl PartialEq<$name> for String {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(&self.0)
@@ -97,6 +115,7 @@ name_type!(ResourcePath);
 name_type!(SymbolName);
 name_type!(DataSetName);
 name_type!(ExportName);
+name_type!(GenericLabel);
 name_type!(EnvironmentLabel);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

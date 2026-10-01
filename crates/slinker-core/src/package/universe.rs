@@ -1,8 +1,8 @@
 use crate::metadata::Priority;
 use crate::package::{
     CanonicalSyntax, DispatchSubject, GenericName, InstalledPackage, PackageId, PackageIdentity,
-    PackageImage, PackageIndex, PackageLocation, PackageProvider, PackageResolver, PackageRole,
-    SyntaxValidation, fingerprint_image,
+    PackageImage, PackageIndex, PackageLocation, PackageName, PackageProvider, PackageResolver,
+    PackageRole, SyntaxValidation, fingerprint_image,
 };
 use crate::{Error, Result, TargetEnvironment};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -110,7 +110,7 @@ impl<P: PackageResolver> TargetUniverse<P> {
         &self.package(id).identity
     }
 
-    pub fn name(&self, id: PackageId) -> &str {
+    pub fn name(&self, id: PackageId) -> &PackageName {
         &self.identity(id).name
     }
 

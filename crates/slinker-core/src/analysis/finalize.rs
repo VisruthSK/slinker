@@ -1,5 +1,5 @@
 use super::diagnostic::{Cause, Evidence};
-use super::dynamic_names::{CreatedName, NameCreator};
+use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
 use super::object_world::reachable_environment_labels;
 use super::relocation::PendingRelocation;
 use super::state::{AnalyzerState, LoadedPackage};
@@ -23,7 +23,7 @@ use crate::package::PackageIdentity;
 use crate::package::PackageImage;
 use crate::package::PackageSources;
 use crate::package::{
-    EnvironmentLabel, NativeComponent, PackageAvailability, PackageId, PackageProvider,
+    EnvironmentLabel, NativeComponent, PackageAvailability, PackageId, PackageName, PackageProvider,
 };
 use crate::source::generated_description;
 use crate::syntax::{SourceKey, SourceOrigin, Sources};
@@ -243,7 +243,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         issues.extend(
             unreached
                 .into_iter()
-                .map(|name| FinalizationIssue::UnreachedExternal(name.clone())),
+                .map(|name| FinalizationIssue::UnreachedExternal(PackageName::from(name))),
         );
         Ok(contracts)
     }
@@ -387,7 +387,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &self,
         builder: &mut ProgramBuilder,
         retained: &BTreeSet<PackageId>,
-        namespace_ids: &HashMap<String, FinalizedNamespace>,
+        namespace_ids: &HashMap<PackageName, FinalizedNamespace>,
         issues: &mut Vec<FinalizationIssue>,
     ) -> HashMap<NamespaceId, BTreeSet<NamespaceId>> {
         let mut namespace_dependencies = HashMap::<NamespaceId, BTreeSet<NamespaceId>>::new();
@@ -405,8 +405,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Ok(resolved) => resolved,
                 Err(unknown) => {
                     issues.push(FinalizationIssue::UnknownImportAll {
-                        package: package_name.to_owned(),
-                        import: unknown.to_owned(),
+                        package: package_name.clone(),
+                        import: unknown.clone(),
                     });
                     continue;
                 }
@@ -435,23 +435,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                 return None;
                             }
                             ImportSlotIr::Removed(RemovedImportIr {
-                                package: imported.package.into(),
-                                binding: imported.binding.into(),
+                                package: imported.package,
+                                binding: imported.binding,
                             })
                         }
                     };
-                    Some((BindingName::from(local), slot))
+                    Some((local, slot))
                 })
                 .collect();
             let import_records = records
                 .into_iter()
                 .map(|record| ImportRecordIr {
-                    package: record.package.into(),
-                    names: record
-                        .names
-                        .into_iter()
-                        .map(|(local, remote)| (local.into(), remote.into()))
-                        .collect(),
+                    package: record.package,
+                    names: record.names.into_iter().collect(),
                 })
                 .collect();
             builder.set_imports(owner, imports, import_records);
@@ -462,7 +458,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn export_contents(
         &self,
         retained: &BTreeSet<PackageId>,
-        namespace_ids: &HashMap<String, FinalizedNamespace>,
+        namespace_ids: &HashMap<PackageName, FinalizedNamespace>,
     ) -> Result<(ExportTable, HashMap<NamespaceId, LinkedActivationContents>)> {
         let mut root_exports = ExportTable::default();
         let mut linked_contents = HashMap::new();
@@ -491,7 +487,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn plan_relocations(
         &self,
         builder: &mut ProgramBuilder,
-        namespace_ids: &HashMap<String, FinalizedNamespace>,
+        namespace_ids: &HashMap<PackageName, FinalizedNamespace>,
         issues: &mut Vec<FinalizationIssue>,
     ) -> Result<()> {
         let emitted_code = |builder: &ProgramBuilder, origin: &SourceOrigin| {
@@ -517,8 +513,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let code = self.payload_closure(builder, namespace_ids, origin);
             if code.is_none() {
                 issues.push(FinalizationIssue::NonRelocatableCode {
-                    package: origin.package.to_string(),
-                    binding: origin.key.to_string(),
+                    package: origin.package.clone(),
+                    key: origin.key.clone(),
                 });
             }
             payload_codes.insert(origin, code);
@@ -647,7 +643,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn payload_closure(
         &self,
         builder: &mut ProgramBuilder,
-        namespace_ids: &HashMap<String, FinalizedNamespace>,
+        namespace_ids: &HashMap<PackageName, FinalizedNamespace>,
         origin: &SourceOrigin,
     ) -> Option<CodeId> {
         let package = self.known_package(&origin.package)?;
@@ -703,7 +699,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &self,
         builder: &mut ProgramBuilder,
         retained: &BTreeSet<PackageId>,
-        namespace_ids: &HashMap<String, FinalizedNamespace>,
+        namespace_ids: &HashMap<PackageName, FinalizedNamespace>,
         issues: &mut Vec<FinalizationIssue>,
     ) -> Vec<(NamespaceId, NamespaceId)> {
         let mut linked = Vec::new();
@@ -876,9 +872,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             })
         };
         if !platform && declared.is_empty() {
-            issues.push(FinalizationIssue::UndeclaredExternal(
-                identity.name.to_string(),
-            ));
+            issues.push(FinalizationIssue::UndeclaredExternal(identity.name.clone()));
         }
         if let Some(unmet) = requirements
             .iter()
@@ -898,7 +892,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn activation_time_dependencies(
         &self,
-        namespace_ids: &HashMap<String, FinalizedNamespace>,
+        namespace_ids: &HashMap<PackageName, FinalizedNamespace>,
     ) -> Vec<(NamespaceId, NamespaceId)> {
         let mut dependencies = Vec::new();
         for start in self.graph.nodes.iter().filter(|node| {
@@ -1024,8 +1018,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.dynamic_names.observe_creator(NameCreator {
                 node,
                 package,
-                binding: component.to_string(),
-                operation: "useDynLib(.registration = TRUE)",
+                binding: BindingName::from(component.as_str()),
+                operation: CreatorOperation::DynLibRegistration,
                 name: CreatedName::Any,
             });
         }
@@ -1036,7 +1030,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 (
                     creator.clone(),
                     Evidence {
-                        package: self.packages.name(unresolved.package).to_owned(),
+                        package: self.packages.name(unresolved.package).clone(),
                         binding: unresolved.binding.clone(),
                         span: Some(unresolved.span.clone()),
                         detail: format!("`{}` is bound nowhere", unresolved.name),
@@ -1045,7 +1039,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             })
             .collect::<Vec<_>>();
         for (creator, evidence) in creatable {
-            let package = self.packages.name(creator.package).to_owned();
+            let package = self.packages.name(creator.package).clone();
             let primary = Diagnostic {
                 package: package.clone(),
                 binding: Some(creator.binding.clone()),
@@ -1066,7 +1060,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
             let cause = Cause::NameCreator {
                 package: creator.package,
-                created: creator.created_name().map(str::to_owned),
+                created: creator.created_name().cloned(),
                 operation: creator.operation,
                 binding: creator.binding,
             };
@@ -1083,7 +1077,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 RejectCode::SyntaxObservation,
                 format!(
                     "{} can observe syntax changed by a planned rewrite",
-                    observation.kind
+                    observation.callee
                 ),
                 Some(observation.span),
             );
@@ -1119,16 +1113,16 @@ impl LinkIr {
 
 #[derive(Debug)]
 pub(super) enum FinalizationIssue {
-    UnreachedExternal(String),
-    OnLoadNotRetained(String),
+    UnreachedExternal(PackageName),
+    OnLoadNotRetained(PackageName),
     CyclicLinkedImports,
     RootOnLoadNotRelocatable,
     NonRelocatableCode {
-        package: String,
-        binding: String,
+        package: PackageName,
+        key: SourceKey,
     },
     IncompatibleRequirements(String),
-    UndeclaredExternal(String),
+    UndeclaredExternal(PackageName),
     UnsatisfiedRequirement {
         identity: PackageIdentity,
         requirement: Relation,
@@ -1137,13 +1131,13 @@ pub(super) enum FinalizationIssue {
     InvalidDataset(InvalidDataset),
     Description(String),
     PayloadOutsideProgram {
-        package: String,
+        package: PackageName,
         namespace: String,
     },
-    PayloadRefersToRoot(String),
+    PayloadRefersToRoot(PackageName),
     UnknownImportAll {
-        package: String,
-        import: String,
+        package: PackageName,
+        import: PackageName,
     },
 }
 
@@ -1177,9 +1171,9 @@ impl std::fmt::Display for FinalizationIssue {
             Self::RootOnLoadNotRelocatable => f.write_str(
                 "the Root `.onLoad` is not relocatable source, so the generated wrapper cannot call it",
             ),
-            Self::NonRelocatableCode { package, binding } => write!(
+            Self::NonRelocatableCode { package, key } => write!(
                 f,
-                "`{package}::{binding}` needs a code relocation but is not emitted as relocatable source"
+                "`{package}::{key}` needs a code relocation but is not emitted as relocatable source"
             ),
             Self::IncompatibleRequirements(problem) | Self::Description(problem) => {
                 f.write_str(problem)
@@ -1204,7 +1198,7 @@ type LinkedActivationContents = (ExportTable, Vec<BindingName>);
 
 #[derive(Default)]
 struct FinalizedNamespaces {
-    ids: HashMap<String, FinalizedNamespace>,
+    ids: HashMap<PackageName, FinalizedNamespace>,
     on_load: HashMap<NamespaceId, BindingId>,
     root_natives: Vec<NativeComponent>,
     linked_natives: HashMap<NamespaceId, Vec<NativeComponent>>,

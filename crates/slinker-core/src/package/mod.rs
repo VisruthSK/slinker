@@ -30,5 +30,6 @@ pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUn
 
 pub use names::{
     BindingName, ClassName, ComponentName, DataSetName, DatasetName, EnvironmentKind,
-    EnvironmentLabel, ExportName, GenericName, MemberPath, PackageName, ResourcePath, SymbolName,
+    EnvironmentLabel, ExportName, GenericLabel, GenericName, MemberPath, PackageName, ResourcePath,
+    SymbolName,
 };

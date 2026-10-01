@@ -932,7 +932,7 @@ pub(super) fn expression_definitely_non_returning(
                 && !identifier_occurs_before(text, &callee, callee_start)
         }
         None => {
-            context.non_returning_names.contains(&callee)
+            context.non_returning_names.contains(callee.as_str())
                 && !identifier_occurs_before(text, &callee, callee_start)
         }
     }

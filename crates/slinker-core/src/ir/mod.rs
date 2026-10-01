@@ -5,7 +5,7 @@ pub use crate::package::{
 };
 
 use crate::package::NativeComponent;
-use crate::package::{DataSetName, Digest};
+use crate::package::{DataSetName, Digest, SymbolName};
 use crate::syntax::TextRange;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -377,7 +377,7 @@ pub enum RelocationTarget {
     NativeSymbol {
         package: PackageId,
         component: ComponentName,
-        symbol: String,
+        symbol: SymbolName,
     },
     NativeLibrary {
         package: PackageId,
@@ -1370,7 +1370,8 @@ impl ProvenanceIr {
     }
 
     pub fn binding(&self, package: &str, name: &str) -> Option<NodeId> {
-        self.graph.binding(package, name)
+        self.graph
+            .binding(&PackageName::from(package), &BindingName::from(name))
     }
 
     pub fn incoming(&self, node: NodeId) -> impl Iterator<Item = &Edge> {

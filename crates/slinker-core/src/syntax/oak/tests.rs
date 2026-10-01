@@ -1,4 +1,5 @@
 use super::*;
+use crate::package::{BindingName, PackageName};
 use crate::syntax::{ConstructionExprKind, ConstructionTarget, DeclaredCallable, DeclaredDomain};
 use oak_semantic::ImportsResolver;
 
@@ -284,7 +285,7 @@ fn quotation_evaluated_elsewhere_stays_inert() {
 
 #[test]
 fn shadowed_bquote_does_not_receive_base_effects() {
-    let context = OakParseContext::new(BTreeSet::from(["bquote".to_owned()]));
+    let context = OakParseContext::new(BTreeSet::from(["bquote".into()]));
     let parsed = OakParser
         .parse_binding_with_context(
             SourceId(0),
@@ -505,7 +506,7 @@ fn exhaustive_dispatch_with_stop_proves_local_binding() {
 #[test]
 fn package_local_non_returning_helper_proves_local_binding() {
     let mut context = OakParseContext::default();
-    context.non_returning_names.insert(".die".to_owned());
+    context.non_returning_names.insert(".die".into());
     let parsed = OakParser
         .parse_binding_with_context(
             SourceId(0),
@@ -552,7 +553,7 @@ fn zero_iteration_loop_keeps_real_fallthrough() {
 #[test]
 fn locally_shadowed_non_returning_helper_does_not_discharge_fallthrough() {
     let mut context = OakParseContext::default();
-    context.non_returning_names.insert(".die".to_owned());
+    context.non_returning_names.insert(".die".into());
     let parsed = OakParser
         .parse_binding_with_context(
             SourceId(0),
@@ -1031,18 +1032,15 @@ fn explicit_return_prevents_never_returns_summary() {
 #[test]
 fn later_import_from_replaces_an_earlier_one() {
     let mut imports = NamespaceImports::default();
-    imports.add_import_from("first", [("target".to_owned(), "first_target".to_owned())]);
-    imports.add_import_from(
-        "second",
-        [("target".to_owned(), "second_target".to_owned())],
-    );
+    imports.add_import_from("first".into(), [("target".into(), "first_target".into())]);
+    imports.add_import_from("second".into(), [("target".into(), "second_target".into())]);
 
     assert_eq!(
         imports.resolve("target"),
         NamespaceImportResolution::Imported {
-            package: "second".to_owned(),
-            binding: "second_target".to_owned(),
-            effect_name: "second_target".to_owned(),
+            package: "second".into(),
+            binding: "second_target".into(),
+            effect_name: "second_target".into(),
         }
     );
 }
@@ -1050,22 +1048,22 @@ fn later_import_from_replaces_an_earlier_one() {
 #[test]
 fn later_import_all_replaces_an_earlier_import_from() {
     let mut imports = NamespaceImports::default();
-    imports.add_import_from("first", [("target".to_owned(), "target".to_owned())]);
+    imports.add_import_from("first".into(), [("target".into(), "target".into())]);
     imports.add_import_all(
-        "later",
+        "later".into(),
         Some(BTreeMap::from([
-            ("target".to_owned(), "target_impl".to_owned()),
-            (".onLoad".to_owned(), ".onLoad".to_owned()),
+            ("target".into(), "target_impl".into()),
+            (".onLoad".into(), ".onLoad".into()),
         ])),
-        Vec::<String>::new(),
+        Vec::new(),
     );
 
     assert_eq!(
         imports.resolve("target"),
         NamespaceImportResolution::Imported {
-            package: "later".to_owned(),
-            binding: "target_impl".to_owned(),
-            effect_name: "target".to_owned(),
+            package: "later".into(),
+            binding: "target_impl".into(),
+            effect_name: "target".into(),
         }
     );
     assert_eq!(
@@ -1076,34 +1074,34 @@ fn later_import_all_replaces_an_earlier_import_from() {
         imports
             .names()
             .map(|names| names.into_keys().collect::<Vec<_>>()),
-        Ok(vec!["target".to_owned()])
+        Ok(vec![BindingName::from("target")])
     );
 }
 
 #[test]
 fn missing_import_all_blocks_only_names_no_later_import_provides() {
     let mut imports = NamespaceImports::default();
-    imports.add_import_all("missing", None, Vec::<String>::new());
+    imports.add_import_all("missing".into(), None, Vec::new());
     imports.add_import_all(
-        "later",
-        Some(BTreeMap::from([("target".to_owned(), "target".to_owned())])),
-        Vec::<String>::new(),
+        "later".into(),
+        Some(BTreeMap::from([("target".into(), "target".into())])),
+        Vec::new(),
     );
 
     assert_eq!(
         imports.resolve("target"),
         NamespaceImportResolution::Imported {
-            package: "later".to_owned(),
-            binding: "target".to_owned(),
-            effect_name: "target".to_owned(),
+            package: "later".into(),
+            binding: "target".into(),
+            effect_name: "target".into(),
         }
     );
     assert_eq!(
         imports.resolve("other"),
         NamespaceImportResolution::MissingImportAll {
-            package: "missing".to_owned(),
-            binding: "other".to_owned(),
+            package: "missing".into(),
+            binding: "other".into(),
         }
     );
-    assert_eq!(imports.names(), Err("missing"));
+    assert_eq!(imports.names(), Err(&PackageName::from("missing")));
 }

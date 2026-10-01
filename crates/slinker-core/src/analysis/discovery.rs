@@ -275,7 +275,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.relocations.push(PendingRelocation::ResourceAccess {
             source: resource.span.clone(),
             package: foreign,
-            resource: path.clone(),
+            resource: path.into(),
         });
         Ok(())
     }

@@ -315,7 +315,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     source,
                     package: current,
                     component: component.into(),
-                    symbol: symbol.clone(),
+                    symbol: symbol.into(),
                 });
             }
             _ => self.diagnostic(

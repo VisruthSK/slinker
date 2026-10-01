@@ -8,6 +8,7 @@ use crate::analysis::export::{
     root_reason, semantic_node_ids, stable_source, target_identity,
 };
 use crate::ir::PackageRole;
+use crate::package::PackageName;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -46,7 +47,7 @@ pub struct ExplanationComponent {
 pub struct ExplanationMember {
     pub id: String,
     pub kind: GraphNodeKindExport,
-    pub package: String,
+    pub package: PackageName,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -83,8 +84,8 @@ pub struct ExplanationEdge {
     pub occurrences: usize,
     pub evidence: Vec<ExplanationEvidence>,
     pub crosses_package_boundary: bool,
-    pub source_packages: Vec<String>,
-    pub target_packages: Vec<String>,
+    pub source_packages: Vec<PackageName>,
+    pub target_packages: Vec<PackageName>,
     pub reachability_redundant: bool,
 }
 
@@ -121,7 +122,7 @@ pub struct ExplanationRoot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplanationPackage {
-    pub name: String,
+    pub name: PackageName,
     pub version: Option<String>,
     pub image_fingerprint: Option<String>,
     pub external: bool,
@@ -480,7 +481,7 @@ fn presentation_rank(kind: GraphNodeKindExport) -> u8 {
 
 fn package_identities(
     plan: &LinkIr,
-) -> Result<BTreeMap<String, PackageIdentityExport>, ExplanationError> {
+) -> Result<BTreeMap<PackageName, PackageIdentityExport>, ExplanationError> {
     let mut identities = BTreeMap::new();
     for (_, package) in plan.program().packages() {
         let package = package.identity();
@@ -497,12 +498,12 @@ fn package_identities(
                 package.name
             )));
         }
-        identities.insert(package.name.to_string(), identity);
+        identities.insert(package.name.clone(), identity);
     }
     Ok(identities)
 }
 
-fn component_packages(component: &ExplanationComponent) -> Vec<String> {
+fn component_packages(component: &ExplanationComponent) -> Vec<PackageName> {
     component
         .members
         .iter()
@@ -693,7 +694,7 @@ fn package_summaries(
     root_name: &str,
     components: &[ExplanationComponent],
     edges: &[ExplanationEdge],
-    identities: &BTreeMap<String, PackageIdentityExport>,
+    identities: &BTreeMap<PackageName, PackageIdentityExport>,
 ) -> Vec<ExplanationPackage> {
     let members = components
         .iter()

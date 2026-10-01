@@ -1,4 +1,8 @@
-use crate::syntax::source::Span;
+use crate::package::{
+    BindingName, ClassName, ComponentName, DatasetName, EnvironmentLabel, GenericLabel, MemberPath,
+    PackageName, ResourcePath,
+};
+use crate::syntax::source::{SourceKey, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -9,40 +13,40 @@ pub struct NodeId(pub usize);
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeKind {
     Binding {
-        name: String,
+        name: BindingName,
     },
     PrivateBinding {
-        environment: String,
-        name: String,
+        environment: EnvironmentLabel,
+        name: BindingName,
     },
     ClosureObject {
-        owner: String,
-        path: String,
-        enclosure: String,
+        owner: SourceKey,
+        path: MemberPath,
+        enclosure: EnvironmentLabel,
         derived: bool,
     },
     Activation,
     Dataset {
-        name: String,
+        name: DatasetName,
     },
     Lifecycle {
-        hook: String,
+        hook: BindingName,
     },
     S3Registration {
-        generic: String,
-        class: String,
+        generic: GenericLabel,
+        class: ClassName,
     },
     Resource {
-        path: String,
+        path: ResourcePath,
     },
     NativeComponent {
-        name: String,
+        name: ComponentName,
     },
     ExternalBinding {
-        name: String,
+        name: BindingName,
     },
     PackageMetadata {
-        name: String,
+        name: BindingName,
     },
     MissingPackage,
 }
@@ -50,7 +54,7 @@ pub enum NodeKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct Node {
     pub id: NodeId,
-    pub package: String,
+    pub package: PackageName,
     pub kind: NodeKind,
     pub span: Option<Span>,
 }
@@ -89,18 +93,12 @@ pub struct Graph {
     pub edges: Vec<Edge>,
     outgoing: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
-    keys: HashMap<(String, NodeKind), NodeId>,
+    keys: HashMap<(PackageName, NodeKind), NodeId>,
     edge_keys: HashSet<(NodeId, NodeId, EdgeKind, String, Option<Span>)>,
 }
 
 impl Graph {
-    pub fn add_node(
-        &mut self,
-        package: impl Into<String>,
-        kind: NodeKind,
-        span: Option<Span>,
-    ) -> NodeId {
-        let package = package.into();
+    pub fn add_node(&mut self, package: PackageName, kind: NodeKind, span: Option<Span>) -> NodeId {
         let key = (package, kind);
         if let Some(&id) = self.keys.get(&key) {
             return id;
@@ -146,11 +144,9 @@ impl Graph {
         self.incoming[to.0].push(index);
     }
 
-    pub fn binding(&self, package: &str, name: &str) -> Option<NodeId> {
-        let kind = NodeKind::Binding {
-            name: name.to_owned(),
-        };
-        self.keys.get(&(package.to_owned(), kind)).copied()
+    pub fn binding(&self, package: &PackageName, name: &BindingName) -> Option<NodeId> {
+        let kind = NodeKind::Binding { name: name.clone() };
+        self.keys.get(&(package.clone(), kind)).copied()
     }
 
     pub fn missing_packages(&self) -> impl Iterator<Item = NodeId> + '_ {

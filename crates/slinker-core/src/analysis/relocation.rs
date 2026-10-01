@@ -1,6 +1,8 @@
 use super::NodeId;
 use crate::ir::NamespaceOperation;
-use crate::package::{BindingName, ComponentName, DataSetName, DatasetName, PackageId};
+use crate::package::{
+    BindingName, ComponentName, DataSetName, DatasetName, PackageId, ResourcePath, SymbolName,
+};
 use crate::syntax::Span;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,7 +22,7 @@ pub(super) enum PendingRelocation {
     ResourceAccess {
         source: Span,
         package: PackageId,
-        resource: String,
+        resource: ResourcePath,
     },
     RequireNamespace {
         source: Span,
@@ -61,7 +63,7 @@ pub(super) enum PendingRelocation {
         source: Span,
         package: PackageId,
         component: ComponentName,
-        symbol: String,
+        symbol: SymbolName,
     },
     NativeLibrary {
         source: Span,
@@ -141,7 +143,7 @@ pub(super) struct SyntaxObservation {
     pub(super) node: NodeId,
     pub(super) package: PackageId,
     pub(super) span: Span,
-    pub(super) kind: String,
+    pub(super) callee: BindingName,
 }
 
 #[derive(Default)]

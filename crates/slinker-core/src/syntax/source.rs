@@ -77,6 +77,12 @@ impl SourceKey {
     }
 }
 
+impl Serialize for SourceKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 impl fmt::Display for SourceKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
