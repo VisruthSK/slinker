@@ -87,6 +87,7 @@ impl WorkerClient {
             protocol_path,
             next_request: 1,
         };
+        crate::profile::count(crate::profile::Count::RStartups, 1);
         let response = client.exchange(&WorkerRequest::Hello {
             protocol: PROTOCOL_VERSION,
             target: TargetSpec {
@@ -282,9 +283,15 @@ impl WorkerClient {
     }
 
     fn exchange(&mut self, request: &WorkerRequest) -> Result<WorkerResponse> {
+        let _timer = crate::profile::time(crate::profile::Probe::WorkerRequest);
         let context = request_context(request);
-        serde_json::to_writer(&mut self.input, request).map_err(|error| {
+        let encoded = serde_json::to_vec(request).map_err(|error| {
             Error::Analysis(format!("failed to serialize Harp worker request: {error}"))
+        })?;
+        crate::profile::record_request(request.opcode(), encoded.len());
+        self.input.write_all(&encoded).map_err(|source| Error::Io {
+            path: "<r-worker-stdin>".into(),
+            source,
         })?;
         self.input.write_all(b"\n").map_err(|source| Error::Io {
             path: "<r-worker-stdin>".into(),

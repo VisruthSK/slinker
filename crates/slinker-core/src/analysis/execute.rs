@@ -630,11 +630,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .collect(),
         };
         if let Some(value) = self.construction_calls.get(&memo) {
+            crate::profile::count(crate::profile::Count::ConstructionMemoHit, 1);
             return Ok(ExecutionOutcome::value(value.clone()));
         }
         self.construction_calls
             .insert(memo.clone(), AbstractValue::Unknown);
         self.construction_evaluations += 1;
+        crate::profile::count(crate::profile::Count::ConstructionMemoMiss, 1);
+        let _evaluation = crate::profile::time(crate::profile::Probe::ConstructionEvaluation);
+        crate::profile::unique(
+            crate::profile::Probe::ConstructionEvaluation,
+            &(memo.package, &memo.owner, &memo.arguments),
+        );
+        crate::profile::record_callee(&owner.to_string(), 0);
         let owner_name = owner.to_string();
         let Some(parsed) = self.parsed_source(
             context.package,

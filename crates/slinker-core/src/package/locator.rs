@@ -74,6 +74,7 @@ impl PackageLocator {
 }
 
 pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
+    let _timer = crate::profile::time(crate::profile::Probe::PackageFingerprint);
     let mut files = Vec::<(String, PathBuf)>::new();
     let mut pending = vec![root.to_path_buf()];
     let io = |path: &Path| {
@@ -105,12 +106,14 @@ pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
     for (relative, path) in &files {
         hash.update(relative.as_bytes());
         hash.update([0]);
+        crate::profile::count(crate::profile::Count::FingerprintFiles, 1);
         let mut reader = BufReader::new(File::open(path).map_err(io(path))?);
         loop {
             let read = reader.read(&mut buffer).map_err(io(path))?;
             if read == 0 {
                 break;
             }
+            crate::profile::count(crate::profile::Count::FingerprintBytes, read as u64);
             hash.update(&buffer[..read]);
         }
         hash.update([0xff]);

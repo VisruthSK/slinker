@@ -1,5 +1,5 @@
 use super::dynamic_names::UnresolvedName;
-use super::object_world::{ClosureId, ClosureObject};
+use super::object_world::{ClosureId, ClosureObject, ObjectGraph, ObjectId};
 use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, NodeKind, RejectCode};
@@ -9,7 +9,7 @@ use crate::syntax::{
     NamespaceImportResolution, NamespaceImports, OakParseContext, SourceKey, Span,
     closure_definitely_non_returning,
 };
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Resolution<T> {
@@ -293,66 +293,90 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &str,
         name: &str,
     ) -> Result<Resolution<BindingTarget>> {
+        let _timer = crate::profile::time(crate::profile::Probe::ResolveLexicalName);
+        crate::profile::unique(
+            crate::profile::Probe::ResolveLexicalName,
+            &(current, lexical_environment, name),
+        );
+        let unresolved = || Resolution::OpenDynamic(OpenReason::Unresolved(name.to_owned()));
         let mut environment = lexical_environment.to_owned();
+        let mut seen = HashSet::new();
+        while environment.starts_with("derived:") {
+            if !seen.insert(environment.clone()) {
+                return Ok(unresolved());
+            }
+            let Some(graph) = self.objects.get(current) else {
+                return Ok(unresolved());
+            };
+            let Some(environment_id) = graph.environment_id(&environment) else {
+                return Ok(unresolved());
+            };
+            let (object, blocked) = graph.lookup_environment_binding(environment_id, name);
+            if let Some(object) = object {
+                return Ok(Resolution::Static(derived_binding_target(
+                    graph, current, object,
+                )));
+            }
+            if blocked {
+                return Ok(unresolved());
+            }
+            let Some(parent) = graph.environment(environment_id).parent else {
+                return Ok(unresolved());
+            };
+            environment = graph.environment(parent).label.clone();
+        }
+        self.resolve_installed_environment(current, image, &environment, name)
+    }
+
+    fn resolve_installed_environment(
+        &mut self,
+        current: PackageId,
+        image: &PackageImage,
+        environment: &str,
+        name: &str,
+    ) -> Result<Resolution<BindingTarget>> {
+        if let Some(memoized) = self
+            .lexical_memo
+            .get(self.namespace_epoch, current, environment, name)
+        {
+            crate::profile::count(crate::profile::Count::LexicalMemoHit, 1);
+            #[cfg(debug_assertions)]
+            {
+                let recomputed =
+                    self.resolve_installed_environment_uncached(current, image, environment, name)?;
+                assert_eq!(
+                    memoized, recomputed,
+                    "lexical memo diverged for {environment}::{name}"
+                );
+            }
+            return Ok(memoized);
+        }
+        crate::profile::count(crate::profile::Count::LexicalMemoMiss, 1);
+        let resolved =
+            self.resolve_installed_environment_uncached(current, image, environment, name)?;
+        self.lexical_memo.insert(
+            self.namespace_epoch,
+            current,
+            environment,
+            name,
+            resolved.clone(),
+        );
+        Ok(resolved)
+    }
+
+    fn resolve_installed_environment_uncached(
+        &mut self,
+        current: PackageId,
+        image: &PackageImage,
+        environment: &str,
+        name: &str,
+    ) -> Result<Resolution<BindingTarget>> {
+        let unresolved = || Resolution::OpenDynamic(OpenReason::Unresolved(name.to_owned()));
+        let mut environment = environment.to_owned();
         let mut seen = HashSet::new();
         loop {
             if !seen.insert(environment.clone()) {
-                return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                    name.to_owned(),
-                )));
-            }
-            if environment.starts_with("derived:") {
-                if let Some(graph) = self.objects.get(current)
-                    && let Some(environment_id) = graph.environment_id(&environment)
-                {
-                    let (object, blocked) = graph.lookup_environment_binding(environment_id, name);
-                    if let Some(object) = object {
-                        let resolved = match graph.closure_of(object) {
-                            Some(closure) => {
-                                let closure_object = graph.closure(closure);
-                                let provenance = &closure_object.provenance;
-                                if closure_object.derived_from.is_some() || provenance.path != "$" {
-                                    Resolution::Static(BindingTarget::Closure {
-                                        package: current,
-                                        closure,
-                                    })
-                                } else if let Some(binding) = &provenance.namespace_binding {
-                                    Resolution::Static(BindingTarget::Namespace {
-                                        package: current,
-                                        binding: binding.clone().into(),
-                                    })
-                                } else if let (Some(environment), Some(binding)) =
-                                    (&provenance.private_environment, &provenance.private_binding)
-                                {
-                                    Resolution::Static(BindingTarget::Private {
-                                        package: current,
-                                        environment: environment.clone(),
-                                        binding: binding.clone().into(),
-                                    })
-                                } else {
-                                    Resolution::Static(BindingTarget::Local)
-                                }
-                            }
-                            None => Resolution::Static(BindingTarget::Local),
-                        };
-                        return Ok(resolved);
-                    }
-                    if blocked {
-                        return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                            name.to_owned(),
-                        )));
-                    }
-                    if let Some(parent) = graph.environment(environment_id).parent {
-                        environment = graph.environment(parent).label.clone();
-                        continue;
-                    }
-                    return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                        name.to_owned(),
-                    )));
-                }
-                return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                    name.to_owned(),
-                )));
+                return Ok(unresolved());
             }
             if let Some(private) = image.private_environment(&environment) {
                 if private.bindings.contains_key(name) {
@@ -389,12 +413,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 return Ok(if self.packages.is_base_binding(name) {
                     Resolution::Static(BindingTarget::Base)
                 } else {
-                    Resolution::OpenDynamic(OpenReason::Unresolved(name.to_owned()))
+                    unresolved()
                 });
             }
-            return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                name.to_owned(),
-            )));
+            return Ok(unresolved());
         }
     }
 
@@ -649,5 +671,85 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ReferenceUse::Recorded => self.require_classified_at(from, need, kind, reason, span),
             ReferenceUse::Unrecorded => self.require_at(from, need, kind, reason, span),
         }
+    }
+}
+
+fn derived_binding_target(
+    graph: &ObjectGraph,
+    current: PackageId,
+    object: ObjectId,
+) -> BindingTarget {
+    let Some(closure) = graph.closure_of(object) else {
+        return BindingTarget::Local;
+    };
+    let closure_object = graph.closure(closure);
+    let provenance = &closure_object.provenance;
+    if closure_object.derived_from.is_some() || provenance.path != "$" {
+        BindingTarget::Closure {
+            package: current,
+            closure,
+        }
+    } else if let Some(binding) = &provenance.namespace_binding {
+        BindingTarget::Namespace {
+            package: current,
+            binding: binding.clone().into(),
+        }
+    } else if let (Some(environment), Some(binding)) =
+        (&provenance.private_environment, &provenance.private_binding)
+    {
+        BindingTarget::Private {
+            package: current,
+            environment: environment.clone(),
+            binding: binding.clone().into(),
+        }
+    } else {
+        BindingTarget::Local
+    }
+}
+
+#[derive(Default)]
+pub(super) struct LexicalMemo {
+    epoch: u64,
+    entries: HashMap<PackageId, HashMap<String, HashMap<String, Resolution<BindingTarget>>>>,
+}
+
+impl LexicalMemo {
+    fn get(
+        &mut self,
+        epoch: u64,
+        package: PackageId,
+        environment: &str,
+        name: &str,
+    ) -> Option<Resolution<BindingTarget>> {
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+            return None;
+        }
+        self.entries
+            .get(&package)?
+            .get(environment)?
+            .get(name)
+            .cloned()
+    }
+
+    fn insert(
+        &mut self,
+        epoch: u64,
+        package: PackageId,
+        environment: &str,
+        name: &str,
+        resolution: Resolution<BindingTarget>,
+    ) {
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+        }
+        self.entries
+            .entry(package)
+            .or_default()
+            .entry(environment.to_owned())
+            .or_default()
+            .insert(name.to_owned(), resolution);
     }
 }

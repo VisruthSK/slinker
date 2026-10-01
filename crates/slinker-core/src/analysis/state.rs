@@ -13,7 +13,7 @@ use super::object_world::{ClosureId, ObjectId, ObjectWorld};
 use super::parse_cache::{ParseCache, ParseKey, ParseState};
 use super::reflection::ReflectionFacts;
 use super::relocation::{NamespaceCall, PendingRelocation, RelocationPlan, SyntaxObservation};
-use super::resolution::{BindingTarget, OpenReason, ReferenceUse, Resolution};
+use super::resolution::{BindingTarget, LexicalMemo, OpenReason, ReferenceUse, Resolution};
 use super::s3::{CallableId, S3Model, callable_target};
 use crate::analysis::{
     Diagnostic, EdgeKind, GenericId, Graph, LifecycleHook, Need, NodeId, NodeKind, RejectCode, S3Id,
@@ -110,6 +110,8 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) namespace_imports: HashMap<PackageId, NamespaceImports>,
     pub(super) non_returning_bindings: HashMap<PackageId, BTreeSet<String>>,
     pub(super) root_description: Option<Arc<str>>,
+    pub(super) lexical_memo: LexicalMemo,
+    pub(super) namespace_epoch: u64,
 }
 
 pub(super) struct LoadedPackage {
@@ -166,6 +168,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             namespace_imports: HashMap::new(),
             non_returning_bindings: HashMap::new(),
             root_description: options.root_description,
+            lexical_memo: LexicalMemo::default(),
+            namespace_epoch: 0,
         })
     }
 
@@ -266,6 +270,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         binding: &str,
     ) -> Result<Arc<PackageImage>> {
+        let _timer = crate::profile::time(crate::profile::Probe::BindingImage);
         let image = self.image(package)?;
         if image.binding(binding).is_some()
             || !image.index.binding_names.iter().any(|name| name == binding)
@@ -319,6 +324,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn preparse_frontier_bindings(&mut self, frontier: usize) -> Result<()> {
+        let _timer = crate::profile::time(crate::profile::Probe::PreparseFrontier);
         struct Work {
             key: ParseKey,
             owner_binding: String,
@@ -506,6 +512,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn process_need(&mut self, need: Need) -> Result<()> {
+        let _timer = crate::profile::time(crate::profile::Probe::ProcessNeed);
         match need {
             Need::Binding { package, binding } => self.process_binding(package, &binding),
             Need::PrivateBinding {
@@ -1244,6 +1251,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .add_binding(active.name.clone().into())
             {
                 self.non_returning_bindings.remove(&site.package);
+                self.namespace_epoch += 1;
             }
         }
         Ok(())
@@ -1584,6 +1592,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &str,
         request: ParseRequest<'_>,
     ) -> Result<Option<Arc<ParsedRFile>>> {
+        let _timer = crate::profile::time(crate::profile::Probe::ParsedSource);
         let ParseRequest {
             owner_binding,
             source_key,

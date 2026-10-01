@@ -254,3 +254,20 @@ pub enum WorkerErrorCode {
     BindingForce,
     TargetSyntaxRejection,
 }
+
+impl WorkerRequest {
+    pub fn opcode(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "hello",
+            Self::PackageIndex { .. } => "package_index",
+            Self::Binding { .. } => "binding",
+            Self::DispatchGenerics { .. } => "dispatch_generics",
+            Self::DataLibrary { .. } => "data_library",
+            Self::SerializePayloads { .. } => "serialize_payloads",
+            Self::ValidateSyntax { .. } => "validate_syntax",
+            Self::NormalizeSyntax { .. } => "normalize_syntax",
+            Self::VerifyRelocation { .. } => "verify_relocation",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}

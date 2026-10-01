@@ -86,6 +86,7 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     pub fn analyze(self, root: &str) -> Result<LinkIr> {
+        let _timer = crate::profile::time(crate::profile::Probe::Analysis);
         AnalyzerState::new(self.packages, root, self.options)?
             .run()?
             .finalize()

@@ -50,6 +50,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn finalize(mut self) -> Result<LinkIr> {
+        let _timer = crate::profile::time(crate::profile::Probe::Finalize);
         self.finalize_syntax_observations();
         let root = self.root;
         let retained = self

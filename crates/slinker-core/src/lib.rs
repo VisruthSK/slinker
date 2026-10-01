@@ -25,6 +25,7 @@ pub mod build;
 pub mod cache;
 pub mod ir;
 pub mod package;
+pub mod profile;
 pub mod source;
 pub mod syntax;
 
