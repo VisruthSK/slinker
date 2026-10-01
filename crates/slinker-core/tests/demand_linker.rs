@@ -119,7 +119,7 @@ impl FakeProvider {
                     "&&",
                 ]
                 .into_iter()
-                .map(str::to_owned)
+                .map(BindingName::from)
                 .collect(),
             },
         }

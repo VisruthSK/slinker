@@ -4,7 +4,7 @@ use super::{Coded, InspectionError, WorkerOperationError, field, protocol};
 use super::{InspectionResult, OperationResult};
 use harp::{RFunctionExt, RObjectExt};
 use protocol::{WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse};
-use slinker_core::package::{BindingOrigin, DataSetName, DatasetName};
+use slinker_core::package::{BindingName, BindingOrigin, DataSetName, DatasetName};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 
@@ -156,7 +156,10 @@ impl WorkerRuntime {
             arch: string("R.version$arch")?,
             libraries,
             base_bindings: harp::environment::Environment::view(harp::environment::R_ENVS.base)
-                .names(),
+                .names()
+                .into_iter()
+                .map(BindingName::from)
+                .collect(),
         })
     }
 

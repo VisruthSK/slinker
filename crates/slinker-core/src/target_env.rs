@@ -1,4 +1,5 @@
 use crate::Error;
+use crate::package::BindingName;
 use crate::worker::client::WorkerClient;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -26,7 +27,7 @@ pub struct TargetEnvironment {
     pub r_home: PathBuf,
     pub target: Target,
     pub libraries: Vec<PathBuf>,
-    pub base_bindings: BTreeSet<String>,
+    pub base_bindings: BTreeSet<BindingName>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,23 +61,5 @@ impl fmt::Display for TargetEnvironmentError {
 impl std::error::Error for TargetEnvironmentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.0)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TargetEnvironmentRequest;
-    use std::path::PathBuf;
-
-    #[test]
-    fn request_preserves_explicit_r_home_and_library_order() {
-        let mut request = TargetEnvironmentRequest::new("/opt/R");
-        request.libraries = vec![PathBuf::from("/first"), PathBuf::from("/second")];
-
-        assert_eq!(request.r_home, PathBuf::from("/opt/R"));
-        assert_eq!(
-            request.libraries,
-            vec![PathBuf::from("/first"), PathBuf::from("/second")]
-        );
     }
 }

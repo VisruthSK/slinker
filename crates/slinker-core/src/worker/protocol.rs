@@ -93,7 +93,7 @@ pub struct WorkerTarget {
     pub os: String,
     pub arch: String,
     pub libraries: Vec<PathBuf>,
-    pub base_bindings: Vec<String>,
+    pub base_bindings: Vec<BindingName>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

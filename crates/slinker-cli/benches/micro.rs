@@ -215,7 +215,7 @@ fn memory_target() -> TargetEnvironment {
             "<-",
         ]
         .into_iter()
-        .map(str::to_owned)
+        .map(BindingName::from)
         .collect(),
     }
 }
