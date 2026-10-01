@@ -561,6 +561,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<Option<DispatchOwner>> {
         let mut visited = HashSet::new();
         while visited.insert((package, binding.clone())) {
+            if self.packages.name(package) == "base" {
+                return Ok(Some(DispatchOwner::Base(binding)));
+            }
             let index = self.packages.index(package)?;
             if let Some(exported) = index.exports.get(binding.as_str()) {
                 binding = exported.clone();
@@ -583,6 +586,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 } = import
                     && !except.contains(&binding)
                     && let Some(next) = self.packages.resolve(source)?
+                    && self.packages.name(next) != "base"
                     && self
                         .packages
                         .index(next)?
