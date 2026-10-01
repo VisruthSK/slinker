@@ -10,9 +10,10 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use slinker_core::TargetEnvironment;
 use slinker_core::analysis::{
-    ANALYSIS_STACK_BYTES, Edge, ExplanationDag, LinkIr, NodeId, NodeKind,
+    ANALYSIS_STACK_BYTES, Edge, ExplanationDag, LinkIr, Node, NodeId, NodeKind,
 };
 use slinker_core::build::{BuildReport, PreflightError, PureRStatic, materialize};
+use slinker_core::package::{BindingName, PackageName};
 
 mod session;
 
@@ -136,8 +137,50 @@ struct AnalyzeArgs {
 struct QueryArgs {
     #[command(flatten)]
     analysis: AnalysisArgs,
-    #[arg(value_name = "TARGET", help = "PKG, PKG::name, or PKG:::name")]
-    target: String,
+    #[arg(
+        value_name = "TARGET",
+        value_parser = QueryTarget::parse,
+        help = "PKG, PKG::name, or PKG:::name"
+    )]
+    target: QueryTarget,
+}
+
+#[derive(Clone, Debug)]
+struct QueryTarget {
+    text: String,
+    package: PackageName,
+    binding: Option<BindingName>,
+}
+
+impl QueryTarget {
+    fn parse(text: &str) -> Result<Self, &'static str> {
+        let (package, binding) = match text.split_once(":::").or_else(|| text.split_once("::")) {
+            Some((package, binding)) => (package, Some(BindingName::from(binding))),
+            None => (text, None),
+        };
+        if package.is_empty() {
+            return Err("expected PKG, PKG::name, or PKG:::name");
+        }
+        Ok(Self {
+            text: text.to_owned(),
+            package: PackageName::from(package),
+            binding,
+        })
+    }
+
+    fn selects(&self, node: &Node) -> bool {
+        node.package == self.package
+            && self.binding.as_ref().is_none_or(|wanted| match &node.kind {
+                NodeKind::Binding { name } | NodeKind::ExternalBinding { name } => name == wanted,
+                _ => false,
+            })
+    }
+}
+
+impl std::fmt::Display for QueryTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 impl UserCommand {
@@ -321,14 +364,7 @@ fn explain_why(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
         println!();
         println!("direct semantic uses:");
         for edge in uses {
-            println!(
-                "  {} -- {:?}{}: {} --> {}",
-                node_label(&plan, edge.from),
-                edge.kind,
-                edge_location(&plan, edge),
-                edge.reason,
-                node_label(&plan, edge.to)
-            );
+            print_direct_use(&plan, edge);
         }
     }
     Ok(())
@@ -366,78 +402,44 @@ fn explain_paths(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
             prefix.push(entry);
             print_edge_path(&plan, &prefix);
         } else {
-            println!(
-                "  {} -- {:?}{}: {} --> {}",
-                node_label(&plan, entry.from),
-                entry.kind,
-                edge_location(&plan, entry),
-                entry.reason,
-                node_label(&plan, entry.to)
-            );
+            print_direct_use(&plan, entry);
         }
     }
     Ok(())
 }
 
-fn matching_nodes(plan: &LinkIr, target: &str) -> Vec<NodeId> {
-    let (package, binding) = if let Some((package, binding)) = target.split_once(":::") {
-        (package, Some(binding))
-    } else if let Some((package, binding)) = target.split_once("::") {
-        (package, Some(binding))
-    } else {
-        (target, None)
-    };
+fn matching_nodes(plan: &LinkIr, target: &QueryTarget) -> Vec<NodeId> {
     plan.provenance()
         .nodes()
         .iter()
-        .filter(|node| node.package == package)
+        .filter(|node| target.selects(node))
         .map(|node| node.id)
-        .filter(
-            |id| match (binding, &plan.provenance().nodes()[id.0].kind) {
-                (None, _) => true,
-                (
-                    Some(name),
-                    NodeKind::Binding { name: binding }
-                    | NodeKind::ExternalBinding { name: binding },
-                ) => binding == name,
-                _ => false,
-            },
-        )
         .collect()
 }
 
-fn package_entry_edges<'a>(plan: &'a LinkIr, target: &str) -> Vec<&'a Edge> {
-    let package = target
-        .split_once(":::")
-        .map(|x| x.0)
-        .or_else(|| target.split_once("::").map(|x| x.0))
-        .unwrap_or(target);
-    let binding = target
-        .split_once(":::")
-        .map(|x| x.1)
-        .or_else(|| target.split_once("::").map(|x| x.1));
+fn package_entry_edges<'a>(plan: &'a LinkIr, target: &QueryTarget) -> Vec<&'a Edge> {
+    let nodes = plan.provenance().nodes();
     let mut edges = plan
         .provenance()
         .edges()
         .iter()
         .filter(|edge| {
-            let to = &plan.provenance().nodes()[edge.to.0];
-            let from = &plan.provenance().nodes()[edge.from.0];
-            if to.package != package || from.package == package {
-                return false;
-            }
-            match (binding, &to.kind) {
-                (None, _) => true,
-                (
-                    Some(name),
-                    NodeKind::Binding { name: actual } | NodeKind::ExternalBinding { name: actual },
-                ) => actual == name,
-                _ => false,
-            }
+            target.selects(&nodes[edge.to.0]) && nodes[edge.from.0].package != target.package
         })
         .collect::<Vec<_>>();
     edges.sort_by_key(|edge| (edge.from.0, edge.to.0));
     edges
+}
+
+fn print_direct_use(plan: &LinkIr, edge: &Edge) {
+    println!(
+        "  {} -- {:?}{}: {} --> {}",
+        node_label(plan, edge.from),
+        edge.kind,
+        edge_location(plan, edge),
+        edge.reason,
+        node_label(plan, edge.to)
+    );
 }
 
 fn print_edge_path(plan: &LinkIr, path: &[&Edge]) {
@@ -642,7 +644,7 @@ mod tests {
             panic!("expected why command");
         };
         assert_eq!(args.analysis.root, RootSpec::Installed("voucher".into()));
-        assert_eq!(args.target, "cli::cli_abort");
+        assert_eq!(args.target.to_string(), "cli::cli_abort");
     }
 
     #[test]

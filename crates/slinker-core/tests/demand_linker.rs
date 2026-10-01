@@ -2,13 +2,13 @@ use slinker_core::analysis::{
     EdgeKind, ExplanationDag, GraphEdgeReasonExport, Linker, NodeKind, RejectCode,
 };
 use slinker_core::package::{
-    BindingImage, BindingOrigin, CanonicalSyntax, ClosureSource, DatasetName, Digest,
-    DispatchSubject, EmbeddedClosureSource, ExportMap, GenericName, ImportBinding, ImportSpec,
-    InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeLibrary,
-    NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectImage,
-    ObjectIssue, ObjectKind, PackageData, PackageIdentity, PackageImage, PackageIndex,
-    PackageLocation, PackageProvider, PackageResolver, PrivateBindingImage,
-    PrivateEnvironmentImage, S3Registration, SyntaxValidation,
+    BindingImage, BindingName, BindingOrigin, BindingRepresentation, CanonicalSyntax,
+    ClosureSource, DatasetName, Digest, DispatchSubject, EmbeddedClosureSource, ExportMap,
+    GenericName, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent,
+    NativeFacts, NativeLibrary, NativeRegistration, NativeRoutineSummary, NativeSafety,
+    NativeSymbolBinding, ObjectImage, ObjectIssue, ObjectKind, PackageData, PackageIdentity,
+    PackageImage, PackageIndex, PackageLocation, PackageProvider, PackageResolver,
+    PrivateBindingImage, PrivateEnvironmentImage, S3Registration, SyntaxValidation,
 };
 use slinker_core::package::{EnvironmentLabel, MemberPath, ObjectIssueKind, UnsupportedObject};
 use slinker_core::{Description, Error, Result, Target, TargetEnvironment};
@@ -213,149 +213,145 @@ fn root_calling(dependency: &str, entry: &str) -> PackageImage {
 }
 
 fn package(name: &str, bindings: &[(&str, Option<&str>)]) -> PackageImage {
-    let exports = bindings
-        .iter()
-        .map(|(binding, _)| ((*binding).into(), (*binding).into()))
-        .collect::<ExportMap>();
-    package_from_fixture(
-        name,
-        bindings,
-        FixtureMetadata {
-            imports: Vec::new(),
-            exports,
-            s3: Vec::new(),
-            dynlibs: Vec::new(),
-            files: Vec::new(),
-            extra_description: String::new(),
-        },
-    )
+    PackageFixture::new(name, bindings).exporting_all().build()
 }
 
-struct FixtureMetadata {
+fn package_importing(name: &str, bindings: &[(&str, Option<&str>)], imports: &str) -> PackageImage {
+    PackageFixture::new(name, bindings)
+        .exporting_all()
+        .description(format!("Imports: {imports}\n"))
+        .build()
+}
+
+fn utils_platform() -> PackageImage {
+    PackageFixture::new(
+        "utils",
+        &[("packageVersion", None), ("packageDescription", None)],
+    )
+    .exporting_all()
+    .description("Priority: base\n")
+    .build()
+}
+
+struct PackageFixture<'a> {
+    name: &'a str,
+    bindings: &'a [(&'a str, Option<&'a str>)],
     imports: Vec<ImportSpec>,
     exports: ExportMap,
     s3: Vec<S3Registration>,
     dynlibs: Vec<NativeComponent>,
     files: Vec<String>,
-    extra_description: String,
+    description: String,
 }
 
-macro_rules! package_with {
-    ($name:expr, $bindings:expr, $imports:expr, $exports:expr, $s3:expr, $dynlibs:expr, $files:expr, $description:expr $(,)?) => {
-        package_from_fixture(
-            $name,
-            $bindings,
-            FixtureMetadata {
-                imports: $imports,
-                exports: $exports,
-                s3: $s3,
-                dynlibs: $dynlibs,
-                files: $files,
-                extra_description: $description.into(),
-            },
-        )
-    };
-}
-
-fn package_importing(name: &str, bindings: &[(&str, Option<&str>)], imports: &str) -> PackageImage {
-    let exports = bindings
-        .iter()
-        .map(|(binding, _)| ((*binding).into(), (*binding).into()))
-        .collect::<ExportMap>();
-    package_with!(
-        name,
-        bindings,
-        Vec::new(),
-        exports,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        format!("Imports: {imports}\n"),
-    )
-}
-
-fn utils_platform() -> PackageImage {
-    package_with!(
-        "utils",
-        &[("packageVersion", None), ("packageDescription", None)],
-        Vec::new(),
-        ExportMap::from([
-            ("packageVersion".into(), "packageVersion".into()),
-            ("packageDescription".into(), "packageDescription".into()),
-        ]),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Priority: base\n",
-    )
-}
-
-fn package_from_fixture(
-    name: &str,
-    bindings: &[(&str, Option<&str>)],
-    metadata: FixtureMetadata,
-) -> PackageImage {
-    let FixtureMetadata {
-        imports,
-        exports,
-        s3,
-        dynlibs,
-        files,
-        extra_description,
-    } = metadata;
-    let description = Description::parse(&format!(
-        "Package: {name}\nVersion: 1.0.0\n{extra_description}"
-    ));
-    let mut images = HashMap::new();
-    for (binding, source) in bindings {
-        let closure = source.map(|source| ClosureSource {
-            source: Arc::from(source),
-            environment: EnvironmentLabel::namespace(name),
-        });
-        images.insert(
-            (*binding).into(),
-            BindingImage {
-                name: (*binding).into(),
-                origin: BindingOrigin::Code,
-                object: ObjectImage {
-                    representation: slinker_core::package::BindingRepresentation::Value,
-                    classes: Vec::new(),
-                    object_kind: if closure.is_some() {
-                        ObjectKind::Closure
-                    } else {
-                        ObjectKind::Integer
-                    },
-                    closure,
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: Vec::new(),
-                },
-            },
-        );
+impl<'a> PackageFixture<'a> {
+    fn new(name: &'a str, bindings: &'a [(&'a str, Option<&'a str>)]) -> Self {
+        Self {
+            name,
+            bindings,
+            imports: Vec::new(),
+            exports: ExportMap::new(),
+            s3: Vec::new(),
+            dynlibs: Vec::new(),
+            files: Vec::new(),
+            description: String::new(),
+        }
     }
-    let mut names = images.keys().cloned().collect::<Vec<_>>();
-    names.sort();
-    PackageImage {
-        index: Arc::new(PackageIndex {
-            identity: PackageIdentity {
-                name: name.into(),
-                version: "1.0.0".parse().expect("valid test package version"),
-                image_fingerprint: Digest::from(format!("fp-{name}")),
-            },
-            description,
-            exports,
-            imports,
-            s3,
-            dynlibs,
-            lifecycle: LifecycleMetadata::default(),
-            binding_names: names,
-            data: slinker_core::package::PackageData::default(),
-            files,
-            has_sysdata: false,
-        }),
-        bindings: images,
-        private_environments: HashMap::new(),
+
+    fn exporting_all(self) -> Self {
+        let exports = self
+            .bindings
+            .iter()
+            .map(|(binding, _)| ((*binding).into(), (*binding).into()))
+            .collect();
+        self.exports(exports)
+    }
+
+    fn imports(mut self, imports: Vec<ImportSpec>) -> Self {
+        self.imports = imports;
+        self
+    }
+
+    fn exports(mut self, exports: ExportMap) -> Self {
+        self.exports = exports;
+        self
+    }
+
+    fn s3(mut self, s3: Vec<S3Registration>) -> Self {
+        self.s3 = s3;
+        self
+    }
+
+    fn dynlibs(mut self, dynlibs: Vec<NativeComponent>) -> Self {
+        self.dynlibs = dynlibs;
+        self
+    }
+
+    fn files(mut self, files: Vec<String>) -> Self {
+        self.files = files;
+        self
+    }
+
+    fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    fn build(self) -> PackageImage {
+        let name = self.name;
+        let bindings = self
+            .bindings
+            .iter()
+            .map(|(binding, source)| {
+                let closure = source.map(|source| ClosureSource {
+                    source: Arc::from(source),
+                    environment: EnvironmentLabel::namespace(name),
+                });
+                let object_kind = if closure.is_some() {
+                    ObjectKind::Closure
+                } else {
+                    ObjectKind::Integer
+                };
+                let object = ObjectImage {
+                    closure,
+                    ..ObjectImage::of_kind(BindingRepresentation::Value, object_kind)
+                };
+                (
+                    BindingName::from(*binding),
+                    BindingImage {
+                        name: (*binding).into(),
+                        origin: BindingOrigin::Code,
+                        object,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
+        binding_names.sort();
+        PackageImage {
+            index: Arc::new(PackageIndex {
+                identity: PackageIdentity {
+                    name: name.into(),
+                    version: "1.0.0".parse().expect("valid test package version"),
+                    image_fingerprint: Digest::from(format!("fp-{name}")),
+                },
+                description: Description::parse(&format!(
+                    "Package: {name}\nVersion: 1.0.0\n{}",
+                    self.description
+                )),
+                exports: self.exports,
+                imports: self.imports,
+                s3: self.s3,
+                dynlibs: self.dynlibs,
+                lifecycle: LifecycleMetadata::default(),
+                binding_names,
+                data: PackageData::default(),
+                files: self.files,
+                has_sysdata: false,
+            }),
+            bindings,
+            private_environments: HashMap::new(),
+        }
     }
 }
 
@@ -470,22 +466,18 @@ fn private_closure(name: &str, environment: &str, source: &str) -> PrivateBindin
 
 #[test]
 fn retaining_structured_object_executes_nested_closures() {
-    let mut root = package_with!(
+    let mut root = PackageFixture::new(
         "root",
         &[
             ("generator_funs", None),
             (
                 "nested_dependency",
-                Some("nested_dependency <- function() 1")
+                Some("nested_dependency <- function() 1"),
             ),
         ],
-        Vec::new(),
-        export("generator_funs"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("generator_funs"))
+    .build();
     let binding = root.bindings.get_mut("generator_funs").unwrap();
     binding.object.object_kind = ObjectKind::List;
     binding
@@ -505,9 +497,7 @@ fn retaining_structured_object_executes_nested_closures() {
 
 #[test]
 fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
-    let mut root = package_with!(
-        "root",
-        &[
+    let mut root = PackageFixture::new("root", &[
             (
                 "f",
                 Some(
@@ -516,14 +506,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
             ),
             ("capsule", None),
             ("templates", None),
-        ],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        ]).exports(export("f")).build();
     root.bindings
         .get_mut("f")
         .unwrap()
@@ -642,20 +625,16 @@ fn unknown_closure_enclosure_reports_root_cause_without_lexical_cascade() {
 
 #[test]
 fn root_keeps_every_binding_while_dependencies_keep_only_reached_ones() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[
             ("public", Some("public <- function() dep::api()")),
             ("internal", Some("internal <- function() 2")),
         ],
-        Vec::new(),
-        export("public"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
-    let dep = package_with!(
+    )
+    .exports(export("public"))
+    .build();
+    let dep = PackageFixture::new(
         "dep",
         &[
             ("api", Some("api <- function() helper()")),
@@ -665,26 +644,19 @@ fn root_keeps_every_binding_while_dependencies_keep_only_reached_ones() {
                 Some("unused_optional <- function() foo::bar()"),
             ),
         ],
-        Vec::new(),
-        export("api"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
-    let foo = package_with!(
+    )
+    .exports(export("api"))
+    .description("Suggests: foo\n")
+    .build();
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("bar", Some("bar <- function() hidden()")),
             ("hidden", Some("hidden <- function() 1")),
         ],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("bar"))
+    .build();
     let provider = FakeProvider::new(vec![root, dep, foo]);
     let counts = provider.count_handle();
     let plan = Linker::new(provider, 2).analyze("root").unwrap();
@@ -706,16 +678,10 @@ fn root_keeps_every_binding_while_dependencies_keep_only_reached_ones() {
 
 #[test]
 fn closure_private_environment_is_inventory_not_a_root_set() {
-    let mut root = package_with!(
-        "root",
-        &[("public", Some("public <- function() 1"))],
-        Vec::new(),
-        export("public"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    let mut root = PackageFixture::new("root", &[("public", Some("public <- function() 1"))])
+        .exports(export("public"))
+        .description("Suggests: foo\n")
+        .build();
     root.bindings
         .get_mut("public")
         .unwrap()
@@ -756,16 +722,11 @@ fn closure_private_environment_is_inventory_not_a_root_set() {
 
 #[test]
 fn lexical_lookup_demands_only_the_referenced_private_binding() {
-    let mut root = package_with!(
-        "root",
-        &[("public", Some("public <- function() helper()"))],
-        Vec::new(),
-        export("public"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    let mut root =
+        PackageFixture::new("root", &[("public", Some("public <- function() helper()"))])
+            .exports(export("public"))
+            .description("Suggests: foo\n")
+            .build();
     root.bindings
         .get_mut("public")
         .unwrap()
@@ -818,16 +779,9 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
 
 #[test]
 fn unused_private_binding_issue_does_not_block_owner_closure() {
-    let mut root = package_with!(
-        "root",
-        &[("public", Some("public <- function() 1"))],
-        Vec::new(),
-        export("public"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    let mut root = PackageFixture::new("root", &[("public", Some("public <- function() 1"))])
+        .exports(export("public"))
+        .build();
     root.bindings
         .get_mut("public")
         .unwrap()
@@ -876,9 +830,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
 
 #[test]
 fn onload_can_create_a_missing_exported_active_binding() {
-    let mut root = package_with!(
-        "root",
-        &[
+    let mut root = PackageFixture::new("root", &[
             ("dummy", Some("dummy <- function() NULL")),
             ("get_pb", Some("get_pb <- function() 1")),
             (
@@ -887,14 +839,7 @@ fn onload_can_create_a_missing_exported_active_binding() {
                     ".onLoad <- function(lib, pkg) { pkgenv <- environment(dummy); makeActiveBinding(\"pb\", get_pb, pkgenv) }",
                 ),
             ),
-        ],
-        Vec::new(),
-        export("pb"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        ]).exports(export("pb")).build();
     Arc::make_mut(&mut root.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
@@ -908,19 +853,11 @@ fn onload_can_create_a_missing_exported_active_binding() {
 
 #[test]
 fn dependency_onload_can_create_a_missing_exported_active_binding() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() foo::pb"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Imports: foo\n",
-    );
-    let mut foo = package_with!(
-        "foo",
-        &[
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() foo::pb"))])
+        .exports(export("f"))
+        .description("Imports: foo\n")
+        .build();
+    let mut foo = PackageFixture::new("foo", &[
             ("dummy", Some("dummy <- function() NULL")),
             ("get_pb", Some("get_pb <- function() 1")),
             (
@@ -929,14 +866,7 @@ fn dependency_onload_can_create_a_missing_exported_active_binding() {
                     ".onLoad <- function(lib, pkg) { pkgenv <- environment(dummy); makeActiveBinding(\"pb\", get_pb, pkgenv) }",
                 ),
             ),
-        ],
-        Vec::new(),
-        export("pb"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        ]).exports(export("pb")).build();
     Arc::make_mut(&mut foo.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
@@ -951,19 +881,18 @@ fn dependency_onload_can_create_a_missing_exported_active_binding() {
 
 #[test]
 fn runtime_make_active_binding_does_not_satisfy_missing_export() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "f",
             Some("f <- function() makeActiveBinding(\"pb\", function() 1, asNamespace(\"root\"))"),
         )],
-        Vec::new(),
-        ExportMap::from([("f".into(), "f".into()), ("pb".into(), "pb".into())]),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(ExportMap::from([
+        ("f".into(), "f".into()),
+        ("pb".into(), "pb".into()),
+    ]))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -975,7 +904,7 @@ fn runtime_make_active_binding_does_not_satisfy_missing_export() {
 
 #[test]
 fn dependency_lifecycle_is_an_entrypoint_even_when_not_exported() {
-    let mut dep = package_with!(
+    let mut dep = PackageFixture::new(
         "dep",
         &[
             ("public", Some("public <- function() 1")),
@@ -986,13 +915,9 @@ fn dependency_lifecycle_is_an_entrypoint_even_when_not_exported() {
             ("initialize_state", Some("initialize_state <- function() 1")),
             ("unused", Some("unused <- function() 2")),
         ],
-        Vec::new(),
-        export("public"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("public"))
+    .build();
     Arc::make_mut(&mut dep.index).lifecycle.on_load = true;
     let plan = Linker::new(
         FakeProvider::new(vec![root_calling("dep", "public"), dep]),
@@ -1008,35 +933,26 @@ fn dependency_lifecycle_is_an_entrypoint_even_when_not_exported() {
 
 #[test]
 fn root_reexported_import_is_demanded_without_local_binding() {
-    let root = package_with!(
-        "root",
-        &[],
-        vec![ImportSpec::From {
+    let root = PackageFixture::new("root", &[])
+        .imports(vec![ImportSpec::From {
             package: "utils".into(),
             bindings: vec![ImportBinding {
                 local: "head".into(),
                 remote: "head".into(),
             }],
-        }],
-        export("head"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Imports: utils\n",
-    );
-    let utils = package_with!(
+        }])
+        .exports(export("head"))
+        .description("Imports: utils\n")
+        .build();
+    let utils = PackageFixture::new(
         "utils",
         &[
             ("head", Some("head <- function(x) x")),
             ("unused", Some("unused <- function() 1")),
         ],
-        Vec::new(),
-        export("head"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("head"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, utils]), 1)
         .analyze("root")
         .unwrap();
@@ -1055,20 +971,16 @@ fn root_reexported_import_is_demanded_without_local_binding() {
 #[test]
 fn qualified_access_loads_only_demanded_foreign_binding() {
     let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-    let foo = package_with!(
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("bar", Some("bar <- function() helper()")),
             ("helper", Some("helper <- function() 1")),
             ("unused", Some("unused <- function() 2")),
         ],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("bar"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 4)
         .analyze("root")
         .unwrap();
@@ -1080,29 +992,18 @@ fn qualified_access_loads_only_demanded_foreign_binding() {
 #[test]
 fn foreign_binding_can_pull_another_package_without_rounds() {
     let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-    let foo = package_with!(
-        "foo",
-        &[("bar", Some("bar <- function() baz::qux()"))],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
-    let baz = package_with!(
+    let foo = PackageFixture::new("foo", &[("bar", Some("bar <- function() baz::qux()"))])
+        .exports(export("bar"))
+        .build();
+    let baz = PackageFixture::new(
         "baz",
         &[
             ("qux", Some("qux <- function() 1")),
             ("unused", Some("unused <- function() 2")),
         ],
-        Vec::new(),
-        export("qux"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("qux"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo, baz]), 2)
         .analyze("root")
         .unwrap();
@@ -1113,32 +1014,25 @@ fn foreign_binding_can_pull_another_package_without_rounds() {
 
 #[test]
 fn unused_root_import_metadata_does_not_create_reachability() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() 1"))],
-        vec![ImportSpec::All {
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() 1"))])
+        .imports(vec![ImportSpec::All {
             package: "foo".into(),
             except: Vec::new(),
-        }],
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
-    let foo = package_with!(
+        }])
+        .exports(export("f"))
+        .build();
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("a", Some("a <- function() 1")),
             ("b", Some("b <- function() 2")),
         ],
-        Vec::new(),
-        ExportMap::from([("a".into(), "a".into()), ("b".into(), "b".into())]),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(ExportMap::from([
+        ("a".into(), "a".into()),
+        ("b".into(), "b".into()),
+    ]))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -1155,35 +1049,25 @@ fn unused_root_import_metadata_does_not_create_reachability() {
 
 #[test]
 fn renamed_import_from_resolves_remote_binding() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() local_x()"))],
-        vec![ImportSpec::From {
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() local_x()"))])
+        .imports(vec![ImportSpec::From {
             package: "foo".into(),
             bindings: vec![ImportBinding {
                 local: "local_x".into(),
                 remote: "x".into(),
             }],
-        }],
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
-    let foo = package_with!(
+        }])
+        .exports(export("f"))
+        .build();
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("x", Some("x <- function() 1")),
             ("unused", Some("unused <- function() 2")),
         ],
-        Vec::new(),
-        export("x"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("x"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -1193,32 +1077,25 @@ fn renamed_import_from_resolves_remote_binding() {
 
 #[test]
 fn import_all_resolves_reachable_export_only() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() x()"))],
-        vec![ImportSpec::All {
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() x()"))])
+        .imports(vec![ImportSpec::All {
             package: "foo".into(),
             except: Vec::new(),
-        }],
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
-    let foo = package_with!(
+        }])
+        .exports(export("f"))
+        .build();
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("x", Some("x <- function() 1")),
             ("y", Some("y <- function() 2")),
         ],
-        Vec::new(),
-        ExportMap::from([("x".into(), "x".into()), ("y".into(), "y".into())]),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(ExportMap::from([
+        ("x".into(), "x".into()),
+        ("y".into(), "y".into()),
+    ]))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -1228,16 +1105,10 @@ fn import_all_resolves_reachable_export_only() {
 
 #[test]
 fn depends_metadata_alone_does_not_create_reachability() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() 1"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Depends: foo\n",
-    );
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() 1"))])
+        .exports(export("f"))
+        .description("Depends: foo\n")
+        .build();
     let foo = package("foo", &[("x", Some("x <- function() 1"))]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
@@ -1255,19 +1126,15 @@ fn depends_metadata_alone_does_not_create_reachability() {
 #[test]
 fn exact_external_package_terminates_internal_traversal() {
     let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-    let foo = package_with!(
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("bar", Some("bar <- function() hidden()")),
             ("hidden", Some("hidden <- function() 1")),
         ],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("bar"))
+    .build();
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
     let plan = Linker::new(provider, 1)
@@ -1327,7 +1194,7 @@ fn namespace_discovery_matches_named_and_mixed_positional_arguments() {
 
 #[test]
 fn constant_argument_specializes_private_namespace_helper() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[
             ("f", Some("f <- function() helper(\"foo\")")),
@@ -1336,13 +1203,9 @@ fn constant_argument_specializes_private_namespace_helper() {
                 Some("helper <- function(package) requireNamespace(package)"),
             ),
         ],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("f"))
+    .build();
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_external_packages(["foo".into()])
@@ -1387,9 +1250,7 @@ fn unknown_argument_keeps_public_namespace_helper_dynamic() {
 
 #[test]
 fn bounded_string_operations_specialize_namespace_helper() {
-    let root = package_with!(
-        "root",
-        &[
+    let root = PackageFixture::new("root", &[
             ("f", Some("f <- function() helper(\"foo-extra\")")),
             (
                 "helper",
@@ -1397,14 +1258,7 @@ fn bounded_string_operations_specialize_namespace_helper() {
                     "helper <- function(spec) { parts <- strsplit(spec, \"-\", fixed = TRUE)[[1L]]; package <- paste0(parts[[1L]], \"\"); requireNamespace(package) }",
                 ),
             ),
-        ],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        ]).exports(export("f")).build();
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_external_packages(["foo".into()])
@@ -1421,9 +1275,7 @@ fn bounded_string_operations_specialize_namespace_helper() {
 
 #[test]
 fn unknown_string_index_keeps_namespace_discovery_dynamic() {
-    let root = package_with!(
-        "root",
-        &[
+    let root = PackageFixture::new("root", &[
             (
                 "f",
                 Some("f <- function(index) helper(\"foo-extra\", index)"),
@@ -1434,14 +1286,7 @@ fn unknown_string_index_keeps_namespace_discovery_dynamic() {
                     "helper <- function(spec, index) { parts <- strsplit(spec, \"-\", fixed = TRUE)[[1L]]; requireNamespace(parts[[index]]) }",
                 ),
             ),
-        ],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        ]).exports(export("f")).build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1455,7 +1300,7 @@ fn unknown_string_index_keeps_namespace_discovery_dynamic() {
 
 #[test]
 fn resolved_null_coalescing_helper_propagates_constant() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[
             ("f", Some("f <- function() helper(NULL)")),
@@ -1468,13 +1313,9 @@ fn resolved_null_coalescing_helper_propagates_constant() {
                 Some("`%||%` <- function(left, right) if (!is.null(left)) left else right"),
             ),
         ],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("f"))
+    .build();
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_external_packages(["foo".into()])
@@ -1491,9 +1332,7 @@ fn resolved_null_coalescing_helper_propagates_constant() {
 
 #[test]
 fn bounded_switch_propagates_selected_package() {
-    let root = package_with!(
-        "root",
-        &[
+    let root = PackageFixture::new("root", &[
             ("f", Some("f <- function() helper(\"short\")")),
             (
                 "helper",
@@ -1501,14 +1340,7 @@ fn bounded_switch_propagates_selected_package() {
                     "helper <- function(kind) requireNamespace(switch(kind, short = \"foo\", long = \"bar\"))",
                 ),
             ),
-        ],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        ]).exports(export("f")).build();
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_external_packages(["foo".into()])
@@ -1637,13 +1469,9 @@ fn cyclic_local_references_terminate_with_one_node_each() {
 
 #[test]
 fn registered_native_symbol_is_not_an_unresolved_r_binding() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function(x) .Call(croot_f, x)"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        vec![NativeComponent {
+    let root = PackageFixture::new("root", &[("f", Some("f <- function(x) .Call(croot_f, x)"))])
+        .exports(export("f"))
+        .dynlibs(vec![NativeComponent {
             name: "root".into(),
             alias: String::new(),
             registration: Some(NativeRegistration {
@@ -1658,10 +1486,8 @@ fn registered_native_symbol_is_not_an_unresolved_r_binding() {
             safety: NativeSafety::Safe(NativeFacts {
                 callbacks: Vec::new(),
             }),
-        }],
-        Vec::new(),
-        "",
-    );
+        }])
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1690,16 +1516,10 @@ fn opaque_registered_component() -> NativeComponent {
 
 #[test]
 fn opaque_registered_selector_is_consumed_by_native_call() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function(x) .Call(croot_f, x)"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        vec![opaque_registered_component()],
-        Vec::new(),
-        "",
-    );
+    let root = PackageFixture::new("root", &[("f", Some("f <- function(x) .Call(croot_f, x)"))])
+        .exports(export("f"))
+        .dynlibs(vec![opaque_registered_component()])
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1722,19 +1542,16 @@ fn opaque_registered_selector_is_consumed_by_native_call() {
 
 #[test]
 fn opaque_native_selector_consumption_is_occurrence_specific() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "f",
             Some("f <- function(x) { identity(croot_f); .Call(croot_f, x) }"),
         )],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        vec![opaque_registered_component()],
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("f"))
+    .dynlibs(vec![opaque_registered_component()])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1750,16 +1567,13 @@ fn opaque_native_selector_consumption_is_occurrence_specific() {
 
 #[test]
 fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[("f", Some("f <- function(x) .Call(foo, x)")), ("foo", None)],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        vec![opaque_registered_component()],
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("f"))
+    .dynlibs(vec![opaque_registered_component()])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1774,16 +1588,13 @@ fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
 
 #[test]
 fn shadowed_native_primitive_does_not_consume_selector() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[("f", Some("f <- function(.Call, x) .Call(croot_f, x)"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        vec![opaque_registered_component()],
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("f"))
+    .dynlibs(vec![opaque_registered_component()])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1805,16 +1616,13 @@ fn shadowed_native_primitive_does_not_consume_selector() {
 
 #[test]
 fn named_opaque_native_selector_is_matched_by_formal_name() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[("f", Some("f <- function(x) .Call(x, .NAME = croot_f)"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        vec![opaque_registered_component()],
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("f"))
+    .dynlibs(vec![opaque_registered_component()])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1850,19 +1658,16 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
             callbacks: Vec::new(),
         }),
     };
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "by_symbol",
             Some("by_symbol <- function(x) .Call(\"root_f\", x)"),
-        ),],
-        Vec::new(),
-        export("by_symbol"),
-        Vec::new(),
-        vec![component],
-        Vec::new(),
-        "",
-    );
+        )],
+    )
+    .exports(export("by_symbol"))
+    .dynlibs(vec![component])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1874,31 +1679,28 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
 
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "by_binding",
             Some("by_binding <- function(x) .Call(\"croot_f\", x)"),
         )],
-        Vec::new(),
-        export("by_binding"),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "root".into(),
-            alias: String::new(),
-            registration: None,
-            symbols: vec![NativeSymbolBinding {
-                binding: "croot_f".into(),
-                symbol: "root_f".into(),
-            }],
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Safe(NativeFacts {
-                callbacks: Vec::new(),
-            }),
+    )
+    .exports(export("by_binding"))
+    .dynlibs(vec![NativeComponent {
+        name: "root".into(),
+        alias: String::new(),
+        registration: None,
+        symbols: vec![NativeSymbolBinding {
+            binding: "croot_f".into(),
+            symbol: "root_f".into(),
         }],
-        Vec::new(),
-        "",
-    );
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Safe(NativeFacts {
+            callbacks: Vec::new(),
+        }),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -1911,7 +1713,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
 
 #[test]
 fn registered_native_symbol_can_be_assigned_into_namespace_state() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[
             ("slot", None),
@@ -1920,28 +1722,24 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
                 Some(".onLoad <- function(lib, pkg) slot <<- croot_tick"),
             ),
         ],
-        Vec::new(),
-        ExportMap::new(),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "root".into(),
-            alias: String::new(),
-            registration: Some(NativeRegistration {
-                prefix: "c".into(),
-                suffix: String::new(),
-            }),
-            symbols: vec![NativeSymbolBinding {
-                binding: "croot_tick".into(),
-                symbol: "root_tick".into(),
-            }],
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Safe(NativeFacts {
-                callbacks: Vec::new(),
-            }),
+    )
+    .dynlibs(vec![NativeComponent {
+        name: "root".into(),
+        alias: String::new(),
+        registration: Some(NativeRegistration {
+            prefix: "c".into(),
+            suffix: String::new(),
+        }),
+        symbols: vec![NativeSymbolBinding {
+            binding: "croot_tick".into(),
+            symbol: "root_tick".into(),
         }],
-        Vec::new(),
-        "",
-    );
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Safe(NativeFacts {
+            callbacks: Vec::new(),
+        }),
+    }])
+    .build();
     let mut root = root;
     Arc::make_mut(&mut root.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
@@ -1961,7 +1759,7 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
 
 #[test]
 fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
-    let mut root = package_with!(
+    let mut root = PackageFixture::new(
         "root",
         &[
             ("slot", None),
@@ -1970,23 +1768,19 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
                 Some(".onLoad <- function(lib, pkg) slot <<- croot_tick"),
             ),
         ],
-        Vec::new(),
-        ExportMap::new(),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "root".into(),
-            alias: String::new(),
-            registration: Some(NativeRegistration {
-                prefix: String::new(),
-                suffix: String::new(),
-            }),
-            symbols: Vec::new(),
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Unanalyzed,
-        }],
-        Vec::new(),
-        "",
-    );
+    )
+    .dynlibs(vec![NativeComponent {
+        name: "root".into(),
+        alias: String::new(),
+        registration: Some(NativeRegistration {
+            prefix: String::new(),
+            suffix: String::new(),
+        }),
+        symbols: Vec::new(),
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Unanalyzed,
+    }])
+    .build();
     Arc::make_mut(&mut root.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
@@ -2011,29 +1805,26 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
 #[test]
 fn native_activation_keeps_component_without_widening_r_bindings() {
     let root = package("root", &[("f", Some("f <- function() foo::a()"))]);
-    let foo = package_with!(
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("a", Some("a <- function(x) .Call(foo_a, x)")),
             ("b", Some("b <- function(x) .Call(foo_b, x)")),
             ("unused", Some("unused <- function(x) x")),
         ],
-        Vec::new(),
-        export("a"),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "foo".into(),
-            alias: String::new(),
-            registration: None,
-            symbols: Vec::new(),
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Safe(NativeFacts {
-                callbacks: Vec::new(),
-            }),
-        }],
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("a"))
+    .dynlibs(vec![NativeComponent {
+        name: "foo".into(),
+        alias: String::new(),
+        registration: None,
+        symbols: Vec::new(),
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Safe(NativeFacts {
+            callbacks: Vec::new(),
+        }),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -2049,28 +1840,25 @@ fn native_activation_keeps_component_without_widening_r_bindings() {
 #[test]
 fn known_native_callback_adds_binding_edge() {
     let root = package("root", &[("f", Some("f <- function() foo::a()"))]);
-    let foo = package_with!(
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("a", Some("a <- function() 1")),
             ("callback", Some("callback <- function() 2")),
         ],
-        Vec::new(),
-        export("a"),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "foo".into(),
-            alias: String::new(),
-            registration: None,
-            symbols: Vec::new(),
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Safe(NativeFacts {
-                callbacks: vec!["callback".into()],
-            }),
-        }],
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("a"))
+    .dynlibs(vec![NativeComponent {
+        name: "foo".into(),
+        alias: String::new(),
+        registration: None,
+        symbols: Vec::new(),
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Safe(NativeFacts {
+            callbacks: vec!["callback".into()],
+        }),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -2092,7 +1880,7 @@ fn known_native_callback_adds_binding_edge() {
 #[test]
 fn declared_callables_link_a_native_callback_parameter() {
     let analyze = |source: &str| {
-        let dep = package_with!(
+        let dep = PackageFixture::new(
             "dep",
             &[
                 ("a", Some(source)),
@@ -2100,29 +1888,26 @@ fn declared_callables_link_a_native_callback_parameter() {
                 ("other", Some("other <- function(x) x")),
                 ("unrelated", Some("unrelated <- function() 3")),
             ],
-            Vec::new(),
-            export("a"),
-            Vec::new(),
-            vec![NativeComponent {
-                name: "root".into(),
-                alias: String::new(),
-                registration: Some(NativeRegistration {
-                    prefix: String::new(),
-                    suffix: String::new(),
-                }),
-                symbols: vec![NativeSymbolBinding {
-                    binding: "root_a".into(),
-                    symbol: "root_a".into(),
-                }],
-                library: NativeLibrary::Missing,
-                safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
-                    selector: "root_a".into(),
-                    callback_arguments: vec![2],
-                }]),
+        )
+        .exports(export("a"))
+        .dynlibs(vec![NativeComponent {
+            name: "root".into(),
+            alias: String::new(),
+            registration: Some(NativeRegistration {
+                prefix: String::new(),
+                suffix: String::new(),
+            }),
+            symbols: vec![NativeSymbolBinding {
+                binding: "root_a".into(),
+                symbol: "root_a".into(),
             }],
-            Vec::new(),
-            "",
-        );
+            library: NativeLibrary::Missing,
+            safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
+                selector: "root_a".into(),
+                callback_arguments: vec![2],
+            }]),
+        }])
+        .build();
         Linker::new(FakeProvider::new(vec![root_calling("dep", "a"), dep]), 1)
             .analyze("root")
             .unwrap()
@@ -2178,36 +1963,33 @@ fn declared_callables_are_retained_where_the_binding_is_applied() {
 
 #[test]
 fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
-    let dep = package_with!(
+    let dep = PackageFixture::new(
         "dep",
         &[
             ("a", Some("a <- function() .Call(root_a, 1, callback)")),
             ("callback", Some("callback <- function(x) x")),
             ("unrelated", Some("unrelated <- function() 3")),
         ],
-        Vec::new(),
-        export("a"),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "root".into(),
-            alias: String::new(),
-            registration: Some(NativeRegistration {
-                prefix: String::new(),
-                suffix: String::new(),
-            }),
-            symbols: vec![NativeSymbolBinding {
-                binding: "root_a".into(),
-                symbol: "root_a".into(),
-            }],
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
-                selector: "root_a".into(),
-                callback_arguments: vec![2],
-            }]),
+    )
+    .exports(export("a"))
+    .dynlibs(vec![NativeComponent {
+        name: "root".into(),
+        alias: String::new(),
+        registration: Some(NativeRegistration {
+            prefix: String::new(),
+            suffix: String::new(),
+        }),
+        symbols: vec![NativeSymbolBinding {
+            binding: "root_a".into(),
+            symbol: "root_a".into(),
         }],
-        Vec::new(),
-        "",
-    );
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
+            selector: "root_a".into(),
+            callback_arguments: vec![2],
+        }]),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root_calling("dep", "a"), dep]), 1)
         .analyze("root")
         .unwrap();
@@ -2238,35 +2020,32 @@ fn native_callback_argument_summary_adds_a_targeted_call_site_edge() {
 
 #[test]
 fn native_summary_accepts_oak_proven_local_closure_callback() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "a",
             Some("a <- function() { callback <- function(x) x; .Call(root_a, callback) }"),
         )],
-        Vec::new(),
-        export("a"),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "root".into(),
-            alias: String::new(),
-            registration: Some(NativeRegistration {
-                prefix: String::new(),
-                suffix: String::new(),
-            }),
-            symbols: vec![NativeSymbolBinding {
-                binding: "root_a".into(),
-                symbol: "root_a".into(),
-            }],
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
-                selector: "root_a".into(),
-                callback_arguments: vec![1],
-            }]),
+    )
+    .exports(export("a"))
+    .dynlibs(vec![NativeComponent {
+        name: "root".into(),
+        alias: String::new(),
+        registration: Some(NativeRegistration {
+            prefix: String::new(),
+            suffix: String::new(),
+        }),
+        symbols: vec![NativeSymbolBinding {
+            binding: "root_a".into(),
+            symbol: "root_a".into(),
         }],
-        Vec::new(),
-        "",
-    );
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
+            selector: "root_a".into(),
+            callback_arguments: vec![1],
+        }]),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -2295,7 +2074,7 @@ fn native_summary_accepts_oak_proven_local_closure_callback() {
 
 #[test]
 fn native_callback_positions_ignore_named_package_and_match_named_selector() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[
             (
@@ -2304,29 +2083,26 @@ fn native_callback_positions_ignore_named_package_and_match_named_selector() {
             ),
             ("callback", Some("callback <- function(x) x")),
         ],
-        Vec::new(),
-        export("a"),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "root".into(),
-            alias: String::new(),
-            registration: Some(NativeRegistration {
-                prefix: String::new(),
-                suffix: String::new(),
-            }),
-            symbols: vec![NativeSymbolBinding {
-                binding: "root_a".into(),
-                symbol: "root_a".into(),
-            }],
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
-                selector: "root_a".into(),
-                callback_arguments: vec![2],
-            }]),
+    )
+    .exports(export("a"))
+    .dynlibs(vec![NativeComponent {
+        name: "root".into(),
+        alias: String::new(),
+        registration: Some(NativeRegistration {
+            prefix: String::new(),
+            suffix: String::new(),
+        }),
+        symbols: vec![NativeSymbolBinding {
+            binding: "root_a".into(),
+            symbol: "root_a".into(),
         }],
-        Vec::new(),
-        "",
-    );
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
+            selector: "root_a".into(),
+            callback_arguments: vec![2],
+        }]),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -2341,35 +2117,32 @@ fn native_callback_positions_ignore_named_package_and_match_named_selector() {
 
 #[test]
 fn summarized_native_callbacks_are_not_global_component_roots() {
-    let dep = package_with!(
+    let dep = PackageFixture::new(
         "dep",
         &[
             ("a", Some("a <- function() 1")),
             ("callback", Some("callback <- function(x) x")),
         ],
-        Vec::new(),
-        export("a"),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "root".into(),
-            alias: String::new(),
-            registration: Some(NativeRegistration {
-                prefix: String::new(),
-                suffix: String::new(),
-            }),
-            symbols: vec![NativeSymbolBinding {
-                binding: "root_a".into(),
-                symbol: "root_a".into(),
-            }],
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
-                selector: "root_a".into(),
-                callback_arguments: vec![2],
-            }]),
+    )
+    .exports(export("a"))
+    .dynlibs(vec![NativeComponent {
+        name: "root".into(),
+        alias: String::new(),
+        registration: Some(NativeRegistration {
+            prefix: String::new(),
+            suffix: String::new(),
+        }),
+        symbols: vec![NativeSymbolBinding {
+            binding: "root_a".into(),
+            symbol: "root_a".into(),
         }],
-        Vec::new(),
-        "",
-    );
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Summarized(vec![NativeRoutineSummary {
+            selector: "root_a".into(),
+            callback_arguments: vec![2],
+        }]),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root_calling("dep", "a"), dep]), 1)
         .analyze("root")
         .unwrap();
@@ -2378,13 +2151,9 @@ fn summarized_native_callbacks_are_not_global_component_roots() {
 
 #[test]
 fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
-    let root = package_with!(
-        "root",
-        &[("a", Some("a <- function() .Call(root_a, 1)"))],
-        Vec::new(),
-        export("a"),
-        Vec::new(),
-        vec![NativeComponent {
+    let root = PackageFixture::new("root", &[("a", Some("a <- function() .Call(root_a, 1)"))])
+        .exports(export("a"))
+        .dynlibs(vec![NativeComponent {
             name: "root".into(),
             alias: String::new(),
             registration: Some(NativeRegistration {
@@ -2397,10 +2166,8 @@ fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
             }],
             library: NativeLibrary::Missing,
             safety: NativeSafety::Summarized(Vec::new()),
-        }],
-        Vec::new(),
-        "",
-    );
+        }])
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -2420,26 +2187,23 @@ fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
 #[test]
 fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
     let root = package("root", &[("f", Some("f <- function() foo::a()"))]);
-    let foo = package_with!(
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("a", Some("a <- function() 1")),
             ("callback", Some("callback <- function() 2")),
         ],
-        Vec::new(),
-        export("a"),
-        Vec::new(),
-        vec![NativeComponent {
-            name: "foo".into(),
-            alias: String::new(),
-            registration: None,
-            symbols: Vec::new(),
-            library: NativeLibrary::Missing,
-            safety: NativeSafety::Unsupported(vec!["dynamic R lookup".into()]),
-        }],
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("a"))
+    .dynlibs(vec![NativeComponent {
+        name: "foo".into(),
+        alias: String::new(),
+        registration: None,
+        symbols: Vec::new(),
+        library: NativeLibrary::Missing,
+        safety: NativeSafety::Unsupported(vec!["dynamic R lookup".into()]),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -2460,26 +2224,23 @@ fn unsupported_native_lookup_rejects_without_widening_r_namespace() {
 #[test]
 fn dependency_activation_retains_registered_s3_methods() {
     let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
-    let foo = package_with!(
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("x", Some("x <- function() 1")),
             ("print.foo", Some("print.foo <- function(x, ...) x")),
         ],
-        Vec::new(),
-        export("x"),
-        vec![S3Registration {
-            generic: slinker_core::package::GenericSpec {
-                package: None,
-                name: "print".into(),
-            },
-            class: "foo".into(),
-            method: "print.foo".into(),
-        }],
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("x"))
+    .s3(vec![S3Registration {
+        generic: slinker_core::package::GenericSpec {
+            package: None,
+            name: "print".into(),
+        },
+        class: "foo".into(),
+        method: "print.foo".into(),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -2496,16 +2257,9 @@ fn resource_reference_retains_only_required_path() {
             Some("f <- function() system.file(\"data\", \"x.json\", package = \"foo\")"),
         )],
     );
-    let foo = package_with!(
-        "foo",
-        &[],
-        Vec::new(),
-        ExportMap::new(),
-        Vec::new(),
-        Vec::new(),
-        vec!["data/x.json".into(), "data/y.json".into()],
-        "",
-    );
+    let foo = PackageFixture::new("foo", &[])
+        .files(vec!["data/x.json".into(), "data/y.json".into()])
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -2552,9 +2306,7 @@ fn dynamic_resource_package_blocks_only_when_an_installation_is_removed() {
 }
 
 fn root_with_private_helper(main: &str) -> PackageImage {
-    package_with!(
-        "root",
-        &[
+    PackageFixture::new("root", &[
             ("main", Some(main)),
             (
                 "helper",
@@ -2562,14 +2314,7 @@ fn root_with_private_helper(main: &str) -> PackageImage {
                     "helper <- function(x, package = 'root') system.file('data', package = package)"
                 ),
             ),
-        ],
-        Vec::new(),
-        ExportMap::from([("main".into(), "main".into())]),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    )
+        ]).exports(ExportMap::from([("main".into(), "main".into())])).build()
 }
 
 #[test]
@@ -2720,22 +2465,22 @@ fn activation_order_follows_lifecycle_dependencies_not_only_imports() {
 #[test]
 fn finalization_does_not_depend_on_provenance() {
     let fixture = || {
-        let root = package_with!(
+        let root = PackageFixture::new(
             "root",
             &[
                 ("f", Some("f <- function() alpha::run()")),
                 ("g", Some("g <- function() ext:::secret(opened())")),
             ],
-            vec![ImportSpec::All {
-                package: "ext".into(),
-                except: Vec::new(),
-            }],
-            ExportMap::from([("f".into(), "f".into()), ("g".into(), "g".into())]),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            "",
-        );
+        )
+        .imports(vec![ImportSpec::All {
+            package: "ext".into(),
+            except: Vec::new(),
+        }])
+        .exports(ExportMap::from([
+            ("f".into(), "f".into()),
+            ("g".into(), "g".into()),
+        ]))
+        .build();
         let mut alpha = package(
             "alpha",
             &[
@@ -2748,19 +2493,15 @@ fn finalization_does_not_depend_on_provenance() {
         );
         Arc::make_mut(&mut alpha.index).lifecycle.on_load = true;
         let beta = package("beta", &[("setup", Some("setup <- function() 2"))]);
-        let ext = package_with!(
+        let ext = PackageFixture::new(
             "ext",
             &[
                 ("opened", Some("opened <- function() 3")),
                 ("secret", Some("secret <- function(x) x")),
             ],
-            Vec::new(),
-            export("opened"),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            "",
-        );
+        )
+        .exports(export("opened"))
+        .build();
         vec![root, alpha, beta, ext]
     };
     let analyze = |provenance: bool| {
@@ -2936,7 +2677,7 @@ fn declared_strings_make_computed_names_exact() {
         Linker::new(
             FakeProvider::new(vec![
                 root_calling("dep", "f"),
-                package_with!(
+                PackageFixture::new(
                     "dep",
                     &[
                         ("f", Some(source)),
@@ -2944,14 +2685,13 @@ fn declared_strings_make_computed_names_exact() {
                         ("other", Some("other <- function() 2")),
                         ("unused", Some("unused <- function() 3")),
                     ],
-                    Vec::new(),
-                    export("f"),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
+                )
+                .exports(export("f"))
+                .description(
                     "Imports: ext
 ",
-                ),
+                )
+                .build(),
                 package("ext", &[("x", Some("x <- function() 1"))]),
             ]),
             1,
@@ -3243,16 +2983,9 @@ fn air_and_target_rejection_is_invalid_installed_representation() {
 #[test]
 fn every_non_root_node_has_an_incoming_reason_and_why_path() {
     let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-    let foo = package_with!(
-        "foo",
-        &[("bar", Some("bar <- function() 1"))],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    let foo = PackageFixture::new("foo", &[("bar", Some("bar <- function() 1"))])
+        .exports(export("bar"))
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -3296,22 +3029,16 @@ fn missing_packages_are_collated_instead_of_failing_fast() {
 #[test]
 fn unused_dependency_import_does_not_pull_or_report_missing_package() {
     let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
-    let foo = package_with!(
-        "foo",
-        &[("x", Some("x <- function() 1"))],
-        vec![ImportSpec::From {
+    let foo = PackageFixture::new("foo", &[("x", Some("x <- function() 1"))])
+        .imports(vec![ImportSpec::From {
             package: "otelsdk".into(),
             bindings: vec![ImportBinding {
                 local: "span".into(),
                 remote: "span".into(),
             }],
-        }],
-        export("x"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        }])
+        .exports(export("x"))
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -3328,22 +3055,16 @@ fn unused_dependency_import_does_not_pull_or_report_missing_package() {
 #[test]
 fn reachable_dependency_import_reports_missing_package_with_provenance() {
     let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
-    let foo = package_with!(
-        "foo",
-        &[("x", Some("x <- function() span()"))],
-        vec![ImportSpec::From {
+    let foo = PackageFixture::new("foo", &[("x", Some("x <- function() span()"))])
+        .imports(vec![ImportSpec::From {
             package: "otelsdk".into(),
             bindings: vec![ImportBinding {
                 local: "span".into(),
                 remote: "span".into(),
             }],
-        }],
-        export("x"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        }])
+        .exports(export("x"))
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -3363,19 +3084,13 @@ fn reachable_dependency_import_reports_missing_package_with_provenance() {
 
 #[test]
 fn missing_unused_root_import_is_not_reported() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() 1"))],
-        vec![ImportSpec::All {
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() 1"))])
+        .imports(vec![ImportSpec::All {
             package: "required_at_root_load".into(),
             except: Vec::new(),
-        }],
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        }])
+        .exports(export("f"))
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -3397,16 +3112,7 @@ fn absent_optional_resource_is_not_a_blocker() {
             Some("f <- function() system.file(\"missing\", package = \"foo\")"),
         )],
     );
-    let foo = package_with!(
-        "foo",
-        &[],
-        Vec::new(),
-        ExportMap::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    let foo = PackageFixture::new("foo", &[]).build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -3427,16 +3133,7 @@ fn absent_must_work_resource_is_a_precise_blocker() {
             Some("f <- function() system.file(\"missing\", package = \"foo\", mustWork = TRUE)"),
         )],
     );
-    let foo = package_with!(
-        "foo",
-        &[],
-        Vec::new(),
-        ExportMap::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    let foo = PackageFixture::new("foo", &[]).build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -3449,16 +3146,10 @@ fn absent_must_work_resource_is_a_precise_blocker() {
 
 #[test]
 fn suggests_alone_never_enters_the_graph() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() 1"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() 1"))])
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build();
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
@@ -3475,16 +3166,10 @@ fn suggests_alone_never_enters_the_graph() {
 
 #[test]
 fn selecting_extra_does_not_root_an_unused_optional_package() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() 1"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() 1"))])
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build();
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
@@ -3505,35 +3190,26 @@ fn selecting_extra_does_not_root_an_unused_optional_package() {
 
 #[test]
 fn effective_namespace_import_is_required_even_if_description_also_suggests_it() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() imported_bar()"))],
-        vec![ImportSpec::From {
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() imported_bar()"))])
+        .imports(vec![ImportSpec::From {
             package: "foo".into(),
             bindings: vec![ImportBinding {
                 local: "imported_bar".into(),
                 remote: "bar".into(),
             }],
-        }],
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
-    let foo = package_with!(
+        }])
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build();
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("bar", Some("bar <- function() 1")),
             ("unused", Some("unused <- function() 2")),
         ],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("bar"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -3544,16 +3220,10 @@ fn effective_namespace_import_is_required_even_if_description_also_suggests_it()
 
 #[test]
 fn config_needs_does_not_enable_a_suggested_runtime_package() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() foo::bar()"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\nConfig/Needs/website: foo, bar\n",
-    );
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() foo::bar()"))])
+        .exports(export("f"))
+        .description("Suggests: foo\nConfig/Needs/website: foo, bar\n")
+        .build();
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
@@ -3582,29 +3252,19 @@ fn config_needs_does_not_enable_a_suggested_runtime_package() {
 #[test]
 fn required_description_relationship_wins_over_duplicate_suggests_when_source_uses_package() {
     for required_field in ["Imports", "Depends"] {
-        let root = package_with!(
-            "root",
-            &[("f", Some("f <- function() foo::bar()"))],
-            Vec::new(),
-            export("f"),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            &format!("{required_field}: foo\nSuggests: foo\n"),
-        );
-        let foo = package_with!(
+        let root = PackageFixture::new("root", &[("f", Some("f <- function() foo::bar()"))])
+            .exports(export("f"))
+            .description(format!("{required_field}: foo\nSuggests: foo\n"))
+            .build();
+        let foo = PackageFixture::new(
             "foo",
             &[
                 ("bar", Some("bar <- function() 1")),
                 ("unused", Some("unused <- function() 2")),
             ],
-            Vec::new(),
-            export("bar"),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            "",
-        );
+        )
+        .exports(export("bar"))
+        .build();
         let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
             .analyze("root")
             .unwrap();
@@ -3619,29 +3279,19 @@ fn required_description_relationship_wins_over_duplicate_suggests_when_source_us
 
 #[test]
 fn direct_suggested_namespace_access_is_ignored_without_link() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() foo::bar()"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
-    let foo = package_with!(
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() foo::bar()"))])
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build();
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("bar", Some("bar <- function() helper()")),
             ("helper", Some("helper <- function() 1")),
         ],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("bar"))
+    .build();
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
     let locate_counts = provider.optional_locate_count_handle();
@@ -3678,30 +3328,20 @@ fn direct_suggested_namespace_access_is_ignored_without_link() {
 
 #[test]
 fn direct_suggested_namespace_access_is_linked_when_selected() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() foo::bar()"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
-    let foo = package_with!(
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() foo::bar()"))])
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build();
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("bar", Some("bar <- function() helper()")),
             ("helper", Some("helper <- function() 1")),
             ("unused", Some("unused <- function() 2")),
         ],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("bar"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_linked_packages(["foo".to_owned()])
         .analyze("root")
@@ -3714,26 +3354,14 @@ fn direct_suggested_namespace_access_is_linked_when_selected() {
 
 #[test]
 fn selecting_one_extra_does_not_enable_its_suggests() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() foo::bar()"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
-    let foo = package_with!(
-        "foo",
-        &[("bar", Some("bar <- function() baz::qux()"))],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: baz\n",
-    );
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() foo::bar()"))])
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build();
+    let foo = PackageFixture::new("foo", &[("bar", Some("bar <- function() baz::qux()"))])
+        .exports(export("bar"))
+        .description("Suggests: baz\n")
+        .build();
     let baz = package("baz", &[("qux", Some("qux <- function() 1"))]);
     let provider = FakeProvider::new(vec![root, foo, baz]);
     let counts = provider.count_handle();
@@ -3765,7 +3393,7 @@ fn selecting_one_extra_does_not_enable_its_suggests() {
 
 #[test]
 fn cli_like_unreachable_optional_helpers_do_not_expand_suggests() {
-    let cli = package_with!(
+    let cli = PackageFixture::new(
         "cli",
         &[
             ("cli_alert", Some("cli_alert <- function() format_alert()")),
@@ -3786,13 +3414,10 @@ fn cli_like_unreachable_optional_helpers_do_not_expand_suggests() {
                 Some("rmarkdown_helper <- function() rmarkdown::render('x.Rmd')"),
             ),
         ],
-        Vec::new(),
-        export("cli_alert"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests:\n    knitr,\n    testthat,\n    rmarkdown\n",
-    );
+    )
+    .exports(export("cli_alert"))
+    .description("Suggests:\n    knitr,\n    testthat,\n    rmarkdown\n")
+    .build();
     let knitr = package("knitr", &[("knit", Some("knit <- function() 1"))]);
     let testthat = package(
         "testthat",
@@ -3834,7 +3459,7 @@ fn cli_like_unreachable_optional_helpers_do_not_expand_suggests() {
 
 #[test]
 fn cli_like_required_import_is_demanded_while_suggests_stay_out() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "cli",
         &[
             ("cli_head", Some("cli_head <- function(x) head(x)")),
@@ -3851,32 +3476,26 @@ fn cli_like_required_import_is_demanded_while_suggests_stay_out() {
                 Some("testthat_helper <- function() testthat::test_that('x', function() 1)"),
             ),
         ],
-        vec![ImportSpec::From {
-            package: "utils".into(),
-            bindings: vec![ImportBinding {
-                local: "head".into(),
-                remote: "head".into(),
-            }],
+    )
+    .imports(vec![ImportSpec::From {
+        package: "utils".into(),
+        bindings: vec![ImportBinding {
+            local: "head".into(),
+            remote: "head".into(),
         }],
-        export("cli_head"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Imports:\n    utils\nSuggests:\n    knitr,\n    rlang,\n    testthat\n",
-    );
-    let utils = package_with!(
+    }])
+    .exports(export("cli_head"))
+    .description("Imports:\n    utils\nSuggests:\n    knitr,\n    rlang,\n    testthat\n")
+    .build();
+    let utils = PackageFixture::new(
         "utils",
         &[
             ("head", Some("head <- function(x) x")),
             ("unused", Some("unused <- function() 1")),
         ],
-        Vec::new(),
-        export("head"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("head"))
+    .build();
     let knitr = package("knitr", &[("knit", Some("knit <- function() 1"))]);
     let rlang = package("rlang", &[("env", Some("env <- function() 1"))]);
     let testthat = package(
@@ -3906,29 +3525,19 @@ fn cli_like_required_import_is_demanded_while_suggests_stay_out() {
 
 #[test]
 fn unselected_suggested_resource_does_not_discover_package() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "f",
             Some("f <- function() system.file('data', 'x.json', package = 'foo')"),
         )],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
-    let foo = package_with!(
-        "foo",
-        &[],
-        Vec::new(),
-        ExportMap::new(),
-        Vec::new(),
-        Vec::new(),
-        vec!["data/x.json".into()],
-        "",
-    );
+    )
+    .exports(export("f"))
+    .description("Suggests: foo\n")
+    .build();
+    let foo = PackageFixture::new("foo", &[])
+        .files(vec!["data/x.json".into()])
+        .build();
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
     let plan = Linker::new(provider, 1).analyze("root").unwrap();
@@ -3955,16 +3564,10 @@ fn unselected_suggested_resource_does_not_discover_package() {
 
 #[test]
 fn unselected_suggested_attachment_call_is_ignored() {
-    let root = package_with!(
-        "root",
-        &[("f", Some("f <- function() require(foo)"))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    let root = PackageFixture::new("root", &[("f", Some("f <- function() require(foo)"))])
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build();
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
@@ -3988,39 +3591,36 @@ fn unselected_suggested_attachment_call_is_ignored() {
 #[test]
 fn closed_generic_retains_every_registered_and_lexical_method() {
     let root = package("root", &[("f", Some("f <- function(x) foo::criterion(x)"))]);
-    let foo = package_with!(
+    let foo = PackageFixture::new(
         "foo",
         &[
             (
                 "criterion",
-                Some("criterion <- function(x) UseMethod(\"criterion\")")
+                Some("criterion <- function(x) UseMethod(\"criterion\")"),
             ),
             (
                 "criterion.character",
-                Some("criterion.character <- function(x) helper(x)")
+                Some("criterion.character <- function(x) helper(x)"),
             ),
             (
                 "criterion.default",
-                Some("criterion.default <- function(x) x")
+                Some("criterion.default <- function(x) x"),
             ),
             ("as_criterion", Some("as_criterion <- function(x) x")),
             ("helper", Some("helper <- function(x) x")),
             ("unrelated", Some("unrelated <- function() 1")),
         ],
-        Vec::new(),
-        export("criterion"),
-        vec![S3Registration {
-            generic: slinker_core::package::GenericSpec {
-                package: None,
-                name: "criterion".into(),
-            },
-            class: "root_criterion".into(),
-            method: "as_criterion".into(),
-        }],
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("criterion"))
+    .s3(vec![S3Registration {
+        generic: slinker_core::package::GenericSpec {
+            package: None,
+            name: "criterion".into(),
+        },
+        class: "root_criterion".into(),
+        method: "as_criterion".into(),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -4121,35 +3721,31 @@ fn declared_generic_names_dispatch_each_generic() {
 fn declared_receiver_class_narrows_generic_methods() {
     let analyze = |caller: &str| {
         let root = package("root", &[("f", Some(caller))]);
-        let foo = package_with!(
+        let foo = PackageFixture::new(
             "foo",
             &[
                 (
                     "criterion",
-                    Some("criterion <- function(x) UseMethod(\"criterion\")")
+                    Some("criterion <- function(x) UseMethod(\"criterion\")"),
                 ),
                 (
                     "criterion.character",
-                    Some("criterion.character <- function(x) helper(x)")
+                    Some("criterion.character <- function(x) helper(x)"),
                 ),
                 (
                     "criterion.root_criterion",
-                    Some("criterion.root_criterion <- function(x) special(x)")
+                    Some("criterion.root_criterion <- function(x) special(x)"),
                 ),
                 (
                     "criterion.default",
-                    Some("criterion.default <- function(x) x")
+                    Some("criterion.default <- function(x) x"),
                 ),
                 ("helper", Some("helper <- function(x) x")),
                 ("special", Some("special <- function(x) x")),
             ],
-            Vec::new(),
-            export("criterion"),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            "",
-        );
+        )
+        .exports(export("criterion"))
+        .build();
         Linker::new(FakeProvider::new(vec![root, foo]), 1)
             .analyze("root")
             .unwrap()
@@ -4187,26 +3783,23 @@ fn external_method_registration_opens_a_closed_generic() {
             ),
         ],
     );
-    let bar = package_with!(
+    let bar = PackageFixture::new(
         "bar",
         &[
             ("g", Some("g <- function() 1")),
             ("criterion.bar", Some("criterion.bar <- function(x) 1")),
         ],
-        Vec::new(),
-        export("g"),
-        vec![S3Registration {
-            generic: slinker_core::package::GenericSpec {
-                package: Some("root".into()),
-                name: "criterion".into(),
-            },
-            class: "bar".into(),
-            method: "criterion.bar".into(),
-        }],
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("g"))
+    .s3(vec![S3Registration {
+        generic: slinker_core::package::GenericSpec {
+            package: Some("root".into()),
+            name: "criterion".into(),
+        },
+        class: "bar".into(),
+        method: "criterion.bar".into(),
+    }])
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, bar]), 1)
         .with_external_packages(["bar".into()])
         .analyze("root")
@@ -4254,7 +3847,7 @@ fn next_method_is_supported_only_inside_a_closed_method_set() {
 
 #[test]
 fn registered_operator_method_is_retained_with_its_dependencies() {
-    let mut root = package_with!(
+    let mut root = PackageFixture::new(
         "root",
         &[
             ("f", Some("f <- function(other) criterion | other")),
@@ -4265,23 +3858,20 @@ fn registered_operator_method_is_retained_with_its_dependencies() {
             ),
             (
                 "is_root_criterion",
-                Some("is_root_criterion <- function(x) TRUE")
+                Some("is_root_criterion <- function(x) TRUE"),
             ),
         ],
-        Vec::new(),
-        export("f"),
-        vec![S3Registration {
-            generic: slinker_core::package::GenericSpec {
-                package: None,
-                name: "|".into(),
-            },
-            class: "root_criterion".into(),
-            method: "|.root_criterion".into(),
-        }],
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("f"))
+    .s3(vec![S3Registration {
+        generic: slinker_core::package::GenericSpec {
+            package: None,
+            name: "|".into(),
+        },
+        class: "root_criterion".into(),
+        method: "|.root_criterion".into(),
+    }])
+    .build();
     root.bindings
         .get_mut("criterion")
         .expect("criterion binding")
@@ -4309,26 +3899,24 @@ fn registered_operator_method_is_retained_with_its_dependencies() {
 
 #[test]
 fn unselected_suggested_s3_generic_keeps_a_delayed_registration_without_inspecting_it() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[
             ("public", Some("public <- function() 1")),
             ("print.foo", Some("print.foo <- function(x, ...) x")),
         ],
-        Vec::new(),
-        export("public"),
-        vec![S3Registration {
-            generic: slinker_core::package::GenericSpec {
-                package: Some("foo".into()),
-                name: "print".into(),
-            },
-            class: "foo".into(),
-            method: "print.foo".into(),
-        }],
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    )
+    .exports(export("public"))
+    .s3(vec![S3Registration {
+        generic: slinker_core::package::GenericSpec {
+            package: Some("foo".into()),
+            name: "print".into(),
+        },
+        class: "foo".into(),
+        method: "print.foo".into(),
+    }])
+    .description("Suggests: foo\n")
+    .build();
     let foo = package("foo", &[("print", Some("print <- function(x, ...) x"))]);
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
@@ -4355,23 +3943,21 @@ fn unselected_suggested_s3_generic_keeps_a_delayed_registration_without_inspecti
 #[test]
 fn retained_dependency_method_keeps_its_delayed_registration_on_an_unselected_generic() {
     let root = package("root", &[("f", Some("f <- function() dep::method()"))]);
-    let dep = package_with!(
+    let dep = PackageFixture::new(
         "dep",
         &[("method", Some("method <- function(x = NULL, ...) x"))],
-        Vec::new(),
-        export("method"),
-        vec![S3Registration {
-            generic: slinker_core::package::GenericSpec {
-                package: Some("foo".into()),
-                name: "generic".into(),
-            },
-            class: "dep_class".into(),
-            method: "method".into(),
-        }],
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    )
+    .exports(export("method"))
+    .s3(vec![S3Registration {
+        generic: slinker_core::package::GenericSpec {
+            package: Some("foo".into()),
+            name: "generic".into(),
+        },
+        class: "dep_class".into(),
+        method: "method".into(),
+    }])
+    .description("Suggests: foo\n")
+    .build();
     let foo = package("foo", &[("generic", Some("generic <- function(x, ...) x"))]);
     let provider = FakeProvider::new(vec![root, dep, foo]);
     let counts = provider.count_handle();
@@ -4399,23 +3985,21 @@ fn retained_dependency_method_keeps_its_delayed_registration_on_an_unselected_ge
 #[test]
 fn selected_extra_enables_retained_dependency_s3_generic() {
     let root = package("root", &[("f", Some("f <- function() dep::method()"))]);
-    let dep = package_with!(
+    let dep = PackageFixture::new(
         "dep",
         &[("method", Some("method <- function(x = NULL, ...) x"))],
-        Vec::new(),
-        export("method"),
-        vec![S3Registration {
-            generic: slinker_core::package::GenericSpec {
-                package: Some("foo".into()),
-                name: "generic".into(),
-            },
-            class: "dep_class".into(),
-            method: "method".into(),
-        }],
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    )
+    .exports(export("method"))
+    .s3(vec![S3Registration {
+        generic: slinker_core::package::GenericSpec {
+            package: Some("foo".into()),
+            name: "generic".into(),
+        },
+        class: "dep_class".into(),
+        method: "method".into(),
+    }])
+    .description("Suggests: foo\n")
+    .build();
     let foo = package("foo", &[("generic", Some("generic <- function(x, ...) x"))]);
     let plan = Linker::new(FakeProvider::new(vec![root, dep, foo]), 2)
         .with_linked_packages(["foo".to_owned()])
@@ -4439,32 +4023,22 @@ fn selected_extra_enables_retained_dependency_s3_generic() {
 }
 
 fn suggesting_root(source: &str) -> PackageImage {
-    package_with!(
-        "root",
-        &[("f", Some(source))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    )
+    PackageFixture::new("root", &[("f", Some(source))])
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build()
 }
 
 fn optional_foo() -> PackageImage {
-    package_with!(
+    PackageFixture::new(
         "foo",
         &[
             ("bar", Some("bar <- function() hidden()")),
             ("hidden", Some("hidden <- function() 1")),
         ],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
     )
+    .exports(export("bar"))
+    .build()
 }
 
 fn optional_availability_blockers(plan: &slinker_core::analysis::LinkIr) -> Vec<String> {
@@ -4599,19 +4173,16 @@ fn selected_optional_package_follows_the_supported_guard_semantics() {
 
 #[test]
 fn required_package_guard_is_not_an_optional_availability_blocker() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "f",
             Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()"),
         )],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Imports: foo\n",
-    );
+    )
+    .exports(export("f"))
+    .description("Imports: foo\n")
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, optional_foo()]), 1)
         .analyze("root")
         .unwrap();
@@ -4622,33 +4193,26 @@ fn required_package_guard_is_not_an_optional_availability_blocker() {
 
 #[test]
 fn selected_extra_enables_guarded_optional_branch_without_rooting_whole_package() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "f",
             Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()"),
         )],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
-    let foo = package_with!(
+    )
+    .exports(export("f"))
+    .description("Suggests: foo\n")
+    .build();
+    let foo = PackageFixture::new(
         "foo",
         &[
             ("bar", Some("bar <- function() helper()")),
             ("helper", Some("helper <- function() 1")),
             ("unused", Some("unused <- function() 2")),
         ],
-        Vec::new(),
-        export("bar"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("bar"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .with_linked_packages(["foo".to_owned()])
         .analyze("root")
@@ -4660,19 +4224,16 @@ fn selected_extra_enables_guarded_optional_branch_without_rooting_whole_package(
 
 #[test]
 fn selected_missing_extra_is_reported_as_missing_dependency() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[(
             "f",
             Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()"),
         )],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: foo\n",
-    );
+    )
+    .exports(export("f"))
+    .description("Suggests: foo\n")
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .with_linked_packages(["foo".to_owned()])
         .analyze("root")
@@ -4688,9 +4249,7 @@ fn selected_missing_extra_is_reported_as_missing_dependency() {
 #[test]
 fn optional_onload_hook_does_not_activate_suggested_namespace() {
     let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
-    let mut glue = package_with!(
-        "glue",
-        &[
+    let mut glue = PackageFixture::new("glue", &[
             ("glue", Some("glue <- function(x) x")),
             (
                 ".onLoad",
@@ -4698,14 +4257,7 @@ fn optional_onload_hook_does_not_activate_suggested_namespace() {
                     ".onLoad <- function(...) { if (isNamespaceLoaded(\"knitr\") && \"knit_engines\" %in% getNamespaceExports(\"knitr\")) { knitr::knit_engines$set(glue = glue) } else { setHook(packageEvent(\"knitr\", \"onLoad\"), function(...) knitr::knit_engines$set(glue = glue)) } }",
                 ),
             ),
-        ],
-        Vec::new(),
-        export("glue"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: knitr\n",
-    );
+        ]).exports(export("glue")).description("Suggests: knitr\n").build();
     Arc::make_mut(&mut glue.index).lifecycle.on_load = true;
     let plan = Linker::new(FakeProvider::new(vec![root, glue]), 4)
         .analyze("root")
@@ -4729,9 +4281,7 @@ fn optional_onload_hook_does_not_activate_suggested_namespace() {
 #[test]
 fn selected_extra_enables_optional_onload_hook_namespace() {
     let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
-    let mut glue = package_with!(
-        "glue",
-        &[
+    let mut glue = PackageFixture::new("glue", &[
             ("glue", Some("glue <- function(x) x")),
             (
                 ".onLoad",
@@ -4739,28 +4289,17 @@ fn selected_extra_enables_optional_onload_hook_namespace() {
                     ".onLoad <- function(...) { if (isNamespaceLoaded(\"knitr\")) knitr::knit_engines$set(glue = glue) else setHook(packageEvent(\"knitr\", \"onLoad\"), function(...) knitr::knit_engines$set(glue = glue)) }",
                 ),
             ),
-        ],
-        Vec::new(),
-        export("glue"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: knitr\n",
-    );
+        ]).exports(export("glue")).description("Suggests: knitr\n").build();
     Arc::make_mut(&mut glue.index).lifecycle.on_load = true;
-    let knitr = package_with!(
+    let knitr = PackageFixture::new(
         "knitr",
         &[
             ("knit_engines", None),
             ("unused", Some("unused <- function() 1")),
         ],
-        Vec::new(),
-        export("knit_engines"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("knit_engines"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, glue, knitr]), 4)
         .with_linked_packages(["knitr".to_owned()])
         .analyze("root")
@@ -4773,9 +4312,7 @@ fn selected_extra_enables_optional_onload_hook_namespace() {
 #[test]
 fn external_namespace_is_not_assumed_loaded_for_onload_guard() {
     let root = package("root", &[("f", Some("f <- function() glue::glue(\"x\")"))]);
-    let mut glue = package_with!(
-        "glue",
-        &[
+    let mut glue = PackageFixture::new("glue", &[
             ("glue", Some("glue <- function(x) x")),
             (
                 ".onLoad",
@@ -4783,25 +4320,12 @@ fn external_namespace_is_not_assumed_loaded_for_onload_guard() {
                     ".onLoad <- function(...) if (isNamespaceLoaded(\"knitr\")) knitr::knit_engines$set(glue = glue)",
                 ),
             ),
-        ],
-        Vec::new(),
-        export("glue"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Suggests: knitr\n",
-    );
+        ]).exports(export("glue")).description("Suggests: knitr\n").build();
     Arc::make_mut(&mut glue.index).lifecycle.on_load = true;
-    let knitr = package_with!(
-        "knitr",
-        &[("knit_engines", None)],
-        Vec::new(),
-        export("knit_engines"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Priority: base\n",
-    );
+    let knitr = PackageFixture::new("knitr", &[("knit_engines", None)])
+        .exports(export("knit_engines"))
+        .description("Priority: base\n")
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root, glue, knitr]), 4)
         .analyze("root")
         .unwrap();
@@ -4869,16 +4393,9 @@ fn conditional_special_callee_blocks_path_dependent_specialization() {
             ),
         )],
     );
-    let foo = package_with!(
-        "foo",
-        &[],
-        Vec::new(),
-        ExportMap::new(),
-        Vec::new(),
-        Vec::new(),
-        vec!["data".into()],
-        "",
-    );
+    let foo = PackageFixture::new("foo", &[])
+        .files(vec!["data".into()])
+        .build();
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
         .analyze("root")
         .unwrap();
@@ -4919,7 +4436,7 @@ fn repeated_predicate_refines_conditional_local_fallthrough() {
 
 #[test]
 fn non_returning_package_helper_refines_exhaustive_dispatch() {
-    let root = package_with!(
+    let root = PackageFixture::new(
         "root",
         &[
             (
@@ -4938,13 +4455,9 @@ fn non_returning_package_helper_refines_exhaustive_dispatch() {
                 Some(".stop_invalid_direction <- function() { stop('invalid direction') }"),
             ),
         ],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(export("f"))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
         .analyze("root")
         .unwrap();
@@ -5090,21 +4603,12 @@ fn uncaptured_superassignment_remains_environment_mutation_blocker() {
 
 #[test]
 fn private_non_returning_helper_refines_enclosing_private_closure() {
-    let mut root = package_with!(
-        "root",
-        &[(
+    let mut root = PackageFixture::new("root", &[(
             "public",
             Some(
                 "public <- function(direction) { if (direction == 'ok') value <- 1 else .die(); value }",
             ),
-        )],
-        Vec::new(),
-        export("public"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+        )]).exports(export("public")).build();
     root.bindings
         .get_mut("public")
         .unwrap()
@@ -5143,16 +4647,9 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
 fn graph_export_is_deterministic_semantic_and_count_consistent() {
     let analyze = || {
         let root = package("root", &[("f", Some("f <- function() foo::bar()"))]);
-        let foo = package_with!(
-            "foo",
-            &[("bar", Some("bar <- function() 1"))],
-            Vec::new(),
-            export("bar"),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            "",
-        );
+        let foo = PackageFixture::new("foo", &[("bar", Some("bar <- function() 1"))])
+            .exports(export("bar"))
+            .build();
         Linker::new(FakeProvider::new(vec![root, foo]), 2)
             .analyze("root")
             .unwrap()
@@ -5313,7 +4810,7 @@ fn explanation_dag_attributes_roots_and_redundant_edges() {
             ("g", Some("g <- function() dep::g()")),
         ],
     );
-    let dep = package_with!(
+    let dep = PackageFixture::new(
         "dep",
         &[
             ("f", Some("f <- function() { a(); c() }")),
@@ -5322,13 +4819,12 @@ fn explanation_dag_attributes_roots_and_redundant_edges() {
             ("b", Some("b <- function() c()")),
             ("c", Some("c <- function() 1")),
         ],
-        Vec::new(),
-        ExportMap::from([("f".into(), "f".into()), ("g".into(), "g".into())]),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "",
-    );
+    )
+    .exports(ExportMap::from([
+        ("f".into(), "f".into()),
+        ("g".into(), "g".into()),
+    ]))
+    .build();
     let plan = Linker::new(FakeProvider::new(vec![root, dep]), 1)
         .analyze("root")
         .unwrap();
@@ -5508,16 +5004,10 @@ fn lexical_method_namespace(
 ) -> PackageImage {
     let mut bindings = vec![("run", Some(entry))];
     bindings.extend(methods.iter().map(|(name, source)| (*name, Some(*source))));
-    package_with!(
-        "foo",
-        &bindings,
-        Vec::new(),
-        export("run"),
-        s3,
-        Vec::new(),
-        Vec::new(),
-        "",
-    )
+    PackageFixture::new("foo", &bindings)
+        .exports(export("run"))
+        .s3(s3)
+        .build()
 }
 
 fn lexical_root() -> PackageImage {
@@ -5612,22 +5102,17 @@ fn lexical_method_follows_an_external_reexport_to_the_defining_namespace() {
         Vec::new(),
     );
     let ext = package("ext", &[("gen", None)]);
-    let mid = package_with!(
-        "mid",
-        &[],
-        vec![ImportSpec::From {
+    let mid = PackageFixture::new("mid", &[])
+        .imports(vec![ImportSpec::From {
             package: "ext".into(),
             bindings: vec![ImportBinding {
                 local: "gen".into(),
                 remote: "gen".into(),
             }],
-        }],
-        export("gen"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Imports: ext\n",
-    );
+        }])
+        .exports(export("gen"))
+        .description("Imports: ext\n")
+        .build();
     let provider = FakeProvider::new(vec![lexical_root(), foo, ext, mid]).dispatching(
         Some("ext"),
         "gen",
@@ -5744,16 +5229,10 @@ fn carried_sets(plan: &slinker_core::analysis::LinkIr, package: &str) -> Vec<Str
 }
 
 fn importing_root(source: &str) -> PackageImage {
-    package_with!(
-        "root",
-        &[("f", Some(source))],
-        Vec::new(),
-        export("f"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Imports: foo\n",
-    )
+    PackageFixture::new("root", &[("f", Some(source))])
+        .exports(export("f"))
+        .description("Imports: foo\n")
+        .build()
 }
 
 fn data_use(source: &str) -> slinker_core::analysis::LinkIr {
@@ -5960,33 +5439,31 @@ fn unreached_datasets_are_never_carried() {
 }
 
 fn dependency_importing_from_missing_package() -> PackageImage {
-    package_with!(
+    PackageFixture::new(
         "dep",
         &[
             ("f1", Some("f1 <- function() a()")),
             ("f2", Some("f2 <- function() b()")),
             ("f3", Some("f3 <- function() c3()")),
         ],
-        vec![ImportSpec::From {
-            package: "gone".into(),
-            bindings: ["a", "b", "c3"]
-                .into_iter()
-                .map(|name| ImportBinding {
-                    local: name.into(),
-                    remote: name.into(),
-                })
-                .collect(),
-        }],
-        ExportMap::from([
-            ("f1".into(), "f1".into()),
-            ("f2".into(), "f2".into()),
-            ("f3".into(), "f3".into()),
-        ]),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        "Imports: gone\n",
     )
+    .imports(vec![ImportSpec::From {
+        package: "gone".into(),
+        bindings: ["a", "b", "c3"]
+            .into_iter()
+            .map(|name| ImportBinding {
+                local: name.into(),
+                remote: name.into(),
+            })
+            .collect(),
+    }])
+    .exports(ExportMap::from([
+        ("f1".into(), "f1".into()),
+        ("f2".into(), "f2".into()),
+        ("f3".into(), "f3".into()),
+    ]))
+    .description("Imports: gone\n")
+    .build()
 }
 
 fn missing_package_blockers(
