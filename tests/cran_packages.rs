@@ -39,13 +39,17 @@ fn represtools_suite_passes_with_whisker_linked() {
 }
 
 #[test]
-fn qrcode_suite_passes_with_assertthat_linked() {
+fn qrcode_blocks_on_unselected_optional_package_availability() {
     LinkedSuite {
         package: "qrcode",
         linked: &["assertthat"],
-        checks: &[Check::Testthat],
+        checks: &[],
     }
-    .assert_passes();
+    .assert_blocks(&[
+        "OptionalAvailability in qrcode::generate_svg.qr_logo: reachable code depends on whether unselected optional package `knitr` is installed",
+        "OptionalAvailability in qrcode::read_logo: reachable code depends on whether unselected optional package `png` is installed",
+        "OptionalAvailability in qrcode::validate_qr: reachable code depends on whether unselected optional package `httr` is installed",
+    ]);
 }
 
 #[test]

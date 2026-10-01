@@ -318,6 +318,7 @@ fn reject_code_name(code: RejectCode) -> &'static str {
         RejectCode::MissingResource => "missing_resource",
         RejectCode::NativeLoadFailure => "native_load_failure",
         RejectCode::ObjectSystem => "object_system",
+        RejectCode::OptionalAvailability => "optional_availability",
         RejectCode::PackageAttachmentUnsupported => "package_attachment_unsupported",
         RejectCode::SemanticAmbiguity => "semantic_ambiguity",
         RejectCode::SyntaxObservation => "syntax_observation",

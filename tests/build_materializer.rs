@@ -185,6 +185,212 @@ fn unregistered_lexical_methods_dispatch_from_linked_code_as_in_the_original() {
     }
 }
 
+struct OptionalFixture {
+    dependency: PathBuf,
+    optional: PathBuf,
+    root: PathBuf,
+}
+
+fn optional_fixture(fixture: &Path, suggests: &str, mode_code: &str) -> OptionalFixture {
+    let optional = fixture.join("optpkg");
+    write_package(
+        &optional,
+        "optpkg",
+        "",
+        "export(marker)\n",
+        "marker <- function() 'opt-ran'\n",
+    );
+    let dependency = fixture.join("optdep");
+    write_package(&dependency, "optdep", suggests, "export(mode)\n", mode_code);
+    let root = fixture.join("optroot");
+    write_package(
+        &root,
+        "optroot",
+        "Imports: optdep\n",
+        "importFrom(optdep, mode)\nexport(go)\n",
+        "go <- function() mode()\n",
+    );
+    OptionalFixture {
+        dependency,
+        optional,
+        root,
+    }
+}
+
+fn library_with(r_home: &Path, root: &Path, packages: &[&Path]) -> PathBuf {
+    let library = tempfile::Builder::new()
+        .tempdir_in(root)
+        .expect("library")
+        .keep();
+    for package in packages {
+        install_package(r_home, package, &library);
+    }
+    library
+}
+
+fn build_optional_root(
+    fixture: &OptionalFixture,
+    library: &Path,
+    output: &Path,
+    flags: &[&str],
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(library)
+        .args(flags)
+        .arg("--output")
+        .arg(output)
+        .arg(&fixture.root)
+        .output()
+        .expect("run optional-package build")
+}
+
+#[test]
+fn unselected_optional_availability_varies_in_the_original_and_blocks_the_build() {
+    let r_home = discover_r_home();
+    let scratch = tempfile::tempdir().expect("fixture tempdir");
+    let fixture = optional_fixture(
+        scratch.path(),
+        "Suggests: optpkg\n",
+        "mode <- function() if (requireNamespace('optpkg', quietly = TRUE)) 'with-opt' else 'without-opt'\n",
+    );
+    let absent = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.dependency, &fixture.root],
+    );
+    let present = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.dependency, &fixture.root, &fixture.optional],
+    );
+    run_r(
+        &r_home,
+        &absent,
+        "library(optroot); stopifnot(identical(go(), 'without-opt'))",
+    );
+    run_r(
+        &r_home,
+        &present,
+        "library(optroot); stopifnot(identical(go(), 'with-opt'))",
+    );
+
+    for library in [&absent, &present] {
+        let output = scratch.path().join("generated-optroot");
+        let result = build_optional_root(&fixture, library, &output, &[]);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{stderr}");
+        assert!(stderr.contains("OptionalAvailability"), "{stderr}");
+        assert!(
+            stderr.contains("unselected optional package `optpkg`"),
+            "{stderr}"
+        );
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn external_optional_package_builds_and_matches_the_original() {
+    let r_home = discover_r_home();
+    let scratch = tempfile::tempdir().expect("fixture tempdir");
+    let fixture = optional_fixture(
+        scratch.path(),
+        "Suggests: optpkg\n",
+        "mode <- function() if (requireNamespace('optpkg', quietly = TRUE)) paste('with-opt', optpkg::marker()) else 'without-opt'\n",
+    );
+    let build = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.dependency, &fixture.optional],
+    );
+    let original = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.dependency, &fixture.root, &fixture.optional],
+    );
+    let behavior = "library(optroot); stopifnot(identical(go(), 'with-opt opt-ran'))";
+    run_r(&r_home, &original, behavior);
+
+    let external_output = scratch.path().join("generated-external");
+    let external = build_optional_root(
+        &fixture,
+        &build,
+        &external_output,
+        &["--external", "optpkg"],
+    );
+    assert_success(
+        &external,
+        "slinker build with the optional package External",
+    );
+    let external_library = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.optional, &external_output],
+    );
+    run_r(&r_home, &external_library, behavior);
+}
+
+#[test]
+fn unused_suggests_entry_neither_blocks_nor_becomes_a_dependency() {
+    let r_home = discover_r_home();
+    let scratch = tempfile::tempdir().expect("fixture tempdir");
+    let fixture = optional_fixture(
+        scratch.path(),
+        "Suggests: optpkg\n",
+        "mode <- function() 'plain'\n",
+    );
+    let build = library_with(&r_home, scratch.path(), &[&fixture.dependency]);
+    let output = scratch.path().join("generated-optroot");
+    let result = build_optional_root(&fixture, &build, &output, &[]);
+    assert_success(&result, "slinker build with an unused Suggests entry");
+    let description =
+        fs::read_to_string(output.join("DESCRIPTION")).expect("generated DESCRIPTION");
+    assert!(!description.contains("optpkg"), "{description}");
+
+    let runtime = library_with(&r_home, scratch.path(), &[&output]);
+    run_r(
+        &r_home,
+        &runtime,
+        "library(optroot); stopifnot(identical(go(), 'plain'))",
+    );
+}
+
+#[test]
+fn guard_on_a_required_package_that_is_not_imported_runs_its_branch() {
+    let r_home = discover_r_home();
+    let scratch = tempfile::tempdir().expect("fixture tempdir");
+    let required = scratch.path().join("optpkg");
+    write_package(
+        &required,
+        "optpkg",
+        "",
+        "export(marker)\n",
+        "marker <- function() 'opt-ran'\n",
+    );
+    let fixture = optional_fixture(
+        scratch.path(),
+        "Imports: optpkg\n",
+        "mode <- function() if (requireNamespace('optpkg', quietly = TRUE)) optpkg::marker() else 'without-opt'\n",
+    );
+    let build = library_with(&r_home, scratch.path(), &[&required, &fixture.dependency]);
+    let original = library_with(
+        &r_home,
+        scratch.path(),
+        &[&required, &fixture.dependency, &fixture.root],
+    );
+    let behavior = "library(optroot); stopifnot(identical(go(), 'opt-ran'))";
+    run_r(&r_home, &original, behavior);
+
+    let output = scratch.path().join("generated-optroot");
+    let result = build_optional_root(&fixture, &build, &output, &[]);
+    assert_success(
+        &result,
+        "slinker build with a required, unimported guard package",
+    );
+    let runtime = library_with(&r_home, scratch.path(), &[&output]);
+    run_r(&r_home, &runtime, behavior);
+}
+
 #[test]
 fn linked_on_load_outside_the_namespace_environment_still_runs() {
     let r_home = discover_r_home();

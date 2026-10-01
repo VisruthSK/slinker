@@ -71,10 +71,10 @@ missing fact.
 ## Regression corpus
 
 Keep passing: `tests/build_materializer.rs` (synthetic fixtures, vendored `praise`/`pkgconfig`);
-`tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, `qrcode`, and `here`, each run
+`tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, and `here`, each run
 against one build with its Linked dependencies absent, installed, and loaded; `pkgcond`, `doubt`,
-`config`, and `voucher` with cli and fs Linked block with their exact unproven behavior until a sound
-rule covers it); `tests/harp_runtime.rs` (target-R relocation verification accepts exactly the planned
+`config`, `qrcode` (unselected optional packages), and `voucher` with cli and fs Linked block with their
+exact unproven behavior until a sound rule covers it); `tests/harp_runtime.rs` (target-R relocation verification accepts exactly the planned
 replacements and rejects parseable unplanned changes and malformed rewrites). Each item adds its own
 acceptance cases here.
 
@@ -98,8 +98,6 @@ that fails before its fix.
 - Lexical S3 retention reaches calls and binary operators only. Dispatch through unary operators,
   `[`, `[[`, `$`, `@`, and replacement forms (`names(x) <- v`) needs Oak call facts for those
   syntax forms; until then a method reached only that way is a stub that fails loudly.
-- Optional `Suggests` availability: reachable behavior that depends on whether an unselected
-  Suggests package is installed blocks.
 - Diagnostics: collapse derivative missing-name cascades behind one primary blocker.
 
 ## Track C: Rust cleanup, types, and performance

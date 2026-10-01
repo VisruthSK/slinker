@@ -4331,22 +4331,21 @@ fn selected_extra_enables_retained_dependency_s3_generic() {
     );
 }
 
-#[test]
-fn unselected_suggested_guard_prunes_optional_branch() {
-    let root = package_with!(
+fn suggesting_root(source: &str) -> PackageImage {
+    package_with!(
         "root",
-        &[(
-            "f",
-            Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()"),
-        )],
+        &[("f", Some(source))],
         Vec::new(),
         export("f"),
         Vec::new(),
         Vec::new(),
         Vec::new(),
         "Suggests: foo\n",
-    );
-    let foo = package_with!(
+    )
+}
+
+fn optional_foo() -> PackageImage {
+    package_with!(
         "foo",
         &[
             ("bar", Some("bar <- function() hidden()")),
@@ -4358,10 +4357,35 @@ fn unselected_suggested_guard_prunes_optional_branch() {
         Vec::new(),
         Vec::new(),
         "",
-    );
-    let provider = FakeProvider::new(vec![root, foo]);
+    )
+}
+
+fn optional_availability_blockers(plan: &slinker::analysis::LinkIr) -> Vec<String> {
+    plan.blockers()
+        .iter()
+        .filter(|diagnostic| diagnostic.code == RejectCode::OptionalAvailability)
+        .map(|diagnostic| {
+            format!(
+                "{}::{}",
+                diagnostic.package,
+                diagnostic.binding.as_deref().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn unselected_suggested_availability_guard_blocks_instead_of_freezing() {
+    let provider = FakeProvider::new(vec![
+        suggesting_root(
+            "f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()",
+        ),
+        optional_foo(),
+    ]);
     let counts = provider.count_handle();
     let plan = Linker::new(provider, 1).analyze("root").unwrap();
+
+    assert_eq!(optional_availability_blockers(&plan), ["root::f"]);
     assert!(
         !plan
             .provenance()
@@ -4370,13 +4394,123 @@ fn unselected_suggested_guard_prunes_optional_branch() {
             .any(|node| node.package == "foo")
     );
     assert_eq!(counts.lock().unwrap().get("foo").copied().unwrap_or(0), 0);
+}
+
+#[test]
+fn unselected_suggested_availability_query_blocks_without_a_guard() {
+    let plan = Linker::new(
+        FakeProvider::new(vec![
+            suggesting_root("f <- function() requireNamespace(\"foo\", quietly = TRUE)"),
+            optional_foo(),
+        ]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+
+    assert_eq!(optional_availability_blockers(&plan), ["root::f"]);
+}
+
+#[test]
+fn unselected_suggested_loaded_guard_blocks_the_pruned_branch() {
+    let plan = Linker::new(
+        FakeProvider::new(vec![
+            suggesting_root("f <- function() if (isNamespaceLoaded(\"foo\")) foo::bar()"),
+            optional_foo(),
+        ]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+
+    assert_eq!(optional_availability_blockers(&plan), ["root::f"]);
+}
+
+#[test]
+fn unselected_suggested_loaded_query_alone_is_not_environment_frozen() {
+    let plan = Linker::new(
+        FakeProvider::new(vec![
+            suggesting_root("f <- function() isNamespaceLoaded(\"foo\")"),
+            optional_foo(),
+        ]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+
+    assert!(plan.blockers().is_empty());
+}
+
+#[test]
+fn unused_suggests_entry_neither_blocks_nor_links() {
+    let plan = Linker::new(
+        FakeProvider::new(vec![suggesting_root("f <- function() 1"), optional_foo()]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+
+    assert!(plan.blockers().is_empty());
     assert!(
-        plan.program()
-            .relocations()
+        !plan
+            .provenance()
+            .nodes()
             .iter()
-            .any(|relocation| relocation.target
-                == slinker::ir::RelocationTarget::RequireNamespace { result: false })
+            .any(|node| node.package == "foo")
     );
+}
+
+#[test]
+fn selected_optional_package_follows_the_supported_guard_semantics() {
+    let source = "f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()";
+    let extra = Linker::new(
+        FakeProvider::new(vec![suggesting_root(source), optional_foo()]),
+        1,
+    )
+    .with_extra_packages(["foo".to_owned()])
+    .analyze("root")
+    .unwrap();
+    let external = Linker::new(
+        FakeProvider::new(vec![suggesting_root(source), optional_foo()]),
+        1,
+    )
+    .with_external_packages(["foo".to_owned()])
+    .analyze("root")
+    .unwrap();
+
+    assert!(extra.blockers().is_empty());
+    assert!(retained_binding(&extra, "foo", "bar"));
+    assert!(external.blockers().is_empty());
+    assert!(
+        !external
+            .provenance()
+            .nodes()
+            .iter()
+            .any(|node| node.package == "foo" && matches!(node.kind, NodeKind::Binding { .. }))
+    );
+}
+
+#[test]
+fn required_package_guard_is_not_an_optional_availability_blocker() {
+    let root = package_with!(
+        "root",
+        &[(
+            "f",
+            Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar()"),
+        )],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Imports: foo\n",
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, optional_foo()]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(plan.blockers().is_empty());
+    assert!(retained_binding(&plan, "foo", "bar"));
 }
 
 #[test]
@@ -4482,6 +4616,7 @@ fn optional_onload_hook_does_not_activate_suggested_namespace() {
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::MissingDependency)
     );
+    assert_eq!(optional_availability_blockers(&plan), ["glue::.onLoad"]);
 }
 
 #[test]
@@ -4523,6 +4658,7 @@ fn selected_extra_enables_optional_onload_hook_namespace() {
         .with_extra_packages(["knitr".to_owned()])
         .analyze("root")
         .unwrap();
+    assert!(optional_availability_blockers(&plan).is_empty());
     assert!(retained_binding(&plan, "knitr", "knit_engines"));
     assert!(!retained_binding(&plan, "knitr", "unused"));
 }

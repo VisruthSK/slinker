@@ -21,6 +21,7 @@ pub enum RejectCode {
     MissingResource,
     NativeLoadFailure,
     ObjectSystem,
+    OptionalAvailability,
     PackageAttachmentUnsupported,
     SemanticAmbiguity,
     SyntaxObservation,

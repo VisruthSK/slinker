@@ -1026,12 +1026,55 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn guards_active(
         &mut self,
+        site: ParsedSite<'_>,
+        guards: &[PackageGuard],
+        span: &Span,
+    ) -> Result<bool> {
+        match self.guard_verdict(site.package, site.image, guards)? {
+            GuardVerdict::Active => Ok(true),
+            GuardVerdict::Pruned => Ok(false),
+            GuardVerdict::PrunedByUnselectedOptional(optional) => {
+                self.optional_availability_blocker(
+                    site.node,
+                    site.package,
+                    site.binding,
+                    &optional,
+                    span,
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    fn optional_availability_blocker(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        optional: &str,
+        span: &Span,
+    ) {
+        self.diagnostic(
+            from,
+            current,
+            Some(binding),
+            RejectCode::OptionalAvailability,
+            format!(
+                "reachable code depends on whether unselected optional package `{optional}` is installed; `{}` lists it only in Suggests, so the build cannot fix either answer (select it with --extra-pkgs or --external)",
+                self.packages.name(current)
+            ),
+            Some(span.clone()),
+        );
+    }
+
+    pub(super) fn guard_verdict(
+        &mut self,
         owner: PackageId,
         image: &PackageImage,
         guards: &[PackageGuard],
-    ) -> Result<bool> {
+    ) -> Result<GuardVerdict> {
         if guards.is_empty() {
-            return Ok(true);
+            return Ok(GuardVerdict::Active);
         }
 
         let helper_shadowed = |helper: &str, image: &PackageImage| {
@@ -1045,7 +1088,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
             helper_shadowed(helper, image)
         }) {
-            return Ok(true);
+            return Ok(GuardVerdict::Active);
         }
 
         for guard in guards {
@@ -1054,7 +1097,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             if self.package_is_suggested_only(owner, package)? {
-                return Ok(false);
+                return Ok(GuardVerdict::PrunedByUnselectedOptional(package.to_owned()));
             }
             let imported = image.index.imports.iter().any(|import| match import {
                 ImportSpec::All {
@@ -1065,10 +1108,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 } => imported == package,
             });
             match guard {
-                PackageGuard::Selected(_) => return Ok(false),
+                PackageGuard::Selected(_) => return Ok(GuardVerdict::Pruned),
                 PackageGuard::Loaded(_) => {
                     if !imported {
-                        return Ok(false);
+                        return Ok(GuardVerdict::Pruned);
                     }
                 }
                 PackageGuard::Available(_) => {
@@ -1079,12 +1122,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         Some(candidate) if self.packages.is_external(candidate) => {
                             self.external.insert(candidate);
                         }
-                        _ => return Ok(false),
+                        Some(_) if self.package_is_required(owner, package)? => {}
+                        _ => return Ok(GuardVerdict::Pruned),
                     }
                 }
             }
         }
-        Ok(true)
+        Ok(GuardVerdict::Active)
     }
 
     pub(super) fn process_parsed(
@@ -1121,7 +1165,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.process_references(site, expression, &consumed_native_selectors)?;
             self.process_package_refs(site, expression)?;
             for resource in &expression.resource_refs {
-                if !self.guards_active(package, image, &resource.guards)? {
+                if !self.guards_active(site, &resource.guards, &resource.span)? {
                     continue;
                 }
                 self.resource_access(node, package, parsed, resource)?;
@@ -1164,7 +1208,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if site.binding != ".onLoad" || !active.certain {
                 continue;
             }
-            if !self.guards_active(site.package, site.image, &active.guards)? {
+            if !self.guards_active(site, &active.guards, &active.span)? {
                 continue;
             }
             if self.active_binding_targets_current_namespace(
@@ -1191,7 +1235,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<Vec<Span>> {
         let mut consumed_native_selectors = Vec::new();
         for call in &expression.calls {
-            if !self.guards_active(site.package, site.image, &call.guards)?
+            if !self.guards_active(site, &call.guards, &call.span)?
                 || !matches!(
                     call.callee.as_str(),
                     ".Call" | ".External" | ".C" | ".Fortran"
@@ -1231,7 +1275,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<()> {
         let enclosure_known = !site.lexical_environment.starts_with("unsupported:");
         for reference in &expression.references {
-            if !self.guards_active(site.package, site.image, &reference.guards)? {
+            if !self.guards_active(site, &reference.guards, &reference.span)? {
                 continue;
             }
             if consumed_native_selectors.contains(&reference.span) {
@@ -1294,7 +1338,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         expression: &ParsedExpression,
     ) -> Result<()> {
         for reference in &expression.package_refs {
-            if !self.guards_active(site.package, site.image, &reference.guards)? {
+            if !self.guards_active(site, &reference.guards, &reference.span)? {
                 continue;
             }
             self.namespace_access(site.node, site.package, reference)?;
@@ -1335,7 +1379,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         expression: &ParsedExpression,
     ) -> Result<()> {
         for call in &expression.calls {
-            if !self.guards_active(site.package, site.image, &call.guards)? {
+            if !self.guards_active(site, &call.guards, &call.span)? {
                 continue;
             }
             if let Some(callable) =
@@ -1438,7 +1482,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<()> {
         let enclosure_known = !site.lexical_environment.starts_with("unsupported:");
         for effect in &expression.effects {
-            if !self.guards_active(site.package, site.image, &effect.guards)? {
+            if !self.guards_active(site, &effect.guards, &effect.span)? {
                 continue;
             }
             match effect.kind {
@@ -3334,8 +3378,13 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         let target = match self.discovered_package(from, current, call, &name)? {
             Discovered::Linked(target) => target,
             Discovered::Settled => return Ok(()),
-            Discovered::Optional if operation != NamespaceCall::Require => return Ok(()),
-            Discovered::Optional | Discovered::Missing => {
+            Discovered::Optional => {
+                if operation == NamespaceCall::Require {
+                    self.optional_availability_blocker(from, current, binding, &name, &call.span);
+                }
+                return Ok(());
+            }
+            Discovered::Missing => {
                 if operation == NamespaceCall::Require {
                     self.relocations.push(PendingRelocation::RequireNamespace {
                         source: call.span.clone(),
@@ -3815,6 +3864,13 @@ fn created_name(call: &CallSite) -> Option<(&'static str, CreatedName)> {
         Some(StaticArg::Symbol(_)) | None => CreatedName::Any,
     };
     Some((operation, name))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GuardVerdict {
+    Active,
+    Pruned,
+    PrunedByUnselectedOptional(String),
 }
 
 enum Discovered {

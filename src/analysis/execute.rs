@@ -3,7 +3,7 @@ use super::arguments::{
 };
 use super::object_world::{ClosureId, EnvironmentId, InstalledObject, ObjectId};
 use super::resolution::{BindingTarget, Resolution};
-use super::state::{AnalyzerState, ParseRequest};
+use super::state::{AnalyzerState, GuardVerdict, ParseRequest};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId};
 use crate::package::{PackageId, PackageImage, PackageProvider};
@@ -121,7 +121,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             for reference in &expression.references {
-                if !self.guards_active(package, image, &reference.guards)? {
+                if self.guard_verdict(package, image, &reference.guards)? != GuardVerdict::Active {
                     continue;
                 }
                 if let Resolution::Static(BindingTarget::Namespace {

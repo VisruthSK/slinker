@@ -85,6 +85,7 @@ Anything slinker cannot prove blocks the build; there is no mode that accepts a 
 - unanalyzed native code, whose C-to-R callbacks are not checked, unless an audited native summary covers it (the blocker names the exact package, version, and image fingerprint to audit);
 - a free name bound nowhere, when retained code can bind names at run time (`assign`, `delayedAssign`, or `makeActiveBinding` of that or a computed name, `list2env`, `environment<-`, `<<-` from an unknown enclosure, or a `useDynLib(.registration = TRUE)` component whose routines the worker could not read). Otherwise the name continues through the same global environment and search path as in the original and is accepted;
 - a dynamic namespace or package name passed to a namespace or package query (`asNamespace`, `requireNamespace`, `getExportedValue`, `isNamespaceLoaded`, `packageDescription`, ...);
+- reachable `requireNamespace()` of an unselected `Suggests` package, and code guarded by whether one is installed or loaded, whose answer would otherwise be frozen or pruned by the build;
 - `get`/`get0`/`exists`/`match.fun`/`do.call` with a computed name or environment;
 - `system.file(package = x)` with a computed `x` while a package is Linked;
 - `NextMethod()` outside a known method set.
