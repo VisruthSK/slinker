@@ -54,6 +54,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .iter()
             .position(|name| name.as_deref() == Some("package"))
         else {
+            self.diagnostic(
+                from,
+                current,
+                Some(binding),
+                RejectCode::DynamicLookup,
+                "data() without `package` searches the attached packages, which can include a Linked package whose installation is removed",
+                Some(call.span.clone()),
+            );
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(package_index).and_then(Option::as_ref)
@@ -70,7 +78,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 self.missing_package_call(from, current, call, &name);
                 Ok(())
             }
-            Discovered::Settled | Discovered::Optional => Ok(()),
+            Discovered::Optional => {
+                self.optional_availability_blocker(from, current, binding, &name, &call.span);
+                Ok(())
+            }
+            Discovered::Settled => Ok(()),
         }
     }
 
