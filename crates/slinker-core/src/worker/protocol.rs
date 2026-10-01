@@ -221,6 +221,21 @@ pub enum WorkerResponse {
     Shutdown,
 }
 
+impl WorkerResponse {
+    pub fn request_id(&self) -> Option<u64> {
+        match self {
+            Self::PackageIndex { request_id, .. }
+            | Self::Binding { request_id, .. }
+            | Self::DispatchGenerics { request_id, .. }
+            | Self::DataLibrary { request_id, .. }
+            | Self::Payloads { request_id, .. }
+            | Self::SyntaxValidation { request_id, .. }
+            | Self::NormalizedSyntax { request_id, .. } => Some(*request_id),
+            Self::Hello { .. } | Self::Error { .. } | Self::Shutdown => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerFailure {
     pub request_id: Option<u64>,
@@ -229,6 +244,28 @@ pub struct WorkerFailure {
     pub code: WorkerErrorCode,
     pub message: String,
     pub captured_output: Vec<String>,
+}
+
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({:?}) for ", self.code)?;
+        match &self.package {
+            Some(package) => write!(
+                f,
+                "{} {} {}",
+                package.name, package.version, package.image_fingerprint
+            )?,
+            None => f.write_str("target")?,
+        }
+        if let Some(binding) = &self.binding {
+            write!(f, "::{binding}")?;
+        }
+        write!(f, ": {}", self.message)?;
+        if !self.captured_output.is_empty() {
+            write!(f, "; R output: {}", self.captured_output.join(" | "))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

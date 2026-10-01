@@ -118,21 +118,44 @@ impl WorkerClient {
         }
     }
 
+    fn call<T>(
+        &mut self,
+        operation: &str,
+        request: impl FnOnce(u64) -> WorkerRequest,
+        pick: impl FnOnce(WorkerResponse) -> Option<T>,
+    ) -> Result<T> {
+        let request_id = self.next_request;
+        self.next_request = self.next_request.wrapping_add(1);
+        let response = self.exchange(&request(request_id))?;
+        if matches!(response, WorkerResponse::Error { .. }) {
+            return Err(worker_error(operation, response));
+        }
+        match response.request_id() {
+            Some(id) if id == request_id => pick(response),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            Error::Analysis(format!(
+                "Harp worker returned an unexpected {operation} response"
+            ))
+        })
+    }
+
     pub(crate) fn package_index(
         &mut self,
         package: &InstalledPackage,
     ) -> Result<WorkerPackageIndex> {
-        let request_id = self.request_id();
-        match self.exchange(&WorkerRequest::PackageIndex {
-            request_id,
-            package: package_spec(package),
-        })? {
-            WorkerResponse::PackageIndex {
-                request_id: response_id,
-                index,
-            } if response_id == request_id => Ok(index),
-            response => Err(worker_error("package index", response)),
-        }
+        self.call(
+            "package index",
+            |request_id| WorkerRequest::PackageIndex {
+                request_id,
+                package: package_spec(package),
+            },
+            |response| match response {
+                WorkerResponse::PackageIndex { index, .. } => Some(index),
+                _ => None,
+            },
+        )
     }
 
     pub(crate) fn binding(
@@ -140,18 +163,20 @@ impl WorkerClient {
         package: &InstalledPackage,
         name: &str,
     ) -> Result<WorkerBinding> {
-        let request_id = self.request_id();
-        match self.exchange(&WorkerRequest::Binding {
-            request_id,
-            package: package_spec(package),
-            name: name.into(),
-        })? {
-            WorkerResponse::Binding {
-                request_id: response_id,
-                binding,
-            } if response_id == request_id && binding.binding.name == name => Ok(binding),
-            response => Err(worker_error("binding", response)),
-        }
+        self.call(
+            "binding",
+            |request_id| WorkerRequest::Binding {
+                request_id,
+                package: package_spec(package),
+                name: name.into(),
+            },
+            |response| match response {
+                WorkerResponse::Binding { binding, .. } if binding.binding.name == name => {
+                    Some(binding)
+                }
+                _ => None,
+            },
+        )
     }
 
     pub(crate) fn dispatch_generics(
@@ -159,18 +184,18 @@ impl WorkerClient {
         package: Option<&InstalledPackage>,
         name: &str,
     ) -> Result<Vec<String>> {
-        let request_id = self.request_id();
-        match self.exchange(&WorkerRequest::DispatchGenerics {
-            request_id,
-            package: package.map(package_spec),
-            name: name.into(),
-        })? {
-            WorkerResponse::DispatchGenerics {
-                request_id: response_id,
-                generics,
-            } if response_id == request_id => Ok(generics),
-            response => Err(worker_error("dispatch generics", response)),
-        }
+        self.call(
+            "dispatch generics",
+            |request_id| WorkerRequest::DispatchGenerics {
+                request_id,
+                package: package.map(package_spec),
+                name: name.into(),
+            },
+            |response| match response {
+                WorkerResponse::DispatchGenerics { generics, .. } => Some(generics),
+                _ => None,
+            },
+        )
     }
 
     pub(crate) fn data_library(
@@ -179,19 +204,19 @@ impl WorkerClient {
         objects: Vec<DatasetName>,
         sets: BTreeMap<DataSetName, Vec<DatasetName>>,
     ) -> Result<DataLibraryFiles> {
-        let request_id = self.request_id();
-        match self.exchange(&WorkerRequest::DataLibrary {
-            request_id,
-            package,
-            objects,
-            sets,
-        })? {
-            WorkerResponse::DataLibrary {
-                request_id: response_id,
-                library,
-            } if response_id == request_id => Ok(library),
-            response => Err(worker_error("data library", response)),
-        }
+        self.call(
+            "data library",
+            |request_id| WorkerRequest::DataLibrary {
+                request_id,
+                package,
+                objects,
+                sets,
+            },
+            |response| match response {
+                WorkerResponse::DataLibrary { library, .. } => Some(library),
+                _ => None,
+            },
+        )
     }
 
     pub(crate) fn serialize_payloads(
@@ -199,7 +224,6 @@ impl WorkerClient {
         namespaces: Vec<NamespaceImageSpec>,
         payloads: Vec<PayloadSpec>,
     ) -> Result<PayloadSerialization> {
-        let request_id = self.request_id();
         let names = payloads
             .iter()
             .map(|payload| payload.names.clone())
@@ -209,35 +233,58 @@ impl WorkerClient {
                 .get(site.payload)
                 .is_some_and(|names| names.contains(&site.binding))
         };
-        match self.exchange(&WorkerRequest::SerializePayloads {
-            request_id,
-            namespaces,
-            payloads,
-        })? {
-            WorkerResponse::Payloads {
-                request_id: response_id,
-                serialization,
-            } if response_id == request_id
-                && match &serialization {
-                    PayloadSerialization::Serialized { bundles } => bundles.len() == names.len(),
-                    PayloadSerialization::SharedIdentity { first, second } => {
-                        first.payload != second.payload && reaches(first) && reaches(second)
-                    }
-                } =>
-            {
-                Ok(serialization)
+        self.call(
+            "payload serialization",
+            |request_id| WorkerRequest::SerializePayloads {
+                request_id,
+                namespaces,
+                payloads,
+            },
+            |response| match response {
+                WorkerResponse::Payloads { serialization, .. }
+                    if match &serialization {
+                        PayloadSerialization::Serialized { bundles } => {
+                            bundles.len() == names.len()
+                        }
+                        PayloadSerialization::SharedIdentity { first, second } => {
+                            first.payload != second.payload && reaches(first) && reaches(second)
+                        }
+                    } =>
+                {
+                    Some(serialization)
+                }
+                _ => None,
+            },
+        )
+    }
+
+    fn syntax_verdict(
+        &mut self,
+        operation: &str,
+        request: impl FnOnce(u64) -> WorkerRequest,
+    ) -> Result<SyntaxValidation> {
+        self.call(operation, request, |response| match response {
+            WorkerResponse::SyntaxValidation { accepted: true, .. } => {
+                Some(SyntaxValidation::Accepted)
             }
-            response => Err(worker_error("payload serialization", response)),
-        }
+            WorkerResponse::SyntaxValidation {
+                accepted: false,
+                message,
+                ..
+            } => Some(SyntaxValidation::Rejected(
+                message.unwrap_or_else(|| format!("target R rejected {operation}")),
+            )),
+            _ => None,
+        })
     }
 
     pub(crate) fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation> {
-        let request_id = self.request_id();
-        let response = self.exchange(&WorkerRequest::ValidateSyntax {
-            request_id,
-            source: source.to_owned(),
-        })?;
-        syntax_verdict(request_id, response, "syntax validation")
+        self.syntax_verdict("syntax validation", |request_id| {
+            WorkerRequest::ValidateSyntax {
+                request_id,
+                source: source.to_owned(),
+            }
+        })
     }
 
     pub(crate) fn verify_relocation(
@@ -246,39 +293,35 @@ impl WorkerClient {
         rewritten: &str,
         sites: Vec<RelocationSiteSpec>,
     ) -> Result<SyntaxValidation> {
-        let request_id = self.request_id();
-        let response = self.exchange(&WorkerRequest::VerifyRelocation {
-            request_id,
-            original: original.to_owned(),
-            rewritten: rewritten.to_owned(),
-            sites,
-        })?;
-        syntax_verdict(request_id, response, "relocation verification")
+        self.syntax_verdict("relocation verification", |request_id| {
+            WorkerRequest::VerifyRelocation {
+                request_id,
+                original: original.to_owned(),
+                rewritten: rewritten.to_owned(),
+                sites,
+            }
+        })
     }
 
     pub(crate) fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
-        let request_id = self.request_id();
-        match self.exchange(&WorkerRequest::NormalizeSyntax {
-            request_id,
-            source: source.to_owned(),
-        })? {
-            WorkerResponse::NormalizedSyntax {
-                request_id: response_id,
-                source,
-                stable,
-            } if response_id == request_id => Ok(if stable {
-                CanonicalSyntax::Stable(source)
-            } else {
-                CanonicalSyntax::Unstable
-            }),
-            response => Err(worker_error("syntax normalization", response)),
-        }
-    }
-
-    fn request_id(&mut self) -> u64 {
-        let request = self.next_request;
-        self.next_request = self.next_request.wrapping_add(1);
-        request
+        self.call(
+            "syntax normalization",
+            |request_id| WorkerRequest::NormalizeSyntax {
+                request_id,
+                source: source.to_owned(),
+            },
+            |response| match response {
+                WorkerResponse::NormalizedSyntax {
+                    source,
+                    stable: true,
+                    ..
+                } => Some(CanonicalSyntax::Stable(source)),
+                WorkerResponse::NormalizedSyntax { stable: false, .. } => {
+                    Some(CanonicalSyntax::Unstable)
+                }
+                _ => None,
+            },
+        )
     }
 
     fn exchange(&mut self, request: &WorkerRequest) -> Result<WorkerResponse> {
@@ -508,53 +551,11 @@ fn package_spec(package: &InstalledPackage) -> PackageSpec {
     }
 }
 
-fn syntax_verdict(
-    request_id: u64,
-    response: WorkerResponse,
-    operation: &str,
-) -> Result<SyntaxValidation> {
-    match response {
-        WorkerResponse::SyntaxValidation {
-            request_id: response_id,
-            accepted: true,
-            message: _,
-        } if response_id == request_id => Ok(SyntaxValidation::Accepted),
-        WorkerResponse::SyntaxValidation {
-            request_id: response_id,
-            accepted: false,
-            message,
-        } if response_id == request_id => {
-            Ok(SyntaxValidation::Rejected(message.unwrap_or_else(|| {
-                format!("target R rejected {operation}")
-            })))
-        }
-        response => Err(worker_error(operation, response)),
-    }
-}
-
 fn worker_error(operation: &str, response: WorkerResponse) -> Error {
     match response {
-        WorkerResponse::Error { error } => Error::Analysis(format!(
-            "Harp worker {operation} failed ({:?}) for {}{}: {}{}",
-            error.code,
-            error.package.as_ref().map_or_else(
-                || "target".into(),
-                |package| format!(
-                    "{} {} {}",
-                    package.name, package.version, package.image_fingerprint
-                )
-            ),
-            error
-                .binding
-                .as_ref()
-                .map_or_else(String::new, |binding| format!("::{binding}")),
-            error.message,
-            if error.captured_output.is_empty() {
-                String::new()
-            } else {
-                format!("; R output: {}", error.captured_output.join(" | "))
-            }
-        )),
+        WorkerResponse::Error { error } => {
+            Error::Analysis(format!("Harp worker {operation} failed {error}"))
+        }
         response => Error::Analysis(format!(
             "Harp worker returned unexpected {operation} response: {response:?}"
         )),

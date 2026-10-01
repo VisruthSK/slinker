@@ -158,37 +158,14 @@ pub(super) fn last_top_level_expression(
 }
 
 pub(super) fn identifier_occurs_before(text: &str, name: &str, end: usize) -> bool {
-    let bytes = text.as_bytes();
-    let mut cursor = 0;
-    let mut quote = None;
-    while cursor < end.min(bytes.len()) {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(end);
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, end),
-            _ if text
-                .get(cursor..end)
-                .is_some_and(|rest| rest.starts_with(name))
-                && word_boundary_before(text, cursor)
-                && word_boundary_after(text, cursor + name.len()) =>
-            {
-                return true;
-            }
-            _ => cursor += text[cursor..].chars().next().map_or(1, char::len_utf8),
+    for (cursor, _) in CodeScanner::new(text, 0, end) {
+        if text
+            .get(cursor..end)
+            .is_some_and(|rest| rest.starts_with(name))
+            && word_boundary_before(text, cursor)
+            && word_boundary_after(text, cursor + name.len())
+        {
+            return true;
         }
     }
     false
@@ -196,49 +173,24 @@ pub(super) fn identifier_occurs_before(text: &str, name: &str, end: usize) -> bo
 
 pub(super) fn function_body_range(text: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
-    let mut cursor = 0;
-    let mut quote = None;
-    while cursor < bytes.len() {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
+    let mut scanner = CodeScanner::new(text, 0, bytes.len());
+    while let Some((cursor, _)) = scanner.next() {
+        if !keyword_at(text, cursor, "function") {
             continue;
         }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, bytes.len()),
-            b'f' if text
-                .get(cursor..)
-                .is_some_and(|rest| rest.starts_with("function"))
-                && word_boundary_before(text, cursor)
-                && word_boundary_after(text, cursor + "function".len()) =>
-            {
-                let open = skip_trivia(text, cursor + "function".len());
-                if bytes.get(open).copied() != Some(b'(') {
-                    cursor += "function".len();
-                    continue;
-                }
-                let close = matching_delimiter(text, open)?;
-                let body_start = skip_trivia(text, close + 1);
-                if bytes.get(body_start).copied() == Some(b'{') {
-                    let body_close = matching_delimiter(text, body_start)?;
-                    return Some((body_start, body_close + 1));
-                }
-                let body_end = expression_end(text, body_start);
-                return Some((body_start, body_end));
-            }
-            _ => cursor += 1,
+        let after_keyword = cursor + "function".len();
+        let open = skip_trivia(text, after_keyword);
+        if bytes.get(open).copied() != Some(b'(') {
+            scanner.skip_to(after_keyword);
+            continue;
         }
+        let close = matching_delimiter(text, open)?;
+        let body_start = skip_trivia(text, close + 1);
+        if bytes.get(body_start).copied() == Some(b'{') {
+            let body_close = matching_delimiter(text, body_start)?;
+            return Some((body_start, body_close + 1));
+        }
+        return Some((body_start, expression_end(text, body_start)));
     }
     None
 }
@@ -564,49 +516,18 @@ pub(super) fn quoted_end(text: &str, start: usize) -> Option<usize> {
 }
 
 pub(super) fn matching_delimiter(text: &str, open: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let opener = *bytes.get(open)?;
-    let expected = match opener {
+    let expected = match *text.as_bytes().get(open)? {
         b'(' => b')',
         b'[' => b']',
         b'{' => b'}',
         _ => return None,
     };
     let mut stack = vec![expected];
-    let mut quote = None;
-    let mut cursor = open + 1;
-
-    while cursor < bytes.len() {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor += 2;
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
+    for (cursor, byte) in CodeScanner::new(text, open + 1, text.len()) {
         match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, bytes.len()),
-            b'(' => {
-                stack.push(b')');
-                cursor += 1;
-            }
-            b'[' => {
-                stack.push(b']');
-                cursor += 1;
-            }
-            b'{' => {
-                stack.push(b'}');
-                cursor += 1;
-            }
+            b'(' => stack.push(b')'),
+            b'[' => stack.push(b']'),
+            b'{' => stack.push(b'}'),
             b')' | b']' | b'}' => {
                 if stack.pop()? != byte {
                     return None;
@@ -614,9 +535,8 @@ pub(super) fn matching_delimiter(text: &str, open: usize) -> Option<usize> {
                 if stack.is_empty() {
                     return Some(cursor);
                 }
-                cursor += 1;
             }
-            _ => cursor += 1,
+            _ => {}
         }
     }
     None
@@ -625,58 +545,25 @@ pub(super) fn matching_delimiter(text: &str, open: usize) -> Option<usize> {
 pub(super) fn find_function_regions(text: &str) -> Vec<FunctionRegion> {
     let mut regions = Vec::new();
     let bytes = text.as_bytes();
-    let mut cursor = 0;
-    let mut quote = None;
-
-    while cursor < bytes.len() {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
+    let mut scanner = CodeScanner::new(text, 0, bytes.len());
+    while let Some((cursor, byte)) = scanner.next() {
+        let keyword = byte == b'f' && keyword_at(text, cursor, "function");
+        if !keyword && byte != b'\\' {
             continue;
         }
-
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, bytes.len()),
-            b'f' if text
-                .get(cursor..)
-                .is_some_and(|rest| rest.starts_with("function"))
-                && word_boundary_before(text, cursor)
-                && word_boundary_after(text, cursor + "function".len()) =>
-            {
-                let open = skip_trivia(text, cursor + "function".len());
-                if bytes.get(open).copied() != Some(b'(') {
-                    cursor += "function".len();
-                    continue;
-                }
-                if let Some(region) = function_region_after_open(text, cursor, open) {
-                    regions.push(region);
-                }
-                cursor += "function".len();
-            }
-            b'\\' => {
-                let open = skip_trivia(text, cursor + 1);
-                if bytes.get(open).copied() == Some(b'(')
-                    && let Some(region) = function_region_after_open(text, cursor, open)
-                {
-                    regions.push(region);
-                }
-                cursor += 1;
-            }
-            _ => cursor += text[cursor..].chars().next().map_or(1, char::len_utf8),
+        let after_introducer = if keyword {
+            cursor + "function".len()
+        } else {
+            cursor + 1
+        };
+        let open = skip_trivia(text, after_introducer);
+        if bytes.get(open).copied() == Some(b'(')
+            && let Some(region) = function_region_after_open(text, cursor, open)
+        {
+            regions.push(region);
         }
+        scanner.skip_to(after_introducer);
     }
-
     regions
 }
 
@@ -709,80 +596,42 @@ pub(super) fn function_region_after_open(
 
 pub(super) fn find_for_regions(text: &str) -> Vec<ForRegion> {
     let mut regions = Vec::new();
-    let bytes = text.as_bytes();
-    let mut cursor = 0;
-    let mut quote = None;
-
-    while cursor < bytes.len() {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
+    let mut scanner = CodeScanner::new(text, 0, text.len());
+    while let Some((cursor, _)) = scanner.next() {
+        if !keyword_at(text, cursor, "for") {
             continue;
         }
-
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, bytes.len()),
-            b'f' if text
-                .get(cursor..)
-                .is_some_and(|rest| rest.starts_with("for"))
-                && word_boundary_before(text, cursor)
-                && word_boundary_after(text, cursor + 3) =>
-            {
-                let open = skip_trivia(text, cursor + 3);
-                if bytes.get(open).copied() != Some(b'(') {
-                    cursor += 3;
-                    continue;
-                }
-                let Some(close) = matching_delimiter(text, open) else {
-                    cursor += 3;
-                    continue;
-                };
-                let variable_start = skip_trivia_bounded(text, open + 1, close);
-                let Some(variable_end) = name_token_end(text, variable_start) else {
-                    cursor += 3;
-                    continue;
-                };
-                let Some(variable) = text
-                    .get(variable_start..variable_end)
-                    .and_then(static_symbol)
-                else {
-                    cursor += 3;
-                    continue;
-                };
-                let in_start = skip_trivia_bounded(text, variable_end, close);
-                if !text
-                    .get(in_start..close)
-                    .is_some_and(|rest| rest.starts_with("in"))
-                    || !word_boundary_after(text, in_start + 2)
-                {
-                    cursor += 3;
-                    continue;
-                }
-                let body_start = skip_trivia(text, close + 1);
-                let body_end = expression_end(text, body_start);
-                regions.push(ForRegion {
-                    variable,
-                    variable_start,
-                    body: TextRange::new(body_start, body_end),
-                });
-                cursor += 3;
-            }
-            _ => cursor += text[cursor..].chars().next().map_or(1, char::len_utf8),
-        }
+        scanner.skip_to(cursor + 3);
+        regions.extend(for_region_at(text, cursor));
     }
-
     regions
+}
+
+fn for_region_at(text: &str, start: usize) -> Option<ForRegion> {
+    let open = skip_trivia(text, start + 3);
+    if text.as_bytes().get(open).copied() != Some(b'(') {
+        return None;
+    }
+    let close = matching_delimiter(text, open)?;
+    let variable_start = skip_trivia_bounded(text, open + 1, close);
+    let variable_end = name_token_end(text, variable_start)?;
+    let variable = text
+        .get(variable_start..variable_end)
+        .and_then(static_symbol)?;
+    let in_start = skip_trivia_bounded(text, variable_end, close);
+    if !text
+        .get(in_start..close)
+        .is_some_and(|rest| rest.starts_with("in"))
+        || !word_boundary_after(text, in_start + 2)
+    {
+        return None;
+    }
+    let body_start = skip_trivia(text, close + 1);
+    Some(ForRegion {
+        variable,
+        variable_start,
+        body: TextRange::new(body_start, expression_end(text, body_start)),
+    })
 }
 
 pub(super) fn find_if_regions(text: &str) -> Vec<IfRegion> {
@@ -795,69 +644,40 @@ pub(super) fn first_if_region(text: &str) -> Option<IfRegion> {
 
 pub(super) fn scan_if_regions(text: &str, limit: usize) -> Vec<IfRegion> {
     let mut regions = Vec::new();
-    let bytes = text.as_bytes();
-    let mut cursor = 0;
-    let mut quote = None;
-    while cursor < bytes.len() && regions.len() < limit {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor += 2;
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
+    let mut scanner = CodeScanner::new(text, 0, text.len());
+    while regions.len() < limit
+        && let Some((cursor, _)) = scanner.next()
+    {
+        if !keyword_at(text, cursor, "if") {
             continue;
         }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, bytes.len()),
-            b'i' if text
-                .get(cursor..)
-                .is_some_and(|rest| rest.starts_with("if"))
-                && word_boundary_before(text, cursor)
-                && word_boundary_after(text, cursor + 2) =>
-            {
-                let open = skip_trivia(text, cursor + 2);
-                if bytes.get(open).copied() != Some(b'(') {
-                    cursor += 2;
-                    continue;
-                }
-                let Some(close) = matching_delimiter(text, open) else {
-                    cursor += 2;
-                    continue;
-                };
-                let then_start = skip_trivia(text, close + 1);
-                let then_end = expression_end(text, then_start);
-                let after_then = skip_trivia(text, then_end);
-                let else_branch = if text
-                    .get(after_then..)
-                    .is_some_and(|rest| rest.starts_with("else"))
-                    && word_boundary_after(text, after_then + 4)
-                {
-                    let start = skip_trivia(text, after_then + 4);
-                    let end = expression_end(text, start);
-                    Some(TextRange::new(start, end))
-                } else {
-                    None
-                };
-                regions.push(IfRegion {
-                    if_start: cursor,
-                    condition: TextRange::new(open + 1, close),
-                    then_branch: TextRange::new(then_start, then_end),
-                    else_branch,
-                });
-                cursor += 2;
-            }
-            _ => cursor += 1,
-        }
+        scanner.skip_to(cursor + 2);
+        regions.extend(if_region_at(text, cursor));
     }
     regions
+}
+
+fn if_region_at(text: &str, start: usize) -> Option<IfRegion> {
+    let open = skip_trivia(text, start + 2);
+    if text.as_bytes().get(open).copied() != Some(b'(') {
+        return None;
+    }
+    let close = matching_delimiter(text, open)?;
+    let then_start = skip_trivia(text, close + 1);
+    let then_end = expression_end(text, then_start);
+    let after_then = skip_trivia(text, then_end);
+    let else_branch = if keyword_at(text, after_then, "else") {
+        let start = skip_trivia(text, after_then + 4);
+        Some(TextRange::new(start, expression_end(text, start)))
+    } else {
+        None
+    };
+    Some(IfRegion {
+        if_start: start,
+        condition: TextRange::new(open + 1, close),
+        then_branch: TextRange::new(then_start, then_end),
+        else_branch,
+    })
 }
 
 pub(super) fn expression_end(text: &str, start: usize) -> usize {
@@ -1004,4 +824,67 @@ pub(super) fn word_boundary_after(text: &str, position: usize) -> bool {
         .is_none_or(|character| {
             !(character.is_alphanumeric() || character == '.' || character == '_')
         })
+}
+
+pub(super) struct CodeScanner<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    end: usize,
+    quote: Option<u8>,
+}
+
+impl<'a> CodeScanner<'a> {
+    pub(super) fn new(text: &'a str, start: usize, end: usize) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            cursor: start,
+            end: end.min(text.len()),
+            quote: None,
+        }
+    }
+
+    pub(super) fn skip_to(&mut self, position: usize) {
+        self.cursor = self.cursor.max(position);
+    }
+}
+
+impl Iterator for CodeScanner<'_> {
+    type Item = (usize, u8);
+
+    fn next(&mut self) -> Option<(usize, u8)> {
+        while self.cursor < self.end {
+            let position = self.cursor;
+            let byte = self.bytes[position];
+            if let Some(delimiter) = self.quote {
+                self.cursor += if byte == b'\\' { 2 } else { 1 };
+                if byte == delimiter {
+                    self.quote = None;
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' | b'`' => {
+                    self.quote = Some(byte);
+                    self.cursor += 1;
+                }
+                b'#' => {
+                    while self.cursor < self.end && self.bytes[self.cursor] != b'\n' {
+                        self.cursor += 1;
+                    }
+                }
+                _ => {
+                    self.cursor += 1;
+                    return Some((position, byte));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn keyword_at(text: &str, position: usize, keyword: &str) -> bool {
+    text.get(position..)
+        .is_some_and(|rest| rest.starts_with(keyword))
+        && word_boundary_before(text, position)
+        && word_boundary_after(text, position + keyword.len())
 }

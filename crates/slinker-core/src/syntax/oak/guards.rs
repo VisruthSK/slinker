@@ -1,6 +1,6 @@
 use super::context::OakParseContext;
 use super::proofs::is_base_call;
-use super::scan::{IfRegion, skip_comment};
+use super::scan::{CodeScanner, IfRegion};
 use super::{LiveCall, static_first_string};
 use crate::syntax::facts::{NameRef, PackageGuard, PackageRef, StaticArg, SyntaxEffect};
 use crate::syntax::source::TextRange;
@@ -137,33 +137,7 @@ pub(super) fn hook_guard_regions(
 }
 
 pub(super) fn condition_contains_or(text: &str, start: usize, end: usize) -> bool {
-    let bytes = text.as_bytes();
-    let mut cursor = start;
-    let mut quote = None;
-    while cursor < end {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor += 2;
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, end),
-            b'|' => return true,
-            _ => cursor += 1,
-        }
-    }
-    false
+    CodeScanner::new(text, start, end).any(|(_, byte)| byte == b'|')
 }
 
 pub(super) fn directly_negated(text: &str, condition_start: usize, call_start: usize) -> bool {
