@@ -9,6 +9,7 @@ use crate::package::{
     BindingName, ClosureSource, EnvironmentLabel, MemberPath, PackageId, PackageImage,
     PackageProvider,
 };
+use crate::profile::{self, Counter, Probe};
 use crate::syntax::{
     ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
     ConstructionTarget, ParsedRFile, SourceKey, Span,
@@ -339,13 +340,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if namespace.is_none() || graph.environment_of(object) != namespace {
             return;
         }
-        if context
-            .image
-            .index
-            .binding_names
-            .iter()
-            .any(|binding| binding == name)
-        {
+        if context.image.index.binding_names.contains(name) {
             self.require(
                 context.node,
                 Need::Binding {
@@ -594,6 +589,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         private_environment: Option<&EnvironmentLabel>,
         binding: &BindingName,
     ) -> Result<ExecutionOutcome> {
+        let _span = profile::span(Probe::EvaluateInstalledFunction);
         let Some((closure, owner)) = installed_closure(context.image, private_environment, binding)
         else {
             return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
@@ -613,11 +609,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .collect(),
         };
         if let Some(value) = self.construction_calls.get(&memo) {
+            profile::count(Counter::ConstructionMemoHits);
             return Ok(ExecutionOutcome::value(value.clone()));
         }
         self.construction_calls
             .insert(memo.clone(), AbstractValue::Unknown);
         self.construction_evaluations += 1;
+        profile::count(Counter::ConstructionEvaluations);
         let Some(parsed) = self.parsed_source(
             context.package,
             &closure.source,

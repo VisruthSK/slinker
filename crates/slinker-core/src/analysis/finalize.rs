@@ -285,6 +285,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let LoadedPackage {
                 image,
                 namespace: namespace_builder,
+                ..
             } = self.loaded_ref(package)?;
             let namespace_label = EnvironmentLabel::namespace(package_name);
             let mut names = retained_bindings.remove(&package).unwrap_or_default();

@@ -221,7 +221,11 @@ fn main() -> ExitCode {
             .stack_size(ANALYSIS_STACK_BYTES)
             .spawn(move || {
                 let format = command.format();
-                report(run(command), format)
+                let code = report(run(command), format);
+                if let Some(summary) = slinker_core::profile::report() {
+                    eprint!("{summary}");
+                }
+                code
             })
             .expect("spawn the slinker command thread")
             .join()

@@ -285,7 +285,7 @@ impl PackageStore {
             lifecycle: LifecycleMetadata {
                 on_load: worker.on_load,
             },
-            binding_names: worker.binding_names,
+            binding_names: worker.binding_names.into(),
             data: PackageData::new(worker.data_sets, worker.data_storage),
             files: Vec::new(),
             has_sysdata: worker.has_sysdata,
@@ -302,10 +302,7 @@ impl PackageStore {
         if identity.name != worker.package_name
             || worker.package_version != identity.version.to_string()
             || worker.image_fingerprint != identity.image_fingerprint
-            || !index
-                .binding_names
-                .iter()
-                .any(|name| name == &worker.binding.name)
+            || !index.binding_names.contains(&worker.binding.name)
         {
             return Err(Error::Analysis(format!(
                 "worker returned unindexed binding {}::{}",
@@ -543,7 +540,7 @@ mod tests {
     use super::*;
     use crate::Description;
     use crate::package::{
-        BindingImage, BindingOrigin, BindingRepresentation, ClosureSource, Digest,
+        BindingImage, BindingNames, BindingOrigin, BindingRepresentation, ClosureSource, Digest,
         LifecycleMetadata, NativeComponent, NativeLibrary, ObjectImage, ObjectKind,
     };
 
@@ -567,7 +564,7 @@ mod tests {
                 safety: NativeSafety::Unanalyzed,
             }],
             lifecycle: LifecycleMetadata::default(),
-            binding_names: Vec::new(),
+            binding_names: BindingNames::default(),
             data: PackageData::default(),
             files: Vec::new(),
             has_sysdata: false,

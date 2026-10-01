@@ -4,6 +4,7 @@ use super::execute::{AbstractValue, ConstructionCallKey};
 use super::guards::DeclaredDependencies;
 use super::invocation::InvocationModel;
 use super::namespace::NamespaceBuilder;
+use super::native::NativeBindingIndex;
 use super::need::{NeedQueue, Popped};
 use super::object_world::ObjectWorld;
 use super::parse_cache::{ParseCache, ParseKey};
@@ -16,6 +17,7 @@ use crate::package::{
     BindingName, ClosureSource, ComponentName, EnvironmentLabel, GenericLabel, PackageId,
     PackageImage, PackageName, PackageProvider, TargetUniverse,
 };
+use crate::profile::{self, Counter, Probe};
 use crate::syntax::{
     CallSite, NamespaceImports, OakParseContext, OakParser, ParsedRFile, SourceId, SourceKey, Span,
 };
@@ -114,6 +116,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
 pub(super) struct LoadedPackage {
     pub(super) image: Arc<PackageImage>,
     pub(super) namespace: NamespaceBuilder,
+    pub(super) native_bindings: NativeBindingIndex,
 }
 
 pub(super) struct NativeCallTarget {
@@ -251,6 +254,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Ok(entry.insert(LoadedPackage {
                     image,
                     namespace: NamespaceBuilder::new(&index),
+                    native_bindings: NativeBindingIndex::new(&index),
                 }))
             }
         }
@@ -265,10 +269,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         binding: &str,
     ) -> Result<Arc<PackageImage>> {
+        let _span = profile::span(Probe::BindingImage);
         let image = self.image(package)?;
-        if image.binding(binding).is_some()
-            || !image.index.binding_names.iter().any(|name| name == binding)
-        {
+        if image.binding(binding).is_some() || !image.index.binding_names.contains(binding) {
             return Ok(image);
         }
         let partial = self.packages.binding_image(package, binding)?;
@@ -318,6 +321,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn preparse_frontier_bindings(&mut self, frontier: usize) -> Result<()> {
+        let _span = profile::span(Probe::Preparse);
         struct Work {
             key: ParseKey,
             owner: SourceKey,
@@ -491,6 +495,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn process_need(&mut self, need: Need) -> Result<()> {
+        let _span = profile::span(Probe::ProcessNeed);
+        profile::count(Counter::NeedsStarted);
         match need {
             Need::Binding { package, binding } => self.process_binding(package, &binding),
             Need::PrivateBinding {

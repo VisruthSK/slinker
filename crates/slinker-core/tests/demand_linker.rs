@@ -344,7 +344,7 @@ impl<'a> PackageFixture<'a> {
                 s3: self.s3,
                 dynlibs: self.dynlibs,
                 lifecycle: LifecycleMetadata::default(),
-                binding_names,
+                binding_names: binding_names.into(),
                 data: PackageData::default(),
                 files: self.files,
                 has_sysdata: false,

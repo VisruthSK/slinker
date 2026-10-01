@@ -4,7 +4,7 @@ use crate::package::{
     PackageIdentity, PackageName, ResourcePath, SymbolName,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub type ExportMap = BTreeMap<ExportName, BindingName>;
 
@@ -255,7 +255,7 @@ pub struct PackageIndex {
     pub s3: Vec<S3Registration>,
     pub dynlibs: Vec<NativeComponent>,
     pub lifecycle: LifecycleMetadata,
-    pub binding_names: Vec<BindingName>,
+    pub binding_names: BindingNames,
     pub data: PackageData,
     pub files: Vec<String>,
     pub has_sysdata: bool,
@@ -270,5 +270,52 @@ impl PackageIndex {
                 .map(|binding| (package.as_str(), binding.remote.as_str())),
             ImportSpec::All { .. } => None,
         })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BindingNames {
+    ordered: Vec<BindingName>,
+    members: HashSet<BindingName>,
+}
+
+impl BindingNames {
+    pub fn contains(&self, name: &str) -> bool {
+        self.members.contains(name)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, BindingName> {
+        self.ordered.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ordered.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ordered.is_empty()
+    }
+}
+
+impl FromIterator<BindingName> for BindingNames {
+    fn from_iter<I: IntoIterator<Item = BindingName>>(names: I) -> Self {
+        let ordered = names.into_iter().collect::<Vec<_>>();
+        let members = ordered.iter().cloned().collect();
+        Self { ordered, members }
+    }
+}
+
+impl From<Vec<BindingName>> for BindingNames {
+    fn from(names: Vec<BindingName>) -> Self {
+        names.into_iter().collect()
+    }
+}
+
+impl<'a> IntoIterator for &'a BindingNames {
+    type Item = &'a BindingName;
+    type IntoIter = std::slice::Iter<'a, BindingName>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ordered.iter()
     }
 }

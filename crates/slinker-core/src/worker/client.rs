@@ -1,5 +1,6 @@
 use crate::package::SyntaxValidation;
 use crate::package::{CanonicalSyntax, DataSetId, DatasetName, InstalledPackage};
+use crate::profile::{self, Counter, Probe};
 use crate::worker::protocol::WorkerBinding;
 use crate::worker::protocol::WorkerPackageIndex;
 use crate::worker::protocol::{
@@ -72,6 +73,7 @@ impl WorkerClient {
         command.env("LD_LIBRARY_PATH", target_library_path(&r_home)?);
         #[cfg(unix)]
         command.envs(target_resource_directories(&r_home)?);
+        profile::count(Counter::RWorkerStartups);
         let mut child = command.spawn().map_err(|source| Error::Io {
             path: executable,
             source,
@@ -325,9 +327,14 @@ impl WorkerClient {
     }
 
     fn exchange(&mut self, request: &WorkerRequest) -> Result<WorkerResponse> {
+        let _span = profile::span(Probe::WorkerRequest);
         let context = request_context(request);
-        serde_json::to_writer(&mut self.input, request).map_err(|error| {
+        let payload = serde_json::to_vec(request).map_err(|error| {
             Error::Analysis(format!("failed to serialize Harp worker request: {error}"))
+        })?;
+        self.input.write_all(&payload).map_err(|source| Error::Io {
+            path: "<r-worker-stdin>".into(),
+            source,
         })?;
         self.input.write_all(b"\n").map_err(|source| Error::Io {
             path: "<r-worker-stdin>".into(),
@@ -361,6 +368,9 @@ impl WorkerClient {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+        if profile::enabled() {
+            profile::r_request(request_opcode(&payload), payload.len(), line.len());
+        }
         serde_json::from_slice(&line).map_err(|error| {
             Error::Analysis(format!(
                 "invalid Harp worker response: {error}; payload {:?}",
@@ -368,6 +378,19 @@ impl WorkerClient {
             ))
         })
     }
+}
+
+fn request_opcode(payload: &[u8]) -> &str {
+    const PREFIX: &[u8] = br#"{"kind":""#;
+    payload
+        .strip_prefix(PREFIX)
+        .and_then(|rest| {
+            rest.iter()
+                .position(|byte| *byte == b'"')
+                .map(|end| &rest[..end])
+        })
+        .and_then(|name| std::str::from_utf8(name).ok())
+        .unwrap_or("unknown")
 }
 
 fn request_context(request: &WorkerRequest) -> String {

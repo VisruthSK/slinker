@@ -101,8 +101,9 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     pub fn analyze(self, root: &str) -> Result<LinkIr> {
-        AnalyzerState::new(self.packages, root, self.options)?
-            .run()?
-            .finalize()
+        let _span = crate::profile::span(crate::profile::Probe::Analysis);
+        let state = AnalyzerState::new(self.packages, root, self.options)?.run()?;
+        let _finalize = crate::profile::span(crate::profile::Probe::Finalize);
+        state.finalize()
     }
 }

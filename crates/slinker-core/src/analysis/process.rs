@@ -14,6 +14,7 @@ use crate::package::{
     BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource, Digest, ObjectImage,
     ObjectKind, PackageId, PackageImage, PackageProvider, SyntaxValidation,
 };
+use crate::profile::{self, Probe};
 use crate::syntax::{
     ActiveBindingDef, NameRefKind, NamespaceInfoReceiver, OakParser, ParsedExpression, ParsedRFile,
     SemanticIssueKind, SourceId, SourceKey, Span, StaticEnvironment, SyntaxEffect,
@@ -135,7 +136,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .loaded
             .get(&id)
             .is_some_and(|loaded| loaded.namespace.contains(binding))
-            && !image.index.binding_names.iter().any(|name| name == binding)
+            && !image.index.binding_names.contains(binding)
         {
             let lifecycle = self.need_node(&Need::Lifecycle {
                 package: id,
@@ -873,6 +874,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &EnvironmentLabel,
         request: ParseRequest<'_>,
     ) -> Result<Option<Arc<ParsedRFile>>> {
+        let _span = profile::span(Probe::ParsedSource);
         let ParseRequest {
             owner,
             source_key,

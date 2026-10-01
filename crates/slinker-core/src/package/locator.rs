@@ -1,4 +1,5 @@
 use crate::package::{Digest, InstalledPackage, PackageIdentity, PackageLocation};
+use crate::profile::{self, Counter, Probe};
 use crate::{Description, Error, Result, TargetEnvironment};
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File};
@@ -74,6 +75,8 @@ impl PackageLocator {
 }
 
 pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
+    let _span = profile::span(Probe::PackageFingerprint);
+    profile::count(Counter::FingerprintOperations);
     let mut files = Vec::<(String, PathBuf)>::new();
     let mut pending = vec![root.to_path_buf()];
     let io = |path: &Path| {
@@ -102,6 +105,7 @@ pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
     let mut hash = Sha256::new();
     hash.update(b"slinker-installed-image-v2\0");
     let mut buffer = vec![0u8; 128 * 1024];
+    profile::add(Counter::FingerprintFiles, files.len() as u64);
     for (relative, path) in &files {
         hash.update(relative.as_bytes());
         hash.update([0]);
@@ -111,6 +115,7 @@ pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
             if read == 0 {
                 break;
             }
+            profile::add(Counter::FingerprintBytes, read as u64);
             hash.update(&buffer[..read]);
         }
         hash.update([0xff]);

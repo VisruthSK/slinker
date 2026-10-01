@@ -15,10 +15,10 @@ pub use image::{
     PrivateBindingImage, PrivateEnvironmentImage, UnsupportedObject,
 };
 pub use index::{
-    DataStorage, ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NameLookup,
-    NativeComponent, NativeFacts, NativeInterface, NativeLibrary, NativeRegistration,
-    NativeRoutineSummary, NativeRoutines, NativeSafety, NativeSymbolBinding, PackageData,
-    PackageIndex, S3Registration,
+    BindingNames, DataStorage, ExportMap, GenericSpec, ImportBinding, ImportSpec,
+    LifecycleMetadata, NameLookup, NativeComponent, NativeFacts, NativeInterface, NativeLibrary,
+    NativeRegistration, NativeRoutineSummary, NativeRoutines, NativeSafety, NativeSymbolBinding,
+    PackageData, PackageIndex, S3Registration,
 };
 pub use locator::PackageLocator;
 pub(crate) use locator::fingerprint_image;

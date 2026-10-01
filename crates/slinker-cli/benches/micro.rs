@@ -184,7 +184,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
             s3: Vec::new(),
             dynlibs: Vec::new(),
             lifecycle: LifecycleMetadata::default(),
-            binding_names,
+            binding_names: binding_names.into(),
             data: slinker_core::package::PackageData::default(),
             files: Vec::new(),
             has_sysdata: false,

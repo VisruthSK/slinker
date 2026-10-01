@@ -8,6 +8,7 @@ use crate::package::{
     BindingName, ClosureSource, ComponentName, EnvironmentKind, EnvironmentLabel, ImportSpec,
     NativeComponent, PackageId, PackageImage, PackageName, PackageProvider,
 };
+use crate::profile::{self, Probe};
 use crate::syntax::{
     NamespaceImportResolution, NamespaceImports, OakParseContext, SourceKey, Span,
     closure_definitely_non_returning,
@@ -129,6 +130,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         image: &PackageImage,
     ) -> Result<NamespaceImports> {
+        let _span = profile::span(Probe::NamespaceImports);
         if let Some(imports) = self.namespace_imports.get(&package) {
             return Ok(imports.clone());
         }
@@ -203,6 +205,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
     ) -> Result<OakParseContext> {
+        let _span = profile::span(Probe::OakParseContext);
         let mut shadowed =
             self.namespace_shadowed_names(package, image, image.index.binding_names.iter())?;
         let mut private_shadowed = BTreeSet::new();
@@ -268,6 +271,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &EnvironmentLabel,
         name: &str,
     ) -> Result<Resolution> {
+        let _span = profile::span(Probe::ResolveLexicalName);
         let mut environment = lexical_environment.clone();
         let mut seen = HashSet::new();
         loop {
@@ -386,11 +390,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 binding,
             }));
         }
-        if image
-            .index
-            .binding_names
-            .iter()
-            .any(|binding| binding == name)
+        if image.index.binding_names.contains(name)
             || self
                 .loaded
                 .get(&current)
@@ -402,10 +402,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }));
         }
 
-        if let Some(component) = Self::native_component_for_binding(&image.index, name) {
+        if let Some(component) = self.loaded(current)?.native_bindings.sole_component(name) {
             return Ok(Resolution::Static(BindingTarget::Native {
                 package: current,
-                component: component.into(),
+                component: component.clone(),
                 binding: name.into(),
             }));
         }

@@ -9,12 +9,13 @@ use crate::Result;
 use crate::analysis::{EdgeKind, Need, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::EnvironmentLabel;
-use crate::package::NativeComponent;
+use crate::package::{BindingName, ComponentName, NativeComponent};
 use crate::package::{
     NameLookup, NativeInterface, NativeLibrary, NativeRoutineSummary, NativeSafety, PackageId,
     PackageImage, PackageIndex, PackageProvider,
 };
 use crate::syntax::{CallSite, DeclaredCallable, Span, StaticArg};
+use std::collections::HashMap;
 
 struct CallbackSite<'a> {
     node: NodeId,
@@ -415,22 +416,6 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         }
     }
 
-    pub(super) fn native_component_for_binding<'a>(
-        index: &'a PackageIndex,
-        name: &str,
-    ) -> Option<&'a str> {
-        let mut matches = index
-            .dynlibs
-            .iter()
-            .filter(|native| native.bindings().any(|symbol| symbol.binding == name));
-        let first = matches.next()?;
-        if matches.next().is_some() {
-            None
-        } else {
-            Some(first.name.as_str())
-        }
-    }
-
     pub(super) fn native_component_for_call(
         &mut self,
         current: PackageId,
@@ -512,5 +497,33 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         } else {
             Some(first.name.as_str())
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct NativeBindingIndex {
+    owners: HashMap<BindingName, Option<ComponentName>>,
+}
+
+impl NativeBindingIndex {
+    pub(super) fn new(index: &PackageIndex) -> Self {
+        let mut owners = HashMap::<BindingName, Option<ComponentName>>::new();
+        for component in &index.dynlibs {
+            for symbol in component.bindings() {
+                owners
+                    .entry(symbol.binding)
+                    .and_modify(|owner| {
+                        if owner.as_ref() != Some(&component.name) {
+                            *owner = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(component.name.clone()));
+            }
+        }
+        Self { owners }
+    }
+
+    pub(super) fn sole_component(&self, binding: &str) -> Option<&ComponentName> {
+        self.owners.get(binding)?.as_ref()
     }
 }
