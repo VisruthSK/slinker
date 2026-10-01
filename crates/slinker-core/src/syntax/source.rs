@@ -1,4 +1,6 @@
+use crate::package::{BindingName, EnvironmentLabel, MemberPath, PackageName};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,30 +49,36 @@ impl TextRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SourceKey {
-    Binding(String),
+    Binding(BindingName),
     Private {
-        environment: String,
-        binding: String,
+        environment: EnvironmentLabel,
+        binding: BindingName,
     },
     Closure {
         owner: Box<SourceKey>,
-        path: String,
-        environment: String,
+        path: MemberPath,
+        environment: EnvironmentLabel,
     },
-    Runtime,
 }
 
 impl SourceKey {
-    pub fn namespace_binding(&self) -> Option<&str> {
+    pub fn private(environment: EnvironmentLabel, binding: BindingName) -> Self {
+        Self::Private {
+            environment,
+            binding,
+        }
+    }
+
+    pub fn namespace_binding(&self) -> Option<&BindingName> {
         match self {
             Self::Binding(name) => Some(name),
-            Self::Private { .. } | Self::Closure { .. } | Self::Runtime => None,
+            Self::Private { .. } | Self::Closure { .. } => None,
         }
     }
 }
 
-impl std::fmt::Display for SourceKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SourceKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Binding(name) => f.write_str(name),
             Self::Private {
@@ -82,20 +90,19 @@ impl std::fmt::Display for SourceKey {
                 path,
                 environment,
             } => write!(f, "{owner}{path}@{environment}"),
-            Self::Runtime => f.write_str("runtime"),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceOrigin {
-    pub package: String,
+    pub package: PackageName,
     pub key: SourceKey,
 }
 
-impl SourceOrigin {
-    pub fn display(&self) -> String {
-        format!("{}::{}", self.package, self.key)
+impl fmt::Display for SourceOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}::{}", self.package, self.key)
     }
 }
 
@@ -113,7 +120,7 @@ pub struct Sources {
 impl Sources {
     pub fn add(
         &mut self,
-        package: impl Into<String>,
+        package: impl Into<PackageName>,
         key: SourceKey,
         text: impl Into<Arc<str>>,
     ) -> SourceId {
@@ -140,16 +147,12 @@ impl Sources {
         self.entries.get(id.0)
     }
 
-    pub fn display(&self, id: &SourceId) -> String {
-        self.origin(id).display()
-    }
-
     pub fn location(&self, span: &Span) -> Option<SourceLocation> {
         let entry = self.get(&span.source)?;
         let before = entry.text.get(..span.start)?;
         let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
         Some(SourceLocation {
-            source: entry.origin.display(),
+            source: entry.origin.to_string(),
             line: before.matches('\n').count() + 1,
             column: before[line_start..].chars().count() + 1,
         })

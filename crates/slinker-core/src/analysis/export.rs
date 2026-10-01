@@ -90,7 +90,7 @@ pub(crate) fn root_identity(
     Ok(PackageIdentityExport {
         name: root_package.name.to_string(),
         version: root_package.version.to_string(),
-        image_fingerprint: root_package.image_fingerprint.0.clone(),
+        image_fingerprint: root_package.image_fingerprint.to_string(),
     })
 }
 
@@ -243,7 +243,7 @@ pub(crate) fn stable_source(sources: &Sources, span: Option<&Span>) -> Option<Gr
     let span = span?;
     let source = sources.get(&span.source)?;
     Some(GraphSourceExport {
-        owner: source.origin.display(),
+        owner: source.origin.to_string(),
         start: span.start,
         end: span.end,
     })

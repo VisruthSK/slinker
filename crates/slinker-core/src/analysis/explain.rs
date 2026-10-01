@@ -399,7 +399,7 @@ fn component_id(members: &[usize], node_ids: &[String]) -> String {
         digest.update(id.len().to_le_bytes());
         digest.update(id.as_bytes());
     }
-    format!("component:{}", crate::package::Digest::finish(digest).0)
+    format!("component:{}", crate::package::Digest::finish(digest))
 }
 
 fn edge_id(from: &str, to: &str) -> String {
@@ -407,7 +407,7 @@ fn edge_id(from: &str, to: &str) -> String {
     digest.update(from.as_bytes());
     digest.update([0]);
     digest.update(to.as_bytes());
-    format!("edge:{}", crate::package::Digest::finish(digest).0)
+    format!("edge:{}", crate::package::Digest::finish(digest))
 }
 
 fn presentation(members: &[ExplanationMember]) -> (PresentationClass, PresentationVisibility) {
@@ -487,7 +487,7 @@ fn package_identities(
         let identity = PackageIdentityExport {
             name: package.name.to_string(),
             version: package.version.to_string(),
-            image_fingerprint: package.image_fingerprint.0.clone(),
+            image_fingerprint: package.image_fingerprint.to_string(),
         };
         if let Some(existing) = identities.get(package.name.as_str())
             && existing != &identity

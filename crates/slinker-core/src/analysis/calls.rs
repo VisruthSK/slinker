@@ -10,6 +10,7 @@ use super::state::{AnalyzerState, NativeCallbackContext, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::ir::NamespaceOperation;
+use crate::package::EnvironmentLabel;
 use crate::package::PackageRole;
 use crate::package::{ImportSpec, PackageId, PackageImage, PackageProvider};
 use crate::syntax::{CallSite, CalleeKind, ParsedRFile, Span, StaticArg};
@@ -209,7 +210,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         current: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<Option<String>> {
         let ([Some(StaticArg::String(name)), _], [None, None], [_, Some(set)]) = (
@@ -234,7 +235,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         current: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<Option<PackageId>> {
         if call.callee_kind != CalleeKind::DefinitelyExternal {
@@ -482,7 +483,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         from: NodeId,
         current: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         name: &str,
         span: &Span,
     ) -> Result<()> {
@@ -708,7 +709,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         current: PackageId,
         image: &PackageImage,
         binding: &str,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<bool> {
         if lexical_environment.starts_with("unsupported:") && call.qualified_package.is_none() {
@@ -804,7 +805,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 from,
                 Need::Native {
                     package: current,
-                    component: component.clone().into(),
+                    component: component.clone(),
                 },
                 EdgeKind::Native,
                 format!(
@@ -1005,7 +1006,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         current: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<bool> {
         if call.callee_kind != CalleeKind::DefinitelyExternal {

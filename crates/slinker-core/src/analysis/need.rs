@@ -1,5 +1,7 @@
 use crate::analysis::object_world::ClosureId;
-use crate::package::{ClassName, ComponentName, DatasetName, GenericName, PackageId, ResourcePath};
+use crate::package::{
+    ClassName, ComponentName, DatasetName, EnvironmentLabel, GenericName, PackageId, ResourcePath,
+};
 use std::collections::{HashSet, VecDeque};
 
 pub use crate::package::BindingName;
@@ -43,7 +45,7 @@ pub enum Need {
     },
     PrivateBinding {
         package: PackageId,
-        environment: String,
+        environment: EnvironmentLabel,
         binding: BindingName,
     },
     ClosureExecution {

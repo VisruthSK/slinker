@@ -4,6 +4,7 @@ use super::protocol::{
     WorkerResponse,
 };
 use super::runtime::WorkerRuntime;
+use slinker_core::package::BindingName;
 use slinker_core::{Error, Result};
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -12,7 +13,7 @@ use std::io::{self, BufRead, Write};
 struct RequestContext {
     request_id: Option<u64>,
     package: Option<WorkerPackageIdentity>,
-    binding: Option<String>,
+    binding: Option<BindingName>,
 }
 
 impl RequestContext {

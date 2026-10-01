@@ -42,8 +42,8 @@ impl RelocatedCode {
                     if &shape != code.normalized_shape() {
                         return Err(BuildContextError::InvalidCode(format!(
                             "CodeIr {id:?} changed normalized shape before emission: expected {}, got {}",
-                            code.normalized_shape().0,
-                            shape.0
+                            code.normalized_shape(),
+                            shape
                         )));
                     }
                     original.to_owned()

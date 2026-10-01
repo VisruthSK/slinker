@@ -1,11 +1,12 @@
 use crate::Description;
 use crate::package::{
-    BindingName, ClassName, DatasetName, GenericName, PackageIdentity, PackageName,
+    BindingName, ClassName, ComponentName, DataSetName, DatasetName, ExportName, GenericName,
+    PackageIdentity, PackageName, ResourcePath, SymbolName,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub type ExportMap = BTreeMap<String, BindingName>;
+pub type ExportMap = BTreeMap<ExportName, BindingName>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ImportBinding {
@@ -50,12 +51,13 @@ impl std::fmt::Display for GenericSpec {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeFacts {
-    pub callbacks: Vec<String>,
+    pub callbacks: Vec<BindingName>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeRoutineSummary {
-    pub selector: String,
+    pub selector: SymbolName,
+    #[serde(default)]
     pub callback_arguments: Vec<usize>,
 }
 
@@ -75,13 +77,13 @@ pub struct NativeRegistration {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeSymbolBinding {
-    pub binding: String,
-    pub symbol: String,
+    pub binding: BindingName,
+    pub symbol: SymbolName,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeComponent {
-    pub name: String,
+    pub name: ComponentName,
     pub alias: String,
     pub registration: Option<NativeRegistration>,
     pub symbols: Vec<NativeSymbolBinding>,
@@ -93,18 +95,18 @@ pub struct NativeComponent {
 pub enum NativeLibrary {
     Missing,
     Unloadable {
-        library: String,
+        library: ResourcePath,
         error: String,
     },
     Loaded {
-        library: String,
+        library: ResourcePath,
         routines: NativeRoutines,
         name_lookup: NameLookup,
     },
 }
 
 impl NativeLibrary {
-    pub fn path(&self) -> Option<&str> {
+    pub fn path(&self) -> Option<&ResourcePath> {
         match self {
             Self::Missing => None,
             Self::Unloadable { library, .. } | Self::Loaded { library, .. } => Some(library),
@@ -128,14 +130,14 @@ impl NativeLibrary {
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeRoutines {
-    pub c: Vec<String>,
-    pub call: Vec<String>,
-    pub fortran: Vec<String>,
-    pub external: Vec<String>,
+    pub c: Vec<SymbolName>,
+    pub call: Vec<SymbolName>,
+    pub fortran: Vec<SymbolName>,
+    pub external: Vec<SymbolName>,
 }
 
 impl NativeRoutines {
-    pub fn of(&self, interface: NativeInterface) -> &[String] {
+    pub fn of(&self, interface: NativeInterface) -> &[SymbolName] {
         match interface {
             NativeInterface::C => &self.c,
             NativeInterface::Call => &self.call,
@@ -148,7 +150,7 @@ impl NativeRoutines {
         [&self.c, &self.call, &self.fortran, &self.external]
             .into_iter()
             .flatten()
-            .map(String::as_str)
+            .map(SymbolName::as_str)
             .collect()
     }
 }
@@ -187,8 +189,8 @@ impl NativeComponent {
                 .into_iter()
                 .flat_map(NativeRoutines::names)
                 .map(move |routine| NativeSymbolBinding {
-                    binding: format!("{}{routine}{}", fixes.prefix, fixes.suffix),
-                    symbol: routine.to_owned(),
+                    binding: format!("{}{routine}{}", fixes.prefix, fixes.suffix).into(),
+                    symbol: routine.into(),
                 })
         });
         self.symbols.iter().cloned().chain(registered)
@@ -202,12 +204,12 @@ pub struct LifecycleMetadata {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PackageData {
-    sets: BTreeMap<String, Vec<DatasetName>>,
+    sets: BTreeMap<DataSetName, Vec<DatasetName>>,
     file_backed: bool,
 }
 
 impl PackageData {
-    pub fn new(sets: BTreeMap<String, Vec<DatasetName>>, file_backed: bool) -> Self {
+    pub fn new(sets: BTreeMap<DataSetName, Vec<DatasetName>>, file_backed: bool) -> Self {
         Self { sets, file_backed }
     }
 

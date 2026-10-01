@@ -1,5 +1,5 @@
 use crate::package::SyntaxValidation;
-use crate::package::{CanonicalSyntax, InstalledPackage};
+use crate::package::{CanonicalSyntax, DataSetName, DatasetName, InstalledPackage};
 use crate::worker::protocol::WorkerBinding;
 use crate::worker::protocol::WorkerPackageIndex;
 use crate::worker::protocol::{
@@ -144,7 +144,7 @@ impl WorkerClient {
         match self.exchange(&WorkerRequest::Binding {
             request_id,
             package: package_spec(package),
-            name: name.to_owned(),
+            name: name.into(),
         })? {
             WorkerResponse::Binding {
                 request_id: response_id,
@@ -163,7 +163,7 @@ impl WorkerClient {
         match self.exchange(&WorkerRequest::DispatchGenerics {
             request_id,
             package: package.map(package_spec),
-            name: name.to_owned(),
+            name: name.into(),
         })? {
             WorkerResponse::DispatchGenerics {
                 request_id: response_id,
@@ -176,8 +176,8 @@ impl WorkerClient {
     pub(crate) fn data_library(
         &mut self,
         package: PackageSpec,
-        objects: Vec<String>,
-        sets: BTreeMap<String, Vec<String>>,
+        objects: Vec<DatasetName>,
+        sets: BTreeMap<DataSetName, Vec<DatasetName>>,
     ) -> Result<DataLibraryFiles> {
         let request_id = self.request_id();
         match self.exchange(&WorkerRequest::DataLibrary {
@@ -501,9 +501,9 @@ fn protocol_file() -> Result<(File, TempPath)> {
 
 fn package_spec(package: &InstalledPackage) -> PackageSpec {
     PackageSpec {
-        name: package.identity.name.to_string(),
+        name: package.identity.name.clone(),
         version: package.identity.version.to_string(),
-        image_fingerprint: package.identity.image_fingerprint.0.clone(),
+        image_fingerprint: package.identity.image_fingerprint.clone(),
         root: package.location.root.clone(),
     }
 }

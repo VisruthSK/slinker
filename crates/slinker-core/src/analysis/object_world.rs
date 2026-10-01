@@ -1,7 +1,8 @@
 use crate::package::{
-    BindingImage, ClosureSource, EmbeddedClosureSource, EmbeddedEnvironmentRef, ObjectKind,
-    PackageId, PackageImage, PrivateBindingImage,
+    BindingName, ClosureSource, EnvironmentLabel, MemberPath, ObjectImage, ObjectKind, PackageId,
+    PackageImage,
 };
+use crate::syntax::SourceKey;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -15,11 +16,30 @@ pub struct ClosureId(usize);
 pub struct EnvironmentId(usize);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClosureOwner {
+    Namespace(BindingName),
+    Private {
+        environment: EnvironmentLabel,
+        binding: BindingName,
+    },
+}
+
+impl ClosureOwner {
+    pub fn source_key(&self) -> SourceKey {
+        match self {
+            Self::Namespace(binding) => SourceKey::Binding(binding.clone()),
+            Self::Private {
+                environment,
+                binding,
+            } => SourceKey::private(environment.clone(), binding.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectProvenance {
-    pub namespace_binding: Option<String>,
-    pub private_environment: Option<String>,
-    pub private_binding: Option<String>,
-    pub path: String,
+    pub owner: ClosureOwner,
+    pub path: MemberPath,
 }
 
 #[derive(Clone, Debug)]
@@ -33,11 +53,16 @@ pub struct ClosureObject {
 
 #[derive(Clone, Debug)]
 pub struct EnvironmentObject {
-    pub label: String,
+    pub label: EnvironmentLabel,
     pub parent: Option<EnvironmentId>,
-    pub bindings: BTreeMap<String, ObjectId>,
-    pub derived: bool,
+    pub bindings: BTreeMap<BindingName, ObjectId>,
     pub unknown_fields: bool,
+}
+
+impl EnvironmentObject {
+    pub fn is_derived(&self) -> bool {
+        self.label.is_derived()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -46,18 +71,34 @@ pub enum InstalledObject {
     Environment(EnvironmentId),
     Structured {
         kind: ObjectKind,
-        members: BTreeMap<String, ObjectId>,
+        members: BTreeMap<MemberPath, ObjectId>,
     },
     Atom,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lookup {
+    Found(ObjectId),
+    Opaque,
+    Absent,
+}
+
+impl Lookup {
+    pub fn found(self) -> Option<ObjectId> {
+        match self {
+            Self::Found(object) => Some(object),
+            Self::Opaque | Self::Absent => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ObjectGraph {
-    namespace_bindings: BTreeMap<String, ObjectId>,
+    namespace_bindings: BTreeMap<BindingName, ObjectId>,
     objects: Vec<InstalledObject>,
     closures: Vec<ClosureObject>,
     environments: Vec<EnvironmentObject>,
-    environment_by_label: BTreeMap<String, EnvironmentId>,
+    environment_by_label: BTreeMap<EnvironmentLabel, EnvironmentId>,
     environment_objects: HashMap<EnvironmentId, ObjectId>,
 }
 
@@ -78,7 +119,7 @@ impl ObjectGraph {
         &self.environments[id.0]
     }
 
-    pub fn environment_id(&self, label: &str) -> Option<EnvironmentId> {
+    pub fn environment_id(&self, label: &EnvironmentLabel) -> Option<EnvironmentId> {
         self.environment_by_label.get(label).copied()
     }
 
@@ -96,7 +137,7 @@ impl ObjectGraph {
         }
     }
 
-    pub fn members_of(&self, object: ObjectId) -> Option<&BTreeMap<String, ObjectId>> {
+    pub fn members_of(&self, object: ObjectId) -> Option<&BTreeMap<MemberPath, ObjectId>> {
         match self.object(object) {
             InstalledObject::Structured { members, .. } => Some(members),
             _ => None,
@@ -104,21 +145,30 @@ impl ObjectGraph {
     }
 
     pub fn merge_image(&mut self, image: &PackageImage) {
-        let namespace_label = format!("namespace:{}", image.index.identity.name);
-        let mut labels = BTreeSet::from([namespace_label.clone()]);
-        for binding in image.bindings.values() {
-            collect_binding_environments(binding, &mut labels);
-        }
-        for private in image.private_environments.values() {
-            labels.insert(private.id.clone());
-            labels.insert(private.parent.clone());
-            for binding in private.bindings.values() {
-                collect_binding_environments(binding, &mut labels);
-            }
-        }
+        let namespace_label = EnvironmentLabel::namespace(&image.index.identity.name);
+        let private_labels = image
+            .private_environments
+            .values()
+            .flat_map(|private| [&private.id, &private.parent])
+            .chain(
+                image
+                    .private_environments
+                    .values()
+                    .flat_map(|private| private.bindings.values())
+                    .flat_map(|binding| binding.object.environment_labels()),
+            );
+        let labels = std::iter::once(&namespace_label)
+            .chain(
+                image
+                    .bindings
+                    .values()
+                    .flat_map(|binding| binding.object.environment_labels()),
+            )
+            .chain(private_labels)
+            .collect::<BTreeSet<_>>();
         for label in labels {
-            if !self.environment_by_label.contains_key(&label) {
-                self.add_environment(label, None, false);
+            if !self.environment_by_label.contains_key(label) {
+                self.add_environment(label.clone(), None);
             }
         }
         for private in image.private_environments.values() {
@@ -127,53 +177,48 @@ impl ObjectGraph {
         }
 
         let namespace = self.environment_by_label[&namespace_label];
-        let mut names = image.bindings.keys().collect::<Vec<_>>();
-        names.sort();
-        for name in names {
-            if self.namespace_bindings.contains_key(name.as_str()) {
+        let mut bindings = image.bindings.iter().collect::<Vec<_>>();
+        bindings.sort_by_key(|(name, _)| *name);
+        for (name, binding) in bindings {
+            if self.namespace_bindings.contains_key(name) {
                 continue;
             }
             let object = self.add_object(
-                &image.bindings[name],
+                &binding.object,
                 ObjectProvenance {
-                    namespace_binding: Some(name.to_string()),
-                    private_environment: None,
-                    private_binding: None,
-                    path: "$".into(),
+                    owner: ClosureOwner::Namespace(name.clone()),
+                    path: MemberPath::root(),
                 },
             );
-            self.namespace_bindings.insert(name.to_string(), object);
+            self.namespace_bindings.insert(name.clone(), object);
             self.environments[namespace.0]
                 .bindings
-                .insert(name.to_string(), object);
+                .insert(name.clone(), object);
         }
 
-        let mut private_ids = image.private_environments.keys().collect::<Vec<_>>();
-        private_ids.sort();
-        for private_id in private_ids {
-            let private = &image.private_environments[private_id];
-            let environment = self.environment_by_label[private_id];
-            let mut names = private.bindings.keys().collect::<Vec<_>>();
-            names.sort();
-            for name in names {
-                if self.environments[environment.0]
-                    .bindings
-                    .contains_key(name.as_str())
-                {
+        let mut privates = image.private_environments.iter().collect::<Vec<_>>();
+        privates.sort_by_key(|(label, _)| *label);
+        for (label, private) in privates {
+            let environment = self.environment_by_label[label];
+            let mut bindings = private.bindings.iter().collect::<Vec<_>>();
+            bindings.sort_by_key(|(name, _)| *name);
+            for (name, binding) in bindings {
+                if self.environments[environment.0].bindings.contains_key(name) {
                     continue;
                 }
                 let object = self.add_object(
-                    &private.bindings[name],
+                    &binding.object,
                     ObjectProvenance {
-                        namespace_binding: None,
-                        private_environment: Some(private_id.clone()),
-                        private_binding: Some(name.to_string()),
-                        path: "$".into(),
+                        owner: ClosureOwner::Private {
+                            environment: label.clone(),
+                            binding: name.clone(),
+                        },
+                        path: MemberPath::root(),
                     },
                 );
                 self.environments[environment.0]
                     .bindings
-                    .insert(name.to_string(), object);
+                    .insert(name.clone(), object);
             }
         }
     }
@@ -189,44 +234,46 @@ impl ObjectGraph {
 
     fn add_environment(
         &mut self,
-        label: String,
+        label: EnvironmentLabel,
         parent: Option<EnvironmentId>,
-        derived: bool,
     ) -> EnvironmentId {
         let id = EnvironmentId(self.environments.len());
         self.environment_by_label.insert(label.clone(), id);
         self.environments.push(EnvironmentObject {
-            unknown_fields: label.starts_with("unsupported:"),
+            unknown_fields: label.is_unsupported(),
             label,
             parent,
             bindings: BTreeMap::new(),
-            derived,
         });
         id
     }
 
-    fn add_object<T: BindingObjectView>(
-        &mut self,
-        binding: &T,
-        provenance: ObjectProvenance,
-    ) -> ObjectId {
-        if let Some(closure) = binding.closure() {
+    fn environment_or_add(&mut self, label: &EnvironmentLabel) -> EnvironmentId {
+        match self.environment_id(label) {
+            Some(environment) => environment,
+            None => self.add_environment(label.clone(), None),
+        }
+    }
+
+    fn add_object(&mut self, image: &ObjectImage, provenance: ObjectProvenance) -> ObjectId {
+        if let Some(closure) = &image.closure {
             return self.add_closure(closure, provenance);
         }
-        if let Some(environment) = binding
-            .environment()
+        if let Some(environment) = image
+            .environment
+            .as_ref()
             .and_then(|label| self.environment_id(label))
         {
             return self.push_object(InstalledObject::Environment(environment));
         }
-        if binding.embedded_closures().is_empty() && binding.embedded_environments().is_empty() {
+        if image.embedded_closures.is_empty() && image.embedded_environments.is_empty() {
             return self.push_object(InstalledObject::Atom);
         }
 
-        let mut members = BTreeMap::new();
-        let mut closures = binding.embedded_closures().iter().collect::<Vec<_>>();
-        closures.sort_by(|left, right| left.path.cmp(&right.path));
         let object = self.push_object(InstalledObject::Atom);
+        let mut members = BTreeMap::new();
+        let mut closures = image.embedded_closures.iter().collect::<Vec<_>>();
+        closures.sort_by(|left, right| left.path.cmp(&right.path));
         for nested in closures {
             let member = self.add_closure(
                 &ClosureSource {
@@ -240,7 +287,7 @@ impl ObjectGraph {
             );
             members.insert(nested.path.clone(), member);
         }
-        let mut environments = binding.embedded_environments().iter().collect::<Vec<_>>();
+        let mut environments = image.embedded_environments.iter().collect::<Vec<_>>();
         environments.sort_by(|left, right| left.path.cmp(&right.path));
         for nested in environments {
             if let Some(environment) = self.environment_id(&nested.environment) {
@@ -249,42 +296,45 @@ impl ObjectGraph {
             }
         }
         self.objects[object.0] = InstalledObject::Structured {
-            kind: binding.object_kind().clone(),
+            kind: image.object_kind.clone(),
             members,
         };
         object
     }
 
     fn add_closure(&mut self, closure: &ClosureSource, provenance: ObjectProvenance) -> ObjectId {
-        let enclosure = match self.environment_id(&closure.environment) {
-            Some(enclosure) => enclosure,
-            None => self.add_environment(closure.environment.clone(), None, false),
-        };
-        self.push_closure(ClosureObject {
-            object: ObjectId(self.objects.len()),
-            enclosure,
-            source: Arc::clone(&closure.source),
-            provenance,
-            derived_from: None,
-        })
+        let enclosure = self.environment_or_add(&closure.environment);
+        self.push_closure(enclosure, Arc::clone(&closure.source), provenance, None)
     }
 
-    fn push_closure(&mut self, closure: ClosureObject) -> ObjectId {
+    fn push_closure(
+        &mut self,
+        enclosure: EnvironmentId,
+        source: Arc<str>,
+        provenance: ObjectProvenance,
+        derived_from: Option<ClosureId>,
+    ) -> ObjectId {
         let id = ClosureId(self.closures.len());
-        self.closures.push(closure);
+        self.closures.push(ClosureObject {
+            object: ObjectId(self.objects.len()),
+            enclosure,
+            source,
+            provenance,
+            derived_from,
+        });
         self.push_object(InstalledObject::Closure(id))
     }
 
     pub fn derive_environment(&mut self, parent: Option<EnvironmentId>) -> EnvironmentId {
         let mut sequence = self.environments.len();
         let label = loop {
-            let label = format!("derived:{sequence}");
+            let label = EnvironmentLabel::derived(sequence);
             if !self.environment_by_label.contains_key(&label) {
                 break label;
             }
             sequence += 1;
         };
-        self.add_environment(label, parent, true)
+        self.add_environment(label, parent)
     }
 
     pub fn environment_object(&mut self, environment: EnvironmentId) -> ObjectId {
@@ -301,7 +351,7 @@ impl ObjectGraph {
     pub fn set_environment_binding(
         &mut self,
         environment: EnvironmentId,
-        name: impl Into<String>,
+        name: impl Into<BindingName>,
         value: ObjectId,
     ) {
         self.environments[environment.0]
@@ -315,12 +365,12 @@ impl ObjectGraph {
 
     pub fn reenclose_closure(&mut self, closure: ClosureId, enclosure: EnvironmentId) -> ObjectId {
         let original = self.closure(closure).clone();
-        self.push_closure(ClosureObject {
-            object: ObjectId(self.objects.len()),
+        self.push_closure(
             enclosure,
-            derived_from: Some(closure),
-            ..original
-        })
+            original.source,
+            original.provenance,
+            Some(closure),
+        )
     }
 
     pub fn reenclose_structured_closures(
@@ -376,7 +426,7 @@ impl ObjectGraph {
         let Some(names) = names else {
             let named = members
                 .iter()
-                .filter_map(|(path, value)| direct_structured_name(path).map(|name| (name, *value)))
+                .filter_map(|(path, value)| path.direct_field().map(|name| (name, *value)))
                 .collect::<Vec<_>>();
             if named.len() != members.len() {
                 self.mark_environment_unknown_fields(environment);
@@ -388,7 +438,7 @@ impl ObjectGraph {
         };
         let indexed = members
             .iter()
-            .filter_map(|(path, value)| direct_structured_index(path).map(|index| (index, *value)))
+            .filter_map(|(path, value)| path.direct_element().map(|index| (index, *value)))
             .collect::<BTreeMap<_, _>>();
         if indexed
             .keys()
@@ -397,11 +447,11 @@ impl ObjectGraph {
             self.mark_environment_unknown_fields(environment);
         }
         for (offset, name) in names.iter().enumerate() {
-            let value = indexed
-                .get(&(offset + 1))
-                .copied()
-                .unwrap_or_else(|| self.abstract_value());
-            self.set_environment_binding(environment, name.clone(), value);
+            let value = match indexed.get(&(offset + 1)) {
+                Some(value) => *value,
+                None => self.abstract_value(),
+            };
+            self.set_environment_binding(environment, name.as_str(), value);
         }
     }
 
@@ -417,27 +467,23 @@ impl ObjectGraph {
         environment
     }
 
-    pub fn lookup_environment_binding(
-        &self,
-        mut environment: EnvironmentId,
-        name: &str,
-    ) -> (Option<ObjectId>, bool) {
+    pub fn lookup_environment_binding(&self, mut environment: EnvironmentId, name: &str) -> Lookup {
         let mut seen = BTreeSet::new();
         loop {
             if !seen.insert(environment) {
-                return (None, true);
+                return Lookup::Opaque;
             }
             let shape = self.environment(environment);
             if let Some(value) = shape.bindings.get(name) {
-                return (Some(*value), false);
+                return Lookup::Found(*value);
             }
             if shape.unknown_fields {
-                return (None, true);
+                return Lookup::Opaque;
             }
-            let Some(parent) = shape.parent else {
-                return (None, false);
-            };
-            environment = parent;
+            match shape.parent {
+                Some(parent) => environment = parent,
+                None => return Lookup::Absent,
+            }
         }
     }
 }
@@ -469,95 +515,30 @@ impl ObjectWorld {
 pub(super) fn reachable_environment_labels<'a>(
     image: &PackageImage,
     names: impl IntoIterator<Item = &'a str>,
-) -> BTreeSet<String> {
-    let mut labels = BTreeSet::new();
-    for binding in names.into_iter().filter_map(|name| image.binding(name)) {
-        collect_binding_environments(binding, &mut labels);
-    }
+) -> BTreeSet<EnvironmentLabel> {
+    let mut labels = names
+        .into_iter()
+        .filter_map(|name| image.binding(name))
+        .flat_map(|binding| binding.object.environment_labels().cloned())
+        .collect::<BTreeSet<_>>();
     let mut pending = labels.iter().cloned().collect::<Vec<_>>();
     while let Some(label) = pending.pop() {
         let Some(private) = image.private_environment(&label) else {
             continue;
         };
-        let mut reached = BTreeSet::from([private.parent.clone()]);
-        for binding in private.bindings.values() {
-            collect_binding_environments(binding, &mut reached);
-        }
-        pending.extend(
-            reached
-                .into_iter()
-                .filter(|label| labels.insert(label.clone())),
+        let reached = std::iter::once(&private.parent).chain(
+            private
+                .bindings
+                .values()
+                .flat_map(|binding| binding.object.environment_labels()),
         );
+        for reached in reached {
+            if labels.insert(reached.clone()) {
+                pending.push(reached.clone());
+            }
+        }
     }
     labels
-}
-
-fn collect_binding_environments<T: BindingObjectView>(binding: &T, labels: &mut BTreeSet<String>) {
-    labels.extend(
-        binding
-            .closure()
-            .map(|closure| closure.environment.clone())
-            .into_iter()
-            .chain(binding.environment().map(str::to_owned))
-            .chain(
-                binding
-                    .embedded_closures()
-                    .iter()
-                    .map(|closure| closure.environment.clone()),
-            )
-            .chain(
-                binding
-                    .embedded_environments()
-                    .iter()
-                    .map(|environment| environment.environment.clone()),
-            ),
-    );
-}
-
-trait BindingObjectView {
-    fn object_kind(&self) -> &ObjectKind;
-    fn closure(&self) -> Option<&ClosureSource>;
-    fn environment(&self) -> Option<&str>;
-    fn embedded_closures(&self) -> &[EmbeddedClosureSource];
-    fn embedded_environments(&self) -> &[EmbeddedEnvironmentRef];
-}
-
-macro_rules! binding_object_view {
-    ($image:ty) => {
-        impl BindingObjectView for $image {
-            fn object_kind(&self) -> &ObjectKind {
-                &self.object.object_kind
-            }
-            fn closure(&self) -> Option<&ClosureSource> {
-                self.object.closure.as_ref()
-            }
-            fn environment(&self) -> Option<&str> {
-                self.object.environment.as_deref()
-            }
-            fn embedded_closures(&self) -> &[EmbeddedClosureSource] {
-                &self.object.embedded_closures
-            }
-            fn embedded_environments(&self) -> &[EmbeddedEnvironmentRef] {
-                &self.object.embedded_environments
-            }
-        }
-    };
-}
-
-binding_object_view!(BindingImage);
-binding_object_view!(PrivateBindingImage);
-
-fn direct_structured_index(path: &str) -> Option<usize> {
-    let value = path.strip_prefix("$[[")?.strip_suffix("]]")?;
-    if value.contains("[[") || value.contains('$') || value.contains('.') {
-        return None;
-    }
-    value.parse().ok()
-}
-
-fn direct_structured_name(path: &str) -> Option<String> {
-    let value = path.strip_prefix("$$")?;
-    (!value.is_empty() && !value.contains(['$', '[', ']'])).then(|| value.to_owned())
 }
 
 #[cfg(test)]
@@ -565,8 +546,9 @@ mod tests {
     use super::*;
     use crate::Description;
     use crate::package::{
-        BindingOrigin, BindingRepresentation, Digest, LifecycleMetadata, ObjectImage, PackageData,
-        PackageIdentity, PackageIndex, PrivateEnvironmentImage,
+        BindingImage, BindingOrigin, BindingRepresentation, Digest, EmbeddedClosureSource,
+        EmbeddedEnvironmentRef, LifecycleMetadata, ObjectImage, PackageData, PackageIdentity,
+        PackageIndex, PrivateBindingImage, PrivateEnvironmentImage,
     };
 
     fn value(name: &str, kind: ObjectKind) -> BindingImage {
@@ -623,7 +605,7 @@ mod tests {
                 identity: PackageIdentity {
                     name: "root".into(),
                     version: "1.0.0".parse().expect("version"),
-                    image_fingerprint: Digest("root".into()),
+                    image_fingerprint: Digest::from("root"),
                 },
                 description: Description::parse("Package: root\nVersion: 1.0.0\n"),
                 exports: Default::default(),
@@ -657,7 +639,9 @@ mod tests {
     }
 
     fn namespace(graph: &ObjectGraph) -> EnvironmentId {
-        graph.environment_id("namespace:root").expect("namespace")
+        graph
+            .environment_id(&"namespace:root".into())
+            .expect("namespace")
     }
 
     #[test]
@@ -707,7 +691,7 @@ mod tests {
             vec![list("holder", &[], &[("$[[1]]", "private:1")])],
             vec![private("private:1", vec![this])],
         ));
-        let environment = graph.environment_id("private:1").expect("private");
+        let environment = graph.environment_id(&"private:1".into()).expect("private");
 
         let this = graph.environment(environment).bindings["self"];
         let nested = graph
@@ -727,7 +711,7 @@ mod tests {
         let original = graph
             .closure_of(graph.namespace_binding("f").expect("f"))
             .expect("closure");
-        let target = graph.environment_id("private:1").expect("private");
+        let target = graph.environment_id(&"private:1".into()).expect("private");
 
         let derived = graph.reenclose_closure(original, target);
         let derived = graph.closure(graph.closure_of(derived).expect("derived closure"));
@@ -748,7 +732,7 @@ mod tests {
         let template_closure = graph
             .closure_of(graph.members_of(template).expect("list")["$[[1]]"])
             .expect("closure");
-        let target = graph.environment_id("private:1").expect("private");
+        let target = graph.environment_id(&"private:1".into()).expect("private");
 
         let transformed = graph.reenclose_structured_closures(template, target);
         let transformed_closure = graph
@@ -772,20 +756,20 @@ mod tests {
 
         assert_eq!(
             graph.lookup_environment_binding(child, "x"),
-            (Some(x), false)
+            Lookup::Found(x)
         );
         assert_eq!(
             graph.lookup_environment_binding(child, "missing"),
-            (None, false)
+            Lookup::Absent
         );
 
         graph.mark_environment_unknown_fields(child);
-        assert_eq!(graph.lookup_environment_binding(child, "x"), (None, true));
+        assert_eq!(graph.lookup_environment_binding(child, "x"), Lookup::Opaque);
 
         graph.set_environment_binding(child, "x", x);
         assert_eq!(
             graph.lookup_environment_binding(child, "x"),
-            (Some(x), false)
+            Lookup::Found(x)
         );
     }
 
@@ -860,7 +844,7 @@ mod tests {
 
         assert_eq!(
             graph.lookup_environment_binding(derived, "self"),
-            (Some(this), false)
+            Lookup::Found(this)
         );
         assert_eq!(graph.environment_object(derived), this);
     }

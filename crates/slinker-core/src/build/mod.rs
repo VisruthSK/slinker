@@ -94,9 +94,9 @@ impl BuildContext {
         let spec = |package| {
             let identity = program.package(package).identity();
             PackageSpec {
-                name: identity.name.to_string(),
+                name: identity.name.clone(),
                 version: identity.version.to_string(),
-                image_fingerprint: identity.image_fingerprint.0.clone(),
+                image_fingerprint: identity.image_fingerprint.clone(),
                 root: location(package).clone(),
             }
         };
@@ -120,7 +120,7 @@ impl BuildContext {
                     names: bundle
                         .bindings()
                         .iter()
-                        .map(|binding| program.binding(*binding).name.to_string())
+                        .map(|binding| program.binding(*binding).name.clone())
                         .collect(),
                     patches: closure_patches(program, bundle, &code),
                 })
@@ -134,14 +134,9 @@ impl BuildContext {
             let sets = library
                 .sets()
                 .iter()
-                .map(|(set, objects)| {
-                    (
-                        set.clone(),
-                        objects.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    )
-                })
+                .map(|(set, objects)| (set.clone(), objects.clone()))
                 .collect();
-            let objects = library.objects().iter().map(ToString::to_string).collect();
+            let objects = library.objects().iter().cloned().collect();
             datasets.insert(package, worker.data_library(spec(package), objects, sets)?);
         }
 
@@ -151,7 +146,10 @@ impl BuildContext {
         let mut resources = BTreeMap::new();
         for (ordinal, (id, resource)) in program.indexed_resources().enumerate() {
             let frozen = directory.path().join(ordinal.to_string());
-            copy_entry(&location(resource.package).join(&resource.path), &frozen)?;
+            copy_entry(
+                &location(resource.package).join(resource.path.as_str()),
+                &frozen,
+            )?;
             resources.insert(id, frozen);
         }
 

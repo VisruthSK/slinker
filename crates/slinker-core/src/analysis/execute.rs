@@ -7,7 +7,10 @@ use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParseRequest};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId};
-use crate::package::{PackageId, PackageImage, PackageProvider};
+use crate::package::{
+    BindingName, ClosureSource, EnvironmentLabel, MemberPath, PackageId, PackageImage,
+    PackageProvider,
+};
 use crate::syntax::{
     ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
     ConstructionTarget, ParsedRFile, SourceKey, Span,
@@ -94,7 +97,7 @@ pub(super) struct ExecutionContext<'a> {
     pub(super) node: NodeId,
     pub(super) package: PackageId,
     pub(super) image: &'a PackageImage,
-    pub(super) lexical_environment: &'a str,
+    pub(super) lexical_environment: &'a EnvironmentLabel,
     pub(super) depth: usize,
     pub(super) specialized: bool,
 }
@@ -113,7 +116,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         package: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         parsed: &ParsedRFile,
     ) -> Result<Arc<PackageImage>> {
         let mut bindings = BTreeSet::new();
@@ -315,10 +318,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let graph = self.objects.graph(context.package);
         let member = match graph.object(object) {
             InstalledObject::Environment(environment) => {
-                graph.lookup_environment_binding(*environment, name).0
+                graph.lookup_environment_binding(*environment, name).found()
             }
             InstalledObject::Structured { members, .. } => {
-                members.get(&format!("$${name}")).copied()
+                members.get(&MemberPath::root().field(name)).copied()
             }
             InstalledObject::Closure(_) | InstalledObject::Atom => None,
         };
@@ -332,9 +335,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         name: &str,
     ) {
         let graph = self.objects.graph(context.package);
-        let namespace = graph.environment_id(&format!(
-            "namespace:{}",
-            self.packages.name(context.package)
+        let namespace = graph.environment_id(&EnvironmentLabel::namespace(
+            self.packages.name(context.package),
         ));
         if namespace.is_none() || graph.environment_of(object) != namespace {
             return;
@@ -359,7 +361,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn own_namespace_object(&mut self, context: ExecutionContext<'_>) -> AbstractValue {
-        let label = format!("namespace:{}", self.packages.name(context.package));
+        let label = EnvironmentLabel::namespace(self.packages.name(context.package));
         let graph = self.objects.graph_mut(context.package);
         graph
             .environment_id(&label)
@@ -400,7 +402,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return AbstractValue::Unknown;
         };
         members
-            .get(&format!("$[[{index}]]"))
+            .get(&MemberPath::root().element(index))
             .copied()
             .map_or(AbstractValue::Unknown, AbstractValue::Object)
     }
@@ -591,30 +593,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
-        private_environment: Option<&str>,
-        binding: &str,
+        private_environment: Option<&EnvironmentLabel>,
+        binding: &BindingName,
     ) -> Result<ExecutionOutcome> {
-        let (closure, owner) = match private_environment {
-            Some(environment) => {
-                let Some(closure) = context
-                    .image
-                    .private_binding(environment, binding)
-                    .and_then(|binding| binding.object.closure.clone())
-                else {
-                    return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
-                };
-                (closure, Self::private_source_key(environment, binding))
-            }
-            None => {
-                let Some(closure) = context
-                    .image
-                    .binding(binding)
-                    .and_then(|binding| binding.object.closure.clone())
-                else {
-                    return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
-                };
-                (closure, SourceKey::Binding(binding.to_owned()))
-            }
+        let Some((closure, owner)) = installed_closure(context.image, private_environment, binding)
+        else {
+            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
         };
         let specialized = arguments
             .iter()
@@ -636,14 +620,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.construction_calls
             .insert(memo.clone(), AbstractValue::Unknown);
         self.construction_evaluations += 1;
-        let owner_name = owner.to_string();
         let Some(parsed) = self.parsed_source(
             context.package,
             &closure.source,
             context.image,
             &closure.environment,
             ParseRequest {
-                owner_binding: &owner_name,
+                owner: &owner,
                 source_key: &owner,
                 owner_node: context.node,
             },
@@ -1270,4 +1253,28 @@ fn fold_c(arguments: &[AbstractValue]) -> AbstractValue {
         }
     }
     AbstractValue::Vector(values)
+}
+
+fn installed_closure(
+    image: &PackageImage,
+    private_environment: Option<&EnvironmentLabel>,
+    binding: &BindingName,
+) -> Option<(ClosureSource, SourceKey)> {
+    match private_environment {
+        Some(environment) => {
+            let closure = image
+                .private_binding(environment, binding)?
+                .object
+                .closure
+                .clone()?;
+            Some((
+                closure,
+                SourceKey::private(environment.clone(), binding.clone()),
+            ))
+        }
+        None => {
+            let closure = image.binding(binding)?.object.closure.clone()?;
+            Some((closure, SourceKey::Binding(binding.clone())))
+        }
+    }
 }

@@ -4,6 +4,7 @@ use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
+use crate::package::EnvironmentLabel;
 use crate::package::PackageAvailability;
 use crate::package::PackageImage;
 use crate::package::{
@@ -266,8 +267,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         generic: &str,
     ) -> Result<()> {
         let (from, current, binding) = (site.node, site.package, site.binding);
-        let namespace_generic =
-            site.lexical_environment == format!("namespace:{}", self.packages.name(current));
+        let namespace_generic = site
+            .lexical_environment
+            .is_namespace_of(self.packages.name(current));
         let selector = match (parameters, call.args.get(1)) {
             (Some(parameters), None) => parameters.first().cloned(),
             (Some(parameters), Some(Some(StaticArg::Symbol(object))))
@@ -465,7 +467,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         current: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<Option<CallableId>> {
         match call.qualified_package.as_deref() {

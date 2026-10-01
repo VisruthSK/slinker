@@ -1,12 +1,13 @@
 use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{
     BindingName, ClassName, ComponentName, DatasetName, GenericName, PackageId, PackageIdentity,
-    PackageName, PackageRole,
+    PackageName, PackageRole, ResourcePath,
 };
 
-use crate::package::Digest;
 use crate::package::NativeComponent;
+use crate::package::{DataSetName, Digest};
 use crate::syntax::TextRange;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -509,13 +510,13 @@ pub struct S3RegistrationIr {
 #[derive(Clone, Debug)]
 pub struct ResourceIr {
     pub package: PackageId,
-    pub path: String,
+    pub path: ResourcePath,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DatasetLibraryIr {
     objects: BTreeSet<DatasetName>,
-    sets: BTreeMap<String, Vec<DatasetName>>,
+    sets: BTreeMap<DataSetName, Vec<DatasetName>>,
 }
 
 impl DatasetLibraryIr {
@@ -523,7 +524,7 @@ impl DatasetLibraryIr {
         &self.objects
     }
 
-    pub fn sets(&self) -> &BTreeMap<String, Vec<DatasetName>> {
+    pub fn sets(&self) -> &BTreeMap<DataSetName, Vec<DatasetName>> {
         &self.sets
     }
 }
@@ -533,7 +534,8 @@ pub enum InvalidDataset {
     NotLinked(PackageId),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
 pub enum ObjectStep {
     Environment,
     Parent,
@@ -1161,7 +1163,7 @@ impl ProgramBuilder {
     pub fn carry_data_set(
         &mut self,
         package: PackageId,
-        set: String,
+        set: DataSetName,
         objects: Vec<DatasetName>,
     ) -> Result<(), InvalidDataset> {
         let library = self.dataset_library(package)?;

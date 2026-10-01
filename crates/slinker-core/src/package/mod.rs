@@ -11,8 +11,8 @@ pub use identity::{
 };
 pub use image::{
     BindingImage, BindingOrigin, BindingRepresentation, ClosureSource, EmbeddedClosureSource,
-    EmbeddedEnvironmentRef, ObjectImage, ObjectIssue, ObjectKind, PackageImage,
-    PrivateBindingImage, PrivateEnvironmentImage,
+    EmbeddedEnvironmentRef, ObjectImage, ObjectIssue, ObjectIssueKind, ObjectKind, PackageImage,
+    PrivateBindingImage, PrivateEnvironmentImage, UnsupportedObject,
 };
 pub use index::{
     ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NameLookup,
@@ -29,5 +29,6 @@ pub use store::{
 pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUniverse};
 
 pub use names::{
-    BindingName, ClassName, ComponentName, DatasetName, GenericName, PackageName, ResourcePath,
+    BindingName, ClassName, ComponentName, DataSetName, DatasetName, EnvironmentKind,
+    EnvironmentLabel, ExportName, GenericName, MemberPath, PackageName, ResourcePath, SymbolName,
 };

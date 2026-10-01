@@ -1,22 +1,22 @@
 use super::protocol::WorkerPackageIndex;
-use super::scan::names;
+use super::sexp::names;
 use super::{InspectionError, InspectionResult, field, list_field, string_field, strings_field};
 use harp::object::RObject;
 use harp::{RFunctionExt, RObjectExt};
 use slinker_core::package::{
-    BindingName, ExportMap, ImportBinding, ImportSpec, NameLookup, NativeComponent, NativeLibrary,
-    NativeRegistration, NativeRoutines, NativeSafety, NativeSymbolBinding, PackageName,
-    S3Registration,
+    BindingName, DataSetName, DatasetName, Digest, ExportMap, ExportName, ImportBinding,
+    ImportSpec, NameLookup, NativeComponent, NativeLibrary, NativeRegistration, NativeRoutines,
+    NativeSafety, NativeSymbolBinding, PackageName, S3Registration,
 };
 use std::collections::BTreeMap;
 
 pub(super) fn worker_package_index(context: &RObject) -> InspectionResult<WorkerPackageIndex> {
     let namespace = field(context, "ns_info")?;
-    let binding_names = strings_field(context, "binding_names")?;
+    let binding_names = typed_strings::<BindingName>(context, "binding_names")?;
     Ok(WorkerPackageIndex {
-        name: string_field(context, "package")?,
+        name: string_field(context, "package")?.into(),
         version: string_field(context, "version")?,
-        image_fingerprint: String::new(),
+        image_fingerprint: Digest::from(""),
         exports: exports(context, &namespace)?,
         imports: list_field(&namespace, "imports")?
             .into_iter()
@@ -30,6 +30,13 @@ pub(super) fn worker_package_index(context: &RObject) -> InspectionResult<Worker
         data_files: bool::try_from(field(context, "data_files")?)?,
         has_sysdata: !strings_field(context, "sysdata_names")?.is_empty(),
     })
+}
+
+fn typed_strings<T: From<String>>(object: &RObject, name: &str) -> InspectionResult<Vec<T>> {
+    Ok(strings_field(object, name)?
+        .into_iter()
+        .map(T::from)
+        .collect())
 }
 
 fn labelled(object: &RObject, values: Vec<String>) -> Vec<(String, String)> {
@@ -54,7 +61,7 @@ fn exports(context: &RObject, namespace: &RObject) -> InspectionResult<ExportMap
     let installed = field(namespace, "exports")?;
     let mut exports = labelled(&installed, Vec::<String>::try_from(&installed)?)
         .into_iter()
-        .map(|(label, value)| (label, BindingName::from(value)))
+        .map(|(label, value)| (ExportName::from(label), BindingName::from(value)))
         .collect::<ExportMap>();
     let image_environment = field(context, "image_env")?;
     for pattern in strings_field(namespace, "exportPatterns")? {
@@ -67,7 +74,7 @@ fn exports(context: &RObject, namespace: &RObject) -> InspectionResult<ExportMap
         exports.extend(
             matches
                 .into_iter()
-                .map(|name| (name.clone(), BindingName::from(name))),
+                .map(|name| (ExportName::from(name.clone()), BindingName::from(name))),
         );
     }
     Ok(exports)
@@ -88,10 +95,7 @@ fn import(item: RObject) -> InspectionResult<ImportSpec> {
     if names(item.sexp).iter().any(|name| name == "except") {
         return Ok(ImportSpec::All {
             package,
-            except: strings_field(&item, "except")?
-                .into_iter()
-                .map(BindingName::from)
-                .collect(),
+            except: typed_strings(&item, "except")?,
         });
     }
     let remote = values
@@ -180,14 +184,17 @@ fn dynlibs(context: &RObject, namespace: &RObject) -> InspectionResult<Vec<Nativ
                 .unwrap_or_default();
             Ok(NativeComponent {
                 alias: aliases.get(position).cloned().unwrap_or_default(),
-                name,
+                name: name.into(),
                 registration: registered.then(|| NativeRegistration {
                     prefix: fixes.first().cloned().unwrap_or_default(),
                     suffix: fixes.get(1).cloned().unwrap_or_default(),
                 }),
                 symbols: symbols
                     .into_iter()
-                    .map(|(binding, symbol)| NativeSymbolBinding { binding, symbol })
+                    .map(|(binding, symbol)| NativeSymbolBinding {
+                        binding: binding.into(),
+                        symbol: symbol.into(),
+                    })
                     .collect(),
                 library: native_library(&compiled)?,
                 safety: NativeSafety::Unanalyzed,
@@ -196,13 +203,13 @@ fn dynlibs(context: &RObject, namespace: &RObject) -> InspectionResult<Vec<Nativ
         .collect()
 }
 
-fn data_sets(context: &RObject) -> InspectionResult<BTreeMap<String, Vec<String>>> {
+fn data_sets(context: &RObject) -> InspectionResult<BTreeMap<DataSetName, Vec<DatasetName>>> {
     let sets = field(context, "data_sets")?;
     names(sets.sexp)
         .into_iter()
         .map(|set| {
-            let objects = strings_field(&sets, &set)?;
-            Ok((set, objects))
+            let objects = typed_strings(&sets, &set)?;
+            Ok((DataSetName::from(set), objects))
         })
         .collect()
 }
@@ -213,18 +220,18 @@ fn native_library(compiled: &RObject) -> InspectionResult<NativeLibrary> {
     };
     if names(compiled.sexp).iter().any(|name| name == "error") {
         return Ok(NativeLibrary::Unloadable {
-            library,
+            library: library.into(),
             error: string_field(compiled, "error")?,
         });
     }
     let routines = field(compiled, "routines")?;
     Ok(NativeLibrary::Loaded {
-        library,
+        library: library.into(),
         routines: NativeRoutines {
-            c: strings_field(&routines, "c")?,
-            call: strings_field(&routines, "call")?,
-            fortran: strings_field(&routines, "fortran")?,
-            external: strings_field(&routines, "external")?,
+            c: typed_strings(&routines, "c")?,
+            call: typed_strings(&routines, "call")?,
+            fortran: typed_strings(&routines, "fortran")?,
+            external: typed_strings(&routines, "external")?,
         },
         name_lookup: if bool::try_from(field(compiled, "force_symbols")?)? {
             NameLookup::Forced

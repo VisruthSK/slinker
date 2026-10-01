@@ -1,12 +1,17 @@
-use super::InspectionError;
-use super::InspectionResult;
+use super::sexp::{classes, names, symbol_name};
+use super::{InspectionError, InspectionResult};
 use harp::RFunctionExt;
+use harp::environment_iter::BindingValue;
+use harp::object::RObject;
 use slinker_core::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClassName, ClosureSource,
-    EmbeddedClosureSource, EmbeddedEnvironmentRef, ObjectIssue, ObjectKind, PrivateBindingImage,
-    PrivateEnvironmentImage,
+    EmbeddedClosureSource, EmbeddedEnvironmentRef, EnvironmentKind, EnvironmentLabel, MemberPath,
+    ObjectImage, ObjectIssue, ObjectIssueKind, ObjectKind, PrivateBindingImage,
+    PrivateEnvironmentImage, UnsupportedObject,
 };
 use std::collections::{HashMap, HashSet};
+
+const MAX_DEPTH: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct InspectionEpoch {
@@ -20,31 +25,57 @@ impl std::fmt::Display for InspectionEpoch {
     }
 }
 
-pub(super) struct ObjectScanner {
-    image_environment: libr::SEXP,
-    package: String,
-    pub(super) private_ids: HashMap<libr::SEXP, String>,
-    epoch: InspectionEpoch,
-    visiting: HashSet<libr::SEXP>,
-    walking: HashSet<libr::SEXP>,
-    pub(super) private_environments: HashMap<String, PrivateEnvironmentImage>,
+#[derive(Clone, Copy)]
+enum PromisePolicy {
+    Force,
+    Preserve,
 }
 
-impl ObjectScanner {
+#[derive(Clone, Copy)]
+enum Site<'a> {
+    Binding(&'a str),
+    Member,
+}
+
+pub(super) type PrivateIds = HashMap<libr::SEXP, EnvironmentLabel>;
+
+pub(super) struct ObjectScanner<'a> {
+    image_environment: libr::SEXP,
+    package: &'a str,
+    known: &'a PrivateIds,
+    epoch: InspectionEpoch,
+    discovered: PrivateIds,
+    walking: HashSet<libr::SEXP>,
+    private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
+}
+
+pub(super) struct ScanOutcome {
+    pub(super) discovered: PrivateIds,
+    pub(super) private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
+}
+
+impl<'a> ObjectScanner<'a> {
     pub(super) fn new(
         image_environment: libr::SEXP,
-        package: String,
-        private_ids: HashMap<libr::SEXP, String>,
+        package: &'a str,
+        known: &'a PrivateIds,
         epoch: InspectionEpoch,
     ) -> Self {
         Self {
             image_environment,
             package,
-            private_ids,
+            known,
             epoch,
-            visiting: HashSet::new(),
+            discovered: HashMap::new(),
             walking: HashSet::new(),
             private_environments: HashMap::new(),
+        }
+    }
+
+    pub(super) fn finish(self) -> ScanOutcome {
+        ScanOutcome {
+            discovered: self.discovered,
+            private_environments: self.private_environments,
         }
     }
 
@@ -52,412 +83,351 @@ impl ObjectScanner {
         &mut self,
         name: &str,
         origin: BindingOrigin,
-        value: harp::environment_iter::BindingValue,
+        value: BindingValue,
     ) -> InspectionResult<BindingImage> {
-        let (representation, object) = match value {
-            harp::environment_iter::BindingValue::Active { .. } => {
-                return Ok(BindingImage {
-                    name: name.into(),
-                    origin,
-                    representation: BindingRepresentation::ActiveBinding,
-                    classes: Vec::new(),
-                    object_kind: ObjectKind::ActiveBinding,
-                    closure: None,
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: Vec::new(),
-                });
-            }
-            harp::environment_iter::BindingValue::Promise { promise } => (
-                BindingRepresentation::LazyLoadPromise,
-                harp::utils::r_promise_force_with_rollback(promise.sexp).map_err(|error| {
-                    format!("failed to force demanded {}::{name}: {error}", self.package)
-                })?,
-            ),
-            harp::environment_iter::BindingValue::Altrep { object, .. } => {
-                let class = harp::utils::r_altrep_class(object.sexp);
-                return Ok(BindingImage {
-                    name: name.into(),
-                    origin,
-                    representation: BindingRepresentation::Altrep {
-                        class: class.clone(),
-                    },
-                    classes: Vec::new(),
-                    object_kind: ObjectKind::Altrep,
-                    closure: None,
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: altrep_issues("$", class),
-                });
-            }
-            harp::environment_iter::BindingValue::Standard { object } => {
-                (BindingRepresentation::Value, object)
-            }
-        };
-        let mut facts = self.scan_value(object.sexp, "$", Some(name), 0)?;
         Ok(BindingImage {
             name: name.into(),
             origin,
-            representation,
-            classes: classes(object.sexp)
-                .into_iter()
-                .map(ClassName::from)
-                .collect(),
-            object_kind: facts.kind,
-            closure: facts.closure.take(),
-            environment: facts.environment.take(),
-            embedded_closures: facts.closures,
-            embedded_environments: facts.environments,
-            issues: facts.issues,
+            object: self.scan_binding(name, value, PromisePolicy::Force)?,
         })
     }
 
     fn private_binding(
         &mut self,
         name: &str,
-        value: harp::environment_iter::BindingValue,
+        value: BindingValue,
     ) -> InspectionResult<PrivateBindingImage> {
-        let (representation, object) = match value {
-            harp::environment_iter::BindingValue::Active { .. } => {
-                return Ok(PrivateBindingImage {
-                    name: name.into(),
-                    representation: BindingRepresentation::ActiveBinding,
-                    classes: Vec::new(),
-                    object_kind: ObjectKind::ActiveBinding,
-                    closure: None,
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: Vec::new(),
-                });
-            }
-            harp::environment_iter::BindingValue::Promise { promise } => {
-                let forced = harp::utils::r_promise_is_forced(promise.sexp);
-                if !forced {
-                    return Ok(PrivateBindingImage {
-                        name: name.into(),
-                        representation: BindingRepresentation::Promise { forced: false },
-                        classes: Vec::new(),
-                        object_kind: ObjectKind::Promise,
-                        closure: None,
-                        environment: None,
-                        embedded_closures: Vec::new(),
-                        embedded_environments: Vec::new(),
-                        issues: vec![ObjectIssue {
-                            path: "$".into(),
-                            kind: "unforced_promise".into(),
-                            detail: "nested promise is preserved without forcing".into(),
-                        }],
-                    });
-                }
-                (
-                    BindingRepresentation::Promise { forced: true },
-                    harp::object::RObject::from(harp::utils::r_promise_value(promise.sexp)),
-                )
-            }
-            harp::environment_iter::BindingValue::Altrep { object, .. } => {
-                let class = harp::utils::r_altrep_class(object.sexp);
-                return Ok(PrivateBindingImage {
-                    name: name.into(),
-                    representation: BindingRepresentation::Altrep {
-                        class: class.clone(),
-                    },
-                    classes: Vec::new(),
-                    object_kind: ObjectKind::Altrep,
-                    closure: None,
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: altrep_issues("$", class),
-                });
-            }
-            harp::environment_iter::BindingValue::Standard { object } => {
-                (BindingRepresentation::Value, object)
-            }
-        };
-        let mut facts = self.scan_value(object.sexp, "$", Some(name), 0)?;
         Ok(PrivateBindingImage {
             name: name.into(),
-            representation,
-            classes: classes(object.sexp)
-                .into_iter()
-                .map(ClassName::from)
-                .collect(),
-            object_kind: facts.kind,
-            closure: facts.closure.take(),
-            environment: facts.environment.take(),
-            embedded_closures: facts.closures,
-            embedded_environments: facts.environments,
-            issues: facts.issues,
+            object: self.scan_binding(name, value, PromisePolicy::Preserve)?,
         })
+    }
+
+    fn scan_binding(
+        &mut self,
+        name: &str,
+        value: BindingValue,
+        policy: PromisePolicy,
+    ) -> InspectionResult<ObjectImage> {
+        let (representation, object) = match value {
+            BindingValue::Active { .. } => {
+                return Ok(ObjectImage::of_kind(
+                    BindingRepresentation::ActiveBinding,
+                    ObjectKind::ActiveBinding,
+                ));
+            }
+            BindingValue::Altrep { object, .. } => {
+                return Ok(altrep_image(&harp::utils::r_altrep_class(object.sexp)));
+            }
+            BindingValue::Promise { promise } => match policy {
+                PromisePolicy::Force => (
+                    BindingRepresentation::LazyLoadPromise,
+                    harp::utils::r_promise_force_with_rollback(promise.sexp).map_err(|error| {
+                        format!("failed to force demanded {}::{name}: {error}", self.package)
+                    })?,
+                ),
+                PromisePolicy::Preserve if !harp::utils::r_promise_is_forced(promise.sexp) => {
+                    return Ok(unforced_promise_image());
+                }
+                PromisePolicy::Preserve => (
+                    BindingRepresentation::Promise { forced: true },
+                    RObject::from(harp::utils::r_promise_value(promise.sexp)),
+                ),
+            },
+            BindingValue::Standard { object } => (BindingRepresentation::Value, object),
+        };
+        let mut image =
+            self.scan_value(object.sexp, &MemberPath::root(), Site::Binding(name), 0)?;
+        image.representation = representation;
+        image.classes = classes(object.sexp)
+            .into_iter()
+            .map(ClassName::from)
+            .collect();
+        Ok(image)
     }
 
     fn scan_value(
         &mut self,
         value: libr::SEXP,
-        path: &str,
-        binding: Option<&str>,
+        path: &MemberPath,
+        site: Site<'_>,
         depth: usize,
-    ) -> InspectionResult<ObjectFacts> {
-        if depth > 128 {
-            return Ok(ObjectFacts::issue(
-                ObjectKind::Other("depth".into()),
+    ) -> InspectionResult<ObjectImage> {
+        if depth > MAX_DEPTH {
+            return Ok(issue_image(
+                ObjectKind::Unsupported(UnsupportedObject::DepthLimit),
                 path,
-                "object_depth",
+                ObjectIssueKind::ObjectDepth,
                 "object graph exceeds 128 levels",
             ));
         }
         if harp::utils::r_is_altrep(value) {
-            let mut facts = ObjectFacts::new(ObjectKind::Altrep);
-            facts.issues = altrep_issues(path, harp::utils::r_altrep_class(value));
-            return Ok(facts);
+            let mut image = ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Altrep);
+            image.issues = altrep_issues(path, &harp::utils::r_altrep_class(value));
+            return Ok(image);
         }
+        let kind = harp::utils::r_typeof(value);
         let recursive = matches!(
-            harp::utils::r_typeof(value),
+            kind,
             libr::CLOSXP | libr::ENVSXP | libr::VECSXP | libr::LISTSXP
         );
+        let mut image = ObjectImage::of_kind(BindingRepresentation::Value, object_kind(value));
         if recursive && !self.walking.insert(value) {
-            let mut facts = ObjectFacts::new(object_kind(value));
-            if harp::utils::r_typeof(value) == libr::ENVSXP {
-                let environment = self.environment_ref(value)?;
-                if binding.is_none() && !environment.starts_with("unsupported:") {
-                    facts.environments.push(EmbeddedEnvironmentRef {
-                        path: path.into(),
-                        environment: environment.clone(),
-                    });
-                }
-                facts.environment = Some(environment);
+            if kind == libr::ENVSXP {
+                self.scan_environment(&mut image, value, path, site, false)?;
             }
-            return Ok(facts);
+            return Ok(image);
         }
-        let mut facts = ObjectFacts::new(object_kind(value));
-        match harp::utils::r_typeof(value) {
-            libr::CLOSXP => {
-                let closure_environment = harp::RFunction::new("base", "environment")
-                    .add(value)
-                    .call()?;
-                let environment = self.environment_ref(closure_environment.sexp)?;
-                let source = self.deparse(binding, value)?.into();
-                match binding {
-                    Some(_) => {
-                        facts.closure = Some(ClosureSource {
-                            environment: environment.clone(),
-                            source,
-                        });
-                    }
-                    None => facts.closures.push(EmbeddedClosureSource {
-                        path: path.into(),
-                        environment: environment.clone(),
-                        source,
-                    }),
-                }
-                facts.environment = Some(environment);
-            }
-            libr::ENVSXP => {
-                let environment = self.environment_ref(value)?;
-                if binding.is_none() && !environment.starts_with("unsupported:") {
-                    facts.environments.push(EmbeddedEnvironmentRef {
-                        path: path.into(),
-                        environment: environment.clone(),
-                    });
-                }
-                if let Some(detail) = environment.strip_prefix("unsupported:") {
-                    facts.issues.push(ObjectIssue {
-                        path: path.into(),
-                        kind: "environment_identity".into(),
-                        detail: detail.into(),
-                    });
-                }
-                facts.environment = Some(environment);
-            }
-            libr::VECSXP => {
-                let names = names(value);
-                for index in 0..harp::object::r_length(value) {
-                    let member = usize::try_from(index)
-                        .ok()
-                        .and_then(|index| names.get(index))
-                        .filter(|name| !name.is_empty())
-                        .map_or_else(|| format!("[[{}]]", index + 1), |name| format!("${name}"));
-                    facts.merge(self.scan_value(
-                        harp::object::list_get(value, index),
-                        &format!("{path}{member}"),
-                        None,
-                        depth + 1,
-                    )?);
-                }
-            }
+        match kind {
+            libr::CLOSXP => self.scan_closure(&mut image, value, path, site)?,
+            libr::ENVSXP => self.scan_environment(&mut image, value, path, site, true)?,
+            libr::VECSXP => self.scan_members(&mut image, value, path, depth)?,
             libr::LISTSXP => {
-                let mut node = value;
-                let mut index = 1;
-                while node != unsafe { libr::R_NilValue } {
-                    let item = unsafe { libr::CAR(node) };
-                    if item != unsafe { libr::R_MissingArg } {
-                        let tag = symbol_name(unsafe { libr::TAG(node) });
-                        let member = tag
-                            .filter(|name| !name.is_empty())
-                            .map_or_else(|| format!("[[{index}]]"), |name| format!("${name}"));
-                        facts.merge(self.scan_value(
-                            item,
-                            &format!("{path}{member}"),
-                            None,
-                            depth + 1,
-                        )?);
-                    }
-                    node = unsafe { libr::CDR(node) };
-                    index += 1;
-                }
+                let members = harp::RFunction::new("base", "as.list")
+                    .add(RObject::view(value))
+                    .call()?;
+                self.scan_members(&mut image, members.sexp, path, depth)?;
             }
-            libr::EXTPTRSXP => facts.issues.push(ObjectIssue {
-                path: path.into(),
-                kind: "external_pointer".into(),
-                detail: "external pointer".into(),
-            }),
-            libr::WEAKREFSXP => facts.issues.push(ObjectIssue {
-                path: path.into(),
-                kind: "weak_reference".into(),
-                detail: "weak reference".into(),
-            }),
+            libr::EXTPTRSXP => image.issues.push(member_issue(
+                path,
+                ObjectIssueKind::ExternalPointer,
+                "external pointer",
+            )),
+            libr::WEAKREFSXP => image.issues.push(member_issue(
+                path,
+                ObjectIssueKind::WeakReference,
+                "weak reference",
+            )),
             _ => {}
         }
-        if !matches!(harp::utils::r_typeof(value), libr::LANGSXP | libr::EXPRSXP) {
-            let mut attribute = unsafe { libr::ATTRIB(value) };
-            while attribute != unsafe { libr::R_NilValue } {
-                let name =
-                    symbol_name(unsafe { libr::TAG(attribute) }).unwrap_or_else(|| "?".into());
-                facts.merge(self.scan_value(
-                    unsafe { libr::CAR(attribute) },
-                    &format!("{path}.attr[{name}]"),
-                    None,
+        if !matches!(kind, libr::LANGSXP | libr::EXPRSXP) {
+            let mut attributes = Vec::new();
+            harp::r::attrib_for_each(value, |tag, attribute| attributes.push((tag, attribute)));
+            for (tag, attribute) in attributes {
+                let name = symbol_name(tag).unwrap_or_else(|| "?".into());
+                let member = self.scan_value(
+                    attribute,
+                    &MemberPath::new(format!("{path}.attr[{name}]")),
+                    Site::Member,
                     depth + 1,
-                )?);
-                attribute = unsafe { libr::CDR(attribute) };
+                )?;
+                image.absorb_members(member);
             }
         }
         if recursive {
             self.walking.remove(&value);
         }
-        Ok(facts)
+        Ok(image)
     }
 
-    fn deparse(&self, binding: Option<&str>, value: libr::SEXP) -> InspectionResult<String> {
+    fn scan_closure(
+        &mut self,
+        image: &mut ObjectImage,
+        value: libr::SEXP,
+        path: &MemberPath,
+        site: Site<'_>,
+    ) -> InspectionResult<()> {
+        let environment = self.environment_ref(harp::r::fn_env(value))?;
+        let source = self.deparse(site, value)?.into();
+        match site {
+            Site::Binding(_) => {
+                image.closure = Some(ClosureSource {
+                    environment: environment.clone(),
+                    source,
+                });
+            }
+            Site::Member => image.embedded_closures.push(EmbeddedClosureSource {
+                path: path.clone(),
+                environment: environment.clone(),
+                source,
+            }),
+        }
+        image.environment = Some(environment);
+        Ok(())
+    }
+
+    fn scan_environment(
+        &mut self,
+        image: &mut ObjectImage,
+        value: libr::SEXP,
+        path: &MemberPath,
+        site: Site<'_>,
+        report_identity: bool,
+    ) -> InspectionResult<()> {
+        let environment = self.environment_ref(value)?;
+        if matches!(site, Site::Member) && !environment.is_unsupported() {
+            image.embedded_environments.push(EmbeddedEnvironmentRef {
+                path: path.clone(),
+                environment: environment.clone(),
+            });
+        }
+        if report_identity && let EnvironmentKind::Unsupported(detail) = environment.kind() {
+            image.issues.push(ObjectIssue {
+                path: path.clone(),
+                kind: ObjectIssueKind::EnvironmentIdentity,
+                detail: detail.into(),
+            });
+        }
+        image.environment = Some(environment);
+        Ok(())
+    }
+
+    fn scan_members(
+        &mut self,
+        image: &mut ObjectImage,
+        list: libr::SEXP,
+        path: &MemberPath,
+        depth: usize,
+    ) -> InspectionResult<()> {
+        let names = names(list);
+        for index in 0..harp::object::r_length(list) {
+            let position = usize::try_from(index).unwrap_or(usize::MAX);
+            let member = match names.get(position).filter(|name| !name.is_empty()) {
+                Some(name) => path.field(name),
+                None => path.element(position + 1),
+            };
+            let scanned = self.scan_value(
+                harp::object::list_get(list, index),
+                &member,
+                Site::Member,
+                depth + 1,
+            )?;
+            image.absorb_members(scanned);
+        }
+        Ok(())
+    }
+
+    fn deparse(&self, site: Site<'_>, value: libr::SEXP) -> InspectionResult<String> {
+        let name = match site {
+            Site::Binding(name) => name,
+            Site::Member => ".slinker_embedded",
+        };
         harp::RFunction::new("", ".slinker_deparse_binding")
-            .add(binding.unwrap_or(".slinker_embedded"))
+            .add(name)
             .add(value)
             .call()
             .and_then(String::try_from)
             .map_err(InspectionError::from)
     }
 
-    fn environment_ref(&mut self, environment: libr::SEXP) -> InspectionResult<String> {
-        if environment == self.image_environment {
-            return Ok(format!("namespace:{}", self.package));
+    fn environment_ref(&mut self, environment: libr::SEXP) -> InspectionResult<EnvironmentLabel> {
+        if let Some(label) = self.distinguished_environment(environment)? {
+            return Ok(label);
         }
-        if environment == unsafe { libr::R_BaseNamespace } {
-            return Ok("namespace:base".into());
+        if let Some(label) = self
+            .known
+            .get(&environment)
+            .or(self.discovered.get(&environment))
+        {
+            return Ok(label.clone());
         }
-        if environment == unsafe { libr::R_BaseEnv } {
-            return Ok("base:base".into());
-        }
-        if environment == unsafe { libr::R_EmptyEnv } {
-            return Ok("base:empty".into());
-        }
-        if environment == unsafe { libr::R_GlobalEnv } {
-            return Ok("unsupported:global".into());
-        }
-        if harp::utils::r_env_is_ns_env(environment) {
-            return harp::utils::r_envir_name(environment)
-                .map(|name| format!("namespace:{name}"))
-                .map_err(InspectionError::from);
-        }
-        if harp::utils::r_env_is_pkg_env(environment) {
-            return harp::utils::r_envir_name(environment)
-                .map(|name| format!("unsupported:{name}"))
-                .map_err(InspectionError::from);
-        }
-        let pointer = environment;
-        if let Some(id) = self.private_ids.get(&pointer) {
-            return Ok(id.clone());
-        }
-        let id = format!("private:{}:{}", self.epoch, self.private_ids.len() + 1);
-        self.private_ids.insert(pointer, id.clone());
-        self.inventory_private(environment, &id)?;
-        Ok(id)
+        let label =
+            EnvironmentLabel::private(self.epoch, self.known.len() + self.discovered.len() + 1);
+        self.discovered.insert(environment, label.clone());
+        self.inventory_private(environment, &label)?;
+        Ok(label)
     }
 
-    fn inventory_private(&mut self, environment: libr::SEXP, id: &str) -> InspectionResult<()> {
-        let pointer = environment;
-        if !self.visiting.insert(pointer) || self.private_environments.contains_key(id) {
-            return Ok(());
-        }
-        self.private_environments.insert(
-            id.into(),
-            PrivateEnvironmentImage {
-                id: id.into(),
-                parent: "base:empty".into(),
-                bindings: HashMap::new(),
-            },
-        );
+    fn distinguished_environment(
+        &self,
+        environment: libr::SEXP,
+    ) -> InspectionResult<Option<EnvironmentLabel>> {
+        let envs = &*harp::environment::R_ENVS;
+        let label = if environment == self.image_environment {
+            EnvironmentLabel::namespace(self.package)
+        } else if environment == envs.base_ns {
+            EnvironmentLabel::namespace("base")
+        } else if environment == envs.base {
+            EnvironmentLabel::base()
+        } else if environment == envs.empty {
+            EnvironmentLabel::empty()
+        } else if environment == envs.global {
+            EnvironmentLabel::unsupported("global")
+        } else if harp::utils::r_env_is_ns_env(environment) {
+            EnvironmentLabel::namespace(&harp::utils::r_envir_name(environment)?)
+        } else if harp::utils::r_env_is_pkg_env(environment) {
+            EnvironmentLabel::unsupported(&harp::utils::r_envir_name(environment)?)
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(label))
+    }
+
+    fn inventory_private(
+        &mut self,
+        environment: libr::SEXP,
+        label: &EnvironmentLabel,
+    ) -> InspectionResult<()> {
         let parent = self.environment_ref(harp::r::env_parent(environment))?;
         let bindings = harp::environment::Environment::view(environment)
             .iter()
             .map(|binding| {
                 let binding = binding?;
                 let name = String::from(binding.name);
-                Ok((
-                    BindingName::from(name.as_str()),
-                    self.private_binding(&name, binding.value)?,
-                ))
+                let image = self.private_binding(&name, binding.value)?;
+                Ok((BindingName::from(name), image))
             })
             .collect::<InspectionResult<HashMap<_, _>>>()?;
         self.private_environments.insert(
-            id.into(),
+            label.clone(),
             PrivateEnvironmentImage {
-                id: id.into(),
+                id: label.clone(),
                 parent,
                 bindings,
             },
         );
-        self.visiting.remove(&pointer);
         Ok(())
     }
 }
 
-struct ObjectFacts {
-    kind: ObjectKind,
-    closure: Option<ClosureSource>,
-    environment: Option<String>,
-    closures: Vec<EmbeddedClosureSource>,
-    environments: Vec<EmbeddedEnvironmentRef>,
-    issues: Vec<ObjectIssue>,
+fn member_issue(path: &MemberPath, kind: ObjectIssueKind, detail: &str) -> ObjectIssue {
+    ObjectIssue {
+        path: path.clone(),
+        kind,
+        detail: detail.into(),
+    }
 }
 
-impl ObjectFacts {
-    pub(super) fn new(kind: ObjectKind) -> Self {
-        Self {
-            kind,
-            closure: None,
-            environment: None,
-            closures: Vec::new(),
-            environments: Vec::new(),
-            issues: Vec::new(),
-        }
+fn issue_image(
+    kind: ObjectKind,
+    path: &MemberPath,
+    issue: ObjectIssueKind,
+    detail: &str,
+) -> ObjectImage {
+    let mut image = ObjectImage::of_kind(BindingRepresentation::Value, kind);
+    image.issues.push(member_issue(path, issue, detail));
+    image
+}
+
+fn altrep_issues(path: &MemberPath, class: &str) -> Vec<ObjectIssue> {
+    if class.starts_with("base::") {
+        return Vec::new();
     }
-    fn issue(kind: ObjectKind, path: &str, issue: &str, detail: &str) -> Self {
-        let mut facts = Self::new(kind);
-        facts.issues.push(ObjectIssue {
-            path: path.into(),
-            kind: issue.into(),
-            detail: detail.into(),
-        });
-        facts
-    }
-    fn merge(&mut self, mut other: Self) {
-        self.closures.append(&mut other.closures);
-        self.environments.append(&mut other.environments);
-        self.issues.append(&mut other.issues);
-    }
+    vec![member_issue(path, ObjectIssueKind::Altrep, class)]
+}
+
+fn altrep_image(class: &str) -> ObjectImage {
+    let mut image = ObjectImage::of_kind(
+        BindingRepresentation::Altrep {
+            class: class.to_owned(),
+        },
+        ObjectKind::Altrep,
+    );
+    image.issues = altrep_issues(&MemberPath::root(), class);
+    image
+}
+
+fn unforced_promise_image() -> ObjectImage {
+    let mut image = ObjectImage::of_kind(
+        BindingRepresentation::Promise { forced: false },
+        ObjectKind::Promise,
+    );
+    image.issues.push(member_issue(
+        &MemberPath::root(),
+        ObjectIssueKind::UnforcedPromise,
+        "nested promise is preserved without forcing",
+    ));
+    image
 }
 
 fn object_kind(value: libr::SEXP) -> ObjectKind {
@@ -481,35 +451,6 @@ fn object_kind(value: libr::SEXP) -> ObjectKind {
         libr::PROMSXP => ObjectKind::Promise,
         libr::EXTPTRSXP => ObjectKind::ExternalPointer,
         libr::WEAKREFSXP => ObjectKind::WeakReference,
-        kind => ObjectKind::Other(format!("SEXPTYPE {kind}")),
+        code => ObjectKind::Unsupported(UnsupportedObject::SexpType(code)),
     }
-}
-
-pub(super) fn names(value: libr::SEXP) -> Vec<String> {
-    let names = unsafe { libr::Rf_getAttrib(value, libr::R_NamesSymbol) };
-    Vec::<String>::try_from(harp::object::RObject::from(names)).unwrap_or_default()
-}
-
-fn altrep_issues(path: &str, class: String) -> Vec<ObjectIssue> {
-    if class.starts_with("base::") {
-        return Vec::new();
-    }
-    vec![ObjectIssue {
-        path: path.into(),
-        kind: "altrep".into(),
-        detail: class,
-    }]
-}
-
-fn classes(value: libr::SEXP) -> Vec<String> {
-    let class = unsafe { libr::Rf_getAttrib(value, libr::R_ClassSymbol) };
-    Vec::<String>::try_from(harp::object::RObject::from(class)).unwrap_or_default()
-}
-
-fn symbol_name(symbol: libr::SEXP) -> Option<String> {
-    if symbol == unsafe { libr::R_NilValue } {
-        return None;
-    }
-    let chars = unsafe { libr::PRINTNAME(symbol) };
-    String::try_from(harp::object::RObject::from(chars)).ok()
 }

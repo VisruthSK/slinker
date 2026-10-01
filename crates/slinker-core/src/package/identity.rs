@@ -1,11 +1,13 @@
 use crate::package::PackageName;
 use crate::{Description, Version};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Digest(pub String);
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Digest(String);
 
 impl Digest {
     pub fn of(bytes: impl AsRef<[u8]>) -> Self {
@@ -16,9 +18,33 @@ impl Digest {
         Self(
             hash.finalize()
                 .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
+                .fold(String::with_capacity(64), |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                }),
         )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Digest {
+    fn from(digest: String) -> Self {
+        Self(digest)
+    }
+}
+
+impl From<&str> for Digest {
+    fn from(digest: &str) -> Self {
+        Self(digest.to_owned())
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 

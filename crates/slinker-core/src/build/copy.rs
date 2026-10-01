@@ -29,7 +29,7 @@ pub(super) fn copy_linked_resources(
         let target = output
             .join("inst/slinker/resources")
             .join(package.name.as_str())
-            .join(&resource.path);
+            .join(resource.path.as_str());
         copy_entry(source, &target)?;
     }
     Ok(())

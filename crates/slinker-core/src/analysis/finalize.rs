@@ -22,7 +22,9 @@ use crate::metadata::{Relation, RelationField, intersect_requirements, relations
 use crate::package::PackageIdentity;
 use crate::package::PackageImage;
 use crate::package::PackageSources;
-use crate::package::{NativeComponent, PackageAvailability, PackageId, PackageProvider};
+use crate::package::{
+    EnvironmentLabel, NativeComponent, PackageAvailability, PackageId, PackageProvider,
+};
 use crate::source::generated_description;
 use crate::syntax::{SourceKey, SourceOrigin, Sources};
 use crate::{Error, Result};
@@ -283,7 +285,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 image,
                 namespace: namespace_builder,
             } = self.loaded_ref(package)?;
-            let namespace_label = format!("namespace:{package_name}");
+            let namespace_label = EnvironmentLabel::namespace(package_name);
             let mut names = retained_bindings.remove(&package).unwrap_or_default();
             names.extend(
                 namespace_builder
@@ -298,7 +300,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         match (
                             &binding.object.closure,
                             self.parses
-                                .shape(&(package, SourceKey::Binding(name.to_string()))),
+                                .shape(&(package, SourceKey::Binding(name.clone()))),
                         ) {
                             (Some(closure), Some(normalized_shape))
                                 if closure.environment == namespace_label =>
@@ -372,7 +374,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 if let (LinkedPackageRole::Linked, Some(library)) = (role, native.library.path()) {
                     builder.add_resource(ResourceIr {
                         package,
-                        path: library.to_owned(),
+                        path: library.clone(),
                     });
                 }
             }
@@ -515,7 +517,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let code = self.payload_closure(builder, namespace_ids, origin);
             if code.is_none() {
                 issues.push(FinalizationIssue::NonRelocatableCode {
-                    package: origin.package.clone(),
+                    package: origin.package.to_string(),
                     binding: origin.key.to_string(),
                 });
             }
@@ -557,7 +559,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 } => {
                     let resource_id = builder.add_resource(ResourceIr {
                         package: *package,
-                        path: resource.clone(),
+                        path: resource.as_str().into(),
                     });
                     RelocationTarget::Resource {
                         target: resource_id,
@@ -687,7 +689,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         .as_ref()?,
                 )
             }
-            SourceKey::Closure { .. } | SourceKey::Runtime => return None,
+            SourceKey::Closure { .. } => return None,
         };
         Some(builder.add_payload_closure(
             bundle,
@@ -752,7 +754,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         builder: &ProgramBuilder,
         namespace: &FinalizedNamespace,
         image: &PackageImage,
-    ) -> HashMap<String, (BindingName, Vec<ObjectStep>)> {
+    ) -> HashMap<EnvironmentLabel, (BindingName, Vec<ObjectStep>)> {
         let mut queue = VecDeque::new();
         for (name, &binding) in &namespace.bindings {
             if builder.binding_is_payload(binding)
@@ -1022,7 +1024,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.dynamic_names.observe_creator(NameCreator {
                 node,
                 package,
-                binding: component,
+                binding: component.to_string(),
                 operation: "useDynLib(.registration = TRUE)",
                 name: CreatedName::Any,
             });

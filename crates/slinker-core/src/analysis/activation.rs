@@ -101,7 +101,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 node,
                 Need::Native {
                     package: id,
-                    component: native.name.clone().into(),
+                    component: native.name.clone(),
                 },
                 EdgeKind::Native,
                 format!("effective useDynLib requires {}", native.name),
@@ -264,7 +264,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         node,
                         Need::Resource {
                             package: id,
-                            resource: library.to_owned().into(),
+                            resource: library.to_owned(),
                         },
                         EdgeKind::Native,
                         format!("native component `{component}` ships its compiled library"),
@@ -285,7 +285,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     let identity = self.packages.identity(id);
                     let message = format!(
                         "native component `{component}` has unanalyzed C-to-R callbacks; an audited SLINKER_NATIVE_SUMMARIES entry for package `{}` version `{}` image `{}` makes it analyzable",
-                        identity.name, identity.version, identity.image_fingerprint.0
+                        identity.name, identity.version, identity.image_fingerprint
                     );
                     self.diagnostic(
                         node,
@@ -302,7 +302,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             node,
                             Need::Binding {
                                 package: id,
-                                binding: callback.clone().into(),
+                                binding: callback.clone(),
                             },
                             EdgeKind::Callback,
                             format!("native component `{component}` calls R binding `{callback}`"),

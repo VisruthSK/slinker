@@ -4,6 +4,7 @@ mod payload;
 mod runtime;
 mod scan;
 mod serve;
+mod sexp;
 #[cfg(test)]
 mod tests;
 
@@ -27,6 +28,12 @@ impl From<harp::Error> for InspectionError {
     }
 }
 
+impl From<&str> for InspectionError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
 impl From<String> for InspectionError {
     fn from(message: String) -> Self {
         Self::Failed(message)
@@ -43,8 +50,21 @@ struct WorkerOperationError {
 }
 
 impl WorkerOperationError {
-    fn with(code: WorkerErrorCode) -> impl Fn(InspectionError) -> Self + Copy {
-        move |error| Self { code, error }
+    fn new(code: WorkerErrorCode, error: impl Into<InspectionError>) -> Self {
+        Self {
+            code,
+            error: error.into(),
+        }
+    }
+}
+
+trait Coded<T> {
+    fn coded(self, code: WorkerErrorCode) -> OperationResult<T>;
+}
+
+impl<T, E: Into<InspectionError>> Coded<T> for Result<T, E> {
+    fn coded(self, code: WorkerErrorCode) -> OperationResult<T> {
+        self.map_err(|error| WorkerOperationError::new(code, error))
     }
 }
 

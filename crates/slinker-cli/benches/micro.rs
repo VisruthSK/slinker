@@ -7,9 +7,10 @@ use slinker_core::analysis::Linker;
 use slinker_core::cache::CacheLocation;
 use slinker_core::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, CanonicalSyntax,
-    ClosureSource, Digest, DispatchSubject, ExportMap, GenericName, InstalledPackage,
-    LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
-    PackageLocator, PackageProvider, PackageResolver, PackageStore, SyntaxValidation,
+    ClosureSource, Digest, DispatchSubject, EnvironmentLabel, ExportMap, ExportName, GenericName,
+    InstalledPackage, LifecycleMetadata, ObjectImage, ObjectKind, PackageIdentity, PackageImage,
+    PackageIndex, PackageLocation, PackageLocator, PackageProvider, PackageResolver, PackageStore,
+    SyntaxValidation,
 };
 use slinker_core::syntax::{OakParseContext, OakParser, SourceKey, Sources};
 use slinker_core::{Description, Result, Target, TargetEnvironment};
@@ -155,17 +156,11 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
                     name: BindingName::from(name.as_str()),
                     origin: BindingOrigin::Code,
                     object: ObjectImage {
-                        representation: BindingRepresentation::Value,
-                        classes: Vec::new(),
-                        object_kind: ObjectKind::Closure,
                         closure: Some(ClosureSource {
                             source: Arc::from(source.as_str()),
-                            environment: "namespace:root".into(),
+                            environment: EnvironmentLabel::namespace("root"),
                         }),
-                        environment: None,
-                        embedded_closures: Vec::new(),
-                        embedded_environments: Vec::new(),
-                        issues: Vec::new(),
+                        ..ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Closure)
                     },
                 },
             )
@@ -178,12 +173,12 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
             identity: PackageIdentity {
                 name: "root".into(),
                 version: "1.0.0".parse().expect("valid version"),
-                image_fingerprint: Digest("fp-root".into()),
+                image_fingerprint: Digest::from("fp-root"),
             },
             description: Description::parse("Package: root\nVersion: 1.0.0\n"),
             exports: binding_names
                 .iter()
-                .map(|name| (name.to_string(), name.clone()))
+                .map(|name| (ExportName::from(name.as_str()), name.clone()))
                 .collect::<ExportMap>(),
             imports: Vec::new(),
             s3: Vec::new(),

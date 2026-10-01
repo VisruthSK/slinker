@@ -3,7 +3,8 @@ use super::resolution::{OpenReason, Resolution};
 use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
-use crate::package::{DatasetName, PackageId, PackageImage, PackageProvider};
+use crate::package::EnvironmentLabel;
+use crate::package::{DataSetName, DatasetName, PackageId, PackageImage, PackageProvider};
 use crate::syntax::{CallSite, CalleeKind, PackageRef, StaticArg};
 
 use super::relocation::PendingRelocation;
@@ -106,12 +107,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Some(call.span.clone()),
             );
         };
-        let mut sets = Vec::new();
+        let mut sets = Vec::<DataSetName>::new();
         for (index, argument) in call.args.iter().enumerate() {
             let named = call.arg_names.get(index).and_then(Option::as_deref);
             match (named, argument) {
-                (None | Some("list"), Some(StaticArg::String(set))) => sets.push(set.clone()),
-                (None, Some(StaticArg::Symbol(set))) => sets.push(set.clone()),
+                (None | Some("list"), Some(StaticArg::String(set))) => sets.push(set.into()),
+                (None, Some(StaticArg::Symbol(set))) => sets.push(set.into()),
                 (None | Some("list"), _) => {
                     blocked(
                         self,
@@ -203,7 +204,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         current: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<bool> {
         if call.callee != "data"

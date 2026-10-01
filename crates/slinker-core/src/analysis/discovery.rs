@@ -49,7 +49,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let index = self.packages.index(foreign)?;
                 index
                     .exports
-                    .get(&reference.symbol)
+                    .get(reference.symbol.as_str())
                     .cloned()
                     .unwrap_or_else(|| BindingName::from(reference.symbol.clone()))
             };
@@ -96,7 +96,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         let index = self.packages.index(foreign)?;
         if !reference.internal
-            && !index.exports.contains_key(&reference.symbol)
+            && !index.exports.contains_key(reference.symbol.as_str())
             && index.data.defines(&reference.symbol)
         {
             self.dataset_access(from, foreign, reference);
@@ -107,7 +107,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         } else {
             index
                 .exports
-                .get(&reference.symbol)
+                .get(reference.symbol.as_str())
                 .cloned()
                 .unwrap_or_else(|| BindingName::from(reference.symbol.clone()))
         };

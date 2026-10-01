@@ -1,6 +1,6 @@
 use super::NodeId;
 use crate::ir::NamespaceOperation;
-use crate::package::{BindingName, ComponentName, DatasetName, PackageId};
+use crate::package::{BindingName, ComponentName, DataSetName, DatasetName, PackageId};
 use crate::syntax::Span;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +55,7 @@ pub(super) enum PendingRelocation {
     DataArgument {
         source: Span,
         package: PackageId,
-        sets: Vec<String>,
+        sets: Vec<DataSetName>,
     },
     NativeSymbol {
         source: Span,

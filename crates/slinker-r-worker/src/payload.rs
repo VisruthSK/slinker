@@ -1,8 +1,10 @@
 use super::runtime::WorkerRuntime;
-use super::{InspectionError, WorkerOperationError, protocol};
+use super::{Coded, WorkerOperationError, protocol};
 use super::{InspectionResult, OperationResult};
 use harp::{RFunctionExt, RObjectExt};
 use protocol::WorkerErrorCode;
+use slinker_core::ir::ObjectStep;
+use slinker_core::package::BindingName;
 use std::collections::{HashMap, HashSet};
 
 impl WorkerRuntime {
@@ -16,7 +18,7 @@ impl WorkerRuntime {
         let mut registered_names = Vec::with_capacity(namespaces.len());
         for namespace in namespaces {
             images.add(self.image_environment(&namespace.package)?);
-            package_names.push(namespace.package.name.clone());
+            package_names.push(namespace.package.name.to_string());
             registered_names.push(namespace.registered_name.clone());
         }
         let mut replaced = Vec::new();
@@ -24,12 +26,12 @@ impl WorkerRuntime {
             let image = self.image_environment(&payload.package)?;
             for patch in &payload.patches {
                 replaced.push(patch_closure(&image, patch).map_err(|error| {
-                    WorkerOperationError::with(WorkerErrorCode::BindingForce)(
+                    WorkerOperationError::new(
+                        WorkerErrorCode::BindingForce,
                         format!(
                             "failed to rewrite payload closure {}::{}: {error}",
                             payload.package.name, patch.binding
-                        )
-                        .into(),
+                        ),
                     )
                 })?);
             }
@@ -39,18 +41,7 @@ impl WorkerRuntime {
             for payload in payloads {
                 let image = self.image_environment(&payload.package)?;
                 for name in &payload.names {
-                    roots.push(
-                        harp::RFunction::new("base", "get")
-                            .add(name.clone())
-                            .param("envir", image.clone())
-                            .param("inherits", false)
-                            .call()
-                            .map_err(|error| {
-                                WorkerOperationError::with(WorkerErrorCode::BindingForce)(
-                                    InspectionError::from(error),
-                                )
-                            })?,
-                    );
+                    roots.push(get_binding(&image, name).coded(WorkerErrorCode::BindingForce)?);
                 }
             }
             let replaced = replaced
@@ -58,10 +49,9 @@ impl WorkerRuntime {
                 .map(|closure| closure.sexp)
                 .collect::<HashSet<_>>();
             if ReferenceWalk::default().reaches(&roots, &replaced) {
-                return Err(WorkerOperationError::with(WorkerErrorCode::BindingForce)(
-                    "a rewritten payload closure is still referenced from another payload location"
-                        .to_owned()
-                        .into(),
+                return Err(WorkerOperationError::new(
+                    WorkerErrorCode::BindingForce,
+                    "a rewritten payload closure is still referenced from another payload location",
                 ));
             }
         }
@@ -72,20 +62,27 @@ impl WorkerRuntime {
                 .iter()
                 .any(|namespace| namespace.package.root == payload.package.root)
             {
-                return Err(WorkerOperationError::with(WorkerErrorCode::Protocol)(
+                return Err(WorkerOperationError::new(
+                    WorkerErrorCode::Protocol,
                     format!(
                         "payload of {} is not a materialized namespace image",
                         payload.package.name
-                    )
-                    .into(),
+                    ),
                 ));
             }
             sources.add(self.image_environment(&payload.package)?);
-            names.add(payload.names.clone());
+            names.add(
+                payload
+                    .names
+                    .iter()
+                    .map(BindingName::to_string)
+                    .collect::<Vec<_>>(),
+            );
         }
         let failed = |error: harp::Error| {
-            WorkerOperationError::with(WorkerErrorCode::BindingForce)(
-                format!("failed to serialize payload bundles: {error}").into(),
+            WorkerOperationError::new(
+                WorkerErrorCode::BindingForce,
+                format!("failed to serialize payload bundles: {error}"),
             )
         };
         let bundles = harp::RFunction::new("", ".slinker_payloads")
@@ -133,16 +130,10 @@ impl WorkerRuntime {
         reference: libr::SEXP,
     ) -> OperationResult<protocol::PayloadSite> {
         let image = self.image_environment(&payload.package)?;
-        let failed = |error: harp::Error| {
-            WorkerOperationError::with(WorkerErrorCode::BindingForce)(InspectionError::from(error))
-        };
+        let failed =
+            |error: harp::Error| WorkerOperationError::new(WorkerErrorCode::BindingForce, error);
         for name in &payload.names {
-            let value = harp::RFunction::new("base", "get")
-                .add(name.clone())
-                .param("envir", image.clone())
-                .param("inherits", false)
-                .call()
-                .map_err(failed)?;
+            let value = get_binding(&image, name).map_err(failed)?;
             let reached = harp::RFunction::new("", ".slinker_serialize")
                 .add(value)
                 .call()
@@ -158,14 +149,25 @@ impl WorkerRuntime {
                 });
             }
         }
-        Err(WorkerOperationError::with(WorkerErrorCode::Protocol)(
+        Err(WorkerOperationError::new(
+            WorkerErrorCode::Protocol,
             format!(
                 "no payload binding of {} reaches its shared reference object",
                 payload.package.name
-            )
-            .into(),
+            ),
         ))
     }
+}
+
+fn get_binding(
+    image: &harp::object::RObject,
+    name: &BindingName,
+) -> harp::Result<harp::object::RObject> {
+    harp::RFunction::new("base", "get")
+        .add(name.as_str())
+        .param("envir", image.clone())
+        .param("inherits", false)
+        .call()
 }
 
 fn patch_closure(
@@ -176,23 +178,29 @@ fn patch_closure(
         .steps
         .iter()
         .map(|step| match step {
-            protocol::ObjectStepSpec::Environment => ("environment".to_owned(), String::new()),
-            protocol::ObjectStepSpec::Parent => ("parent".to_owned(), String::new()),
-            protocol::ObjectStepSpec::Binding(name) => ("binding".to_owned(), name.clone()),
+            ObjectStep::Environment => ("environment".to_owned(), String::new()),
+            ObjectStep::Parent => ("parent".to_owned(), String::new()),
+            ObjectStep::Binding(name) => ("binding".to_owned(), name.to_string()),
         })
         .unzip();
     let home = harp::RFunction::new("", ".slinker_closure_home")
         .add(image.clone())
-        .add(patch.root.iter().cloned().collect::<Vec<_>>())
+        .add(
+            patch
+                .root
+                .iter()
+                .map(BindingName::to_string)
+                .collect::<Vec<_>>(),
+        )
         .add(kinds)
         .add(names)
         .call()?;
     let closure = harp::RFunction::new("", ".slinker_closure_at")
         .add(home.clone())
-        .add(patch.binding.clone())
+        .add(patch.binding.as_str())
         .call()?;
     let deparsed = harp::RFunction::new("", ".slinker_deparse_binding")
-        .add(patch.binding.clone())
+        .add(patch.binding.as_str())
         .add(closure.clone())
         .call()?;
     let normalized = String::try_from(
@@ -200,14 +208,14 @@ fn patch_closure(
             .add(deparsed)
             .call()?,
     )?;
-    if slinker_core::package::Digest::of(&normalized).0 != patch.expected_shape {
+    if slinker_core::package::Digest::of(&normalized) != patch.expected_shape {
         return Err("the installed closure differs from the analyzed one"
             .to_owned()
             .into());
     }
     harp::RFunction::new("", ".slinker_patch_closure")
         .add(home)
-        .add(patch.binding.clone())
+        .add(patch.binding.as_str())
         .add(closure.clone())
         .add(patch.source.clone())
         .call()?;
@@ -237,13 +245,8 @@ impl ReferenceWalk {
                     harp::r::fn_env(value),
                 ]),
                 libr::ENVSXP => {
-                    let special = [
-                        unsafe { libr::R_GlobalEnv },
-                        unsafe { libr::R_BaseEnv },
-                        unsafe { libr::R_EmptyEnv },
-                        unsafe { libr::R_BaseNamespace },
-                    ];
-                    if special.contains(&value)
+                    let envs = &*harp::environment::R_ENVS;
+                    if [envs.global, envs.base, envs.empty, envs.base_ns].contains(&value)
                         || harp::utils::r_env_is_ns_env(value)
                         || harp::utils::r_env_is_pkg_env(value)
                     {
@@ -271,11 +274,12 @@ impl ReferenceWalk {
                     }
                 }
                 libr::LISTSXP | libr::LANGSXP => {
-                    let mut node = value;
-                    while node != unsafe { libr::R_NilValue } {
-                        stack.push(unsafe { libr::CAR(node) });
-                        node = unsafe { libr::CDR(node) };
-                    }
+                    let elements = std::cell::RefCell::new(Vec::new());
+                    harp::utils::r_pairlist_any(value, |element| {
+                        elements.borrow_mut().push(element);
+                        false
+                    });
+                    stack.extend(elements.into_inner());
                 }
                 _ => {}
             }

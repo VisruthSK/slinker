@@ -1,10 +1,8 @@
 use super::BuildReport;
 use super::relocated::RelocatedCode;
-use crate::ir::{
-    ClosureHome, NamespaceId, ObjectStep, PayloadBundleId, PayloadBundleIr, ProgramIr,
-};
+use crate::ir::{ClosureHome, NamespaceId, PayloadBundleId, PayloadBundleIr, ProgramIr};
 use crate::worker::protocol::{
-    ClosurePatchSpec, ObjectStepSpec, PayloadSerialization, PayloadSite, SerializedPayload,
+    ClosurePatchSpec, PayloadSerialization, PayloadSite, SerializedPayload,
 };
 use std::collections::BTreeSet;
 
@@ -93,23 +91,13 @@ pub(super) fn closure_patches(
             let source = relocated.source(closure.code);
             let (root, steps) = match &closure.home {
                 ClosureHome::Namespace => (None, Vec::new()),
-                ClosureHome::Reached { root, steps } => (
-                    Some(root.to_string()),
-                    steps
-                        .iter()
-                        .map(|step| match step {
-                            ObjectStep::Environment => ObjectStepSpec::Environment,
-                            ObjectStep::Parent => ObjectStepSpec::Parent,
-                            ObjectStep::Binding(name) => ObjectStepSpec::Binding(name.to_string()),
-                        })
-                        .collect(),
-                ),
+                ClosureHome::Reached { root, steps } => (Some(root.clone()), steps.clone()),
             };
             ClosurePatchSpec {
                 root,
                 steps,
-                binding: closure.binding.to_string(),
-                expected_shape: code.normalized_shape().0.clone(),
+                binding: closure.binding.clone(),
+                expected_shape: code.normalized_shape().clone(),
                 source: code
                     .assigned_value_start()
                     .map_or(source, |start| &source[start..])

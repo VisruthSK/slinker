@@ -13,7 +13,8 @@ use super::s3::{CallableId, S3Model};
 use crate::analysis::{Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    BindingName, ClosureSource, PackageId, PackageImage, PackageProvider, TargetUniverse,
+    BindingName, ClosureSource, ComponentName, EnvironmentLabel, PackageId, PackageImage,
+    PackageProvider, TargetUniverse,
 };
 use crate::syntax::{
     CallSite, NamespaceImports, OakParseContext, OakParser, ParsedRFile, SourceId, SourceKey, Span,
@@ -30,12 +31,12 @@ pub(super) struct ParsedSite<'a> {
     pub(super) package: PackageId,
     pub(super) image: &'a PackageImage,
     pub(super) binding: &'a str,
-    pub(super) lexical_environment: &'a str,
+    pub(super) lexical_environment: &'a EnvironmentLabel,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct ParseRequest<'a> {
-    pub(super) owner_binding: &'a str,
+    pub(super) owner: &'a SourceKey,
     pub(super) source_key: &'a SourceKey,
     pub(super) owner_node: NodeId,
 }
@@ -46,7 +47,7 @@ pub(super) struct NativeCallbackContext<'a> {
     pub(super) package: PackageId,
     pub(super) image: &'a PackageImage,
     pub(super) binding: &'a str,
-    pub(super) lexical_environment: &'a str,
+    pub(super) lexical_environment: &'a EnvironmentLabel,
     pub(super) component: &'a str,
     pub(super) parsed: &'a ParsedRFile,
     pub(super) call: &'a CallSite,
@@ -99,7 +100,7 @@ pub(super) struct LoadedPackage {
 }
 
 pub(super) struct NativeCallTarget {
-    pub(super) component: String,
+    pub(super) component: ComponentName,
     pub(super) consumes_selector: bool,
 }
 
@@ -302,7 +303,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn preparse_frontier_bindings(&mut self, frontier: usize) -> Result<()> {
         struct Work {
             key: ParseKey,
-            owner_binding: String,
+            owner: SourceKey,
             source_key: SourceKey,
             owner_node: NodeId,
             source: SourceId,
@@ -315,7 +316,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let mut scheduled = HashSet::<ParseKey>::new();
 
         for need in needs {
-            let (id, owner_binding, source_key, closure, owner_node, image) = match need {
+            let (id, owner, source_key, closure, owner_node, image) = match need {
                 Need::Binding {
                     package: id,
                     binding,
@@ -334,14 +335,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         package: id,
                         binding: binding.clone(),
                     });
-                    (
-                        id,
-                        binding.to_string(),
-                        SourceKey::Binding(binding.into_string()),
-                        closure,
-                        owner_node,
-                        image,
-                    )
+                    let key = SourceKey::Binding(binding);
+                    (id, key.clone(), key, closure, owner_node, image)
                 }
                 Need::PrivateBinding {
                     package: id,
@@ -365,15 +360,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         environment: environment.clone(),
                         binding: binding.clone(),
                     });
-                    let source_key = Self::private_source_key(&environment, &binding);
-                    (
-                        id,
-                        source_key.to_string(),
-                        source_key,
-                        closure,
-                        owner_node,
-                        image,
-                    )
+                    let key = SourceKey::private(environment, binding);
+                    (id, key.clone(), key, closure, owner_node, image)
                 }
                 Need::ClosureExecution {
                     package: id,
@@ -383,23 +371,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         continue;
                     }
                     let image = self.image(id)?;
-                    let Some((closure_object, owner_source, source_key, environment)) =
-                        self.closure_execution_source(id, closure)
-                    else {
+                    let Some(execution) = self.closure_execution_source(id, closure) else {
                         continue;
                     };
                     let owner_node = self.need_node(&Need::ClosureExecution {
                         package: id,
                         closure,
                     });
+                    let source = ClosureSource {
+                        source: execution.closure.source,
+                        environment: execution.environment,
+                    };
                     (
                         id,
-                        owner_source.to_string(),
-                        source_key,
-                        ClosureSource {
-                            source: closure_object.source,
-                            environment,
-                        },
+                        execution.owner,
+                        execution.key,
+                        source,
                         owner_node,
                         image,
                     )
@@ -412,13 +399,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             let Some(source) =
-                self.admit_source(id, &owner_binding, &source_key, owner_node, &closure.source)?
+                self.admit_source(id, &owner, &source_key, owner_node, &closure.source)?
             else {
                 continue;
             };
             work.push(Work {
                 key,
-                owner_binding,
+                owner,
                 source_key,
                 owner_node,
                 source,
@@ -475,7 +462,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Err(error) => {
                     self.handle_air_rejection(
                         item.key.0,
-                        &item.owner_binding,
+                        &item.owner,
                         &item.source_key,
                         item.owner_node,
                         &error,
@@ -619,18 +606,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 binding,
                 ..
             } => NodeKind::PrivateBinding {
-                environment: environment.clone(),
+                environment: environment.to_string(),
                 name: binding.to_string(),
             },
             Need::ClosureExecution { package, closure } => {
-                let (closure, owner, _, enclosure) = self
+                let execution = self
                     .closure_execution_source(*package, *closure)
                     .expect("closure execution need references the package object graph");
                 NodeKind::ClosureObject {
-                    owner: owner.to_string(),
-                    path: closure.provenance.path,
-                    enclosure,
-                    derived: closure.derived_from.is_some(),
+                    owner: execution.owner.to_string(),
+                    path: execution.closure.provenance.path.to_string(),
+                    enclosure: execution.environment.to_string(),
+                    derived: execution.closure.derived_from.is_some(),
                 }
             }
             Need::Activation { .. } => NodeKind::Activation,

@@ -1,10 +1,10 @@
 use super::index::worker_package_index;
-use super::scan::{InspectionEpoch, ObjectScanner};
-use super::{InspectionError, WorkerOperationError, field, protocol};
+use super::scan::{InspectionEpoch, ObjectScanner, PrivateIds};
+use super::{Coded, InspectionError, WorkerOperationError, field, protocol};
 use super::{InspectionResult, OperationResult};
 use harp::{RFunctionExt, RObjectExt};
 use protocol::{WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse};
-use slinker_core::package::BindingOrigin;
+use slinker_core::package::{BindingOrigin, DataSetName, DatasetName};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 
@@ -12,7 +12,7 @@ struct PackageImageContext {
     image: harp::object::RObject,
     index: WorkerPackageIndex,
     epoch: InspectionEpoch,
-    private_ids: HashMap<libr::SEXP, String>,
+    private_ids: PrivateIds,
 }
 
 pub(super) struct WorkerRuntime {
@@ -175,7 +175,7 @@ impl WorkerRuntime {
             }
             let image = harp::RFunction::new("", ".slinker_package_context")
                 .add(package.root.to_string_lossy().into_owned())
-                .add(package.name.clone())
+                .add(package.name.as_str())
                 .call()
                 .map_err(|error| {
                     format!(
@@ -193,7 +193,7 @@ impl WorkerRuntime {
                         worker: self.worker,
                         context: self.contexts.len() + 1,
                     },
-                    private_ids: HashMap::new(),
+                    private_ids: PrivateIds::new(),
                 },
             );
         }
@@ -221,51 +221,48 @@ impl WorkerRuntime {
     ) -> OperationResult<protocol::WorkerBinding> {
         let context = self
             .context(package)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
-        let image_environment = field(&context.image, "image_env")
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
+            .coded(WorkerErrorCode::PackageMetadata)?;
+        let image_environment =
+            field(&context.image, "image_env").coded(WorkerErrorCode::PackageMetadata)?;
         if !harp::environment::Environment::new(image_environment).exists(name) {
-            return Err(WorkerOperationError::with(WorkerErrorCode::MissingBinding)(
-                format!("installed image has no binding {name}").into(),
+            return Err(WorkerOperationError::new(
+                WorkerErrorCode::MissingBinding,
+                format!("installed image has no binding {name}"),
             ));
         }
         self.binding_value(package, name)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
+            .coded(WorkerErrorCode::BindingForce)
     }
 
     pub(super) fn data_library(
         &mut self,
         package: &protocol::PackageSpec,
-        objects: &[String],
-        sets: &BTreeMap<String, Vec<String>>,
+        objects: &[DatasetName],
+        sets: &BTreeMap<DataSetName, Vec<DatasetName>>,
     ) -> OperationResult<protocol::DataLibraryFiles> {
-        let forced = WorkerOperationError::with(WorkerErrorCode::BindingForce);
         let root = self
             .context(package)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?
+            .coded(WorkerErrorCode::PackageMetadata)?
             .image
             .elt("root")
-            .map_err(InspectionError::from)
-            .map_err(forced)?;
+            .coded(WorkerErrorCode::BindingForce)?;
         let set_lengths = sets
             .values()
             .map(|members| f64::from(u32::try_from(members.len()).unwrap_or(u32::MAX)))
             .collect::<Vec<_>>();
         let library = harp::RFunction::new("", ".slinker_data_library")
             .add(root)
-            .add(objects.to_vec())
-            .add(sets.keys().cloned().collect::<Vec<_>>())
+            .add(strings(objects))
+            .add(strings(sets.keys()))
             .add(&set_lengths)
-            .add(sets.values().flatten().cloned().collect::<Vec<_>>())
+            .add(strings(sets.values().flatten()))
             .call()
-            .map_err(InspectionError::from)
-            .map_err(forced)?;
+            .coded(WorkerErrorCode::BindingForce)?;
         let bytes = |name: &str| {
             library
                 .elt(name)
-                .map_err(InspectionError::from)
-                .and_then(|value| Vec::<u8>::try_from(&value).map_err(InspectionError::from))
-                .map_err(forced)
+                .and_then(|value| Vec::<u8>::try_from(&value))
+                .coded(WorkerErrorCode::BindingForce)
         };
         Ok(protocol::DataLibraryFiles {
             rdb: bytes("rdb")?,
@@ -279,20 +276,21 @@ impl WorkerRuntime {
         package: Option<&protocol::PackageSpec>,
         name: &str,
     ) -> OperationResult<Vec<String>> {
-        let metadata = WorkerOperationError::with(WorkerErrorCode::PackageMetadata);
         let environment = match package {
             Some(package) => {
-                let context = self.context(package).map_err(metadata)?;
-                field(&context.image, "image_env").map_err(metadata)?
+                let context = self
+                    .context(package)
+                    .coded(WorkerErrorCode::PackageMetadata)?;
+                field(&context.image, "image_env").coded(WorkerErrorCode::PackageMetadata)?
             }
             None => harp::RFunction::new("base", "baseenv")
                 .call()
-                .map_err(InspectionError::from)
-                .map_err(metadata)?,
+                .coded(WorkerErrorCode::PackageMetadata)?,
         };
         if !harp::environment::Environment::new(environment.clone()).exists(name) {
-            return Err(WorkerOperationError::with(WorkerErrorCode::MissingBinding)(
-                format!("installed image has no binding {name}").into(),
+            return Err(WorkerOperationError::new(
+                WorkerErrorCode::MissingBinding,
+                format!("installed image has no binding {name}"),
             ));
         }
         harp::RFunction::new("", ".slinker_dispatch_generics")
@@ -300,8 +298,7 @@ impl WorkerRuntime {
             .add(name)
             .call()
             .and_then(Vec::<String>::try_from)
-            .map_err(InspectionError::from)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
+            .coded(WorkerErrorCode::BindingForce)
     }
 
     fn binding_value(
@@ -325,12 +322,13 @@ impl WorkerRuntime {
         };
         let mut scanner = ObjectScanner::new(
             environment.inner.sexp,
-            package.name.clone(),
-            context.private_ids.clone(),
+            package.name.as_str(),
+            &context.private_ids,
             context.epoch,
         );
         let binding = scanner.top_binding(name, origin, binding.value)?;
-        context.private_ids.clone_from(&scanner.private_ids);
+        let outcome = scanner.finish();
+        context.private_ids.extend(outcome.discovered);
         if binding.name != name
             || context.index.name != package.name
             || context.index.version != package.version
@@ -346,7 +344,7 @@ impl WorkerRuntime {
             package_version: package.version.clone(),
             image_fingerprint: package.image_fingerprint.clone(),
             binding,
-            private_environments: scanner.private_environments,
+            private_environments: outcome.private_environments,
         })
     }
 
@@ -356,9 +354,8 @@ impl WorkerRuntime {
     ) -> OperationResult<harp::object::RObject> {
         let context = self
             .context(package)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
-        field(&context.image, "image_env")
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))
+            .coded(WorkerErrorCode::PackageMetadata)?;
+        field(&context.image, "image_env").coded(WorkerErrorCode::PackageMetadata)
     }
 
     pub(super) fn answer(&mut self, request: WorkerRequest) -> OperationResult<WorkerResponse> {
@@ -367,11 +364,9 @@ impl WorkerRuntime {
                 syntax_verdict(request_id, self.validate_syntax(&source))
             }
             WorkerRequest::NormalizeSyntax { request_id, source } => {
-                let (source, stable) =
-                    self.canonical_syntax(&source)
-                        .map_err(WorkerOperationError::with(
-                            WorkerErrorCode::TargetSyntaxRejection,
-                        ))?;
+                let (source, stable) = self
+                    .canonical_syntax(&source)
+                    .coded(WorkerErrorCode::TargetSyntaxRejection)?;
                 WorkerResponse::NormalizedSyntax {
                     request_id,
                     source,
@@ -394,7 +389,7 @@ impl WorkerRuntime {
                 request_id,
                 index: self
                     .package_index(&package)
-                    .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?,
+                    .coded(WorkerErrorCode::PackageMetadata)?,
             },
             WorkerRequest::Binding {
                 request_id,
@@ -402,7 +397,7 @@ impl WorkerRuntime {
                 name,
             } => WorkerResponse::Binding {
                 request_id,
-                binding: self.binding(&package, &name)?,
+                binding: self.binding(&package, name.as_str())?,
             },
             WorkerRequest::DataLibrary {
                 request_id,
@@ -419,7 +414,7 @@ impl WorkerRuntime {
                 name,
             } => WorkerResponse::DispatchGenerics {
                 request_id,
-                generics: self.dispatch_generics(package.as_ref(), &name)?,
+                generics: self.dispatch_generics(package.as_ref(), name.as_str())?,
             },
             WorkerRequest::SerializePayloads {
                 request_id,
@@ -430,14 +425,17 @@ impl WorkerRuntime {
                 serialization: self.serialize_payloads(&namespaces, &payloads)?,
             },
             WorkerRequest::Hello { .. } | WorkerRequest::Shutdown => {
-                return Err(WorkerOperationError::with(WorkerErrorCode::Protocol)(
-                    "lifecycle request received after worker startup"
-                        .to_owned()
-                        .into(),
+                return Err(WorkerOperationError::new(
+                    WorkerErrorCode::Protocol,
+                    "lifecycle request received after worker startup",
                 ));
             }
         })
     }
+}
+
+fn strings<T: ToString>(values: impl IntoIterator<Item = T>) -> Vec<String> {
+    values.into_iter().map(|value| value.to_string()).collect()
 }
 
 fn sanitize_environment(r_home: &std::path::Path) {

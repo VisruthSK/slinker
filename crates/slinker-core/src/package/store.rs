@@ -1,7 +1,7 @@
 use crate::cache::{Cache, CacheLocation};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, DatasetName, GenericName, InstalledPackage, LifecycleMetadata, NativeFacts,
+    BindingName, Digest, GenericName, InstalledPackage, LifecycleMetadata, NativeFacts,
     NativeRoutineSummary, NativeSafety, PackageData, PackageIdentity, PackageImage, PackageIndex,
     PackageLocator,
 };
@@ -21,7 +21,7 @@ const ANALYSIS_SCHEMA: &str = "slinker-analysis-v10";
 struct CachedIndex {
     schema: String,
     target: String,
-    package_fingerprint: String,
+    package_fingerprint: Digest,
     index: WorkerPackageIndex,
 }
 
@@ -29,7 +29,7 @@ struct CachedIndex {
 struct CachedBinding {
     schema: String,
     target: String,
-    package_fingerprint: String,
+    package_fingerprint: Digest,
     binding_name: String,
     binding: WorkerBinding,
 }
@@ -45,7 +45,7 @@ struct NativeSummaryManifest {
 struct NativePackageSummary {
     package: String,
     version: String,
-    image_fingerprint: String,
+    image_fingerprint: Digest,
     components: Vec<NativeComponentSummary>,
 }
 
@@ -61,21 +61,14 @@ struct NativeComponentSummary {
 enum NativeSummarySafety {
     Safe {
         #[serde(default)]
-        callbacks: Vec<String>,
+        callbacks: Vec<BindingName>,
     },
     Summarized {
-        routines: Vec<NativeRoutineSummaryRecord>,
+        routines: Vec<NativeRoutineSummary>,
     },
     Unsupported {
         effects: Vec<String>,
     },
-}
-
-#[derive(Debug, Deserialize)]
-struct NativeRoutineSummaryRecord {
-    selector: String,
-    #[serde(default)]
-    callback_arguments: Vec<usize>,
 }
 
 impl NativeSummaryManifest {
@@ -153,7 +146,7 @@ impl NativeSummaryManifest {
         let Some(package) = self.packages.iter().find(|summary| {
             index.identity.name == summary.package
                 && summary.version == index.identity.version.as_ref()
-                && summary.image_fingerprint == index.identity.image_fingerprint.0
+                && summary.image_fingerprint == index.identity.image_fingerprint
         }) else {
             return;
         };
@@ -169,15 +162,9 @@ impl NativeSummaryManifest {
                 NativeSummarySafety::Safe { callbacks } => NativeSafety::Safe(NativeFacts {
                     callbacks: callbacks.clone(),
                 }),
-                NativeSummarySafety::Summarized { routines } => NativeSafety::Summarized(
-                    routines
-                        .iter()
-                        .map(|routine| NativeRoutineSummary {
-                            selector: routine.selector.clone(),
-                            callback_arguments: routine.callback_arguments.clone(),
-                        })
-                        .collect(),
-                ),
+                NativeSummarySafety::Summarized { routines } => {
+                    NativeSafety::Summarized(routines.clone())
+                }
                 NativeSummarySafety::Unsupported { effects } => {
                     NativeSafety::Unsupported(effects.clone())
                 }
@@ -260,7 +247,7 @@ impl PackageStore {
                         .map(|path| path.to_string_lossy().into_owned()),
                 ),
         )
-        .0;
+        .to_string();
         Ok(Self {
             locator: PackageLocator::new(target),
             indexes: HashMap::new(),
@@ -282,7 +269,7 @@ impl PackageStore {
         let identity = &package.identity;
         if identity.name != worker.name
             || worker.version != identity.version.to_string()
-            || worker.image_fingerprint != identity.image_fingerprint.0
+            || worker.image_fingerprint != identity.image_fingerprint
         {
             return Err(Error::Analysis(format!(
                 "installed index identity changed while inspecting {}",
@@ -299,21 +286,8 @@ impl PackageStore {
             lifecycle: LifecycleMetadata {
                 on_load: worker.on_load,
             },
-            binding_names: worker
-                .binding_names
-                .into_iter()
-                .map(BindingName::from)
-                .collect(),
-            data: PackageData::new(
-                worker
-                    .data_sets
-                    .into_iter()
-                    .map(|(set, objects)| {
-                        (set, objects.into_iter().map(DatasetName::from).collect())
-                    })
-                    .collect(),
-                worker.data_files,
-            ),
+            binding_names: worker.binding_names,
+            data: PackageData::new(worker.data_sets, worker.data_files),
             files: Vec::new(),
             has_sysdata: worker.has_sysdata,
         };
@@ -328,7 +302,7 @@ impl PackageStore {
     ) -> Result<Arc<PackageImage>> {
         if identity.name != worker.package_name
             || worker.package_version != identity.version.to_string()
-            || worker.image_fingerprint != identity.image_fingerprint.0
+            || worker.image_fingerprint != identity.image_fingerprint
             || !index
                 .binding_names
                 .iter()
@@ -357,9 +331,9 @@ impl PackageStore {
             ANALYSIS_SCHEMA,
             identity.name.as_str(),
             identity.version.as_ref(),
-            identity.image_fingerprint.0.as_str(),
+            identity.image_fingerprint.as_str(),
         ])
-        .0
+        .to_string()
     }
 
     fn index_cache_name(&self, identity: &PackageIdentity) -> String {
@@ -371,7 +345,7 @@ impl PackageStore {
     }
 
     fn binding_cache_name(&self, identity: &PackageIdentity, binding: &str) -> String {
-        let binding = fingerprint_strings([binding]).0;
+        let binding = fingerprint_strings([binding]).to_string();
         format!(
             "{}-{}-{binding}.binding.slinker",
             identity.name,
@@ -396,7 +370,7 @@ impl PackageStore {
             .filter(|entry| {
                 entry.schema == ANALYSIS_SCHEMA
                     && entry.target == self.target_fingerprint
-                    && entry.package_fingerprint == package.identity.image_fingerprint.0
+                    && entry.package_fingerprint == package.identity.image_fingerprint
             })?;
         self.package_index(cached.index, package).ok()
     }
@@ -412,7 +386,7 @@ impl PackageStore {
             .filter(|entry| {
                 entry.schema == ANALYSIS_SCHEMA
                     && entry.target == self.target_fingerprint
-                    && entry.package_fingerprint == package.identity.image_fingerprint.0
+                    && entry.package_fingerprint == package.identity.image_fingerprint
                     && entry.binding_name == binding
                     && is_epoch_independent(&entry.binding)
             })
@@ -473,7 +447,7 @@ impl PackageProvider for PackageStore {
                 let cached = CachedIndex {
                     schema: ANALYSIS_SCHEMA.into(),
                     target: self.target_fingerprint.clone(),
-                    package_fingerprint: package.identity.image_fingerprint.0.clone(),
+                    package_fingerprint: package.identity.image_fingerprint.clone(),
                     index: worker,
                 };
                 self.cache
@@ -504,7 +478,7 @@ impl PackageProvider for PackageStore {
                     let cached = CachedBinding {
                         schema: ANALYSIS_SCHEMA.into(),
                         target: self.target_fingerprint.clone(),
-                        package_fingerprint: package.identity.image_fingerprint.0.clone(),
+                        package_fingerprint: package.identity.image_fingerprint.clone(),
                         binding_name: name.into(),
                         binding: binding.clone(),
                     };
@@ -579,7 +553,7 @@ mod tests {
             identity: PackageIdentity {
                 name: "fixture".into(),
                 version: "1.0.0".parse().expect("version"),
-                image_fingerprint: Digest("exact-image".into()),
+                image_fingerprint: Digest::from("exact-image"),
             },
             description: Description::parse("Package: fixture\nVersion: 1.0.0\n"),
             exports: Default::default(),

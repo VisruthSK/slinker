@@ -8,6 +8,7 @@ use super::state::{AnalyzerState, NativeCallTarget, NativeCallbackContext};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, RejectCode};
 use crate::ir::ExternalBindingAccess;
+use crate::package::EnvironmentLabel;
 use crate::package::NativeComponent;
 use crate::package::{
     NameLookup, NativeInterface, NativeLibrary, NativeRoutineSummary, NativeSafety, PackageId,
@@ -164,7 +165,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         current: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         callable: &DeclaredCallable,
     ) -> Result<Resolution> {
         let Some(name) = &callable.package else {
@@ -173,8 +174,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let binding = callable.name.clone().into();
         Ok(match self.packages.resolve(name)? {
             None => Resolution::OpenDynamic(OpenReason::MissingPackage {
-                package: name.clone(),
-                binding: Some(callable.name.clone()),
+                package: name.as_str().into(),
+                binding: Some(callable.name.as_str().into()),
             }),
             Some(package) if self.packages.is_external(package) => {
                 self.external.insert(package);
@@ -300,7 +301,12 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             });
         let registered = NativeInterface::of_callee(&call.callee)
             .zip(native.library.routines())
-            .is_some_and(|(interface, routines)| routines.of(interface).contains(symbol));
+            .is_some_and(|(interface, routines)| {
+                routines
+                    .of(interface)
+                    .iter()
+                    .any(|routine| routine == symbol)
+            });
         let source = call.arg_spans.get(index).cloned().flatten();
         match (native.library.name_lookup(), source) {
             (Some(NameLookup::Forced), _) if !names_other_library => {}
@@ -429,7 +435,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         &mut self,
         current: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<Option<NativeCallTarget>> {
         let Some(selector_index) = matched_arg_index(call, &[".NAME"], ".NAME") else {
@@ -451,7 +457,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 return Ok(None);
             }
             return Ok(Some(NativeCallTarget {
-                component: component.name.clone(),
+                component: component.name.as_str().into(),
                 consumes_selector: false,
             }));
         }

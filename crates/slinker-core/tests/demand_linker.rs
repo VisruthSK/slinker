@@ -2,14 +2,15 @@ use slinker_core::analysis::{
     EdgeKind, ExplanationDag, GraphEdgeReasonExport, Linker, NodeKind, RejectCode,
 };
 use slinker_core::package::{
-    BindingImage, BindingOrigin, CanonicalSyntax, ObjectImage, ClosureSource, DatasetName, Digest,
+    BindingImage, BindingOrigin, CanonicalSyntax, ClosureSource, DatasetName, Digest,
     DispatchSubject, EmbeddedClosureSource, ExportMap, GenericName, ImportBinding, ImportSpec,
     InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeLibrary,
-    NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectIssue,
-    ObjectKind, PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
-    PackageProvider, PackageResolver, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
-    SyntaxValidation,
+    NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectImage,
+    ObjectIssue, ObjectKind, PackageData, PackageIdentity, PackageImage, PackageIndex,
+    PackageLocation, PackageProvider, PackageResolver, PrivateBindingImage,
+    PrivateEnvironmentImage, S3Registration, SyntaxValidation,
 };
+use slinker_core::package::{EnvironmentLabel, MemberPath, ObjectIssueKind, UnsupportedObject};
 use slinker_core::{Description, Error, Result, Target, TargetEnvironment};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -214,7 +215,7 @@ fn root_calling(dependency: &str, entry: &str) -> PackageImage {
 fn package(name: &str, bindings: &[(&str, Option<&str>)]) -> PackageImage {
     let exports = bindings
         .iter()
-        .map(|(binding, _)| ((*binding).to_owned(), (*binding).into()))
+        .map(|(binding, _)| ((*binding).into(), (*binding).into()))
         .collect::<ExportMap>();
     package_from_fixture(
         name,
@@ -259,7 +260,7 @@ macro_rules! package_with {
 fn package_importing(name: &str, bindings: &[(&str, Option<&str>)], imports: &str) -> PackageImage {
     let exports = bindings
         .iter()
-        .map(|(binding, _)| ((*binding).to_owned(), (*binding).into()))
+        .map(|(binding, _)| ((*binding).into(), (*binding).into()))
         .collect::<ExportMap>();
     package_with!(
         name,
@@ -279,8 +280,8 @@ fn utils_platform() -> PackageImage {
         &[("packageVersion", None), ("packageDescription", None)],
         Vec::new(),
         ExportMap::from([
-            ("packageVersion".to_owned(), "packageVersion".into()),
-            ("packageDescription".to_owned(), "packageDescription".into()),
+            ("packageVersion".into(), "packageVersion".into()),
+            ("packageDescription".into(), "packageDescription".into()),
         ]),
         Vec::new(),
         Vec::new(),
@@ -309,7 +310,7 @@ fn package_from_fixture(
     for (binding, source) in bindings {
         let closure = source.map(|source| ClosureSource {
             source: Arc::from(source),
-            environment: format!("namespace:{name}"),
+            environment: EnvironmentLabel::namespace(name),
         });
         images.insert(
             (*binding).into(),
@@ -340,7 +341,7 @@ fn package_from_fixture(
             identity: PackageIdentity {
                 name: name.into(),
                 version: "1.0.0".parse().expect("valid test package version"),
-                image_fingerprint: Digest(format!("fp-{name}")),
+                image_fingerprint: Digest::from(format!("fp-{name}")),
             },
             description,
             exports,
@@ -371,7 +372,7 @@ fn installed(index: &PackageIndex) -> InstalledPackage {
 }
 
 fn export(name: &str) -> ExportMap {
-    ExportMap::from([(name.to_owned(), name.into())])
+    ExportMap::from([(name.into(), name.into())])
 }
 
 fn test_target() -> TargetEnvironment {
@@ -542,7 +543,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
                 .object
                 .embedded_closures
                 .push(EmbeddedClosureSource {
-                    path: format!("$${name}"),
+                    path: MemberPath::root().field(name),
                     source: Arc::from(format!(
                         ".slinker_embedded <- function() {{ self; {name}_dependency() }}"
                     )),
@@ -847,14 +848,14 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
                     object: ObjectImage {
                         representation: slinker_core::package::BindingRepresentation::Value,
                         classes: Vec::new(),
-                        object_kind: ObjectKind::Other("externalptr".into()),
+                        object_kind: ObjectKind::Unsupported(UnsupportedObject::SexpType(22)),
                         closure: None,
                         environment: None,
                         embedded_closures: Vec::new(),
                         embedded_environments: Vec::new(),
                         issues: vec![ObjectIssue {
                             path: "$".into(),
-                            kind: "external_pointer".into(),
+                            kind: ObjectIssueKind::ExternalPointer,
                             detail: "external pointer".into(),
                         }],
                     },
@@ -2563,7 +2564,7 @@ fn root_with_private_helper(main: &str) -> PackageImage {
             ),
         ],
         Vec::new(),
-        ExportMap::from([("main".to_owned(), "main".into())]),
+        ExportMap::from([("main".into(), "main".into())]),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -5702,7 +5703,7 @@ fn with_data(mut image: PackageImage, sets: &[(&str, &[&str])], file_backed: boo
         .iter()
         .map(|(set, objects)| {
             (
-                (*set).to_owned(),
+                (*set).into(),
                 objects
                     .iter()
                     .map(|object| DatasetName::from(*object))
@@ -5738,7 +5739,7 @@ fn carried_sets(plan: &slinker_core::analysis::LinkIr, package: &str) -> Vec<Str
     plan.program()
         .dataset_libraries()
         .filter(|(id, _)| plan.program().package(*id).identity().name == package)
-        .flat_map(|(_, library)| library.sets().keys().cloned())
+        .flat_map(|(_, library)| library.sets().keys().map(ToString::to_string))
         .collect()
 }
 
@@ -5977,9 +5978,9 @@ fn dependency_importing_from_missing_package() -> PackageImage {
                 .collect(),
         }],
         ExportMap::from([
-            ("f1".to_owned(), "f1".into()),
-            ("f2".to_owned(), "f2".into()),
-            ("f3".to_owned(), "f3".into()),
+            ("f1".into(), "f1".into()),
+            ("f2".into(), "f2".into()),
+            ("f3".into(), "f3".into()),
         ]),
         Vec::new(),
         Vec::new(),

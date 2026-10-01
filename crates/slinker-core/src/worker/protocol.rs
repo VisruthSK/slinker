@@ -1,5 +1,7 @@
+use crate::ir::ObjectStep;
 use crate::package::{
-    BindingImage, ExportMap, ImportSpec, NativeComponent, PrivateEnvironmentImage, S3Registration,
+    BindingImage, BindingName, DataSetName, DatasetName, Digest, EnvironmentLabel, ExportMap,
+    ImportSpec, NativeComponent, PackageName, PrivateEnvironmentImage, S3Registration,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -18,9 +20,9 @@ pub struct TargetSpec {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PackageSpec {
-    pub name: String,
+    pub name: PackageName,
     pub version: String,
-    pub image_fingerprint: String,
+    pub image_fingerprint: Digest,
     pub root: PathBuf,
 }
 
@@ -33,7 +35,7 @@ pub struct NamespaceImageSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PayloadSpec {
     pub package: PackageSpec,
-    pub names: Vec<String>,
+    pub names: Vec<BindingName>,
     pub patches: Vec<ClosurePatchSpec>,
 }
 
@@ -58,15 +60,15 @@ pub struct SerializedPayload {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PayloadSite {
     pub payload: usize,
-    pub binding: String,
+    pub binding: BindingName,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClosurePatchSpec {
-    pub root: Option<String>,
-    pub steps: Vec<ObjectStepSpec>,
-    pub binding: String,
-    pub expected_shape: String,
+    pub root: Option<BindingName>,
+    pub steps: Vec<ObjectStep>,
+    pub binding: BindingName,
+    pub expected_shape: Digest,
     pub source: String,
 }
 
@@ -85,14 +87,6 @@ pub struct AppendedArgumentSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
-pub enum ObjectStepSpec {
-    Environment,
-    Parent,
-    Binding(String),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerTarget {
     pub r_home: PathBuf,
     pub r_version: String,
@@ -104,27 +98,27 @@ pub struct WorkerTarget {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerPackageIndex {
-    pub name: String,
+    pub name: PackageName,
     pub version: String,
-    pub image_fingerprint: String,
+    pub image_fingerprint: Digest,
     pub exports: ExportMap,
     pub imports: Vec<ImportSpec>,
     pub s3: Vec<S3Registration>,
     pub dynlibs: Vec<NativeComponent>,
     pub on_load: bool,
-    pub binding_names: Vec<String>,
-    pub data_sets: BTreeMap<String, Vec<String>>,
+    pub binding_names: Vec<BindingName>,
+    pub data_sets: BTreeMap<DataSetName, Vec<DatasetName>>,
     pub data_files: bool,
     pub has_sysdata: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerBinding {
-    pub package_name: String,
+    pub package_name: PackageName,
     pub package_version: String,
-    pub image_fingerprint: String,
+    pub image_fingerprint: Digest,
     pub binding: BindingImage,
-    pub private_environments: HashMap<String, PrivateEnvironmentImage>,
+    pub private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -148,18 +142,18 @@ pub enum WorkerRequest {
     Binding {
         request_id: u64,
         package: PackageSpec,
-        name: String,
+        name: BindingName,
     },
     DispatchGenerics {
         request_id: u64,
         package: Option<PackageSpec>,
-        name: String,
+        name: BindingName,
     },
     DataLibrary {
         request_id: u64,
         package: PackageSpec,
-        objects: Vec<String>,
-        sets: BTreeMap<String, Vec<String>>,
+        objects: Vec<DatasetName>,
+        sets: BTreeMap<DataSetName, Vec<DatasetName>>,
     },
     SerializePayloads {
         request_id: u64,
@@ -231,7 +225,7 @@ pub enum WorkerResponse {
 pub struct WorkerFailure {
     pub request_id: Option<u64>,
     pub package: Option<WorkerPackageIdentity>,
-    pub binding: Option<String>,
+    pub binding: Option<BindingName>,
     pub code: WorkerErrorCode,
     pub message: String,
     pub captured_output: Vec<String>,
@@ -239,9 +233,9 @@ pub struct WorkerFailure {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkerPackageIdentity {
-    pub name: String,
+    pub name: PackageName,
     pub version: String,
-    pub image_fingerprint: String,
+    pub image_fingerprint: Digest,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

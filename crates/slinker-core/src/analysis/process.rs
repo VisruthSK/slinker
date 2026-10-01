@@ -8,10 +8,11 @@ use super::s3::{CallableId, callable_target};
 use super::state::{AnalyzerState, ParseRequest, ParsedSite};
 use crate::analysis::{EdgeKind, LifecycleHook, Need, NodeId, RejectCode};
 use crate::ir::ExternalBindingAccess;
+use crate::package::EnvironmentLabel;
 use crate::package::PackageRole;
 use crate::package::{
-    BindingImage, BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource, Digest,
-    ObjectKind, PackageId, PackageImage, PackageProvider, PrivateBindingImage, SyntaxValidation,
+    BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource, Digest, ObjectImage,
+    ObjectKind, PackageId, PackageImage, PackageProvider, SyntaxValidation,
 };
 use crate::syntax::{
     ActiveBindingDef, NameRefKind, NamespaceInfoReceiver, OakParser, ParsedExpression, ParsedRFile,
@@ -21,25 +22,39 @@ use crate::syntax::{
 use crate::{Error, Result};
 use std::sync::Arc;
 
+struct ClosureSite<'a> {
+    node: NodeId,
+    package: PackageId,
+    image: &'a Arc<PackageImage>,
+    owner: &'a SourceKey,
+    key: &'a SourceKey,
+    closure: &'a ClosureSource,
+}
+
+#[derive(Clone, Copy)]
+struct ObjectSite<'a> {
+    node: NodeId,
+    package: PackageId,
+    binding: &'a BindingName,
+    private: Option<&'a EnvironmentLabel>,
+}
+
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn process_closure_execution(
         &mut self,
         id: PackageId,
         closure: ClosureId,
     ) -> Result<()> {
-        let need = Need::ClosureExecution {
+        let node = self.need_node(&Need::ClosureExecution {
             package: id,
             closure,
-        };
-        let node = self.need_node(&need);
+        });
         if self.packages.is_external(id) {
             self.external.insert(id);
             return Ok(());
         }
         let image = self.image(id)?;
-        let Some((closure_object, owner_source, source_key, environment)) =
-            self.closure_execution_source(id, closure)
-        else {
+        let Some(execution) = self.closure_execution_source(id, closure) else {
             self.diagnostic(
                 node,
                 id,
@@ -50,34 +65,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             return Ok(());
         };
-        let owner_name = owner_source.to_string();
-
-        if environment.starts_with("unsupported:") {
-            self.diagnostic(
-                node,
-                id,
-                Some(&owner_name),
-                RejectCode::UnknownClosureEnclosure,
-                format!("executable closure has unknown enclosure `{environment}`"),
-                None,
-            );
-        }
-        if let Some(parsed) = self.parsed_source(
-            id,
-            &closure_object.source,
-            &image,
-            &environment,
-            ParseRequest {
-                owner_binding: &owner_name,
-                source_key: &source_key,
-                owner_node: node,
-            },
-        )? {
-            let image =
-                self.prepare_construction_image(id, &image, &environment, parsed.as_ref())?;
-            self.process_parsed(node, id, &image, &owner_name, &environment, parsed.as_ref())?;
-        }
-        Ok(())
+        let source = ClosureSource {
+            source: Arc::clone(&execution.closure.source),
+            environment: execution.environment,
+        };
+        self.analyze_closure(&ClosureSite {
+            node,
+            package: id,
+            image: &image,
+            owner: &execution.owner,
+            key: &execution.key,
+            closure: &source,
+        })
     }
 
     pub(super) fn process_binding(&mut self, id: PackageId, binding: &BindingName) -> Result<()> {
@@ -90,14 +89,34 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let image = self.binding_image(id, binding)?;
-        let Some(binding_image) = image.binding(binding).cloned() else {
+        let Some(binding_image) = image.binding(binding) else {
             return self.process_absent_binding(node, id, &image, binding);
         };
-        self.diagnose_binding_object(node, id, binding, &binding_image);
+        self.diagnose_object(
+            ObjectSite {
+                node,
+                package: id,
+                binding,
+                private: None,
+            },
+            &binding_image.object,
+        );
         let object = self.objects.graph(id).namespace_binding(binding);
         self.require_member_closures(node, id, object);
         if let Some(closure) = &binding_image.object.closure {
-            self.process_binding_closure(node, id, &image, binding, &binding_image, closure)?;
+            let key = SourceKey::Binding(binding.clone());
+            let site = ClosureSite {
+                node,
+                package: id,
+                image: &image,
+                owner: &key,
+                key: &key,
+                closure,
+            };
+            if let Some(parsed) = self.parse_closure(&site)? {
+                self.check_linked_onload_libname(node, id, binding, &parsed);
+                self.process_closure(&site, &parsed)?;
+            }
         }
         Ok(())
     }
@@ -205,7 +224,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }) => {
                 self.require(
                     node,
-                    Need::Native { package, component: component.clone().into() },
+                    Need::Native { package, component: component.clone() },
                     EdgeKind::Export,
                     format!("root export `{binding}` resolves to registered native symbol `{native_binding}` in `{component}`"),
                 );
@@ -246,119 +265,129 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(false)
     }
 
-    fn diagnose_binding_object(
+    fn check_linked_onload_libname(
         &mut self,
         node: NodeId,
         id: PackageId,
-        binding: &str,
-        binding_image: &BindingImage,
+        binding: &BindingName,
+        parsed: &ParsedRFile,
     ) {
-        let object_issues = binding_image
-            .object
-            .issues
-            .iter()
-            .filter(|issue| {
-                !(issue.kind == "environment_identity" && issue.path.ends_with(".environment"))
-            })
-            .map(|issue| format!("{}: {} ({})", issue.path, issue.kind, issue.detail))
-            .collect::<Vec<_>>();
-        if !object_issues.is_empty() {
+        let reads_libname = binding == ".onLoad"
+            && self.packages.role(id) == PackageRole::Linked
+            && parsed.expressions.first().is_some_and(|expression| {
+                expression
+                    .parameters
+                    .first()
+                    .is_some_and(|libname| expression.used_parameters.contains(libname))
+            });
+        if reads_libname {
             self.diagnostic(
                 node,
                 id,
                 Some(binding),
-                RejectCode::UnsupportedObject,
-                object_issues.join("; "),
+                RejectCode::UnsupportedLinkedLibname,
+                "Linked .onLoad reads libname, which has no installed library once linked",
                 None,
             );
-        }
-        if matches!(
-            binding_image.object.representation,
-            BindingRepresentation::ActiveBinding
-        ) {
-            self.diagnostic(
-                node,
-                id,
-                Some(binding),
-                RejectCode::ActiveBinding,
-                "active binding is preserved without execution",
-                None,
-            );
-        }
-        match &binding_image.object.object_kind {
-            ObjectKind::Other(kind) => self.diagnostic(
-                node,
-                id,
-                Some(binding),
-                RejectCode::UnsupportedObject,
-                format!("unsupported installed object type `{kind}`"),
-                None,
-            ),
-            ObjectKind::Unavailable => self.diagnostic(
-                node,
-                id,
-                Some(binding),
-                RejectCode::UnsupportedObject,
-                "installed binding could not be forced",
-                None,
-            ),
-            _ => {}
         }
     }
 
-    fn process_binding_closure(
-        &mut self,
-        node: NodeId,
-        id: PackageId,
-        image: &Arc<PackageImage>,
-        binding: &str,
-        binding_image: &BindingImage,
-        closure: &ClosureSource,
-    ) -> Result<()> {
-        if closure.environment.starts_with("unsupported:") {
+    fn parse_closure(&mut self, site: &ClosureSite<'_>) -> Result<Option<Arc<ParsedRFile>>> {
+        if site.closure.environment.is_unsupported() {
             self.diagnostic(
-                node,
-                id,
-                Some(binding),
+                site.node,
+                site.package,
+                Some(&site.owner.to_string()),
                 RejectCode::UnknownClosureEnclosure,
                 format!(
                     "closure enclosure `{}` cannot be modeled",
-                    closure.environment
+                    site.closure.environment
                 ),
                 None,
             );
         }
-        if let Some(parsed) = self.parsed(id, binding, image, binding_image)? {
-            if binding == ".onLoad"
-                && self.packages.role(id) == PackageRole::Linked
-                && parsed.expressions.first().is_some_and(|expression| {
-                    expression
-                        .parameters
-                        .first()
-                        .is_some_and(|libname| expression.used_parameters.contains(libname))
-                })
-            {
-                self.diagnostic(
-                    node,
-                    id,
-                    Some(binding),
-                    RejectCode::UnsupportedLinkedLibname,
-                    "Linked .onLoad reads libname, which has no installed library once linked",
-                    None,
-                );
-            }
-            let image =
-                self.prepare_construction_image(id, image, &closure.environment, parsed.as_ref())?;
-            self.process_parsed(
-                node,
-                id,
-                &image,
-                binding,
-                &closure.environment,
-                parsed.as_ref(),
-            )?;
+        self.parsed_source(
+            site.package,
+            &site.closure.source,
+            site.image,
+            &site.closure.environment,
+            ParseRequest {
+                owner: site.owner,
+                source_key: site.key,
+                owner_node: site.node,
+            },
+        )
+    }
+
+    fn process_closure(&mut self, site: &ClosureSite<'_>, parsed: &ParsedRFile) -> Result<()> {
+        let image = self.prepare_construction_image(
+            site.package,
+            site.image,
+            &site.closure.environment,
+            parsed,
+        )?;
+        self.process_parsed(
+            site.node,
+            site.package,
+            &image,
+            &site.owner.to_string(),
+            &site.closure.environment,
+            parsed,
+        )
+    }
+
+    fn analyze_closure(&mut self, site: &ClosureSite<'_>) -> Result<()> {
+        if let Some(parsed) = self.parse_closure(site)? {
+            self.process_closure(site, &parsed)?;
         }
         Ok(())
+    }
+
+    fn diagnose_object(&mut self, site: ObjectSite<'_>, object: &ObjectImage) {
+        let ObjectSite {
+            node,
+            package,
+            binding,
+            private,
+        } = site;
+        let subject = private
+            .map(|environment| format!("private binding {environment}${binding}: "))
+            .unwrap_or_default();
+        let issues = object
+            .issues
+            .iter()
+            .map(|issue| format!("{}: {} ({})", issue.path, issue.kind, issue.detail))
+            .collect::<Vec<_>>();
+        let findings = [
+            (!issues.is_empty()).then(|| (RejectCode::UnsupportedObject, issues.join("; "))),
+            (object.representation == BindingRepresentation::ActiveBinding).then(|| {
+                (
+                    RejectCode::ActiveBinding,
+                    "active binding is preserved without execution".to_owned(),
+                )
+            }),
+            match &object.object_kind {
+                ObjectKind::Unsupported(kind) => Some((
+                    RejectCode::UnsupportedObject,
+                    format!("unsupported installed object type `{kind}`"),
+                )),
+                ObjectKind::Unavailable => Some((
+                    RejectCode::UnsupportedObject,
+                    "installed binding could not be forced".to_owned(),
+                )),
+                _ => None,
+            },
+        ];
+        for (code, message) in findings.into_iter().flatten() {
+            self.diagnostic(
+                node,
+                package,
+                Some(binding),
+                code,
+                format!("{subject}{message}"),
+                None,
+            );
+        }
     }
 
     fn require_member_closures(&mut self, node: NodeId, id: PackageId, object: Option<ObjectId>) {
@@ -388,12 +417,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn process_private_binding(
         &mut self,
         id: PackageId,
-        environment: &str,
+        environment: &EnvironmentLabel,
         binding: &BindingName,
     ) -> Result<()> {
         let node = self.need_node(&Need::PrivateBinding {
             package: id,
-            environment: environment.to_owned(),
+            environment: environment.clone(),
             binding: binding.clone(),
         });
         if self.packages.is_external(id) {
@@ -401,7 +430,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let image = self.image(id)?;
-        let Some(binding_image) = image.private_binding(environment, binding).cloned() else {
+        let Some(binding_image) = image.private_binding(environment, binding) else {
             self.diagnostic(
                 node,
                 id,
@@ -412,133 +441,34 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             return Ok(());
         };
-
-        self.diagnose_private_object(node, id, environment, binding, &binding_image);
+        self.diagnose_object(
+            ObjectSite {
+                node,
+                package: id,
+                binding,
+                private: Some(environment),
+            },
+            &binding_image.object,
+        );
         let object = {
             let graph = self.objects.graph(id);
-            graph.environment_id(environment).and_then(|private| {
-                graph
-                    .environment(private)
-                    .bindings
-                    .get(binding.as_str())
-                    .copied()
-            })
+            graph
+                .environment_id(environment)
+                .and_then(|private| graph.environment(private).bindings.get(binding).copied())
         };
         self.require_member_closures(node, id, object);
-
-        let source_key = Self::private_source_key(environment, binding);
-        let source_name = source_key.to_string();
         if let Some(closure) = &binding_image.object.closure {
-            if closure.environment.starts_with("unsupported:") {
-                self.diagnostic(
-                    node,
-                    id,
-                    Some(binding),
-                    RejectCode::UnknownClosureEnclosure,
-                    format!(
-                        "private closure enclosure `{}` cannot be modeled",
-                        closure.environment
-                    ),
-                    None,
-                );
-            }
-            if let Some(parsed) = self.parsed_source(
-                id,
-                &closure.source,
-                &image,
-                &closure.environment,
-                ParseRequest {
-                    owner_binding: &source_name,
-                    source_key: &source_key,
-                    owner_node: node,
-                },
-            )? {
-                let image = self.prepare_construction_image(
-                    id,
-                    &image,
-                    &closure.environment,
-                    parsed.as_ref(),
-                )?;
-                self.process_parsed(
-                    node,
-                    id,
-                    &image,
-                    &source_name,
-                    &closure.environment,
-                    parsed.as_ref(),
-                )?;
-            }
+            let key = SourceKey::private(environment.clone(), binding.clone());
+            self.analyze_closure(&ClosureSite {
+                node,
+                package: id,
+                image: &image,
+                owner: &key,
+                key: &key,
+                closure,
+            })?;
         }
-
         Ok(())
-    }
-
-    fn diagnose_private_object(
-        &mut self,
-        node: NodeId,
-        id: PackageId,
-        environment: &str,
-        binding: &str,
-        image: &PrivateBindingImage,
-    ) {
-        let object_issues = image
-            .object
-            .issues
-            .iter()
-            .filter(|issue| {
-                !(issue.kind == "environment_identity" && issue.path.ends_with(".environment"))
-            })
-            .map(|issue| format!("{}: {} ({})", issue.path, issue.kind, issue.detail))
-            .collect::<Vec<_>>();
-        if !object_issues.is_empty() {
-            self.diagnostic(
-                node,
-                id,
-                Some(binding),
-                RejectCode::UnsupportedObject,
-                format!(
-                    "private binding {environment}${binding}: {}",
-                    object_issues.join("; ")
-                ),
-                None,
-            );
-        }
-        if matches!(
-            image.object.representation,
-            BindingRepresentation::ActiveBinding
-        ) {
-            self.diagnostic(
-                node,
-                id,
-                Some(binding),
-                RejectCode::ActiveBinding,
-                format!(
-                    "private active binding {environment}${binding} is preserved without execution"
-                ),
-                None,
-            );
-        }
-        match &image.object.object_kind {
-            ObjectKind::Other(kind) => self.diagnostic(
-                node,
-                id,
-                Some(binding),
-                RejectCode::UnsupportedObject,
-                format!(
-                    "private binding {environment}${binding} has unsupported object type `{kind}`"
-                ),
-                None,
-            ),
-            ObjectKind::Unavailable => self.diagnostic(
-                node,
-                id,
-                Some(binding),
-                RejectCode::UnsupportedObject,
-                format!("private binding {environment}${binding} could not be forced"),
-                None,
-            ),
-            _ => {}
-        }
     }
 
     fn process_parsed(
@@ -547,7 +477,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         image: &PackageImage,
         binding: &str,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         parsed: &ParsedRFile,
     ) -> Result<()> {
         let site = ParsedSite {
@@ -935,46 +865,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn parsed(
-        &mut self,
-        id: PackageId,
-        binding: &str,
-        package_image: &PackageImage,
-        image: &BindingImage,
-    ) -> Result<Option<Arc<ParsedRFile>>> {
-        let closure = image.object.closure.as_ref().ok_or_else(|| {
-            Error::Analysis(format!(
-                "closure binding {}::{binding} has no source",
-                self.packages.name(id)
-            ))
-        })?;
-        let node = self.need_node(&Need::Binding {
-            package: id,
-            binding: binding.to_owned().into(),
-        });
-        self.parsed_source(
-            id,
-            &closure.source,
-            package_image,
-            &closure.environment,
-            ParseRequest {
-                owner_binding: binding,
-                source_key: &SourceKey::Binding(binding.to_owned()),
-                owner_node: node,
-            },
-        )
-    }
-
     pub(super) fn parsed_source(
         &mut self,
         id: PackageId,
         source_text: &Arc<str>,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         request: ParseRequest<'_>,
     ) -> Result<Option<Arc<ParsedRFile>>> {
         let ParseRequest {
-            owner_binding,
+            owner,
             source_key,
             owner_node,
         } = request;
@@ -985,8 +885,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 ParseState::Blocked => None,
             });
         }
-        let Some(source) =
-            self.admit_source(id, owner_binding, source_key, owner_node, source_text)?
+        let Some(source) = self.admit_source(id, owner, source_key, owner_node, source_text)?
         else {
             return Ok(None);
         };
@@ -998,7 +897,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Ok(Some(parsed))
             }
             Err(error) => {
-                self.handle_air_rejection(id, owner_binding, source_key, owner_node, &error)?;
+                self.handle_air_rejection(id, owner, source_key, owner_node, &error)?;
                 Ok(None)
             }
         }
@@ -1007,7 +906,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn admit_source(
         &mut self,
         id: PackageId,
-        owner_binding: &str,
+        owner: &SourceKey,
         source_key: &SourceKey,
         owner_node: NodeId,
         text: &Arc<str>,
@@ -1020,7 +919,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.diagnostic(
                 owner_node,
                 id,
-                Some(owner_binding),
+                Some(&owner.to_string()),
                 RejectCode::InvalidInstalledRepresentation,
                 format!(
                     "target-R canonical source for {source_key} is not stable across parse/deparse"
@@ -1037,7 +936,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn handle_air_rejection(
         &mut self,
         id: PackageId,
-        owner_binding: &str,
+        owner: &SourceKey,
         source_key: &SourceKey,
         owner_node: NodeId,
         air_error: &str,
@@ -1055,7 +954,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             SyntaxValidation::Accepted => self.diagnostic(
                 owner_node,
                 id,
-                Some(owner_binding),
+                Some(&owner.to_string()),
                 RejectCode::AirUnsupportedSyntax,
                 format!(
                     "target R accepts {source_key}; Air {air_error}; analysis of this retained closure is conservatively blocked"
@@ -1065,7 +964,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             SyntaxValidation::Rejected(r_error) => self.diagnostic(
                 owner_node,
                 id,
-                Some(owner_binding),
+                Some(&owner.to_string()),
                 RejectCode::InvalidInstalledRepresentation,
                 format!(
                     "Air rejects generated source for {source_key} ({air_error}); target R also rejects it ({r_error})"
@@ -1104,7 +1003,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         package: PackageId,
         image: &PackageImage,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         active: &ActiveBindingDef,
     ) -> Result<bool> {
         let expected = format!("namespace:{}", self.packages.name(package));
@@ -1139,7 +1038,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         image: &PackageImage,
         binding: &str,
-        lexical_environment: &str,
+        lexical_environment: &EnvironmentLabel,
         effect: &SyntaxEffect,
     ) -> Result<()> {
         if let Some(value) = &effect.value_symbol

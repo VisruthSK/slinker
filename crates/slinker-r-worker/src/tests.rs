@@ -1,12 +1,12 @@
 use super::protocol::*;
 use super::runtime::WorkerRuntime;
-use super::scan::{InspectionEpoch, ObjectScanner};
+use super::scan::{InspectionEpoch, ObjectScanner, PrivateIds};
 use super::serve::write_response;
 use super::*;
 use harp::RFunctionExt;
+use slinker_core::package::BindingName;
 use slinker_core::package::BindingOrigin;
 use slinker_core::package::BindingRepresentation;
-use std::collections::HashMap;
 
 #[test]
 fn protocol_round_trips_binding_request() {
@@ -146,10 +146,11 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
 
     let lazy = harp::environment_iter::Binding::new(&image_environment, "lazy".into())
         .expect("lazy binding");
+    let known = PrivateIds::new();
     let mut scanner = ObjectScanner::new(
         image.sexp,
-        "fixture".into(),
-        HashMap::new(),
+        "fixture",
+        &known,
         InspectionEpoch {
             worker: 0,
             context: 0,
@@ -181,7 +182,22 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
             .contains("function")
     );
     assert_eq!(holder.object.classes, ["first_class", "second_class"]);
-    let private = scanner
+    let altrep = harp::environment_iter::Binding::new(&image_environment, "altrep".into())
+        .expect("ALTREP binding");
+    let altrep = scanner
+        .top_binding("altrep", BindingOrigin::Code, altrep.value)
+        .expect("classify ALTREP");
+    assert!(matches!(
+        altrep.object.representation,
+        BindingRepresentation::Altrep { .. }
+    ));
+    assert!(
+        altrep.object.issues.is_empty(),
+        "base ALTREP serializes as a plain vector"
+    );
+
+    let scanned = scanner.finish();
+    let private = scanned
         .private_environments
         .values()
         .find(|environment| environment.bindings.contains_key("active"))
@@ -207,8 +223,8 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
     );
     let mut later_epoch = ObjectScanner::new(
         image.sexp,
-        "fixture".into(),
-        HashMap::new(),
+        "fixture",
+        &known,
         InspectionEpoch {
             worker: 0,
             context: 1,
@@ -221,9 +237,10 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
         .expect("inspect holder in a later epoch");
     assert!(
         later_epoch
+            .finish()
             .private_environments
             .keys()
-            .all(|label| !scanner.private_environments.contains_key(label)),
+            .all(|label| !scanned.private_environments.contains_key(label)),
         "private labels from separate inspection epochs alias"
     );
     let private_environment = harp::environment::Environment::new(
@@ -232,20 +249,6 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
     assert_eq!(
         i32::try_from(private_environment.get("counter").expect("counter")).expect("integer"),
         0
-    );
-
-    let altrep = harp::environment_iter::Binding::new(&image_environment, "altrep".into())
-        .expect("ALTREP binding");
-    let altrep = scanner
-        .top_binding("altrep", BindingOrigin::Code, altrep.value)
-        .expect("classify ALTREP");
-    assert!(matches!(
-        altrep.object.representation,
-        BindingRepresentation::Altrep { .. }
-    ));
-    assert!(
-        altrep.object.issues.is_empty(),
-        "base ALTREP serializes as a plain vector"
     );
 
     harp::parse_eval_global("cat('worker console noise')")
@@ -324,7 +327,7 @@ fn payload_identity_stays_within_one_bundle(
     }];
     let payload = |names: &[&str]| PayloadSpec {
         package: package.clone(),
-        names: names.iter().map(|name| (*name).to_owned()).collect(),
+        names: names.iter().map(|name| BindingName::from(*name)).collect(),
         patches: Vec::new(),
     };
 
