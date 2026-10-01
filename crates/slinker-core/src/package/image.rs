@@ -36,35 +36,6 @@ pub enum ObjectKind {
     Unavailable,
 }
 
-impl ObjectKind {
-    pub fn from_r_type(value: &str) -> Self {
-        match value {
-            "closure" => Self::Closure,
-            "NULL" => Self::Null,
-            "logical" => Self::Logical,
-            "integer" => Self::Integer,
-            "double" => Self::Double,
-            "complex" => Self::Complex,
-            "character" => Self::Character,
-            "raw" => Self::Raw,
-            "symbol" => Self::Symbol,
-            "list" => Self::List,
-            "pairlist" => Self::Pairlist,
-            "language" => Self::Language,
-            "expression" => Self::Expression,
-            "environment" => Self::Environment,
-            "builtin" => Self::Builtin,
-            "special" => Self::Special,
-            "unavailable" => Self::Unavailable,
-            other => Self::Other(other.to_owned()),
-        }
-    }
-
-    pub fn needs_air(&self) -> bool {
-        matches!(self, Self::Closure)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectIssue {
     pub path: String,

@@ -1,30 +1,15 @@
 use crate::syntax::source::Span;
-use serde::{Deserialize, Serialize};
+
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BindingDef {
-    pub name: String,
-    pub span: Span,
-    pub certainty: BindingCertainty,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BindingCertainty {
-    Definite,
-    Possible,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameRefKind {
     External,
     ConditionalFallthrough,
     MaybeLocal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameRef {
     pub name: String,
     pub kind: NameRefKind,
@@ -33,15 +18,13 @@ pub struct NameRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalPhase {
     Materialization,
     Runtime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "package", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageGuard {
     Available(String),
     Loaded(String),
@@ -56,7 +39,7 @@ impl PackageGuard {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRef {
     pub package: String,
     pub symbol: String,
@@ -65,36 +48,30 @@ pub struct PackageRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CalleeKind {
     DefinitelyLexical,
     DefinitelyExternal,
     ConditionalFallthrough,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
     pub callee: String,
     pub callee_kind: CalleeKind,
     pub qualified_package: Option<String>,
     pub args: Vec<Option<StaticArg>>,
-    #[serde(default)]
     pub arg_names: Vec<Option<String>>,
-    #[serde(default)]
     pub arg_spans: Vec<Option<Span>>,
-    #[serde(default)]
     pub local_closure_args: Vec<bool>,
-    #[serde(default)]
     pub scope: LexicalScopeId,
-    #[serde(default)]
     pub arg_bindings: Vec<Option<LexicalBindingId>>,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRef {
     pub package: ResourcePackage,
     pub path: Option<String>,
@@ -104,34 +81,31 @@ pub struct ResourceRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourcePackage {
     Literal(String),
     Computed(Option<LexicalBindingId>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaticArg {
     String(String),
     Symbol(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaticEnvironment {
     ClosureBinding(String),
     Namespace(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstructionExpr {
     pub kind: ConstructionExprKind,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstructionExprKind {
     Unknown,
     Null,
@@ -179,7 +153,7 @@ pub enum ConstructionExprKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstructionCall {
     pub callee: String,
     pub callee_kind: CalleeKind,
@@ -187,14 +161,13 @@ pub struct ConstructionCall {
     pub arguments: Vec<ConstructionArgument>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstructionArgument {
     pub name: Option<String>,
     pub value: Option<ConstructionExpr>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstructionTarget {
     Local {
         name: String,
@@ -209,7 +182,7 @@ pub enum ConstructionTarget {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveBindingDef {
     pub name: String,
     pub target: StaticEnvironment,
@@ -218,15 +191,14 @@ pub struct ActiveBindingDef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxEffectKind {
     SuperAssignment,
     IndirectPackageWrite,
     UnsupportedAssignmentTarget,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxEffect {
     pub kind: SyntaxEffectKind,
     pub target: Option<String>,
@@ -237,8 +209,7 @@ pub struct SyntaxEffect {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticIssueKind {
     AmbiguousEffect,
     AmbiguousAttachOrder,
@@ -247,95 +218,75 @@ pub enum SemanticIssueKind {
     InvalidDeclaration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticIssue {
     pub kind: SemanticIssueKind,
     pub message: String,
     pub span: Option<Span>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ParsedExpression {
     pub span: Span,
-    #[serde(default)]
     pub parameters: Vec<String>,
-    #[serde(default)]
     pub used_parameters: Vec<String>,
-    #[serde(default)]
     pub pinned_defaults: Vec<PinnedDefault>,
-    pub definitions: Vec<BindingDef>,
     pub references: Vec<NameRef>,
     pub package_refs: Vec<PackageRef>,
     pub resource_refs: Vec<ResourceRef>,
     pub calls: Vec<CallSite>,
     pub active_bindings: Vec<ActiveBindingDef>,
     pub effects: Vec<SyntaxEffect>,
-    #[serde(default)]
     pub construction: Vec<ConstructionExpr>,
-    #[serde(default)]
     pub namespace_info_reads: Vec<NamespaceInfoRead>,
-    #[serde(default)]
     pub namespace_enumerations: Vec<NamespaceEnumeration>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedDefault {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceInfoRead {
     pub receiver: NamespaceInfoReceiver,
     pub field: Option<String>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceEnumeration {
     pub package: String,
     pub callee: String,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceInfoReceiver {
     Lexical,
     Namespace(String),
     Computed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ParsedRFile {
     pub expressions: Vec<ParsedExpression>,
-    #[serde(default)]
     pub issues: Vec<SemanticIssue>,
-    #[serde(default)]
     pub scope_parents: Vec<Option<LexicalScopeId>>,
-    #[serde(default)]
     pub declarations: Vec<BindingDeclaration>,
 }
 
-impl ParsedRFile {
-    pub fn bindings(&self) -> impl Iterator<Item = &BindingDef> {
-        self.expressions
-            .iter()
-            .flat_map(|expr| expr.definitions.iter())
-    }
-}
-
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LexicalScopeId(pub u32);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LexicalBindingId {
     pub defining_scope: LexicalScopeId,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingDeclaration {
     pub declaring_scope: LexicalScopeId,
     pub binding: LexicalBindingId,
@@ -343,14 +294,14 @@ pub struct BindingDeclaration {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclaredDomain {
     Classes(Vec<Vec<String>>),
     Strings(BTreeSet<String>),
     Callables(BTreeSet<DeclaredCallable>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclaredCallable {
     pub package: Option<String>,
     pub name: String,

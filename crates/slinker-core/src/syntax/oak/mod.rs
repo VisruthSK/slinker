@@ -485,7 +485,6 @@ fn translate_index(
             parameters,
             used_parameters,
             pinned_defaults,
-            definitions: Vec::new(),
             references,
             package_refs,
             resource_refs,
