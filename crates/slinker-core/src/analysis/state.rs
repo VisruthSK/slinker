@@ -21,12 +21,15 @@ use crate::analysis::{
 use crate::ir::ExternalBindingAccess;
 use crate::ir::NamespaceOperation;
 use crate::metadata::{RelationField, relations};
+use crate::package::PackageRole;
 use crate::package::{
     BindingImage, BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource,
     ComponentName, DatasetName, Digest, ImportSpec, NativeLibrary, NativeSafety, ObjectKind,
     PackageId, PackageImage, PackageProvider, PrivateBindingImage, ResourcePath, SyntaxValidation,
     TargetUniverse,
 };
+use crate::syntax::PackageRef;
+use crate::syntax::ResourceRef;
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, NamespaceInfoReceiver,
     OakParseContext, OakParser, PackageGuard, ParsedExpression, ParsedRFile, ResourcePackage,
@@ -835,7 +838,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         if let Some(parsed) = self.parsed(id, binding, image, binding_image)? {
             if binding == ".onLoad"
-                && self.packages.role(id) == crate::package::PackageRole::Linked
+                && self.packages.role(id) == PackageRole::Linked
                 && parsed.expressions.first().is_some_and(|expression| {
                     expression
                         .parameters
@@ -1444,9 +1447,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             match &read.receiver {
                 NamespaceInfoReceiver::Lexical => {}
                 NamespaceInfoReceiver::Namespace(name) => {
-                    let linked = self.known_package(name).is_some_and(|package| {
-                        self.packages.role(package) == crate::package::PackageRole::Linked
-                    });
+                    let linked = self
+                        .known_package(name)
+                        .is_some_and(|package| self.packages.role(package) == PackageRole::Linked);
                     if linked {
                         self.diagnostic(
                             site.node,
@@ -1479,9 +1482,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for enumeration in &expression.namespace_enumerations {
             let linked = self
                 .known_package(&enumeration.package)
-                .is_some_and(|package| {
-                    self.packages.role(package) == crate::package::PackageRole::Linked
-                });
+                .is_some_and(|package| self.packages.role(package) == PackageRole::Linked);
             if linked {
                 self.diagnostic(
                     site.node,
@@ -2084,7 +2085,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         from: NodeId,
         current: PackageId,
-        reference: &crate::syntax::PackageRef,
+        reference: &PackageRef,
     ) -> Result<()> {
         if reference.package == "base" {
             return Ok(());
@@ -2215,7 +2216,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
         expression: &ParsedExpression,
-        resource: &crate::syntax::ResourceRef,
+        resource: &ResourceRef,
     ) -> Result<()> {
         let (from, current) = (site.node, site.package);
         let package_name = match &resource.package {
@@ -2251,9 +2252,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         value: pinned.value.clone(),
                         span: resource.span.clone(),
                     });
-                    let names_linked = self.known_package(&pinned.value).is_some_and(|package| {
-                        self.packages.role(package) == crate::package::PackageRole::Linked
-                    });
+                    let names_linked = self
+                        .known_package(&pinned.value)
+                        .is_some_and(|package| self.packages.role(package) == PackageRole::Linked);
                     if !names_linked {
                         return Ok(());
                     }
@@ -2262,9 +2263,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 for name in names {
                     let linked = self
                         .resource_package(from, current, resource, &name)?
-                        .is_some_and(|package| {
-                            self.packages.role(package) == crate::package::PackageRole::Linked
-                        });
+                        .is_some_and(|package| self.packages.role(package) == PackageRole::Linked);
                     if linked {
                         self.diagnostic(
                             from,
@@ -2288,7 +2287,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         from: NodeId,
         current: PackageId,
-        resource: &crate::syntax::ResourceRef,
+        resource: &ResourceRef,
         package_name: &str,
     ) -> Result<()> {
         let Some(foreign) = self.resource_package(from, current, resource, package_name)? else {
@@ -2354,7 +2353,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         from: NodeId,
         current: PackageId,
-        resource: &crate::syntax::ResourceRef,
+        resource: &ResourceRef,
         name: &str,
     ) -> Result<Option<PackageId>> {
         if self.is_root(current) && name == self.packages.name(current) {
@@ -2558,9 +2557,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         match matched_static_arg(call, &["ns", "which"], "ns") {
             Some(StaticArg::String(name)) => {
-                if self.known_package(name).is_some_and(|package| {
-                    self.packages.role(package) == crate::package::PackageRole::Linked
-                }) {
+                if self
+                    .known_package(name)
+                    .is_some_and(|package| self.packages.role(package) == PackageRole::Linked)
+                {
                     self.diagnostic(
                         from,
                         current,
@@ -2707,9 +2707,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let package = if name == self.packages.name(current) {
             (!self.is_root(current)).then_some(current)
         } else if imported {
-            self.packages.resolve(name)?.filter(|package| {
-                self.packages.role(*package) == crate::package::PackageRole::Linked
-            })
+            self.packages
+                .resolve(name)?
+                .filter(|package| self.packages.role(*package) == PackageRole::Linked)
         } else {
             None
         };
@@ -2904,7 +2904,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(self
             .packages
             .resolve(name)?
-            .filter(|package| self.packages.role(*package) == crate::package::PackageRole::Linked))
+            .filter(|package| self.packages.role(*package) == PackageRole::Linked))
     }
     fn utils_call(
         &mut self,

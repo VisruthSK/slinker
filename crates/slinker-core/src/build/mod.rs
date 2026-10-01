@@ -19,6 +19,7 @@ use payload::{CheckedPayloadBundle, check_payload_bundles, closure_patches};
 use relocated::RelocatedCode;
 use std::collections::BTreeMap;
 
+use crate::ir::PackageRole;
 use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -105,7 +106,7 @@ impl BuildContext {
         if !program.payload_bundles().is_empty() {
             let namespaces = program
                 .packages()
-                .filter(|(_, package)| package.role() != crate::ir::PackageRole::External)
+                .filter(|(_, package)| package.role() != PackageRole::External)
                 .map(|(id, package)| NamespaceImageSpec {
                     package: spec(id),
                     registered_name: package.registered_namespace().as_str().to_owned(),

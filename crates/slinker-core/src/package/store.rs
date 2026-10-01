@@ -566,7 +566,10 @@ impl PackageProvider for PackageStore {
 mod tests {
     use super::*;
     use crate::Description;
-    use crate::package::{Digest, LifecycleMetadata, NativeComponent, NativeLibrary};
+    use crate::package::{
+        BindingImage, BindingOrigin, BindingRepresentation, ClosureSource, Digest,
+        LifecycleMetadata, NativeComponent, NativeLibrary, ObjectKind,
+    };
 
     fn package_index() -> PackageIndex {
         PackageIndex {
@@ -633,13 +636,13 @@ mod tests {
             package_name: "fixture".into(),
             package_version: "1.0.0".into(),
             image_fingerprint: "exact-image".into(),
-            binding: crate::package::BindingImage {
+            binding: BindingImage {
                 name: "f".into(),
-                origin: crate::package::BindingOrigin::Code,
-                representation: crate::package::BindingRepresentation::Value,
+                origin: BindingOrigin::Code,
+                representation: BindingRepresentation::Value,
                 classes: Vec::new(),
-                object_kind: crate::package::ObjectKind::Closure,
-                closure: Some(crate::package::ClosureSource {
+                object_kind: ObjectKind::Closure,
+                closure: Some(ClosureSource {
                     source: "function() 1".into(),
                     environment: environment.into(),
                 }),

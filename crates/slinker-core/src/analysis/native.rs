@@ -8,6 +8,7 @@ use super::state::{AnalyzerState, NativeCallTarget, NativeCallbackContext};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, RejectCode};
 use crate::ir::ExternalBindingAccess;
+use crate::package::NativeComponent;
 use crate::package::{
     NameLookup, NativeInterface, NativeLibrary, NativeRoutineSummary, NativeSafety, PackageId,
     PackageImage, PackageIndex, PackageProvider,
@@ -32,7 +33,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn native_summary_for_selector<'a>(
-        native: &'a crate::package::NativeComponent,
+        native: &'a NativeComponent,
         selector: &str,
         summaries: &'a [NativeRoutineSummary],
     ) -> Option<&'a NativeRoutineSummary> {

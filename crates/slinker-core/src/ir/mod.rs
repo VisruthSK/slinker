@@ -5,6 +5,7 @@ pub use crate::package::{
 };
 
 use crate::package::Digest;
+use crate::package::NativeComponent;
 use crate::syntax::TextRange;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -433,7 +434,7 @@ impl std::fmt::Display for InvalidRelocation {
 pub struct NamespaceActivationIr {
     pub namespace: NamespaceId,
     pub on_load: Option<BindingId>,
-    pub native_components: Vec<crate::package::NativeComponent>,
+    pub native_components: Vec<NativeComponent>,
     pub exports: ExportTable,
     pub removed_bindings: Vec<BindingName>,
 }
@@ -442,7 +443,7 @@ pub struct NamespaceActivationIr {
 pub struct RootArtifactIr {
     pub description: Option<Arc<str>>,
     pub exports: ExportTable,
-    pub native_components: Vec<crate::package::NativeComponent>,
+    pub native_components: Vec<NativeComponent>,
     pub on_load: Option<ClosureId>,
     pub load: RootLoadIr,
 }

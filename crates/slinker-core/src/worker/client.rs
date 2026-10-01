@@ -1,4 +1,7 @@
+use crate::package::SyntaxValidation;
 use crate::package::{CanonicalSyntax, InstalledPackage};
+use crate::worker::protocol::WorkerBinding;
+use crate::worker::protocol::WorkerPackageIndex;
 use crate::worker::protocol::{
     DataLibraryFiles, NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization,
     PayloadSite, PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
@@ -118,7 +121,7 @@ impl WorkerClient {
     pub(crate) fn package_index(
         &mut self,
         package: &InstalledPackage,
-    ) -> Result<crate::worker::protocol::WorkerPackageIndex> {
+    ) -> Result<WorkerPackageIndex> {
         let request_id = self.request_id();
         match self.exchange(&WorkerRequest::PackageIndex {
             request_id,
@@ -136,7 +139,7 @@ impl WorkerClient {
         &mut self,
         package: &InstalledPackage,
         name: &str,
-    ) -> Result<crate::worker::protocol::WorkerBinding> {
+    ) -> Result<WorkerBinding> {
         let request_id = self.request_id();
         match self.exchange(&WorkerRequest::Binding {
             request_id,
@@ -228,10 +231,7 @@ impl WorkerClient {
         }
     }
 
-    pub(crate) fn validate_syntax(
-        &mut self,
-        source: &str,
-    ) -> Result<crate::package::SyntaxValidation> {
+    pub(crate) fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation> {
         let request_id = self.request_id();
         let response = self.exchange(&WorkerRequest::ValidateSyntax {
             request_id,
@@ -245,7 +245,7 @@ impl WorkerClient {
         original: &str,
         rewritten: &str,
         sites: Vec<RelocationSiteSpec>,
-    ) -> Result<crate::package::SyntaxValidation> {
+    ) -> Result<SyntaxValidation> {
         let request_id = self.request_id();
         let response = self.exchange(&WorkerRequest::VerifyRelocation {
             request_id,
@@ -512,20 +512,22 @@ fn syntax_verdict(
     request_id: u64,
     response: WorkerResponse,
     operation: &str,
-) -> Result<crate::package::SyntaxValidation> {
+) -> Result<SyntaxValidation> {
     match response {
         WorkerResponse::SyntaxValidation {
             request_id: response_id,
             accepted: true,
             message: _,
-        } if response_id == request_id => Ok(crate::package::SyntaxValidation::Accepted),
+        } if response_id == request_id => Ok(SyntaxValidation::Accepted),
         WorkerResponse::SyntaxValidation {
             request_id: response_id,
             accepted: false,
             message,
-        } if response_id == request_id => Ok(crate::package::SyntaxValidation::Rejected(
-            message.unwrap_or_else(|| format!("target R rejected {operation}")),
-        )),
+        } if response_id == request_id => {
+            Ok(SyntaxValidation::Rejected(message.unwrap_or_else(|| {
+                format!("target R rejected {operation}")
+            })))
+        }
         response => Err(worker_error(operation, response)),
     }
 }

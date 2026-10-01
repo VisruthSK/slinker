@@ -1,6 +1,7 @@
 use crate::TargetEnvironment;
 use crate::analysis::Graph;
 use crate::analysis::LinkIr;
+use crate::analysis::NodeId;
 use crate::analysis::export::{
     GraphBlockerExport, GraphEdgeReasonExport, GraphNodeKindExport, GraphSourceExport,
     PackageIdentityExport, TargetIdentityExport, blockers, edge_reason, node_kind, root_identity,
@@ -530,7 +531,7 @@ fn component_adjacency(count: usize, edges: &[ExplanationEdge], ids: &[String]) 
 
 fn explanation_roots(
     graph: &Graph,
-    root_nodes: &[crate::analysis::NodeId],
+    root_nodes: &[NodeId],
     component_of: &[usize],
     component_ids: &[String],
     node_ids: &[String],

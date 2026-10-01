@@ -565,8 +565,8 @@ mod tests {
     use super::*;
     use crate::Description;
     use crate::package::{
-        BindingOrigin, BindingRepresentation, Digest, LifecycleMetadata, PackageIdentity,
-        PackageIndex, PrivateEnvironmentImage,
+        BindingOrigin, BindingRepresentation, Digest, LifecycleMetadata, PackageData,
+        PackageIdentity, PackageIndex, PrivateEnvironmentImage,
     };
 
     fn value(name: &str, kind: ObjectKind) -> BindingImage {
@@ -644,7 +644,7 @@ mod tests {
                     .iter()
                     .map(|binding| binding.name.clone())
                     .collect(),
-                data: crate::package::PackageData::default(),
+                data: PackageData::default(),
                 files: Vec::new(),
                 has_sysdata: false,
             }),

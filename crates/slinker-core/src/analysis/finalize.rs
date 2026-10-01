@@ -5,6 +5,11 @@ use super::relocation::PendingRelocation;
 use super::state::{AnalyzerState, LoadedPackage};
 use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
+use crate::ir::CodeIr;
+use crate::ir::GenericId;
+use crate::ir::NamespaceActivationIr;
+use crate::ir::ProvenanceIr;
+use crate::ir::ResourceIr;
 use crate::ir::{
     BindingId, BindingName, ClosureHome, CodeId, ExportTable, ExternalBindingAccess,
     ExternalPackageContract, FinalizedNamespace, GenericHome, ImportRecordIr, ImportSlotIr,
@@ -14,6 +19,9 @@ use crate::ir::{
     RelocationTarget, RemovedImportIr, RootArtifactIr, TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
+use crate::package::PackageIdentity;
+use crate::package::PackageImage;
+use crate::package::PackageSources;
 use crate::package::{NativeComponent, PackageAvailability, PackageId, PackageProvider};
 use crate::source::generated_description;
 use crate::syntax::{SourceKey, SourceOrigin, Sources};
@@ -23,9 +31,9 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct LinkIr {
-    packages: crate::package::PackageSources,
+    packages: PackageSources,
     program: ProgramIr,
-    provenance: crate::ir::ProvenanceIr,
+    provenance: ProvenanceIr,
     blockers: Vec<Diagnostic>,
     sources: Sources,
     construction_evaluations: usize,
@@ -100,7 +108,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let blockers = self.diagnostics.into_sorted();
         Ok(LinkIr {
             program,
-            provenance: crate::ir::ProvenanceIr::new(self.graph, self.roots),
+            provenance: ProvenanceIr::new(self.graph, self.roots),
             blockers,
             sources: self.parses.into_sources(),
             packages: self.packages.sources(retained),
@@ -151,7 +159,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for (namespace, (exports, removed_bindings)) in
             activation_order(linked_contents, &dependencies, &mut issues)
         {
-            builder.add_activation(crate::ir::NamespaceActivationIr {
+            builder.add_activation(NamespaceActivationIr {
                 namespace,
                 on_load: namespaces.on_load.get(&namespace).copied(),
                 native_components: namespaces
@@ -319,7 +327,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 };
                 builder.attach_s3_registration(
                     namespace.namespace,
-                    crate::ir::GenericId {
+                    GenericId {
                         home: registration
                             .generic
                             .package
@@ -337,7 +345,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 };
                 builder.attach_s3_registration(
                     namespace.namespace,
-                    crate::ir::GenericId {
+                    GenericId {
                         home: GenericHome::Optional(registration.package.clone()),
                         name: registration.generic.clone(),
                     },
@@ -355,7 +363,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             for native in &image.index.dynlibs {
                 if let (LinkedPackageRole::Linked, Some(library)) = (role, native.library.path()) {
-                    builder.add_resource(crate::ir::ResourceIr {
+                    builder.add_resource(ResourceIr {
                         package,
                         path: library.to_owned(),
                     });
@@ -540,7 +548,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 PendingRelocation::ResourceAccess {
                     package, resource, ..
                 } => {
-                    let resource_id = builder.add_resource(crate::ir::ResourceIr {
+                    let resource_id = builder.add_resource(ResourceIr {
                         package: *package,
                         path: resource.clone(),
                     });
@@ -613,7 +621,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 PendingRelocation::DescriptionArgument { package, .. } => {
                     RelocationTarget::DescriptionArgument {
-                        description: builder.add_resource(crate::ir::ResourceIr {
+                        description: builder.add_resource(ResourceIr {
                             package: *package,
                             path: "Meta/package.rds".into(),
                         }),
@@ -677,7 +685,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             bundle,
             home,
             binding,
-            crate::ir::CodeIr::new(Arc::clone(&closure.source), shape),
+            CodeIr::new(Arc::clone(&closure.source), shape),
         ))
     }
 
@@ -735,7 +743,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &self,
         builder: &ProgramBuilder,
         namespace: &FinalizedNamespace,
-        image: &crate::package::PackageImage,
+        image: &PackageImage,
     ) -> HashMap<String, (BindingName, Vec<ObjectStep>)> {
         let mut queue = VecDeque::new();
         for (name, &binding) in &namespace.bindings {
@@ -880,8 +888,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn activation_time_dependencies(
         &self,
-        namespace_ids: &HashMap<String, crate::ir::FinalizedNamespace>,
-    ) -> Vec<(crate::ir::NamespaceId, crate::ir::NamespaceId)> {
+        namespace_ids: &HashMap<String, FinalizedNamespace>,
+    ) -> Vec<(NamespaceId, NamespaceId)> {
         let mut dependencies = Vec::new();
         for start in self.graph.nodes.iter().filter(|node| {
             matches!(
@@ -1078,7 +1086,7 @@ impl LinkIr {
         &self.program
     }
 
-    pub fn provenance(&self) -> &crate::ir::ProvenanceIr {
+    pub fn provenance(&self) -> &ProvenanceIr {
         &self.provenance
     }
 
@@ -1086,7 +1094,7 @@ impl LinkIr {
         &self.blockers
     }
 
-    pub fn package_sources(&self) -> &crate::package::PackageSources {
+    pub fn package_sources(&self) -> &PackageSources {
         &self.packages
     }
 
@@ -1112,7 +1120,7 @@ pub(super) enum FinalizationIssue {
     IncompatibleRequirements(String),
     UndeclaredExternal(String),
     UnsatisfiedRequirement {
-        identity: crate::package::PackageIdentity,
+        identity: PackageIdentity,
         requirement: Relation,
     },
     InvalidRelocation(InvalidRelocation),

@@ -4,9 +4,12 @@ use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
+use crate::package::PackageAvailability;
+use crate::package::PackageImage;
 use crate::package::{
     BindingName, ClassName, DispatchCallee, GenericName, ImportSpec, PackageId, PackageProvider,
 };
+use crate::syntax::CalleeKind;
 use crate::syntax::{CallSite, ParsedRFile, Span, StaticArg};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -461,7 +464,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn call_target(
         &mut self,
         current: PackageId,
-        image: &crate::package::PackageImage,
+        image: &PackageImage,
         lexical_environment: &str,
         call: &CallSite,
     ) -> Result<Option<CallableId>> {
@@ -471,7 +474,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 package,
                 binding: call.callee.clone().into(),
             })),
-            None if call.callee_kind == crate::syntax::CalleeKind::DefinitelyLexical => Ok(None),
+            None if call.callee_kind == CalleeKind::DefinitelyLexical => Ok(None),
             None => Ok(callable_target(&self.resolve_lexical_name(
                 current,
                 image,
@@ -514,7 +517,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }),
                 None => return Ok(None),
             },
-            None if call.callee_kind == crate::syntax::CalleeKind::DefinitelyLexical => {
+            None if call.callee_kind == CalleeKind::DefinitelyLexical => {
                 return Ok(None);
             }
             None => self.resolve_lexical_name(
@@ -612,6 +615,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn known_package(&self, name: &str) -> Option<PackageId> {
         self.packages
             .availability(name)
-            .and_then(crate::package::PackageAvailability::package)
+            .and_then(PackageAvailability::package)
     }
 }
