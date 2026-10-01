@@ -424,7 +424,7 @@ fn blocked_preflight_reports_every_blocker_and_publishes_nothing() {
 fn private_environments_and_registrations_survive_linking() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");
-    let state_code = "counter <- local({\n  n <- 0L\n  function() {\n    n <<- n + 1L\n    n\n  }\n})\nstore <- local({\n  value <- NULL\n  list(get = function() value, set = function(x) value <<- x)\n})\nget_value <- store$get\nset_value <- store$set\nmake <- function() structure(list(), class = 'tinystate')\nformat.tinystate <- function(x, ...) 'formatted tinystate'\nunused <- function() stop('never linked')\n";
+    let state_code = "counter <- local({\n  n <- 0L\n  function() {\n    n <<- n + 1L\n    n\n  }\n})\nstore <- local({\n  value <- NULL\n  list(get = function() value, set = function(x) value <<- x)\n})\nget_value <- store$get\nset_value <- store$set\nmake <- function() structure(list(), class = 'tinystate')\nformat.tinystate <- function(x, ...) 'formatted tinystate'\nunused <- function() stop('never linked')\nzzz_unused <- function() stop('never linked')\n";
     let dependency_source = fixture.path().join("tinystate");
     write_package(
         &dependency_source,
@@ -475,6 +475,8 @@ fn private_environments_and_registrations_survive_linking() {
         stopifnot(exists("unused", envir = linked, inherits = FALSE))
         removed <- tryCatch(get("unused", envir = linked), error = conditionMessage)
         stopifnot(grepl("`tinystate::unused` was removed by slinker", removed, fixed = TRUE))
+        removed_last <- tryCatch(get("zzz_unused", envir = linked), error = conditionMessage)
+        stopifnot(grepl("`tinystate::zzz_unused` was removed by slinker", removed_last, fixed = TRUE))
         stopifnot(setequal(getNamespaceExports(linked), c("counter", "get_value", "set_value", "make", "unused")))
         stopifnot(identical(get(".packageName", envir = linked, inherits = FALSE), "tinystate"))
     "#;

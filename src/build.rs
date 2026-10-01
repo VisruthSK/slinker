@@ -1074,6 +1074,8 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
   invisible(list2env(readRDS(bundle), envir = namespace))
 }
 .slinker_stub <- function(envir, name, package, binding) {
+  force(package)
+  force(binding)
   makeActiveBinding(name, function(value) {
     stop(sprintf("`%s::%s` was removed by slinker because the build never reached it", package, binding), call. = FALSE)
   }, envir)
