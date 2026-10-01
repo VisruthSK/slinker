@@ -3,18 +3,18 @@ use std::error::Error;
 use std::io;
 use std::io::Write;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode};
 
 use clap::{Args, Parser, Subcommand};
-use slinker::analysis::{
-    ANALYSIS_STACK_BYTES, Diagnostic, Edge, ExplanationDag, LinkIr, Linker, NodeId, NodeKind,
-};
-use slinker::build::{BuildContext, PureRStatic, materialize};
-use slinker::cache::CacheLocation;
-use slinker::package::PackageStore;
-use slinker::source::{SourcePackageSnapshot, stage_root};
-use slinker::{TargetEnvironment, TargetEnvironmentRequest};
+use serde_json::json;
+use slinker::TargetEnvironment;
+use slinker::analysis::{ANALYSIS_STACK_BYTES, Edge, ExplanationDag, LinkIr, NodeId, NodeKind};
+use slinker::build::{BuildReport, PreflightError, PureRStatic, materialize};
+
+mod session;
+
+use session::{RootSpec, Session, SourceSession};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,7 +39,9 @@ enum Command {
 enum UserCommand {
     #[command(about = "Build a generated linked R source package")]
     Build(BuildArgs),
-    #[command(about = "Analyze an installed package image", alias = "analyse")]
+    #[command(about = "Run the build pipeline through preflight and write nothing")]
+    Check(CheckArgs),
+    #[command(about = "Analyze a package", alias = "analyse")]
     Analyze(AnalyzeArgs),
     #[command(about = "Explain why TARGET is retained by ROOT")]
     Why(QueryArgs),
@@ -63,6 +65,14 @@ struct UniverseArgs {
         help = "Keep declared packages as runtime dependencies"
     )]
     external: Vec<String>,
+    #[arg(
+        long = "extra-pkgs",
+        value_name = "PKG",
+        value_delimiter = ',',
+        value_parser = package_name,
+        help = "Enable optional packages when reachable"
+    )]
+    extra_pkgs: Vec<String>,
     #[arg(long, value_name = "N", default_value_t = default_jobs(), help = "Analysis workers")]
     jobs: NonZeroUsize,
 }
@@ -77,24 +87,32 @@ struct BuildArgs {
         help = "Generated source package directory [default: PATH/target/slinker/<Package>]"
     )]
     output: Option<PathBuf>,
+    #[arg(long, help = "Report the outcome as JSON on stdout")]
+    json: bool,
+    #[command(flatten)]
+    universe: UniverseArgs,
+}
+
+#[derive(Debug, Args)]
+struct CheckArgs {
+    #[arg(default_value = ".", help = "Source package root")]
+    path: PathBuf,
+    #[arg(long, help = "Report the outcome as JSON on stdout")]
+    json: bool,
     #[command(flatten)]
     universe: UniverseArgs,
 }
 
 #[derive(Debug, Args)]
 struct AnalysisArgs {
-    #[arg(value_name = "ROOT", value_parser = package_name, help = "Installed root package")]
-    root: String,
+    #[arg(
+        value_name = "ROOT",
+        value_parser = RootSpec::parse,
+        help = "Source package path, installed package name, or installed package directory"
+    )]
+    root: RootSpec,
     #[command(flatten)]
     universe: UniverseArgs,
-    #[arg(
-        long = "extra-pkgs",
-        value_name = "PKG",
-        value_delimiter = ',',
-        value_parser = package_name,
-        help = "Enable optional packages when reachable"
-    )]
-    extra_pkgs: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -146,6 +164,7 @@ fn report(result: Result<(), Box<dyn Error>>) -> ExitCode {
 fn run(command: UserCommand) -> Result<(), Box<dyn Error>> {
     match command {
         UserCommand::Build(args) => build(&args),
+        UserCommand::Check(args) => check(&args),
         UserCommand::Analyze(args) => analyze(&args),
         UserCommand::Why(args) => explain_why(&args),
         UserCommand::Path(args) => explain_paths(&args),
@@ -165,92 +184,95 @@ fn default_jobs() -> NonZeroUsize {
         .min(NonZeroUsize::new(8).expect("8 is nonzero"))
 }
 
-fn cache_location() -> CacheLocation {
-    env::var_os("SLINKER_CACHE_DIR").map_or(CacheLocation::Default, |root| {
-        CacheLocation::Directory(PathBuf::from(root))
-    })
+#[derive(Debug, thiserror::Error)]
+#[error("build blocked by {0} blocker(s); the JSON report is on stdout")]
+struct BlockedJson(usize);
+
+fn link(args: &AnalysisArgs) -> Result<(Session, LinkIr), Box<dyn Error>> {
+    let session = Session::open(&args.root, &args.universe, discover_r_home()?)?;
+    let plan = session.analyze(&args.universe, true)?;
+    Ok((session, plan))
 }
 
-fn absolute_libraries(universe: &UniverseArgs) -> io::Result<Vec<PathBuf>> {
-    universe
-        .libraries
-        .iter()
-        .map(|library| absolute_path(library))
-        .collect()
-}
-
-fn link(args: &AnalysisArgs) -> Result<(TargetEnvironment, LinkIr), Box<dyn Error>> {
-    let r_home = discover_r_home()?;
-    let mut target_request = TargetEnvironmentRequest::new(r_home.clone());
-    target_request.libraries = absolute_libraries(&args.universe)?;
-    let target = target_request.capture()?;
-
-    let store = PackageStore::new(r_home, target.clone(), cache_location())?;
-    let plan = Linker::new(store, args.universe.jobs.get())
-        .with_external_packages(args.universe.external.iter().cloned())
-        .with_extra_packages(args.extra_pkgs.iter().cloned())
-        .analyze(&args.root)?;
-    Ok((target, plan))
+fn preflight_failure(error: PreflightError, json: bool) -> Box<dyn Error> {
+    match error {
+        PreflightError::Blocked(report) if json => {
+            let blockers = report.blockers().count();
+            let rendered = json!({ "status": "blocked", "groups": report.groups() });
+            println!("{rendered:#}");
+            Box::new(BlockedJson(blockers))
+        }
+        other => Box::new(other),
+    }
 }
 
 fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
-    let r_home = discover_r_home()?;
-    let source = SourcePackageSnapshot::capture(&args.path)?;
-    let libraries = match absolute_libraries(&args.universe)? {
-        explicit if explicit.is_empty() => {
-            TargetEnvironmentRequest::new(r_home.clone())
-                .capture()?
-                .libraries
-        }
-        explicit => explicit,
-    };
-    let staged = stage_root(&source, &r_home, &libraries)?;
-    let mut target_request = TargetEnvironmentRequest::new(r_home.clone());
-    target_request.libraries = std::iter::once(staged.library().to_path_buf())
-        .chain(libraries)
-        .collect();
-    let target = target_request.capture()?;
-    let store = PackageStore::new(r_home.clone(), target.clone(), cache_location())?;
-    let ir = Linker::new(store, args.universe.jobs.get())
-        .without_provenance()
-        .with_external_packages(args.universe.external.iter().cloned())
-        .with_root_source(source.description_source())
-        .analyze(source.package())?;
-    let context = BuildContext::new(source, staged, r_home, target);
+    let session = SourceSession::open(&args.path, &args.universe, discover_r_home()?)?;
+    let ir = session.session().analyze(&args.universe, false)?;
+    let package = session.snapshot().package().to_owned();
     let output = args.output.clone().unwrap_or_else(|| {
-        context
-            .source()
+        session
+            .snapshot()
             .original_root()
             .join("target")
             .join("slinker")
-            .join(context.source().package())
+            .join(&package)
     });
-    let buildable = PureRStatic::check(&ir, &context)?;
+    let context = session.into_build_context();
+    let buildable =
+        PureRStatic::check(&ir, &context).map_err(|error| preflight_failure(error, args.json))?;
     let generated = materialize(buildable, &output)?;
-    println!("{}", generated.path().display());
+    if args.json {
+        let rendered = json!({
+            "status": "built",
+            "package": package,
+            "output": generated.path(),
+        });
+        println!("{rendered:#}");
+    } else {
+        println!("{}", generated.path().display());
+    }
+    Ok(())
+}
+
+fn check(args: &CheckArgs) -> Result<(), Box<dyn Error>> {
+    let session = SourceSession::open(&args.path, &args.universe, discover_r_home()?)?;
+    let ir = session.session().analyze(&args.universe, false)?;
+    let package = session.snapshot().package().to_owned();
+    let version = session.snapshot().version().to_string();
+    let context = session.into_build_context();
+    PureRStatic::check(&ir, &context).map_err(|error| preflight_failure(error, args.json))?;
+    if args.json {
+        let rendered = json!({ "status": "ok", "package": package, "version": version });
+        println!("{rendered:#}");
+    } else {
+        println!("{package} {version} passes preflight; nothing was written");
+    }
     Ok(())
 }
 
 fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
-    let (target, plan) = link(&args.analysis)?;
+    let (session, plan) = link(&args.analysis)?;
+    let target = session.target();
     if args.graph {
-        let graph = ExplanationDag::from_plan(&plan, &target, &args.analysis.root)?;
+        let graph = ExplanationDag::from_plan(&plan, target, session.root())?;
         let mut stdout = io::stdout().lock();
         serde_json::to_writer_pretty(&mut stdout, &graph)?;
         writeln!(stdout)?;
     } else {
-        print_analysis(&target, &plan);
+        print_analysis(target, &plan);
     }
     Ok(())
 }
 
 fn explain_why(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
-    let (_, plan) = link(&args.analysis)?;
+    let (session, plan) = link(&args.analysis)?;
     let targets = matching_nodes(&plan, &args.target);
     if targets.is_empty() {
         println!(
             "{} is not in the semantic closure of {}.",
-            args.target, args.analysis.root
+            args.target,
+            session.root()
         );
         return Ok(());
     }
@@ -266,7 +288,8 @@ fn explain_why(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
     let Some((target, path)) = best else {
         println!(
             "{} exists in the graph but is not reachable from {}.",
-            args.target, args.analysis.root
+            args.target,
+            session.root()
         );
         return Ok(());
     };
@@ -293,28 +316,27 @@ fn explain_why(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn explain_paths(args: &QueryArgs) -> Result<(), Box<dyn Error>> {
-    let (_, plan) = link(&args.analysis)?;
+    let (session, plan) = link(&args.analysis)?;
     let entries = package_entry_edges(&plan, &args.target);
     if entries.is_empty() {
         let targets = matching_nodes(&plan, &args.target);
         if targets.is_empty() {
             println!(
                 "{} is not in the semantic closure of {}.",
-                args.target, args.analysis.root
+                args.target,
+                session.root()
             );
         } else {
             println!(
                 "{} has no cross-package entry edge from {}.",
-                args.target, args.analysis.root
+                args.target,
+                session.root()
             );
         }
         return Ok(());
     }
 
-    println!(
-        "semantic paths from {} to {}:",
-        args.analysis.root, args.target
-    );
+    println!("semantic paths from {} to {}:", session.root(), args.target);
     for (ordinal, entry) in entries.iter().enumerate() {
         println!();
         println!("path {}:", ordinal + 1);
@@ -490,27 +512,12 @@ fn print_analysis(target: &TargetEnvironment, plan: &LinkIr) {
     println!("  derivations: {}", plan.provenance().edges().len());
     println!("  roots: {}", plan.provenance().roots().len());
     println!();
-    print_diagnostics("blockers", plan.blockers());
-}
-
-fn print_diagnostics(title: &str, diagnostics: &[Diagnostic]) {
-    println!("{title}");
-    if diagnostics.is_empty() {
+    let report = BuildReport::from_analysis(plan);
+    println!("blockers");
+    if report.is_empty() {
         println!("  none");
-    }
-    for diagnostic in diagnostics {
-        println!("  - {:?}: {}", diagnostic.code, diagnostic.message);
-        if let Some(summary) = diagnostic.evidence_summary() {
-            println!("      reached from {summary}");
-        }
-    }
-}
-
-fn absolute_path(path: &Path) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
     } else {
-        Ok(env::current_dir()?.join(path))
+        println!("{report}");
     }
 }
 
@@ -559,7 +566,7 @@ fn parse_r_home(stdout: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, UserCommand, parse_r_home};
+    use super::{Cli, Command, RootSpec, UserCommand, parse_r_home};
     use clap::{CommandFactory, Parser};
     use std::path::Path;
 
@@ -598,13 +605,13 @@ mod tests {
         else {
             panic!("expected analyze command");
         };
-        assert_eq!(args.analysis.root, "voucher");
+        assert_eq!(args.analysis.root, RootSpec::Installed("voucher".into()));
         assert_eq!(
             args.analysis.universe.libraries,
             [Path::new("one"), Path::new("two")]
         );
         assert_eq!(args.analysis.universe.external, ["cli", "glue"]);
-        assert_eq!(args.analysis.extra_pkgs, ["foo", "bar"]);
+        assert_eq!(args.analysis.universe.extra_pkgs, ["foo", "bar"]);
         assert_eq!(args.analysis.universe.jobs.get(), 3);
         assert!(args.graph);
     }
@@ -616,15 +623,41 @@ mod tests {
         else {
             panic!("expected why command");
         };
-        assert_eq!(args.analysis.root, "voucher");
+        assert_eq!(args.analysis.root, RootSpec::Installed("voucher".into()));
         assert_eq!(args.target, "cli::cli_abort");
+    }
+
+    #[test]
+    fn root_is_a_package_name_or_a_path() {
+        assert_eq!(
+            RootSpec::parse("voucher"),
+            Ok(RootSpec::Installed("voucher".into()))
+        );
+        for path in ["./voucher", "..", ".", "C:\\src\\voucher"] {
+            assert_eq!(
+                RootSpec::parse(path),
+                Ok(RootSpec::Source(path.into())),
+                "{path}"
+            );
+        }
+        assert!(RootSpec::parse("").is_err());
+    }
+
+    #[test]
+    fn check_takes_a_path_defaulting_to_the_current_directory() {
+        let Command::User(UserCommand::Check(args)) =
+            Cli::parse_from(["slinker", "check", "--json"]).command
+        else {
+            panic!("expected check command");
+        };
+        assert_eq!(args.path, Path::new("."));
+        assert!(args.json);
     }
 
     #[test]
     fn rejects_invalid_arguments() {
         for args in [
             &["slinker", "analyze"][..],
-            &["slinker", "analyze", "./voucher"],
             &["slinker", "analyze", "voucher", "--jobs=0"],
             &["slinker", "analyze", "voucher", "--external", "cli,,glue"],
             &["slinker", "analyze", "voucher", "--graph-format", "json"],

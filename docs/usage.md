@@ -14,6 +14,21 @@ slinker build path/to/rootpkg --lib C:/project/renv/library --external dplyr --o
 
 Third-party dependencies are Linked by default; base-priority packages and every `--external` package stay External. The generated `DESCRIPTION` drops Linked packages and declares the intersection of every retained requirement on each External package. A build that the profile cannot realize exactly fails with one report listing every blocker. Diagnostics that exist only because analysis continued past one failed prerequisite are grouped under it: a missing package reached from many sites, or one run-time name creator that could bind many free names, is one primary blocker followed by `reached from` the distinct sites, while independent blockers stay separate lines. Grouping changes only the report; the graph still records every reaching edge. See [semantics](semantics.md) for what a build preserves and what blocks it.
 
+The report groups blockers by rejection code. Each blocker names its package and owning binding, the line and column inside that binding's source when analysis has one, and the sites it was reached from. `--json` prints `{"status": "built" | "blocked", ...}` to stdout; a blocked build also exits non-zero and carries the grouped blockers under `groups`.
+
+Snapshotting the source tree skips `.git`, `target`, and `renv` at the package root and every entry matched by a `.Rbuildignore` regular expression (case-insensitive, matched against the path relative to the root, as `R CMD build` does). A pattern the regex engine cannot parse, such as lookaround, fails the build. Symlinks and other non-regular entries fail the build.
+
+`--extra-pkgs` applies to `build` and `check` as it does to `analyze`.
+
+## Check
+
+```text
+slinker check
+slinker check path/to/rootpkg --json
+```
+
+`check` runs `build` through preflight, prints the result, and writes no generated package. It exits zero only when `build` would produce a package.
+
 ## Analyze
 
 ```text
@@ -24,7 +39,15 @@ slinker analyze voucher --extra-pkgs posterior,distributional
 slinker analyze voucher --graph
 ```
 
-`PACKAGE` is an installed package name. slinker never installs, rebuilds, or downloads packages. `--lib` is repeatable and ordered; the first installed occurrence wins, matching R library precedence.
+`ROOT` (also the first argument of `why` and `path`) is one of:
+
+- an installed package name, resolved in the library order below;
+- a path to a source package, staged and analyzed exactly as `build` does, with provenance;
+- a path to an installed package directory (one holding `Meta/package.rds`), whose parent library is searched first, ahead of `--lib` and the default libraries. The directory name must equal the package name.
+
+A value with no path separator, other than `.` and `..`, is a package name.
+
+slinker never installs, rebuilds, or downloads packages outside staging the source root into a private library. `--lib` is repeatable and ordered; the first installed occurrence wins, matching R library precedence.
 
 `Suggests` is not a dependency graph. A package appearing only in `Suggests` contributes no edge and is not inspected merely because it is installed.
 
