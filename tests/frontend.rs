@@ -129,3 +129,17 @@ fn analyze_accepts_source_paths_installed_names_and_installed_directories() {
         assert!(stdout.contains("none"), "{label}: {stdout}");
     }
 }
+
+#[test]
+fn json_mode_reports_failures_as_one_document_on_stdout() {
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let missing = fixture.path().join("absent");
+
+    let result = slinker(&["check", "--json"], &[&missing]);
+
+    assert!(!result.status.success());
+    assert!(result.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).expect("JSON report");
+    assert_eq!(report["status"], "error");
+    assert!(report["message"].is_string(), "{report}");
+}

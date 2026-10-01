@@ -614,19 +614,19 @@ fn graph_export_is_identical_across_runs() {
     install_package(&r_home, &source, &library);
     let graph = |run: &str| {
         let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
-            .args(["analyze", "privategraph", "--graph", "--lib"])
+            .args(["analyze", "privategraph", "--json", "--lib"])
             .arg(&library)
             .env("SLINKER_CACHE_DIR", fixture.path().join(run))
             .output()
             .expect("run slinker analyze");
-        assert_success(&output, "slinker analyze --graph");
+        assert_success(&output, "slinker analyze --json");
         output.stdout
     };
     let first = graph("first");
     let second = graph("second");
 
     assert!(String::from_utf8_lossy(&first).contains("private:"));
-    assert!(first == second, "--graph output differs between runs");
+    assert!(first == second, "--json output differs between runs");
 }
 
 #[test]

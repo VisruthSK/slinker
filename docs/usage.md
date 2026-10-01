@@ -14,7 +14,7 @@ slinker build path/to/rootpkg --lib C:/project/renv/library --external dplyr --o
 
 Third-party dependencies are Linked by default; base-priority packages and every `--external` package stay External. The generated `DESCRIPTION` drops Linked packages and declares the intersection of every retained requirement on each External package. A build that the profile cannot realize exactly fails with one report listing every blocker. Diagnostics that exist only because analysis continued past one failed prerequisite are grouped under it: a missing package reached from many sites, or one run-time name creator that could bind many free names, is one primary blocker followed by `reached from` the distinct sites, while independent blockers stay separate lines. Grouping changes only the report; the graph still records every reaching edge. See [semantics](semantics.md) for what a build preserves and what blocks it.
 
-The report groups blockers by rejection code. Each blocker names its package and owning binding, the line and column inside that binding's source when analysis has one, and the sites it was reached from. `--json` prints `{"status": "built" | "blocked", ...}` to stdout; a blocked build also exits non-zero and carries the grouped blockers under `groups`.
+The report groups blockers by rejection code. Each blocker names its package and owning binding, the line and column inside that binding's source when analysis has one, and the sites it was reached from. See [JSON output](#json-output) for the machine-readable form.
 
 Snapshotting the source tree skips `.git`, `target`, and `renv` at the package root and every entry matched by a `.Rbuildignore` regular expression (case-insensitive, matched against the path relative to the root, as `R CMD build` does). A pattern the regex engine cannot parse, such as lookaround, fails the build. Symlinks and other non-regular entries fail the build.
 
@@ -36,7 +36,7 @@ slinker analyze voucher
 slinker analyze voucher --lib C:/project/renv/library --lib C:/Users/me/AppData/Local/R/win-library/4.6
 slinker analyze voucher --external cli
 slinker analyze voucher --extra-pkgs posterior,distributional
-slinker analyze voucher --graph
+slinker analyze voucher --json
 ```
 
 `ROOT` (also the first argument of `why` and `path`) is one of:
@@ -55,11 +55,19 @@ slinker never installs, rebuilds, or downloads packages outside staging the sour
 
 `--external` leaves named third-party namespaces external after resolving their exact installed identity. Base packages remain part of the target R platform.
 
-### Graph inspection
+## JSON output
 
-`--graph` writes only deterministic explanation-DAG JSON to stdout, so output can be redirected and compared without cleanup. Progress messages remain on stderr. The versioned export coalesces parallel evidence, condenses strongly connected components into a DAG, and includes root attribution, package boundaries and entry points, presentation metadata, and transparent closure paths.
+`build`, `check`, and `analyze` take `--json`. With it, stdout carries exactly one JSON document and slinker writes nothing to stderr (the target R process may still write its own diagnostics there), so output can be redirected and compared without cleanup. The exit status is unchanged: zero on success, non-zero otherwise. `why` and `path` print text only.
 
-Graph inspection is observational. Enabling it does not request additional bindings, discover packages, change retention, or alter blocker generation. Blocked analyses still have a graph export because blockers are a primary use case for graph inspection.
+| Command | Success | Blocked | Any other failure |
+| --- | --- | --- | --- |
+| `build` | `{"status": "built", "package", "output"}` | `{"status": "blocked", "groups"}` | `{"status": "error", "message", "causes"}` |
+| `check` | `{"status": "ok", "package", "version"}` | `{"status": "blocked", "groups"}` | `{"status": "error", "message", "causes"}` |
+| `analyze` | the explanation DAG | the explanation DAG | `{"status": "error", "message", "causes"}` |
+
+`groups` lists blockers by rejection code; each blocker carries its package, binding, message, source `location` (source, line, column), and `reached_from`.
+
+The `analyze` document is the versioned, deterministic explanation DAG. It coalesces parallel evidence, condenses strongly connected components into a DAG, and includes root attribution, package boundaries and entry points, presentation metadata, and transparent closure paths. It is observational: it does not request additional bindings, discover packages, change retention, or alter blocker generation. Blocked analyses still produce it, because blockers are a primary use case.
 
 ## Provenance
 

@@ -78,6 +78,12 @@ struct UniverseArgs {
 }
 
 #[derive(Debug, Args)]
+struct JsonArg {
+    #[arg(long, help = "Print one JSON document on stdout, including on failure")]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct BuildArgs {
     #[arg(default_value = ".", help = "Source package root")]
     path: PathBuf,
@@ -87,20 +93,20 @@ struct BuildArgs {
         help = "Generated source package directory [default: PATH/target/slinker/<Package>]"
     )]
     output: Option<PathBuf>,
-    #[arg(long, help = "Report the outcome as JSON on stdout")]
-    json: bool,
     #[command(flatten)]
     universe: UniverseArgs,
+    #[command(flatten)]
+    json: JsonArg,
 }
 
 #[derive(Debug, Args)]
 struct CheckArgs {
     #[arg(default_value = ".", help = "Source package root")]
     path: PathBuf,
-    #[arg(long, help = "Report the outcome as JSON on stdout")]
-    json: bool,
     #[command(flatten)]
     universe: UniverseArgs,
+    #[command(flatten)]
+    json: JsonArg,
 }
 
 #[derive(Debug, Args)]
@@ -119,8 +125,8 @@ struct AnalysisArgs {
 struct AnalyzeArgs {
     #[command(flatten)]
     analysis: AnalysisArgs,
-    #[arg(long, help = "Emit deterministic explanation-DAG JSON")]
-    graph: bool,
+    #[command(flatten)]
+    json: JsonArg,
 }
 
 #[derive(Debug, Args)]
@@ -131,34 +137,63 @@ struct QueryArgs {
     target: String,
 }
 
+impl UserCommand {
+    fn json(&self) -> bool {
+        match self {
+            Self::Build(args) => args.json.json,
+            Self::Check(args) => args.json.json,
+            Self::Analyze(args) => args.json.json,
+            Self::Why(_) | Self::Path(_) => false,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::RWorker { protocol } => {
-            report(slinker::r_worker::run(&protocol).map_err(Into::into))
+            report(slinker::r_worker::run(&protocol).map_err(Into::into), false)
         }
         Command::User(command) => std::thread::Builder::new()
             .name("slinker".into())
             .stack_size(ANALYSIS_STACK_BYTES)
-            .spawn(move || report(run(command)))
+            .spawn(move || {
+                let json = command.json();
+                report(run(command), json)
+            })
             .expect("spawn the slinker command thread")
             .join()
             .unwrap_or(ExitCode::FAILURE),
     }
 }
 
-fn report(result: Result<(), Box<dyn Error>>) -> ExitCode {
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("slinker: {error}");
-            let mut source = error.source();
-            while let Some(cause) = source {
-                eprintln!("  caused by: {cause}");
-                source = cause.source();
-            }
-            ExitCode::FAILURE
+fn report(result: Result<(), Box<dyn Error>>, json: bool) -> ExitCode {
+    let Err(error) = result else {
+        return ExitCode::SUCCESS;
+    };
+    if json {
+        println!("{:#}", failure_document(error.as_ref()));
+    } else {
+        eprintln!("slinker: {error}");
+        let mut source = error.source();
+        while let Some(cause) = source {
+            eprintln!("  caused by: {cause}");
+            source = cause.source();
         }
     }
+    ExitCode::FAILURE
+}
+
+fn failure_document(error: &(dyn Error + 'static)) -> serde_json::Value {
+    if let Some(PreflightError::Blocked(report)) = error.downcast_ref() {
+        return json!({ "status": "blocked", "groups": report.groups() });
+    }
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    json!({ "status": "error", "message": error.to_string(), "causes": causes })
 }
 
 fn run(command: UserCommand) -> Result<(), Box<dyn Error>> {
@@ -184,26 +219,10 @@ fn default_jobs() -> NonZeroUsize {
         .min(NonZeroUsize::new(8).expect("8 is nonzero"))
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("build blocked by {0} blocker(s); the JSON report is on stdout")]
-struct BlockedJson(usize);
-
 fn link(args: &AnalysisArgs) -> Result<(Session, LinkIr), Box<dyn Error>> {
     let session = Session::open(&args.root, &args.universe, discover_r_home()?)?;
     let plan = session.analyze(&args.universe, true)?;
     Ok((session, plan))
-}
-
-fn preflight_failure(error: PreflightError, json: bool) -> Box<dyn Error> {
-    match error {
-        PreflightError::Blocked(report) if json => {
-            let blockers = report.blockers().count();
-            let rendered = json!({ "status": "blocked", "groups": report.groups() });
-            println!("{rendered:#}");
-            Box::new(BlockedJson(blockers))
-        }
-        other => Box::new(other),
-    }
 }
 
 fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
@@ -219,10 +238,9 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
             .join(&package)
     });
     let context = session.into_build_context();
-    let buildable =
-        PureRStatic::check(&ir, &context).map_err(|error| preflight_failure(error, args.json))?;
+    let buildable = PureRStatic::check(&ir, &context)?;
     let generated = materialize(buildable, &output)?;
-    if args.json {
+    if args.json.json {
         let rendered = json!({
             "status": "built",
             "package": package,
@@ -241,8 +259,8 @@ fn check(args: &CheckArgs) -> Result<(), Box<dyn Error>> {
     let package = session.snapshot().package().to_owned();
     let version = session.snapshot().version().to_string();
     let context = session.into_build_context();
-    PureRStatic::check(&ir, &context).map_err(|error| preflight_failure(error, args.json))?;
-    if args.json {
+    PureRStatic::check(&ir, &context)?;
+    if args.json.json {
         let rendered = json!({ "status": "ok", "package": package, "version": version });
         println!("{rendered:#}");
     } else {
@@ -254,7 +272,7 @@ fn check(args: &CheckArgs) -> Result<(), Box<dyn Error>> {
 fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
     let (session, plan) = link(&args.analysis)?;
     let target = session.target();
-    if args.graph {
+    if args.json.json {
         let graph = ExplanationDag::from_plan(&plan, target, session.root())?;
         let mut stdout = io::stdout().lock();
         serde_json::to_writer_pretty(&mut stdout, &graph)?;
@@ -599,7 +617,7 @@ mod tests {
             "--extra-pkgs=foo,bar",
             "--jobs",
             "3",
-            "--graph",
+            "--json",
         ])
         .command
         else {
@@ -613,7 +631,7 @@ mod tests {
         assert_eq!(args.analysis.universe.external, ["cli", "glue"]);
         assert_eq!(args.analysis.universe.extra_pkgs, ["foo", "bar"]);
         assert_eq!(args.analysis.universe.jobs.get(), 3);
-        assert!(args.graph);
+        assert!(args.json.json);
     }
 
     #[test]
@@ -651,7 +669,7 @@ mod tests {
             panic!("expected check command");
         };
         assert_eq!(args.path, Path::new("."));
-        assert!(args.json);
+        assert!(args.json.json);
     }
 
     #[test]
@@ -660,7 +678,7 @@ mod tests {
             &["slinker", "analyze"][..],
             &["slinker", "analyze", "voucher", "--jobs=0"],
             &["slinker", "analyze", "voucher", "--external", "cli,,glue"],
-            &["slinker", "analyze", "voucher", "--graph-format", "json"],
+            &["slinker", "analyze", "voucher", "--bogus", "json"],
             &["slinker", "why", "voucher"],
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
