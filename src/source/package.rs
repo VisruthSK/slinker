@@ -1,8 +1,6 @@
-use crate::package::Digest;
 use crate::{Description, Version};
-use sha2::{Digest as Sha2Digest, Sha256};
+use regex::{Regex, RegexBuilder};
 use std::fs;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -25,7 +23,6 @@ pub struct SourcePackageSnapshot {
     original_root: PathBuf,
     package: String,
     version: Version,
-    source_digest: Digest,
     description: Description,
     description_source: Arc<str>,
     namespace: Arc<str>,
@@ -81,13 +78,11 @@ impl SourcePackageSnapshot {
                 path: namespace_path,
                 source,
             })?;
-        let source_digest = digest_tree(&frozen)?;
 
         Ok(Self {
             original_root: source,
             package,
             version,
-            source_digest,
             description,
             description_source: description_text.into(),
             namespace: namespace.into(),
@@ -108,10 +103,6 @@ impl SourcePackageSnapshot {
 
     pub fn version(&self) -> &Version {
         &self.version
-    }
-
-    pub fn source_digest(&self) -> &Digest {
-        &self.source_digest
     }
 
     pub fn description(&self) -> &Description {
@@ -141,6 +132,10 @@ pub enum SourcePackageError {
     },
     #[error("source package is missing required input {0}")]
     MissingInput(PathBuf),
+    #[error("source package contains {0}, which is neither a regular file nor a directory")]
+    UnsupportedEntry(PathBuf),
+    #[error("source package .Rbuildignore pattern `{pattern}` is not supported: {message}")]
+    InvalidBuildIgnore { pattern: String, message: String },
     #[error("source package DESCRIPTION is missing {0}")]
     MissingDescriptionField(&'static str),
     #[error("source package DESCRIPTION has invalid Version: {0}")]
@@ -155,66 +150,75 @@ pub enum SourcePackageError {
     Io(#[from] std::io::Error),
 }
 
+const EXCLUDED_ROOT_ENTRIES: [&str; 3] = [".git", "target", "renv"];
+
+struct BuildIgnore(Vec<Regex>);
+
+impl BuildIgnore {
+    fn load(root: &Path) -> Result<Self, SourcePackageError> {
+        let path = root.join(".Rbuildignore");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(source) => return Err(SourcePackageError::Read { path, source }),
+        };
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|pattern| {
+                RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|error| SourcePackageError::InvalidBuildIgnore {
+                        pattern: pattern.to_owned(),
+                        message: error.to_string(),
+                    })
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+
+    fn excludes(&self, relative: &str) -> bool {
+        self.0.iter().any(|pattern| pattern.is_match(relative))
+    }
+}
+
 fn copy_tree(source: &Path, target: &Path) -> Result<(), SourcePackageError> {
+    let ignore = BuildIgnore::load(source)?;
+    copy_directory(source, target, "", &ignore)
+}
+
+fn copy_directory(
+    source: &Path,
+    target: &Path,
+    relative: &str,
+    ignore: &BuildIgnore,
+) -> Result<(), SourcePackageError> {
     fs::create_dir_all(target)?;
     let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        let entry_relative = if relative.is_empty() {
+            name_text.to_string()
+        } else {
+            format!("{relative}/{name_text}")
+        };
+        let excluded_at_root =
+            relative.is_empty() && EXCLUDED_ROOT_ENTRIES.contains(&name_text.as_ref());
+        if excluded_at_root || ignore.excludes(&entry_relative) {
+            continue;
+        }
         let path = entry.path();
-        let destination = target.join(entry.file_name());
+        let destination = target.join(&name);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            copy_tree(&path, &destination)?;
+            copy_directory(&path, &destination, &entry_relative, ignore)?;
         } else if file_type.is_file() {
             fs::copy(path, destination)?;
         } else {
-            return Err(SourcePackageError::MissingInput(path));
-        }
-    }
-    Ok(())
-}
-
-fn digest_tree(root: &Path) -> Result<Digest, SourcePackageError> {
-    let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut hash = Sha256::new();
-    hash.update(b"slinker-source-package-v1\0");
-    for (relative, path) in files {
-        hash.update(relative.as_bytes());
-        hash.update([0]);
-        let mut reader = BufReader::new(fs::File::open(path)?);
-        let mut buffer = [0_u8; 128 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hash.update(&buffer[..read]);
-        }
-        hash.update([0xff]);
-    }
-    Ok(Digest::finish(hash))
-}
-
-fn collect_files(
-    root: &Path,
-    directory: &Path,
-    files: &mut Vec<(String, PathBuf)>,
-) -> Result<(), std::io::Error> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            collect_files(root, &path, files)?;
-        } else if entry.file_type()?.is_file() {
-            files.push((
-                path.strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-                path,
-            ));
+            return Err(SourcePackageError::UnsupportedEntry(path));
         }
     }
     Ok(())
@@ -243,5 +247,56 @@ mod tests {
             fs::read_to_string(snapshot.files().root().join("R/f.R")).expect("frozen source"),
             "f <- function() 1L\n"
         );
+    }
+
+    fn write_package(root: &Path) {
+        fs::create_dir(root.join("R")).expect("R directory");
+        fs::write(
+            root.join("DESCRIPTION"),
+            "Package: fixture\nVersion: 1.0.0\n",
+        )
+        .expect("DESCRIPTION");
+        fs::write(root.join("NAMESPACE"), "export(f)\n").expect("NAMESPACE");
+        fs::write(root.join("R/f.R"), "f <- function() 1L\n").expect("R source");
+    }
+
+    #[test]
+    fn snapshot_skips_vcs_build_output_and_rbuildignore_entries() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        write_package(source.path());
+        for directory in [".git", "target", "renv", "notes"] {
+            fs::create_dir(source.path().join(directory)).expect("excluded directory");
+            fs::write(source.path().join(directory).join("file"), "x").expect("excluded file");
+        }
+        fs::write(source.path().join("scratch.R"), "x").expect("ignored file");
+        fs::write(source.path().join("R/keep_scratch.R"), "y <- 1\n").expect("kept file");
+        fs::write(
+            source.path().join(".Rbuildignore"),
+            "^notes$\n\n^SCRATCH\\.R$\n",
+        )
+        .expect(".Rbuildignore");
+
+        let snapshot = SourcePackageSnapshot::capture(source.path()).expect("snapshot");
+
+        let root = snapshot.files().root();
+        for excluded in [".git", "target", "renv", "notes", "scratch.R"] {
+            assert!(!root.join(excluded).exists(), "{excluded} was copied");
+        }
+        assert!(root.join("R/keep_scratch.R").is_file());
+        assert!(root.join(".Rbuildignore").is_file());
+    }
+
+    #[test]
+    fn snapshot_rejects_unparseable_rbuildignore_pattern() {
+        let source = tempfile::tempdir().expect("source tempdir");
+        write_package(source.path());
+        fs::write(source.path().join(".Rbuildignore"), "(unclosed\n").expect(".Rbuildignore");
+
+        let error = SourcePackageSnapshot::capture(source.path()).expect_err("invalid pattern");
+
+        assert!(matches!(
+            error,
+            SourcePackageError::InvalidBuildIgnore { .. }
+        ));
     }
 }
