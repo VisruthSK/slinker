@@ -15,7 +15,7 @@ pub use image::{
     PrivateBindingImage, PrivateEnvironmentImage, UnsupportedObject,
 };
 pub use index::{
-    ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NameLookup,
+    DataStorage, ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NameLookup,
     NativeComponent, NativeFacts, NativeInterface, NativeLibrary, NativeRegistration,
     NativeRoutineSummary, NativeRoutines, NativeSafety, NativeSymbolBinding, PackageData,
     PackageIndex, S3Registration,

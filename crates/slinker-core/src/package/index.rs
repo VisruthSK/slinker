@@ -202,15 +202,33 @@ pub struct LifecycleMetadata {
     pub on_load: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataStorage {
+    #[default]
+    Embedded,
+    FileBacked,
+}
+
+impl From<bool> for DataStorage {
+    fn from(file_backed: bool) -> Self {
+        if file_backed {
+            Self::FileBacked
+        } else {
+            Self::Embedded
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PackageData {
     sets: BTreeMap<DataSetId, Vec<DatasetName>>,
-    file_backed: bool,
+    storage: DataStorage,
 }
 
 impl PackageData {
-    pub fn new(sets: BTreeMap<DataSetId, Vec<DatasetName>>, file_backed: bool) -> Self {
-        Self { sets, file_backed }
+    pub fn new(sets: BTreeMap<DataSetId, Vec<DatasetName>>, storage: DataStorage) -> Self {
+        Self { sets, storage }
     }
 
     pub fn set(&self, name: &str) -> Option<&[DatasetName]> {
@@ -223,8 +241,8 @@ impl PackageData {
             .any(|objects| objects.iter().any(|candidate| candidate == object))
     }
 
-    pub fn is_file_backed(&self) -> bool {
-        self.file_backed
+    pub fn storage(&self) -> DataStorage {
+        self.storage
     }
 }
 

@@ -4,7 +4,9 @@ use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::package::EnvironmentLabel;
-use crate::package::{DataSetId, DatasetName, PackageId, PackageImage, PackageProvider};
+use crate::package::{
+    DataSetId, DataStorage, DatasetName, PackageId, PackageImage, PackageProvider,
+};
 use crate::syntax::{CallSite, CalleeKind, PackageRef, StaticArg};
 
 use super::relocation::PendingRelocation;
@@ -149,7 +151,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         };
         let index = self.packages.index(target)?;
-        if index.data.is_file_backed() {
+        if index.data.storage() == DataStorage::FileBacked {
             blocked(
                 self,
                 RejectCode::UnsupportedObject,

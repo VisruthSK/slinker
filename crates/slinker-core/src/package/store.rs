@@ -286,7 +286,7 @@ impl PackageStore {
                 on_load: worker.on_load,
             },
             binding_names: worker.binding_names,
-            data: PackageData::new(worker.data_sets, worker.data_files),
+            data: PackageData::new(worker.data_sets, worker.data_storage),
             files: Vec::new(),
             has_sysdata: worker.has_sysdata,
         };

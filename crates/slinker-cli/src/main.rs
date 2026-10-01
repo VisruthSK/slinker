@@ -87,6 +87,22 @@ struct JsonArg {
     json: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+impl JsonArg {
+    fn format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Text
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct BuildArgs {
     #[arg(default_value = ".", help = "Source package root")]
@@ -184,27 +200,28 @@ impl std::fmt::Display for QueryTarget {
 }
 
 impl UserCommand {
-    fn json(&self) -> bool {
+    fn format(&self) -> OutputFormat {
         match self {
-            Self::Build(args) => args.json.json,
-            Self::Check(args) => args.json.json,
-            Self::Analyze(args) => args.json.json,
-            Self::Why(_) | Self::Path(_) => false,
+            Self::Build(args) => args.json.format(),
+            Self::Check(args) => args.json.format(),
+            Self::Analyze(args) => args.json.format(),
+            Self::Why(_) | Self::Path(_) => OutputFormat::Text,
         }
     }
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::RWorker { protocol } => {
-            report(slinker_r_worker::run(&protocol).map_err(Into::into), false)
-        }
+        Command::RWorker { protocol } => report(
+            slinker_r_worker::run(&protocol).map_err(Into::into),
+            OutputFormat::Text,
+        ),
         Command::User(command) => std::thread::Builder::new()
             .name("slinker".into())
             .stack_size(ANALYSIS_STACK_BYTES)
             .spawn(move || {
-                let json = command.json();
-                report(run(command), json)
+                let format = command.format();
+                report(run(command), format)
             })
             .expect("spawn the slinker command thread")
             .join()
@@ -212,11 +229,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn report(result: Result<(), Box<dyn Error>>, json: bool) -> ExitCode {
+fn report(result: Result<(), Box<dyn Error>>, format: OutputFormat) -> ExitCode {
     let Err(error) = result else {
         return ExitCode::SUCCESS;
     };
-    if json {
+    if format == OutputFormat::Json {
         println!("{:#}", failure_document(error.as_ref()));
     } else {
         eprintln!("slinker: {error}");
@@ -284,7 +301,7 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
     let context = session.into_build_context();
     let buildable = PureRStatic::check(&ir, &context)?;
     let generated = materialize(buildable, &output)?;
-    if args.json.json {
+    if args.json.format() == OutputFormat::Json {
         let rendered = json!({
             "status": "built",
             "package": package,
@@ -304,7 +321,7 @@ fn check(args: &CheckArgs) -> Result<(), Box<dyn Error>> {
     let version = session.snapshot().version().to_string();
     let context = session.into_build_context();
     PureRStatic::check(&ir, &context)?;
-    if args.json.json {
+    if args.json.format() == OutputFormat::Json {
         let rendered = json!({ "status": "ok", "package": package, "version": version });
         println!("{rendered:#}");
     } else {
@@ -316,7 +333,7 @@ fn check(args: &CheckArgs) -> Result<(), Box<dyn Error>> {
 fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
     let (session, plan) = link(&args.analysis)?;
     let target = session.target();
-    if args.json.json {
+    if args.json.format() == OutputFormat::Json {
         let graph = ExplanationDag::from_plan(&plan, target, session.root())?;
         let mut stdout = io::stdout().lock();
         serde_json::to_writer_pretty(&mut stdout, &graph)?;

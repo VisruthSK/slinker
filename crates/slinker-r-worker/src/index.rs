@@ -4,9 +4,9 @@ use super::{InspectionError, InspectionResult, field, list_field, string_field, 
 use harp::object::RObject;
 use harp::{RFunctionExt, RObjectExt};
 use slinker_core::package::{
-    BindingName, DataSetId, DatasetName, Digest, ExportMap, ExportName, ImportBinding, ImportSpec,
-    NameLookup, NativeComponent, NativeLibrary, NativeRegistration, NativeRoutines, NativeSafety,
-    NativeSymbolBinding, PackageName, S3Registration,
+    BindingName, DataSetId, DataStorage, DatasetName, Digest, ExportMap, ExportName, ImportBinding,
+    ImportSpec, NameLookup, NativeComponent, NativeLibrary, NativeRegistration, NativeRoutines,
+    NativeSafety, NativeSymbolBinding, PackageName, S3Registration,
 };
 use std::collections::BTreeMap;
 
@@ -27,7 +27,7 @@ pub(super) fn worker_package_index(context: &RObject) -> InspectionResult<Worker
         on_load: binding_names.iter().any(|name| name == ".onLoad"),
         binding_names,
         data_sets: data_sets(context)?,
-        data_files: bool::try_from(field(context, "data_files")?)?,
+        data_storage: DataStorage::from(bool::try_from(field(context, "data_files")?)?),
         has_sysdata: !strings_field(context, "sysdata_names")?.is_empty(),
     })
 }

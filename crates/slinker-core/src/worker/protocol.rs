@@ -1,13 +1,13 @@
 use crate::ir::ObjectStep;
 use crate::package::{
-    BindingImage, BindingName, DataSetId, DatasetName, Digest, EnvironmentLabel, ExportMap,
-    ImportSpec, NativeComponent, PackageName, PrivateEnvironmentImage, S3Registration,
+    BindingImage, BindingName, DataSetId, DataStorage, DatasetName, Digest, EnvironmentLabel,
+    ExportMap, ImportSpec, NativeComponent, PackageName, PrivateEnvironmentImage, S3Registration,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -108,7 +108,7 @@ pub struct WorkerPackageIndex {
     pub on_load: bool,
     pub binding_names: Vec<BindingName>,
     pub data_sets: BTreeMap<DataSetId, Vec<DatasetName>>,
-    pub data_files: bool,
+    pub data_storage: DataStorage,
     pub has_sysdata: bool,
 }
 

@@ -5023,7 +5023,7 @@ fn with_data(mut image: PackageImage, sets: &[(&str, &[&str])], file_backed: boo
             )
         })
         .collect();
-    Arc::make_mut(&mut image.index).data = PackageData::new(sets, file_backed);
+    Arc::make_mut(&mut image.index).data = PackageData::new(sets, file_backed.into());
     image
 }
 
