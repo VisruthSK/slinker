@@ -493,7 +493,6 @@ fn node_label(plan: &LinkIr, id: NodeId) -> String {
         NodeKind::NativeComponent { name } => format!("{} [native {name}]", node.package),
         NodeKind::PackageMetadata { name } => format!("{} [metadata {name}]", node.package),
         NodeKind::MissingPackage => format!("{} [missing package]", node.package),
-        NodeKind::Rejection { code } => format!("{} [rejection {code}]", node.package),
     }
 }
 

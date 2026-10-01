@@ -414,7 +414,7 @@ fn presentation(members: &[ExplanationMember]) -> (PresentationClass, Presentati
         .iter()
         .map(|member| member.kind)
         .min_by_key(|kind| presentation_rank(*kind))
-        .unwrap_or(GraphNodeKindExport::Rejection);
+        .unwrap_or(GraphNodeKindExport::MissingPackage);
     match kind {
         GraphNodeKindExport::RBinding => {
             (PresentationClass::Binding, PresentationVisibility::Primary)
@@ -451,7 +451,7 @@ fn presentation(members: &[ExplanationMember]) -> (PresentationClass, Presentati
             PresentationClass::PrivateObject,
             PresentationVisibility::Transparent,
         ),
-        GraphNodeKindExport::MissingPackage | GraphNodeKindExport::Rejection => (
+        GraphNodeKindExport::MissingPackage => (
             PresentationClass::Diagnostic,
             PresentationVisibility::Context,
         ),
@@ -472,7 +472,6 @@ fn presentation_rank(kind: GraphNodeKindExport) -> u8 {
         | GraphNodeKindExport::Resource
         | GraphNodeKindExport::Dataset
         | GraphNodeKindExport::MissingPackage
-        | GraphNodeKindExport::Rejection
         | GraphNodeKindExport::PackageMetadata => 1,
         GraphNodeKindExport::Closure | GraphNodeKindExport::PrivateBinding => 2,
     }

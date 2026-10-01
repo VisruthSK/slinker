@@ -35,7 +35,6 @@ pub enum GraphNodeKindExport {
     TargetBinding,
     PackageMetadata,
     MissingPackage,
-    Rejection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -70,7 +69,7 @@ pub struct GraphSourceExport {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GraphBlockerExport {
-    pub kind: String,
+    pub kind: RejectCode,
     pub owner: String,
     pub message: String,
 }
@@ -142,7 +141,7 @@ pub(crate) fn blockers(plan: &LinkIr, node_ids: &[String]) -> Vec<GraphBlockerEx
                 })
                 .unwrap_or_else(|| format!("package:{}", diagnostic.package));
             GraphBlockerExport {
-                kind: reject_code_name(diagnostic.code).to_owned(),
+                kind: diagnostic.code,
                 owner,
                 message: diagnostic.message.clone(),
             }
@@ -150,51 +149,6 @@ pub(crate) fn blockers(plan: &LinkIr, node_ids: &[String]) -> Vec<GraphBlockerEx
         .collect::<Vec<_>>();
     blockers.sort();
     blockers
-}
-
-impl GraphNodeKindExport {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RBinding => "r_binding",
-            Self::PrivateBinding => "private_binding",
-            Self::Closure => "closure",
-            Self::Package => "package",
-            Self::Dataset => "dataset",
-            Self::Lifecycle => "lifecycle",
-            Self::S3Registration => "s3_registration",
-            Self::Resource => "resource",
-            Self::NativeLibrary => "native_library",
-            Self::TargetBinding => "target_binding",
-            Self::PackageMetadata => "package_metadata",
-            Self::MissingPackage => "missing_package",
-            Self::Rejection => "rejection",
-        }
-    }
-}
-
-impl GraphEdgeReasonExport {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ExportRoot => "export_root",
-            Self::PackageRoot => "package_root",
-            Self::OnLoadRoot => "on_load_root",
-            Self::LexicalReference => "lexical_reference",
-            Self::QualifiedReference => "qualified_reference",
-            Self::ImportedBinding => "imported_binding",
-            Self::NamespaceImport => "namespace_import",
-            Self::ExportReference => "export_reference",
-            Self::S3Registration => "s3_registration",
-            Self::Lifecycle => "lifecycle",
-            Self::ResourceReference => "resource_reference",
-            Self::DatasetReference => "dataset_reference",
-            Self::NativeCall => "native_call",
-            Self::NativeCallback => "native_callback",
-            Self::ClosureCapture => "closure_capture",
-            Self::ClosureExecution => "closure_execution",
-            Self::SpecializedDiscovery => "specialized_discovery",
-            Self::SemanticEffect => "semantic_effect",
-        }
-    }
 }
 
 pub(crate) fn semantic_node_id(node: &Node) -> String {
@@ -229,7 +183,6 @@ pub(crate) fn semantic_node_id(node: &Node) -> String {
         }
         NodeKind::PackageMetadata { name } => format!("metadata:{}::{name}", node.package),
         NodeKind::MissingPackage => format!("missing-package:{}", node.package),
-        NodeKind::Rejection { code } => format!("rejection:{}::{code}", node.package),
     }
 }
 
@@ -247,7 +200,6 @@ pub(crate) fn node_kind(kind: &NodeKind) -> GraphNodeKindExport {
         NodeKind::ExternalBinding { .. } => GraphNodeKindExport::TargetBinding,
         NodeKind::PackageMetadata { .. } => GraphNodeKindExport::PackageMetadata,
         NodeKind::MissingPackage => GraphNodeKindExport::MissingPackage,
-        NodeKind::Rejection { .. } => GraphNodeKindExport::Rejection,
     }
 }
 
@@ -298,36 +250,4 @@ pub(crate) fn stable_source(sources: &Sources, span: Option<&Span>) -> Option<Gr
         start: span.start,
         end: span.end,
     })
-}
-
-fn reject_code_name(code: RejectCode) -> &'static str {
-    match code {
-        RejectCode::AirUnsupportedSyntax => "air_unsupported_syntax",
-        RejectCode::InvalidInstalledRepresentation => "invalid_installed_representation",
-        RejectCode::ParserDisagreement => "parser_disagreement",
-        RejectCode::ActiveBinding => "active_binding",
-        RejectCode::ArbitraryEvaluation => "arbitrary_evaluation",
-        RejectCode::DynamicLookup => "dynamic_lookup",
-        RejectCode::InvalidDeclaration => "invalid_declaration",
-        RejectCode::UnsupportedLinkedLibname => "unsupported_linked_libname",
-        RejectCode::DynamicPackageDiscovery => "dynamic_package_discovery",
-        RejectCode::DependsAttachmentUnsupported => "depends_attachment_unsupported",
-        RejectCode::EnvironmentMutation => "environment_mutation",
-        RejectCode::LifecycleHook => "lifecycle_hook",
-        RejectCode::MissingDependency => "missing_dependency",
-        RejectCode::MissingResource => "missing_resource",
-        RejectCode::NativeLoadFailure => "native_load_failure",
-        RejectCode::ObjectSystem => "object_system",
-        RejectCode::OptionalAvailability => "optional_availability",
-        RejectCode::PackageAttachmentUnsupported => "package_attachment_unsupported",
-        RejectCode::SemanticAmbiguity => "semantic_ambiguity",
-        RejectCode::SyntaxObservation => "syntax_observation",
-        RejectCode::UnknownClosureEnclosure => "unknown_closure_enclosure",
-        RejectCode::UnknownNativeEffects => "unknown_native_effects",
-        RejectCode::UnknownNativeLookup => "unknown_native_lookup",
-        RejectCode::UnresolvedBinding => "unresolved_binding",
-        RejectCode::UnsupportedObject => "unsupported_object",
-        RejectCode::UnsupportedRootTransformation => "unsupported_root_transformation",
-        RejectCode::UnsupportedTopLevelEffect => "unsupported_top_level_effect",
-    }
 }

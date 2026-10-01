@@ -45,9 +45,6 @@ pub enum NodeKind {
         name: String,
     },
     MissingPackage,
-    Rejection {
-        code: String,
-    },
 }
 
 #[derive(Debug, Clone, Serialize)]
