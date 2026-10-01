@@ -1,44 +1,20 @@
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("I/O error at {}: {source}", path.display())]
     Io {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    #[error("metadata error at {}: {message}", path.display())]
     Metadata {
         path: std::path::PathBuf,
         message: String,
     },
-    Parse {
-        path: String,
-        message: String,
-    },
+    #[error("{0}")]
     Analysis(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io { path, source } => write!(f, "I/O error at {}: {source}", path.display()),
-            Self::Metadata { path, message } => {
-                write!(f, "metadata error at {}: {message}", path.display())
-            }
-            Self::Parse { path, message } => write!(f, "parse error in {path}: {message}"),
-            Self::Analysis(message) => f.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::Metadata { .. } => None,
-            Self::Parse { .. } | Self::Analysis(_) => None,
-        }
-    }
-}
 
 mod metadata;
 pub mod r_worker;
