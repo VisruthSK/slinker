@@ -895,6 +895,7 @@ fn translate_index(
     };
     let mut package_refs = namespace_access_facts(translation, &live_uses, &mut live_calls);
     binary_operator_facts(translation, &mut references, &mut live_calls);
+    dispatching_syntax_facts(translation, &mut live_calls);
 
     deduplicate_calls(&mut live_calls);
 
@@ -5005,6 +5006,109 @@ impl RParser for OakParser {
                 path: format!("source:{}", source.0),
                 message,
             })
+    }
+}
+
+fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<LiveCall>) {
+    let Translation {
+        source,
+        root,
+        index,
+        scopes,
+        declarations,
+        ..
+    } = translation;
+    let mut record = |callee: String, qualified: bool, node: &AnyRExpression| {
+        let span = ast_span(source, node);
+        if declarations.is_inert(span.start) {
+            return;
+        }
+        let (scope, _) = index.scope_at(node.syntax().text_trimmed_range().start());
+        let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &[]);
+        live_calls.push(LiveCall {
+            site: CallSite {
+                callee,
+                callee_kind: CalleeKind::DefinitelyExternal,
+                qualified_package: qualified.then(|| "base".into()),
+                args: Vec::new(),
+                arg_names: Vec::new(),
+                arg_spans: Vec::new(),
+                local_closure_args: Vec::new(),
+                scope: lexical_scope,
+                arg_bindings,
+                phase: phase_for_scope(index, scope),
+                guards: Vec::new(),
+                span: span.clone(),
+            },
+            raw: RawCall {
+                start: span.start,
+                end: span.end,
+                args: Vec::new(),
+            },
+        });
+    };
+    for expression in root.syntax().descendants().filter_map(AnyRExpression::cast) {
+        match &expression {
+            AnyRExpression::RUnaryExpression(unary) => {
+                if let Ok(operator) = unary.operator()
+                    && matches!(operator.text_trimmed(), "-" | "+" | "!")
+                {
+                    record(operator.text_trimmed().to_owned(), true, &expression);
+                }
+            }
+            AnyRExpression::RSubset(_) => record("[".into(), true, &expression),
+            AnyRExpression::RSubset2(_) => record("[[".into(), true, &expression),
+            AnyRExpression::RExtractExpression(extract) => {
+                if let Ok(operator) = extract.operator() {
+                    record(operator.text_trimmed().to_owned(), true, &expression);
+                }
+            }
+            AnyRExpression::RBinaryExpression(binary) => {
+                let Ok(operator) = binary.operator() else {
+                    continue;
+                };
+                let target = match operator.text_trimmed() {
+                    "<-" | "=" | "<<-" => binary.left().ok(),
+                    "->" | "->>" => binary.right().ok(),
+                    _ => continue,
+                };
+                let mut target = target;
+                while let Some(current) = target.take() {
+                    match &current {
+                        AnyRExpression::RSubset(subset) => {
+                            record("[<-".into(), true, &current);
+                            target = subset.function().ok();
+                        }
+                        AnyRExpression::RSubset2(subset) => {
+                            record("[[<-".into(), true, &current);
+                            target = subset.function().ok();
+                        }
+                        AnyRExpression::RExtractExpression(extract) => {
+                            let Ok(operator) = extract.operator() else {
+                                break;
+                            };
+                            record(format!("{}<-", operator.text_trimmed()), true, &current);
+                            target = extract.left().ok();
+                        }
+                        AnyRExpression::RCall(call) => {
+                            let Some((name, _)) = identifier_callee(call) else {
+                                break;
+                            };
+                            record(format!("{name}<-"), false, &current);
+                            target = call
+                                .arguments()
+                                .ok()
+                                .and_then(|arguments| {
+                                    arguments.items().iter().find_map(std::result::Result::ok)
+                                })
+                                .and_then(|argument| argument.value());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

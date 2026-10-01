@@ -74,6 +74,7 @@ impl FakeProvider {
                     "strsplit",
                     "switch",
                     "names",
+                    "names<-",
                     "isNamespaceLoaded",
                     "getNamespaceExports",
                     "setHook",
@@ -6013,4 +6014,53 @@ fn one_name_creator_is_one_primary_blocker_for_the_free_names_it_could_bind() {
         primaries[0].evidence_summary().as_deref(),
         Some("root::f, root::h")
     );
+}
+
+#[test]
+fn syntax_forms_that_dispatch_retain_their_lexical_methods() {
+    for (source, callee, generics, method) in [
+        ("run <- function(x) x[1]", "[", &["["][..], "[.cls"),
+        ("run <- function(x) x[[1]]", "[[", &["[["][..], "[[.cls"),
+        ("run <- function(x) x$a", "$", &["$"][..], "$.cls"),
+        ("run <- function(x) -x", "-", &["-", "Ops"][..], "Ops.cls"),
+        ("run <- function(x) !x", "!", &["!", "Ops"][..], "!.cls"),
+        (
+            "run <- function(x) { x[1] <- 0; x }",
+            "[<-",
+            &["[<-"][..],
+            "[<-.cls",
+        ),
+        (
+            "run <- function(x) { x$a <- 0; x }",
+            "$<-",
+            &["$<-"][..],
+            "$<-.cls",
+        ),
+        (
+            "run <- function(x) { names(x) <- 'n'; x }",
+            "names<-",
+            &["names<-"][..],
+            "names<-.cls",
+        ),
+        (
+            "run <- function(x) { names(x)[2] <- 'n'; x }",
+            "names<-",
+            &["names<-"][..],
+            "names<-.cls",
+        ),
+    ] {
+        let foo = lexical_method_namespace(
+            source,
+            &[
+                (method, &format!("`{method}` <- function(x, ...) 1")),
+                ("other.cls", "other.cls <- function(x, ...) 2"),
+            ],
+            Vec::new(),
+        );
+        let provider =
+            FakeProvider::new(vec![lexical_root(), foo]).dispatching(None, callee, generics);
+        let plan = Linker::new(provider, 1).analyze("root").unwrap();
+        assert!(retained_binding(&plan, "foo", method), "{source}");
+        assert!(!retained_binding(&plan, "foo", "other.cls"), "{source}");
+    }
 }

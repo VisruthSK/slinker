@@ -81,18 +81,8 @@ acceptance cases here.
 ## Next up
 
 1. Track C: the type and cleanup items.
-2. Track B.
 
 ---
-
-## Track B: Soundness gaps in the current profile
-
-Each item can make a successful build behave differently from the original, and each gets a test
-that fails before its fix.
-
-- Lexical S3 retention reaches calls and binary operators only. Dispatch through unary operators,
-  `[`, `[[`, `$`, `@`, and replacement forms (`names(x) <- v`) needs Oak call facts for those
-  syntax forms; until then a method reached only that way is a stub that fails loudly.
 
 ## Track C: Rust cleanup, types, and performance
 

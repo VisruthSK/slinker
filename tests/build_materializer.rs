@@ -2027,3 +2027,75 @@ fn enumerating_a_linked_namespace_blocks_the_build() {
     assert_success(&result, "slinker build targeted namespace lookup");
     assert!(output.exists());
 }
+
+#[test]
+fn syntax_forms_dispatch_to_unregistered_lexical_methods_as_in_the_original() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("synlinked");
+    write_package(
+        &dependency_source,
+        "synlinked",
+        "",
+        "export(sub, sub2, dollar, negate, assign_sub, assign_dollar, assign_names)\n",
+        concat!(
+            "sub <- function(x) x[1]\n",
+            "sub2 <- function(x) x[[1]]\n",
+            "dollar <- function(x) x$a\n",
+            "negate <- function(x) -x\n",
+            "assign_sub <- function(x) { x[1] <- 0; x }\n",
+            "assign_dollar <- function(x) { x$a <- 0; x }\n",
+            "assign_names <- function(x) { names(x) <- 'n'; x }\n",
+            "`[.syn` <- function(x, ...) 'sub'\n",
+            "`[[.syn` <- function(x, ...) 'sub2'\n",
+            "`$.syn` <- function(x, name) 'dollar'\n",
+            "`-.syn` <- function(e1, e2) 'negate'\n",
+            "`[<-.syn` <- function(x, ..., value) 'assign_sub'\n",
+            "`$<-.syn` <- function(x, name, value) 'assign_dollar'\n",
+            "`names<-.syn` <- function(x, value) 'assign_names'\n",
+            "`[[<-.syn` <- function(x, ..., value) 'never'\n",
+        ),
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+    let root_source = fixture.path().join("synroot");
+    write_package(
+        &root_source,
+        "synroot",
+        "Imports: synlinked\n",
+        "importFrom(synlinked, sub, sub2, dollar, negate, assign_sub, assign_dollar, assign_names)\nexport(go)\n",
+        concat!(
+            "go <- function() {\n",
+            "  x <- structure(list(a = 1), class = 'syn')\n",
+            "  c(sub(x), sub2(x), dollar(x), negate(x), assign_sub(x), assign_dollar(x), assign_names(x))\n",
+            "}\n",
+        ),
+    );
+    let output = fixture.path().join("generated-synroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run syntax dispatch build");
+    assert_success(&result, "slinker build syntax dispatch fixture");
+    let behavior = "library(synroot); stopifnot(identical(go(), c('sub', 'sub2', 'dollar', 'negate', 'assign_sub', 'assign_dollar', 'assign_names')))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &output, &validation);
+    run_r(
+        &r_home,
+        &validation,
+        &format!(
+            "{behavior}; linked <- environment(get('sub', envir = parent.env(asNamespace('synroot')))); message <- tryCatch(get('[[<-.syn', envir = linked), error = conditionMessage); stopifnot(grepl('was removed by slinker', message, fixed = TRUE))"
+        ),
+    );
+}
