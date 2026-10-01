@@ -1,3 +1,4 @@
+use super::diagnostic::{Cause, Evidence};
 use super::dynamic_names::{CreatedName, NameCreator};
 use super::object_world::reachable_environment_labels;
 use super::relocation::PendingRelocation;
@@ -985,7 +986,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             })
             .collect::<Vec<_>>();
         for (package, component) in unknown_registrations {
+            let node = self.need_node(&Need::Activation { package });
             self.dynamic_names.observe_creator(NameCreator {
+                node,
                 package,
                 binding: component,
                 operation: "useDynLib(.registration = TRUE)",
@@ -997,29 +1000,43 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .creatable()
             .map(|(unresolved, creator)| {
                 (
-                    unresolved.node,
-                    unresolved.package,
-                    unresolved.binding.clone(),
-                    format!(
-                        "unresolved name `{}` can be bound at run time by `{}` in `{}::{}`",
-                        unresolved.name,
-                        creator.operation,
-                        self.packages.name(creator.package),
-                        creator.binding
-                    ),
-                    unresolved.span.clone(),
+                    creator.clone(),
+                    Evidence {
+                        package: self.packages.name(unresolved.package).to_owned(),
+                        binding: unresolved.binding.clone(),
+                        span: Some(unresolved.span.clone()),
+                        detail: format!("`{}` is bound nowhere", unresolved.name),
+                    },
                 )
             })
             .collect::<Vec<_>>();
-        for (node, package, binding, message, span) in creatable {
-            self.diagnostic(
-                node,
-                package,
-                binding.as_deref(),
-                RejectCode::UnresolvedBinding,
-                message,
-                Some(span),
-            );
+        for (creator, evidence) in creatable {
+            let package = self.packages.name(creator.package).to_owned();
+            let primary = Diagnostic {
+                package: package.clone(),
+                binding: Some(creator.binding.clone()),
+                code: RejectCode::UnresolvedBinding,
+                message: match creator.created_name() {
+                    Some(created) => format!(
+                        "`{}` in `{package}::{}` can bind `{created}` at run time, so a free name bound nowhere may be created by it",
+                        creator.operation, creator.binding
+                    ),
+                    None => format!(
+                        "`{}` in `{package}::{}` can bind any name at run time, so free names bound nowhere may be created by it",
+                        creator.operation, creator.binding
+                    ),
+                },
+                span: None,
+                node: Some(creator.node),
+                evidence: Vec::new(),
+            };
+            let cause = Cause::NameCreator {
+                package: creator.package,
+                created: creator.created_name().map(str::to_owned),
+                operation: creator.operation,
+                binding: creator.binding,
+            };
+            self.diagnostics.record_derived(cause, primary, evidence);
         }
     }
 

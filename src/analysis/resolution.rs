@@ -613,7 +613,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Resolution::Static(BindingTarget::Local | BindingTarget::Base) => {}
             Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
                 self.dynamic_names.observe_unresolved(UnresolvedName {
-                    node: from,
                     package: requester,
                     binding: binding.map(str::to_owned),
                     name,

@@ -24,7 +24,7 @@ use state::{AnalysisOptions, AnalyzerState};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub use diagnostic::{Diagnostic, RejectCode};
+pub use diagnostic::{Diagnostic, Evidence, RejectCode};
 pub use explain::{
     EXPLANATION_SCHEMA_VERSION, ExplanationComponent, ExplanationDag, ExplanationEdge,
     ExplanationError, ExplanationEvidence, ExplanationMember, ExplanationPackage, ExplanationRoot,

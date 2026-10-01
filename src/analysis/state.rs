@@ -3,7 +3,7 @@ use super::arguments::{
     namespace_target, native_selector_span, only_package_argument, reflective_name_formals,
     static_package_arg, static_string_arg,
 };
-use super::diagnostic::DiagnosticSink;
+use super::diagnostic::{Cause, DiagnosticSink, Evidence};
 use super::dynamic_names::{CreatedName, DynamicNames, NameCreator};
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
 use super::namespace::{NamespaceBuilder, OptionalRegistration};
@@ -1298,6 +1298,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 && matches!(resolved, Resolution::Static(BindingTarget::Base))
             {
                 self.dynamic_names.observe_creator(NameCreator {
+                    node: site.node,
                     package: site.package,
                     binding: site.binding.to_owned(),
                     operation: "environment<-",
@@ -1489,6 +1490,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 SyntaxEffectKind::SuperAssignment => {
                     if !enclosure_known {
                         self.dynamic_names.observe_creator(NameCreator {
+                            node: site.node,
                             package: site.package,
                             binding: site.binding.to_owned(),
                             operation: "<<-",
@@ -3073,6 +3075,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         }
         if let Some((operation, name)) = created_name(call) {
             self.dynamic_names.observe_creator(NameCreator {
+                node: site.node,
                 package: current,
                 binding: binding.to_owned(),
                 operation,
@@ -3781,6 +3784,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             message,
             span,
             node: Some(node),
+            evidence: Vec::new(),
         }
     }
 
@@ -3810,14 +3814,39 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             .add_node(missing, NodeKind::MissingPackage, span.clone());
         self.graph
             .add_edge_at(from, node, kind, reason.clone(), span.clone());
-        self.diagnostic(
+        let primary = self.new_diagnostic(
             node,
             requester,
             None,
             RejectCode::MissingDependency,
-            format!("required package `{missing}` is absent from the selected target library universe ({reason})"),
-            span,
+            format!(
+                "required package `{missing}` is absent from the selected target library universe"
+            ),
+            None,
         );
+        let evidence = Evidence {
+            package: self.packages.name(requester).to_owned(),
+            binding: self.node_binding(from),
+            span,
+            detail: reason,
+        };
+        self.diagnostics.record_derived(
+            Cause::MissingPackage(missing.to_owned()),
+            Diagnostic {
+                package: missing.to_owned(),
+                ..primary
+            },
+            evidence,
+        );
+    }
+
+    fn node_binding(&self, node: NodeId) -> Option<String> {
+        match &self.graph.nodes[node.0].kind {
+            NodeKind::Binding { name } | NodeKind::PrivateBinding { name, .. } => {
+                Some(name.clone())
+            }
+            _ => None,
+        }
     }
 }
 

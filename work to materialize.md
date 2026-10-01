@@ -93,7 +93,6 @@ that fails before its fix.
 - Lexical S3 retention reaches calls and binary operators only. Dispatch through unary operators,
   `[`, `[[`, `$`, `@`, and replacement forms (`names(x) <- v`) needs Oak call facts for those
   syntax forms; until then a method reached only that way is a stub that fails loudly.
-- Diagnostics: collapse derivative missing-name cascades behind one primary blocker.
 
 ## Track C: Rust cleanup, types, and performance
 

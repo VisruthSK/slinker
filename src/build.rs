@@ -253,15 +253,21 @@ impl PureRStatic {
         let mut blockers = ir
             .blockers()
             .iter()
-            .map(|blocker| match &blocker.binding {
-                Some(binding) => format!(
-                    "{:?} in {}::{binding}: {}",
-                    blocker.code, blocker.package, blocker.message
-                ),
-                None => format!(
-                    "{:?} in {}: {}",
-                    blocker.code, blocker.package, blocker.message
-                ),
+            .map(|blocker| {
+                let rendered = match &blocker.binding {
+                    Some(binding) => format!(
+                        "{:?} in {}::{binding}: {}",
+                        blocker.code, blocker.package, blocker.message
+                    ),
+                    None => format!(
+                        "{:?} in {}: {}",
+                        blocker.code, blocker.package, blocker.message
+                    ),
+                };
+                match blocker.evidence_summary() {
+                    Some(summary) => format!("{rendered} (reached from {summary})"),
+                    None => rendered,
+                }
             })
             .collect::<BTreeSet<_>>();
         let description = ir.program().root_artifact().description.as_deref();

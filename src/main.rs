@@ -500,6 +500,9 @@ fn print_diagnostics(title: &str, diagnostics: &[Diagnostic]) {
     }
     for diagnostic in diagnostics {
         println!("  - {:?}: {}", diagnostic.code, diagnostic.message);
+        if let Some(summary) = diagnostic.evidence_summary() {
+            println!("      reached from {summary}");
+        }
     }
 }
 

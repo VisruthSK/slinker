@@ -384,6 +384,17 @@ fn test_target() -> TargetEnvironment {
     }
 }
 
+fn unresolved_name_evidence<'a>(
+    plan: &'a slinker::analysis::LinkIr,
+    name: &'a str,
+) -> impl Iterator<Item = &'a slinker::analysis::Evidence> + 'a {
+    plan.blockers()
+        .iter()
+        .filter(|diagnostic| diagnostic.code == RejectCode::UnresolvedBinding)
+        .flat_map(|diagnostic| diagnostic.evidence.iter())
+        .filter(move |evidence| evidence.detail.contains(name))
+}
+
 fn retained_binding(plan: &slinker::analysis::LinkIr, package: &str, binding: &str) -> bool {
     plan.provenance().nodes().iter().any(|node| {
         node.package == package
@@ -1707,16 +1718,7 @@ fn opaque_native_selector_consumption_is_occurrence_specific() {
         .analyze("root")
         .unwrap();
 
-    assert_eq!(
-        plan.blockers()
-            .iter()
-            .filter(|diagnostic| {
-                diagnostic.code == RejectCode::UnresolvedBinding
-                    && diagnostic.message.contains("croot_f")
-            })
-            .count(),
-        1
-    );
+    assert_eq!(unresolved_name_evidence(&plan, "croot_f").count(), 1);
     assert!(
         !plan
             .blockers()
@@ -1777,9 +1779,7 @@ fn shadowed_native_primitive_does_not_consume_selector() {
                 NodeKind::NativeComponent { .. }
             )
     }));
-    assert!(plan.blockers().iter().any(|diagnostic| {
-        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("croot_f")
-    }));
+    assert!(unresolved_name_evidence(&plan, "croot_f").next().is_some());
 }
 
 #[test]
@@ -2761,10 +2761,9 @@ fn unresolved_name_blocks_only_where_retained_code_can_bind_it() {
             .unwrap()
     };
     let unresolved = |plan: &slinker::analysis::LinkIr| {
-        plan.blockers().iter().any(|diagnostic| {
-            diagnostic.code == RejectCode::UnresolvedBinding
-                && diagnostic.message.contains("missing_everywhere")
-        })
+        unresolved_name_evidence(plan, "missing_everywhere")
+            .next()
+            .is_some()
     };
 
     let alone = analyze(None);
@@ -5820,4 +5819,198 @@ fn unreached_datasets_are_never_carried() {
     let plan = data_use("f <- function() 1");
 
     assert!(plan.program().dataset_libraries().next().is_none());
+}
+
+fn dependency_importing_from_missing_package() -> PackageImage {
+    package_with!(
+        "dep",
+        &[
+            ("f1", Some("f1 <- function() a()")),
+            ("f2", Some("f2 <- function() b()")),
+            ("f3", Some("f3 <- function() c3()")),
+        ],
+        vec![ImportSpec::From {
+            package: "gone".into(),
+            bindings: ["a", "b", "c3"]
+                .into_iter()
+                .map(|name| ImportBinding {
+                    local: name.into(),
+                    remote: name.into(),
+                })
+                .collect(),
+        }],
+        ExportMap::from([
+            ("f1".to_owned(), "f1".into()),
+            ("f2".to_owned(), "f2".into()),
+            ("f3".to_owned(), "f3".into()),
+        ]),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Imports: gone\n",
+    )
+}
+
+fn missing_package_blockers(
+    plan: &slinker::analysis::LinkIr,
+) -> Vec<&slinker::analysis::Diagnostic> {
+    plan.blockers()
+        .iter()
+        .filter(|diagnostic| diagnostic.code == RejectCode::MissingDependency)
+        .collect()
+}
+
+#[test]
+fn one_missing_package_is_one_primary_blocker_with_every_requester_as_evidence() {
+    let root = package(
+        "root",
+        &[
+            ("r1", Some("r1 <- function() dep::f1()")),
+            ("r2", Some("r2 <- function() dep::f2()")),
+            ("r3", Some("r3 <- function() dep::f3()")),
+        ],
+    );
+    let plan = Linker::new(
+        FakeProvider::new(vec![root, dependency_importing_from_missing_package()]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+
+    let primaries = missing_package_blockers(&plan);
+    assert_eq!(primaries.len(), 1, "{primaries:?}");
+    assert_eq!(primaries[0].package, "gone");
+    let requesters = primaries[0]
+        .evidence
+        .iter()
+        .map(|evidence| {
+            format!(
+                "{}::{}",
+                evidence.package,
+                evidence.binding.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requesters, ["dep::f1", "dep::f2", "dep::f3"]);
+    assert_eq!(
+        primaries[0].evidence_summary().as_deref(),
+        Some("dep::f1, dep::f2, dep::f3")
+    );
+}
+
+#[test]
+fn independent_primary_blockers_stay_independent() {
+    let root = package(
+        "root",
+        &[
+            ("r1", Some("r1 <- function() dep::f1()")),
+            ("r2", Some("r2 <- function() dep::f2()")),
+            ("r3", Some("r3 <- function() { other::x(); other::y() }")),
+            ("r4", Some("r4 <- function(n) get(n)")),
+        ],
+    );
+    let plan = Linker::new(
+        FakeProvider::new(vec![root, dependency_importing_from_missing_package()]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+
+    let mut missing = missing_package_blockers(&plan)
+        .into_iter()
+        .map(|primary| (primary.package.clone(), primary.evidence.len()))
+        .collect::<Vec<_>>();
+    missing.sort();
+    assert_eq!(missing, [("gone".to_owned(), 2), ("other".to_owned(), 2)]);
+    assert!(plan.blockers().iter().any(|blocker| {
+        blocker.code == RejectCode::DynamicLookup && blocker.binding.as_deref() == Some("r4")
+    }));
+}
+
+#[test]
+fn derivative_grouping_leaves_the_graph_observational_and_the_report_deterministic() {
+    let analyze = |jobs| {
+        let root = package(
+            "root",
+            &[
+                ("r1", Some("r1 <- function() dep::f1()")),
+                ("r2", Some("r2 <- function() dep::f2()")),
+                ("r3", Some("r3 <- function() dep::f3()")),
+            ],
+        );
+        Linker::new(
+            FakeProvider::new(vec![root, dependency_importing_from_missing_package()]),
+            jobs,
+        )
+        .analyze("root")
+        .unwrap()
+    };
+    let plan = analyze(1);
+
+    let missing = plan.provenance().missing_packages().collect::<Vec<_>>();
+    assert_eq!(missing.len(), 1);
+    let derivations = plan
+        .provenance()
+        .edges()
+        .iter()
+        .filter(|edge| edge.to == missing[0])
+        .count();
+    assert_eq!(derivations, 3);
+
+    let render = |plan: &slinker::analysis::LinkIr| {
+        plan.blockers()
+            .iter()
+            .map(|blocker| {
+                (
+                    blocker.code,
+                    blocker.message.clone(),
+                    blocker.evidence.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(render(&plan), render(&analyze(1)));
+    assert_eq!(render(&plan), render(&analyze(4)));
+}
+
+#[test]
+fn one_name_creator_is_one_primary_blocker_for_the_free_names_it_could_bind() {
+    let root = package(
+        "root",
+        &[
+            (
+                "f",
+                Some("f <- function(n) { assign(n, 1); alpha + beta + gamma }"),
+            ),
+            ("h", Some("h <- function() epsilon")),
+        ],
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
+        .analyze("root")
+        .unwrap();
+
+    let primaries = plan
+        .blockers()
+        .iter()
+        .filter(|blocker| blocker.code == RejectCode::UnresolvedBinding)
+        .collect::<Vec<_>>();
+    assert_eq!(primaries.len(), 1, "{primaries:?}");
+    assert_eq!(primaries[0].binding.as_deref(), Some("f"));
+    assert_eq!(
+        primaries[0]
+            .evidence
+            .iter()
+            .map(|evidence| evidence.detail.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "`alpha` is bound nowhere",
+            "`beta` is bound nowhere",
+            "`gamma` is bound nowhere",
+            "`epsilon` is bound nowhere",
+        ]
+    );
+    assert_eq!(
+        primaries[0].evidence_summary().as_deref(),
+        Some("root::f, root::h")
+    );
 }

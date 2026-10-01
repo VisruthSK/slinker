@@ -8,20 +8,22 @@ pub(super) struct DynamicNames {
     unresolved: Vec<UnresolvedName>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct NameCreator {
+    pub(super) node: NodeId,
     pub(super) package: PackageId,
     pub(super) binding: String,
     pub(super) operation: &'static str,
     pub(super) name: CreatedName,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CreatedName {
     Named(String),
     Any,
 }
 
 pub(super) struct UnresolvedName {
-    pub(super) node: NodeId,
     pub(super) package: PackageId,
     pub(super) binding: Option<String>,
     pub(super) name: String,
@@ -29,6 +31,13 @@ pub(super) struct UnresolvedName {
 }
 
 impl NameCreator {
+    pub(super) fn created_name(&self) -> Option<&str> {
+        match &self.name {
+            CreatedName::Named(created) => Some(created),
+            CreatedName::Any => None,
+        }
+    }
+
     fn can_bind(&self, name: &str) -> bool {
         match &self.name {
             CreatedName::Named(created) => created == name,
