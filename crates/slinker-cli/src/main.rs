@@ -152,7 +152,6 @@ impl UserCommand {
 }
 
 fn main() -> ExitCode {
-    slinker_core::profile::enable_from_environment();
     match Cli::parse().command {
         Command::RWorker { protocol } => {
             report(slinker_r_worker::run(&protocol).map_err(Into::into), false)
@@ -162,11 +161,7 @@ fn main() -> ExitCode {
             .stack_size(ANALYSIS_STACK_BYTES)
             .spawn(move || {
                 let json = command.json();
-                let code = report(run(command), json);
-                if let Some(profile) = slinker_core::profile::report() {
-                    eprint!("{profile}");
-                }
-                code
+                report(run(command), json)
             })
             .expect("spawn the slinker command thread")
             .join()

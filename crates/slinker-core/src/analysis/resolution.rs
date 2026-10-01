@@ -335,9 +335,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         environment: &str,
         name: &str,
     ) -> Result<Resolution<BindingTarget>> {
-        if let Some(memoized) = self
-            .lexical_memo
-            .get(self.namespace_epoch, current, environment, name)
+        if let Some(memoized) =
+            self.lexical_memo
+                .get(self.namespace_epoch, current, environment, name)
         {
             crate::profile::count(crate::profile::Count::LexicalMemoHit, 1);
             #[cfg(debug_assertions)]

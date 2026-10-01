@@ -154,18 +154,16 @@ struct Profiler {
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PROFILER: OnceLock<Profiler> = OnceLock::new();
 
-pub fn enable_from_environment() {
-    if std::env::var_os("SLINKER_PROFILE").is_some_and(|value| value != "0") {
-        PROFILER.get_or_init(|| Profiler {
-            probes: Default::default(),
-            counts: Default::default(),
-            unique: Mutex::default(),
-            opcodes: Mutex::default(),
-            callees: Mutex::default(),
-            started: Instant::now(),
-        });
-        ENABLED.store(true, Ordering::Release);
-    }
+pub fn enable() {
+    PROFILER.get_or_init(|| Profiler {
+        probes: Default::default(),
+        counts: Default::default(),
+        unique: Mutex::default(),
+        opcodes: Mutex::default(),
+        callees: Mutex::default(),
+        started: Instant::now(),
+    });
+    ENABLED.store(true, Ordering::Release);
 }
 
 #[inline]
