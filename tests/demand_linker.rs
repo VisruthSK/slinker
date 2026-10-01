@@ -3386,7 +3386,7 @@ fn selecting_extra_does_not_root_an_unused_optional_package() {
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
     let plan = Linker::new(provider, 1)
-        .with_extra_packages(["foo".to_owned()])
+        .with_linked_packages(["foo".to_owned()])
         .analyze("root")
         .unwrap();
 
@@ -3515,7 +3515,7 @@ fn required_description_relationship_wins_over_duplicate_suggests_when_source_us
 }
 
 #[test]
-fn direct_suggested_namespace_access_is_ignored_without_extra_pkgs() {
+fn direct_suggested_namespace_access_is_ignored_without_link() {
     let root = package_with!(
         "root",
         &[("f", Some("f <- function() foo::bar()"))],
@@ -3600,7 +3600,7 @@ fn direct_suggested_namespace_access_is_linked_when_selected() {
         "",
     );
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_extra_packages(["foo".to_owned()])
+        .with_linked_packages(["foo".to_owned()])
         .analyze("root")
         .unwrap();
 
@@ -3636,7 +3636,7 @@ fn selecting_one_extra_does_not_enable_its_suggests() {
     let counts = provider.count_handle();
     let locate_counts = provider.optional_locate_count_handle();
     let plan = Linker::new(provider, 2)
-        .with_extra_packages(["foo".to_owned()])
+        .with_linked_packages(["foo".to_owned()])
         .analyze("root")
         .unwrap();
 
@@ -4314,7 +4314,7 @@ fn selected_extra_enables_retained_dependency_s3_generic() {
     );
     let foo = package("foo", &[("generic", Some("generic <- function(x, ...) x"))]);
     let plan = Linker::new(FakeProvider::new(vec![root, dep, foo]), 2)
-        .with_extra_packages(["foo".to_owned()])
+        .with_linked_packages(["foo".to_owned()])
         .analyze("root")
         .unwrap();
 
@@ -4470,7 +4470,7 @@ fn selected_optional_package_follows_the_supported_guard_semantics() {
         FakeProvider::new(vec![suggesting_root(source), optional_foo()]),
         1,
     )
-    .with_extra_packages(["foo".to_owned()])
+    .with_linked_packages(["foo".to_owned()])
     .analyze("root")
     .unwrap();
     let external = Linker::new(
@@ -4546,7 +4546,7 @@ fn selected_extra_enables_guarded_optional_branch_without_rooting_whole_package(
         "",
     );
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_extra_packages(["foo".to_owned()])
+        .with_linked_packages(["foo".to_owned()])
         .analyze("root")
         .unwrap();
     assert!(retained_binding(&plan, "foo", "bar"));
@@ -4570,7 +4570,7 @@ fn selected_missing_extra_is_reported_as_missing_dependency() {
         "Suggests: foo\n",
     );
     let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .with_extra_packages(["foo".to_owned()])
+        .with_linked_packages(["foo".to_owned()])
         .analyze("root")
         .unwrap();
     assert!(
@@ -4658,7 +4658,7 @@ fn selected_extra_enables_optional_onload_hook_namespace() {
         "",
     );
     let plan = Linker::new(FakeProvider::new(vec![root, glue, knitr]), 4)
-        .with_extra_packages(["knitr".to_owned()])
+        .with_linked_packages(["knitr".to_owned()])
         .analyze("root")
         .unwrap();
     assert!(optional_availability_blockers(&plan).is_empty());

@@ -2,7 +2,17 @@ use crate::Error;
 use crate::r_worker::client::WorkerClient;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub fn r_executable(r_home: &Path) -> Option<PathBuf> {
+    [
+        r_home.join("bin/x64/R.exe"),
+        r_home.join("bin/R.exe"),
+        r_home.join("bin/R"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Target {

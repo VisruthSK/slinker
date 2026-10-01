@@ -396,14 +396,7 @@ fn discover_r_home() -> Option<PathBuf> {
 }
 
 fn target_r_libraries(r_home: &Path) -> Vec<PathBuf> {
-    let executable = [
-        r_home.join("bin").join("x64").join("R.exe"),
-        r_home.join("bin").join("R.exe"),
-        r_home.join("bin").join("R"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .expect("target R executable");
+    let executable = slinker::r_executable(r_home).expect("target R executable");
     let missing_user = r_home.join("etc").join("__slinker_no_user_Renviron__");
     let output = Command::new(executable)
         .args([

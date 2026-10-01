@@ -1,5 +1,5 @@
 use crate::TargetEnvironment;
-use crate::analysis::LinkIr;
+use crate::analysis::{Diagnostic, LinkIr, RejectCode};
 use crate::ir::{
     BindingName, ClosureHome, GenericHome, ImportSlotIr, LinkBindingState, LinkNamespaceState,
     NamespaceId, ObjectStep, PayloadBundleId, PayloadBundleIr, PayloadDependency, ProgramIr,
@@ -12,7 +12,10 @@ use crate::r_worker::protocol::{
     PayloadSerialization, PayloadSite, PayloadSpec, SerializedPayload,
 };
 use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
+use crate::syntax::{SourceLocation, Sources};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -250,42 +253,25 @@ impl PureRStatic {
         ir: &'a LinkIr,
         context: &'a BuildContext,
     ) -> Result<BuildableProgram<'a, PureRStatic>, PreflightError> {
-        let mut blockers = ir
-            .blockers()
-            .iter()
-            .map(|blocker| {
-                let rendered = match &blocker.binding {
-                    Some(binding) => format!(
-                        "{:?} in {}::{binding}: {}",
-                        blocker.code, blocker.package, blocker.message
-                    ),
-                    None => format!(
-                        "{:?} in {}: {}",
-                        blocker.code, blocker.package, blocker.message
-                    ),
-                };
-                match blocker.evidence_summary() {
-                    Some(summary) => format!("{rendered} (reached from {summary})"),
-                    None => rendered,
-                }
-            })
-            .collect::<BTreeSet<_>>();
+        let mut blockers = BuildReport::analysis_blockers(ir);
         let description = ir.program().root_artifact().description.as_deref();
         if description.is_none() {
-            blockers.insert("Root source-package DESCRIPTION plan is missing".into());
+            blockers.push(Blocker::preflight(
+                "Root source-package DESCRIPTION plan is missing".into(),
+            ));
         }
         let program = ir.program();
         for import in program.root_artifact().load.before_bootstrap().imports() {
             let target = program.binding(import.target);
             if target.name != import.local {
-                blockers.insert(format!(
+                blockers.push(Blocker::preflight(format!(
                     "Root imports External `{}` as `{}`, which NAMESPACE cannot express",
                     target.name, import.local
-                ));
+                )));
             }
         }
         let Some(description) = description.filter(|_| blockers.is_empty()) else {
-            return Err(BuildReport::new(blockers.into_iter().collect()).into());
+            return Err(BuildReport::new(blockers).into());
         };
         let frozen = context.freeze(ir)?;
         Ok(BuildableProgram {
@@ -300,7 +286,7 @@ impl PureRStatic {
 
 #[derive(Debug, Error)]
 pub enum PreflightError {
-    #[error(transparent)]
+    #[error("build preflight failed:\n{0}")]
     Blocked(#[from] BuildReport),
     #[error(transparent)]
     Freeze(#[from] BuildContextError),
@@ -318,25 +304,136 @@ impl From<std::io::Error> for PreflightError {
     }
 }
 
-#[derive(Clone, Debug, Error)]
-#[error("build preflight failed:\n{rendered}")]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub struct Blocker {
+    pub code: Option<RejectCode>,
+    pub package: Option<String>,
+    pub binding: Option<String>,
+    pub message: String,
+    pub location: Option<SourceLocation>,
+    pub reached_from: Option<String>,
+}
+
+impl Blocker {
+    fn preflight(message: String) -> Self {
+        Self {
+            code: None,
+            package: None,
+            binding: None,
+            message,
+            location: None,
+            reached_from: None,
+        }
+    }
+
+    fn from_diagnostic(diagnostic: &Diagnostic, sources: &Sources) -> Self {
+        Self {
+            code: Some(diagnostic.code),
+            package: Some(diagnostic.package.clone()),
+            binding: diagnostic.binding.clone(),
+            message: diagnostic.message.clone(),
+            location: diagnostic
+                .span
+                .as_ref()
+                .and_then(|span| sources.location(span)),
+            reached_from: diagnostic.evidence_summary(),
+        }
+    }
+}
+
+impl fmt::Display for Blocker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let (Some(code), Some(package)) = (self.code, &self.package) {
+            write!(formatter, "{code:?} in {package}")?;
+            if let Some(binding) = &self.binding {
+                write!(formatter, "::{binding}")?;
+            }
+            formatter.write_str(": ")?;
+        }
+        formatter.write_str(&self.message)?;
+        if let Some(location) = &self.location {
+            write!(formatter, " @ {location}")?;
+        }
+        if let Some(reached_from) = &self.reached_from {
+            write!(formatter, " (reached from {reached_from})")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BlockerGroup {
+    pub code: Option<RejectCode>,
+    pub blockers: Vec<Blocker>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BuildReport {
-    blockers: Vec<String>,
-    rendered: String,
+    groups: Vec<BlockerGroup>,
 }
 
 impl BuildReport {
-    fn new(blockers: Vec<String>) -> Self {
-        let rendered = blockers
-            .iter()
-            .map(|blocker| format!("  - {blocker}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        Self { blockers, rendered }
+    fn new(mut blockers: Vec<Blocker>) -> Self {
+        blockers.sort();
+        blockers.dedup();
+        let mut groups: Vec<BlockerGroup> = Vec::new();
+        for blocker in blockers {
+            match groups.iter_mut().find(|group| group.code == blocker.code) {
+                Some(group) => group.blockers.push(blocker),
+                None => groups.push(BlockerGroup {
+                    code: blocker.code,
+                    blockers: vec![blocker],
+                }),
+            }
+        }
+        Self { groups }
     }
 
-    pub fn blockers(&self) -> &[String] {
-        &self.blockers
+    fn preflight(messages: Vec<String>) -> Self {
+        Self::new(messages.into_iter().map(Blocker::preflight).collect())
+    }
+
+    pub fn analysis_blockers(ir: &LinkIr) -> Vec<Blocker> {
+        ir.blockers()
+            .iter()
+            .map(|diagnostic| Blocker::from_diagnostic(diagnostic, ir.sources()))
+            .collect()
+    }
+
+    pub fn from_analysis(ir: &LinkIr) -> Self {
+        Self::new(Self::analysis_blockers(ir))
+    }
+
+    pub fn groups(&self) -> &[BlockerGroup] {
+        &self.groups
+    }
+
+    pub fn blockers(&self) -> impl Iterator<Item = &Blocker> {
+        self.groups.iter().flat_map(|group| &group.blockers)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+}
+
+impl std::error::Error for BuildReport {}
+
+impl fmt::Display for BuildReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (position, group) in self.groups.iter().enumerate() {
+            if position > 0 {
+                formatter.write_str("\n")?;
+            }
+            match group.code {
+                Some(code) => write!(formatter, "  {code:?} ({})", group.blockers.len())?,
+                None => write!(formatter, "  preflight ({})", group.blockers.len())?,
+            }
+            for blocker in &group.blockers {
+                write!(formatter, "\n    - {blocker}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -678,7 +775,7 @@ fn check_payload_bundles(
         |site: &PayloadSite| format!("{}::{}", package_name(&bundles[site.payload]), site.binding);
     let serialized = match serialization {
         PayloadSerialization::SharedIdentity { first, second } => {
-            return Err(BuildReport::new(vec![format!(
+            return Err(BuildReport::preflight(vec![format!(
                 "payload `{}` and payload `{}` reach one environment or reference object, which separate namespace bundles would split into two",
                 site(&first),
                 site(&second)
@@ -718,7 +815,7 @@ fn check_payload_bundles(
     if blockers.is_empty() {
         Ok(checked)
     } else {
-        Err(BuildReport::new(blockers))
+        Err(BuildReport::preflight(blockers))
     }
 }
 

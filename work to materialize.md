@@ -85,21 +85,9 @@ acceptance cases here.
 
 ## Track D: Build infrastructure and frontend
 
-- Linux worker startup: fix `package 'methods' in options("defaultPackages") was not found`;
-  export `R_SHARE_DIR`, `R_INCLUDE_DIR`, `R_DOC_DIR` as Ark does.
-- Source snapshot: honor `.Rbuildignore` and skip `.git`, `target/`, `renv/`. `source_digest` is
-  stored but never checked: detect a source tree changed mid-build, or delete it.
-- One shared `r_executable` helper instead of per-module copies.
-- Cache CRAN downloads and harness libraries in CI.
-- Frontend, documented in `docs/usage.md` as it lands:
-  - `analyze`, `why`, and `path` accept a source package path (staged exactly as `build` does), an
-    installed package name (today's behavior), or an installed package directory, whose parent
-    library goes first in the library order;
-  - `slinker check [PATH]` runs the full build pipeline through preflight, prints the build report,
-    and writes nothing;
-  - `build` takes `--extra-pkgs`;
-  - reports group blockers by root cause, show the owning binding and source line,
-    and have a `--json` form.
+- Linux worker startup: the worker now exports `R_SHARE_DIR`, `R_INCLUDE_DIR`, `R_DOC_DIR` as the R
+  launcher reports them. Confirm on Linux CI that `package 'methods' in options("defaultPackages") was
+  not found` is gone; no Linux R has run it yet.
 
 ## Track E: Retire heuristics
 

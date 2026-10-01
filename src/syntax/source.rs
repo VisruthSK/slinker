@@ -143,4 +143,50 @@ impl Sources {
     pub fn display(&self, id: &SourceId) -> String {
         self.origin(id).display()
     }
+
+    pub fn location(&self, span: &Span) -> Option<SourceLocation> {
+        let entry = self.get(&span.source)?;
+        let before = entry.text.get(..span.start)?;
+        let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+        Some(SourceLocation {
+            source: entry.origin.display(),
+            line: before.matches('\n').count() + 1,
+            column: before[line_start..].chars().count() + 1,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct SourceLocation {
+    pub source: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl std::fmt::Display for SourceLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.source, self.line, self.column)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn location_reports_one_based_line_and_column_within_the_binding_source() {
+        let mut sources = Sources::default();
+        let id = sources.add(
+            "pkg",
+            SourceKey::Binding("f".into()),
+            "function() {\n  g(é, h())\n}",
+        );
+        let start = "function() {\n  g(é, ".len();
+
+        let location = sources
+            .location(&Span::new(id, start, start + 3))
+            .expect("span lies inside the source");
+
+        assert_eq!(location.to_string(), "pkg::f:2:8");
+    }
 }

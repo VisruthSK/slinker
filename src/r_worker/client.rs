@@ -67,6 +67,8 @@ impl WorkerClient {
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         command.env("LD_LIBRARY_PATH", target_library_path(&r_home)?);
+        #[cfg(unix)]
+        command.envs(target_resource_directories(&r_home)?);
         let mut child = command.spawn().map_err(|source| Error::Io {
             path: executable,
             source,
@@ -432,6 +434,52 @@ pub(crate) fn target_library_path(r_home: &std::path::Path) -> Result<std::ffi::
         )));
     }
     Ok(std::ffi::OsString::from_vec(output.stdout))
+}
+
+#[cfg(unix)]
+fn target_resource_directories(
+    r_home: &std::path::Path,
+) -> Result<Vec<(&'static str, std::ffi::OsString)>> {
+    use std::os::unix::ffi::OsStringExt;
+    const NAMES: [&str; 3] = ["R_SHARE_DIR", "R_INCLUDE_DIR", "R_DOC_DIR"];
+    let executable = crate::r_executable(r_home).ok_or_else(|| Error::Io {
+        path: r_home.join("bin").join("R"),
+        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+    })?;
+    let expression = format!(
+        "cat(Sys.getenv(c({})), sep = '\\n')",
+        NAMES.map(|name| format!("'{name}'")).join(", ")
+    );
+    let output = Command::new(&executable)
+        .args(["--slave", "--no-save", "--no-restore", "-e", &expression])
+        .env_remove("R_ENVIRON_USER")
+        .env_remove("R_PROFILE_USER")
+        .env_remove("R_LIBS")
+        .env_remove("R_LIBS_USER")
+        .env_remove("R_LIBS_SITE")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| Error::Io {
+            path: executable.clone(),
+            source,
+        })?;
+    let lines = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if !output.status.success() || lines.len() != NAMES.len() {
+        return Err(Error::Analysis(format!(
+            "target R {} did not report its resource directories: {}",
+            r_home.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(NAMES
+        .into_iter()
+        .zip(lines)
+        .map(|(name, line)| (name, std::ffi::OsString::from_vec(line.to_vec())))
+        .collect())
 }
 
 fn next_worker() -> u64 {

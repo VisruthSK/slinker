@@ -2250,13 +2250,7 @@ unrelated <- function() stop("unrelated binding executed")
 "#,
         )
         .ok()?;
-        let executable = [
-            r_home.join("bin").join("x64").join("R.exe"),
-            r_home.join("bin").join("R.exe"),
-            r_home.join("bin").join("R"),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())?;
+        let executable = crate::r_executable(r_home)?;
         let status = std::process::Command::new(executable)
             .args(["CMD", "INSTALL", "--no-test-load"])
             .arg(format!("--library={}", library.display()))
