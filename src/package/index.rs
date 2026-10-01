@@ -1,5 +1,7 @@
 use crate::Description;
-use crate::package::{BindingName, ClassName, GenericName, PackageIdentity, PackageName};
+use crate::package::{
+    BindingName, ClassName, DatasetName, GenericName, PackageIdentity, PackageName,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -198,6 +200,32 @@ pub struct LifecycleMetadata {
     pub on_load: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PackageData {
+    sets: BTreeMap<String, Vec<DatasetName>>,
+    file_backed: bool,
+}
+
+impl PackageData {
+    pub fn new(sets: BTreeMap<String, Vec<DatasetName>>, file_backed: bool) -> Self {
+        Self { sets, file_backed }
+    }
+
+    pub fn set(&self, name: &str) -> Option<&[DatasetName]> {
+        self.sets.get(name).map(Vec::as_slice)
+    }
+
+    pub fn defines(&self, object: &str) -> bool {
+        self.sets
+            .values()
+            .any(|objects| objects.iter().any(|candidate| candidate == object))
+    }
+
+    pub fn is_file_backed(&self) -> bool {
+        self.file_backed
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PackageIndex {
     pub identity: PackageIdentity,
@@ -208,7 +236,7 @@ pub struct PackageIndex {
     pub dynlibs: Vec<NativeComponent>,
     pub lifecycle: LifecycleMetadata,
     pub binding_names: Vec<BindingName>,
-    pub datasets: Vec<String>,
+    pub data: PackageData,
     pub files: Vec<String>,
     pub has_sysdata: bool,
 }

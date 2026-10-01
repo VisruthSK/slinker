@@ -641,7 +641,7 @@ mod tests {
                     .iter()
                     .map(|binding| binding.name.clone())
                     .collect(),
-                datasets: Vec::new(),
+                data: crate::package::PackageData::default(),
                 files: Vec::new(),
                 has_sysdata: false,
             }),

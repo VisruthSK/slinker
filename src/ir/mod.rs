@@ -1,7 +1,7 @@
 use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{
-    BindingName, ClassName, ComponentName, GenericName, PackageId, PackageIdentity, PackageName,
-    PackageRole,
+    BindingName, ClassName, ComponentName, DatasetName, GenericName, PackageId, PackageIdentity,
+    PackageName, PackageRole,
 };
 
 use crate::package::Digest;
@@ -365,6 +365,13 @@ pub enum RelocationTarget {
     DescriptionArgument {
         description: ResourceId,
     },
+    Dataset {
+        package: PackageId,
+        dataset: DatasetName,
+    },
+    DataArgument {
+        package: PackageId,
+    },
     NativeSymbol {
         package: PackageId,
         component: ComponentName,
@@ -401,6 +408,7 @@ pub enum InvalidRelocation {
     OutsideCode,
     Overlap,
     Mismatch(String),
+    UncarriedDataset,
 }
 
 impl std::fmt::Display for InvalidRelocation {
@@ -413,6 +421,9 @@ impl std::fmt::Display for InvalidRelocation {
                     f,
                     "relocation does not match the syntax it rewrites: `{original}`"
                 )
+            }
+            Self::UncarriedDataset => {
+                f.write_str("relocation names a dataset that the program does not carry")
             }
         }
     }
@@ -500,6 +511,27 @@ pub struct ResourceIr {
     pub path: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DatasetLibraryIr {
+    objects: BTreeSet<DatasetName>,
+    sets: BTreeMap<String, Vec<DatasetName>>,
+}
+
+impl DatasetLibraryIr {
+    pub fn objects(&self) -> &BTreeSet<DatasetName> {
+        &self.objects
+    }
+
+    pub fn sets(&self) -> &BTreeMap<String, Vec<DatasetName>> {
+        &self.sets
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidDataset {
+    NotLinked(PackageId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObjectStep {
     Environment,
@@ -544,6 +576,7 @@ pub struct ProgramIr {
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     resources: Vec<ResourceIr>,
+    dataset_libraries: BTreeMap<PackageId, DatasetLibraryIr>,
     payload_bundles: Vec<PayloadBundleIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
@@ -618,6 +651,12 @@ impl ProgramIr {
             .iter()
             .enumerate()
             .map(|(index, resource)| (ResourceId::from_index(index), resource))
+    }
+
+    pub fn dataset_libraries(&self) -> impl Iterator<Item = (PackageId, &DatasetLibraryIr)> {
+        self.dataset_libraries
+            .iter()
+            .map(|(package, library)| (*package, library))
     }
 
     pub fn payload_bundles(&self) -> &[PayloadBundleIr] {
@@ -708,6 +747,7 @@ pub struct ProgramBuilder {
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     resources: Vec<ResourceIr>,
+    dataset_libraries: BTreeMap<PackageId, DatasetLibraryIr>,
     payload_bundles: Vec<PayloadBundleIr>,
     relocations: Vec<Relocation>,
     root_package: PackageId,
@@ -754,6 +794,7 @@ impl ProgramBuilder {
             activations: Vec::new(),
             s3_registrations: Vec::new(),
             resources: Vec::new(),
+            dataset_libraries: BTreeMap::new(),
             payload_bundles: Vec::new(),
             relocations: Vec::new(),
             root_package: root,
@@ -1107,6 +1148,39 @@ impl ProgramBuilder {
         Ok(Some(dependency))
     }
 
+    pub fn carry_dataset(
+        &mut self,
+        package: PackageId,
+        object: DatasetName,
+    ) -> Result<(), InvalidDataset> {
+        self.dataset_library(package)?.objects.insert(object);
+        Ok(())
+    }
+
+    pub fn carry_data_set(
+        &mut self,
+        package: PackageId,
+        set: String,
+        objects: Vec<DatasetName>,
+    ) -> Result<(), InvalidDataset> {
+        let library = self.dataset_library(package)?;
+        library.objects.extend(objects.iter().cloned());
+        library.sets.insert(set, objects);
+        Ok(())
+    }
+
+    fn dataset_library(
+        &mut self,
+        package: PackageId,
+    ) -> Result<&mut DatasetLibraryIr, InvalidDataset> {
+        match self.packages.get(&package) {
+            Some(PackageIr::Linked { .. }) => {
+                Ok(self.dataset_libraries.entry(package).or_default())
+            }
+            _ => Err(InvalidDataset::NotLinked(package)),
+        }
+    }
+
     pub fn add_resource(&mut self, resource: ResourceIr) -> ResourceId {
         let id = ResourceId::from_index(self.resources.len());
         self.resources.push(resource);
@@ -1134,6 +1208,9 @@ impl ProgramBuilder {
         if !self.relocation_matches(&target, original) {
             return Err(InvalidRelocation::Mismatch(original.to_owned()));
         }
+        if !self.relocation_carries_artifact(&target) {
+            return Err(InvalidRelocation::UncarriedDataset);
+        }
         let occurrence = CodeOccurrenceId::from_index(code_ir.occurrences.len());
         self.codes[code.index()].occurrences.push(range);
         self.relocations.push(Relocation {
@@ -1141,6 +1218,19 @@ impl ProgramBuilder {
             target,
         });
         Ok(())
+    }
+
+    fn relocation_carries_artifact(&self, target: &RelocationTarget) -> bool {
+        match target {
+            RelocationTarget::Dataset { package, dataset } => self
+                .dataset_libraries
+                .get(package)
+                .is_some_and(|library| library.objects.contains(dataset)),
+            RelocationTarget::DataArgument { package } => {
+                self.dataset_libraries.contains_key(package)
+            }
+            _ => true,
+        }
     }
 
     fn relocation_matches(&self, target: &RelocationTarget, original: &str) -> bool {
@@ -1170,8 +1260,17 @@ impl ProgramBuilder {
             RelocationTarget::LoadedQuery => {
                 callee.starts_with("isNamespaceLoaded(") || original.contains("%in%")
             }
+            RelocationTarget::Dataset { dataset, .. } => {
+                original
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or(original)
+                    .trim_matches('`')
+                    == dataset.as_str()
+            }
             RelocationTarget::NamespaceArgument { .. }
             | RelocationTarget::DescriptionArgument { .. }
+            | RelocationTarget::DataArgument { .. }
             | RelocationTarget::NativeSymbol { .. }
             | RelocationTarget::NativeLibrary { .. } => original.starts_with(['"', '\'']),
         }
@@ -1232,6 +1331,7 @@ impl ProgramBuilder {
             activations: self.activations,
             s3_registrations: self.s3_registrations,
             resources: self.resources,
+            dataset_libraries: self.dataset_libraries,
             payload_bundles: self.payload_bundles,
             relocations: self.relocations,
             root_artifact,

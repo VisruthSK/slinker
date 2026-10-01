@@ -1,4 +1,5 @@
 mod arguments;
+mod dataset;
 pub mod diagnostic;
 mod dynamic_names;
 mod execute;

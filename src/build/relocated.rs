@@ -137,6 +137,21 @@ impl Replacement {
                     }),
                 }
             }
+            RelocationTarget::Dataset { package, dataset } => Self::expression(format!(
+                "base::getExportedValue({}, {})",
+                namespace_expression(program, *package),
+                r_string(dataset)
+            )),
+            RelocationTarget::DataArgument { package } => Self {
+                expression: r_string(&program.package(*package).identity().name),
+                appended_argument: Some(AppendedArgument {
+                    name: "lib.loc",
+                    value: format!(
+                        "base::system.file(\"slinker\", \"datalib\", package = {})",
+                        r_string(&program.package(program.root_package()).identity().name)
+                    ),
+                }),
+            },
             RelocationTarget::PackageVersion { version } => {
                 Self::expression(format!("base::package_version({})", r_string(version)))
             }

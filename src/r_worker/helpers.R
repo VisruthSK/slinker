@@ -52,13 +52,17 @@
     sysdata_names <- character()
   }
 
-  data_env <- new.env(hash = TRUE, parent = emptyenv())
-  data_db <- file.path(root, "data", "Rdata")
-  if (
-    file.exists(paste0(data_db, ".rdx")) && file.exists(paste0(data_db, ".rdb"))
-  ) {
-    base::lazyLoad(data_db, envir = data_env)
+  data_directory <- file.path(root, "data")
+  data_index <- file.path(data_directory, "Rdata.rds")
+  data_sets <- if (file.exists(data_index)) {
+    lapply(readRDS(data_index), as.character)
+  } else {
+    list()
   }
+  data_files <- length(setdiff(
+    list.files(data_directory, all.files = TRUE, no.. = TRUE),
+    c("Rdata.rdb", "Rdata.rdx", "Rdata.rds")
+  )) > 0L
 
   list(
     package = package,
@@ -71,7 +75,8 @@
       c(".__NAMESPACE__.", ".__S3MethodsTable__.", ".packageName")
     )),
     sysdata_names = sort(sysdata_names),
-    dataset_names = sort(ls(data_env, all.names = TRUE))
+    data_sets = data_sets[sort(names(data_sets))],
+    data_files = data_files
   )
 }
 
@@ -454,4 +459,25 @@
     .slinker_use_method_generics(body(value)),
     if (name %in% .internalGenerics) name
   ))
+}
+
+.slinker_data_library <- function(root, objects, set_names, set_lengths, set_members) {
+  database <- file.path(root, "data", "Rdata")
+  environment <- new.env(hash = TRUE, parent = emptyenv())
+  base::lazyLoad(database, envir = environment, filter = function(name) name %in% objects)
+  absent <- setdiff(objects, ls(environment, all.names = TRUE))
+  if (length(absent)) {
+    stop(sprintf("installed lazy-load data lacks: %s", toString(absent)), call. = FALSE)
+  }
+  directory <- tempfile("slinker-data-library")
+  dir.create(directory)
+  on.exit(unlink(directory, recursive = TRUE), add = TRUE)
+  tools:::makeLazyLoadDB(environment, file.path(directory, "Rdata"), compress = TRUE)
+  sets <- split(set_members, rep(factor(set_names, levels = set_names), set_lengths))
+  saveRDS(sets, file.path(directory, "Rdata.rds"))
+  read <- function(extension) {
+    path <- file.path(directory, paste0("Rdata.", extension))
+    readBin(path, "raw", file.size(path))
+  }
+  list(rdb = read("rdb"), rdx = read("rdx"), rds = read("rds"))
 }

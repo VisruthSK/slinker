@@ -22,8 +22,8 @@ use crate::ir::NamespaceOperation;
 use crate::metadata::{RelationField, relations};
 use crate::package::{
     BindingImage, BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource,
-    ComponentName, Digest, ImportSpec, NativeLibrary, NativeSafety, ObjectKind, PackageId,
-    PackageImage, PackageProvider, PrivateBindingImage, ResourcePath, SyntaxValidation,
+    ComponentName, DatasetName, Digest, ImportSpec, NativeLibrary, NativeSafety, ObjectKind,
+    PackageId, PackageImage, PackageProvider, PrivateBindingImage, ResourcePath, SyntaxValidation,
     TargetUniverse,
 };
 use crate::syntax::{
@@ -1845,7 +1845,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_dataset(&mut self, id: PackageId, dataset: &str) -> Result<()> {
+    pub(super) fn process_dataset(&mut self, id: PackageId, dataset: &DatasetName) -> Result<()> {
         if self.packages.is_external(id) {
             self.external.insert(id);
             return Ok(());
@@ -1853,9 +1853,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let image = self.image(id)?;
         let node = self.need_node(&Need::Dataset {
             package: id,
-            dataset: dataset.to_owned(),
+            dataset: dataset.clone(),
         });
-        if !image.index.datasets.iter().any(|name| name == dataset) {
+        if !image.index.data.defines(dataset) {
             self.diagnostic(
                 node,
                 id,
@@ -2141,6 +2141,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let index = self.packages.index(foreign)?;
+        if !reference.internal
+            && !index.exports.contains_key(&reference.symbol)
+            && index.data.defines(&reference.symbol)
+        {
+            self.dataset_access(from, foreign, reference);
+            return Ok(());
+        }
         let binding = if reference.internal {
             BindingName::from(reference.symbol.clone())
         } else {
@@ -2671,7 +2678,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         Ok(base.then(|| name.clone()))
     }
 
-    fn dynamic_package_name(
+    pub(super) fn dynamic_package_name(
         &mut self,
         from: NodeId,
         current: PackageId,
@@ -2711,7 +2718,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         );
     }
 
-    fn missing_package_call(
+    pub(super) fn missing_package_call(
         &mut self,
         from: NodeId,
         current: PackageId,
@@ -2858,15 +2865,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 &["topic", "package"],
                 "package",
             ),
-            "data"
-                if call
-                    .arg_names
-                    .iter()
-                    .flatten()
-                    .any(|name| name == "package") =>
-            {
-                self.installed_package_query(from, current, binding, call, &["package"], "package")
-            }
+            "data" => self.data_call(from, current, binding, call),
             _ => Ok(()),
         }
     }
@@ -3067,6 +3066,8 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     "rlang" => self.rlang_call(from, current, binding, call)?,
                     _ => {}
                 }
+            } else if self.is_search_path_data_call(current, image, lexical_environment, call)? {
+                self.data_call(from, current, binding, call)?;
             }
             return Ok(());
         }
@@ -3496,7 +3497,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         Ok(())
     }
 
-    fn discovered_package(
+    pub(super) fn discovered_package(
         &mut self,
         from: NodeId,
         current: PackageId,
@@ -3735,7 +3736,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 path: resource.to_string(),
             },
             Need::Dataset { dataset, .. } => NodeKind::Dataset {
-                name: dataset.clone(),
+                name: dataset.to_string(),
             },
             Need::S3Registration { registration, .. } => NodeKind::S3Registration {
                 generic: self.generic_label(&registration.generic),
@@ -3873,7 +3874,7 @@ pub(super) enum GuardVerdict {
     PrunedByUnselectedOptional(String),
 }
 
-enum Discovered {
+pub(super) enum Discovered {
     Linked(PackageId),
     Settled,
     Optional,

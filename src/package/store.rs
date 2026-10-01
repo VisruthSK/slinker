@@ -1,8 +1,8 @@
 use crate::cache::{Cache, CacheLocation};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, GenericName, InstalledPackage, LifecycleMetadata, NativeFacts,
-    NativeRoutineSummary, NativeSafety, PackageIdentity, PackageImage, PackageIndex,
+    BindingName, DatasetName, GenericName, InstalledPackage, LifecycleMetadata, NativeFacts,
+    NativeRoutineSummary, NativeSafety, PackageData, PackageIdentity, PackageImage, PackageIndex,
     PackageLocator,
 };
 use crate::r_worker::client::WorkerClient;
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-analysis-v9";
+const ANALYSIS_SCHEMA: &str = "slinker-analysis-v10";
 
 #[derive(Deserialize, Serialize)]
 struct CachedIndex {
@@ -301,7 +301,16 @@ impl PackageStore {
                 .into_iter()
                 .map(BindingName::from)
                 .collect(),
-            datasets: worker.datasets,
+            data: PackageData::new(
+                worker
+                    .data_sets
+                    .into_iter()
+                    .map(|(set, objects)| {
+                        (set, objects.into_iter().map(DatasetName::from).collect())
+                    })
+                    .collect(),
+                worker.data_files,
+            ),
             files: Vec::new(),
             has_sysdata: worker.has_sysdata,
         };
@@ -573,7 +582,7 @@ mod tests {
             }],
             lifecycle: LifecycleMetadata::default(),
             binding_names: Vec::new(),
-            datasets: Vec::new(),
+            data: PackageData::default(),
             files: Vec::new(),
             has_sysdata: false,
         }

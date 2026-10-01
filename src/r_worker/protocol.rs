@@ -2,10 +2,10 @@ use crate::package::{
     BindingImage, ExportMap, ImportSpec, NativeComponent, PrivateEnvironmentImage, S3Registration,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -113,7 +113,8 @@ pub struct WorkerPackageIndex {
     pub dynlibs: Vec<NativeComponent>,
     pub on_load: bool,
     pub binding_names: Vec<String>,
-    pub datasets: Vec<String>,
+    pub data_sets: BTreeMap<String, Vec<String>>,
+    pub data_files: bool,
     pub has_sysdata: bool,
 }
 
@@ -124,6 +125,13 @@ pub struct WorkerBinding {
     pub image_fingerprint: String,
     pub binding: BindingImage,
     pub private_environments: HashMap<String, PrivateEnvironmentImage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DataLibraryFiles {
+    pub rdb: Vec<u8>,
+    pub rdx: Vec<u8>,
+    pub rds: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,6 +154,12 @@ pub enum WorkerRequest {
         request_id: u64,
         package: Option<PackageSpec>,
         name: String,
+    },
+    DataLibrary {
+        request_id: u64,
+        package: PackageSpec,
+        objects: Vec<String>,
+        sets: BTreeMap<String, Vec<String>>,
     },
     SerializePayloads {
         request_id: u64,
@@ -188,6 +202,10 @@ pub enum WorkerResponse {
     DispatchGenerics {
         request_id: u64,
         generics: Vec<String>,
+    },
+    DataLibrary {
+        request_id: u64,
+        library: DataLibraryFiles,
     },
     Payloads {
         request_id: u64,

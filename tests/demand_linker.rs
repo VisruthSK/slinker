@@ -4,12 +4,13 @@ use slinker::analysis::{
     EdgeKind, ExplanationDag, GraphEdgeReasonExport, Linker, NodeKind, RejectCode,
 };
 use slinker::package::{
-    BindingImage, BindingOrigin, CanonicalSyntax, ClosureSource, Digest, DispatchSubject,
-    EmbeddedClosureSource, ExportMap, GenericName, ImportBinding, ImportSpec, InstalledPackage,
-    LifecycleMetadata, NativeComponent, NativeFacts, NativeLibrary, NativeRegistration,
-    NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectIssue, ObjectKind,
-    PackageIdentity, PackageImage, PackageIndex, PackageLocation, PackageProvider,
-    PrivateBindingImage, PrivateEnvironmentImage, S3Registration, SyntaxValidation,
+    BindingImage, BindingOrigin, CanonicalSyntax, ClosureSource, DatasetName, Digest,
+    DispatchSubject, EmbeddedClosureSource, ExportMap, GenericName, ImportBinding, ImportSpec,
+    InstalledPackage, LifecycleMetadata, NativeComponent, NativeFacts, NativeLibrary,
+    NativeRegistration, NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectIssue,
+    ObjectKind, PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
+    PackageProvider, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
+    SyntaxValidation,
 };
 use slinker::{Description, Error, Result, Target, TargetEnvironment};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -345,7 +346,7 @@ fn package_from_fixture(
             dynlibs,
             lifecycle: LifecycleMetadata::default(),
             binding_names: names,
-            datasets: Vec::new(),
+            data: slinker::package::PackageData::default(),
             files,
             has_sysdata: false,
         }),
@@ -5588,4 +5589,235 @@ fn lexical_retention_does_not_duplicate_a_registered_method() {
         !program_has_s3_registration(&plan, "foo", None, "print", "cls", "print.cls"),
         "an unregistered lexical method must not gain a registration"
     );
+}
+
+fn with_data(mut image: PackageImage, sets: &[(&str, &[&str])], file_backed: bool) -> PackageImage {
+    let sets = sets
+        .iter()
+        .map(|(set, objects)| {
+            (
+                (*set).to_owned(),
+                objects
+                    .iter()
+                    .map(|object| DatasetName::from(*object))
+                    .collect(),
+            )
+        })
+        .collect();
+    Arc::make_mut(&mut image.index).data = PackageData::new(sets, file_backed);
+    image
+}
+
+fn data_package(file_backed: bool) -> PackageImage {
+    with_data(
+        package("foo", &[("run", Some("run <- function() 1"))]),
+        &[
+            ("alpha", &["alpha"]),
+            ("beta", &["beta"]),
+            ("multi", &["left", "right"]),
+        ],
+        file_backed,
+    )
+}
+
+fn carried_objects(plan: &slinker::analysis::LinkIr, package: &str) -> Vec<String> {
+    plan.program()
+        .dataset_libraries()
+        .filter(|(id, _)| plan.program().package(*id).identity().name == package)
+        .flat_map(|(_, library)| library.objects().iter().map(ToString::to_string))
+        .collect()
+}
+
+fn carried_sets(plan: &slinker::analysis::LinkIr, package: &str) -> Vec<String> {
+    plan.program()
+        .dataset_libraries()
+        .filter(|(id, _)| plan.program().package(*id).identity().name == package)
+        .flat_map(|(_, library)| library.sets().keys().cloned())
+        .collect()
+}
+
+fn importing_root(source: &str) -> PackageImage {
+    package_with!(
+        "root",
+        &[("f", Some(source))],
+        Vec::new(),
+        export("f"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "Imports: foo\n",
+    )
+}
+
+fn data_use(source: &str) -> slinker::analysis::LinkIr {
+    Linker::new(
+        FakeProvider::new(vec![importing_root(source), data_package(false)]),
+        1,
+    )
+    .analyze("root")
+    .unwrap()
+}
+
+#[test]
+fn qualified_dataset_access_carries_only_the_reached_dataset() {
+    let plan = data_use("f <- function() foo::alpha");
+
+    assert!(plan.blockers().is_empty());
+    assert_eq!(carried_objects(&plan, "foo"), ["alpha"]);
+    assert!(carried_sets(&plan, "foo").is_empty());
+    assert!(
+        plan.program()
+            .relocations()
+            .iter()
+            .any(|relocation| matches!(
+                &relocation.target,
+                slinker::ir::RelocationTarget::Dataset { dataset, .. } if dataset == "alpha"
+            ))
+    );
+    assert!(
+        !plan
+            .provenance()
+            .nodes()
+            .iter()
+            .any(|node| { matches!(&node.kind, NodeKind::Dataset { name } if name == "beta") })
+    );
+}
+
+#[test]
+fn dataset_use_inside_a_linked_function_is_carried() {
+    let root = package("root", &[("f", Some("f <- function() foo::run()"))]);
+    let foo = with_data(
+        package("foo", &[("run", Some("run <- function() foo::beta"))]),
+        &[("alpha", &["alpha"]), ("beta", &["beta"])],
+        false,
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(plan.blockers().is_empty());
+    assert_eq!(carried_objects(&plan, "foo"), ["beta"]);
+}
+
+#[test]
+fn static_data_call_carries_the_whole_named_set() {
+    let plan = data_use("f <- function(e) data(multi, package = \"foo\", envir = e)");
+
+    assert!(plan.blockers().is_empty());
+    assert_eq!(carried_objects(&plan, "foo"), ["left", "right"]);
+    assert_eq!(carried_sets(&plan, "foo"), ["multi"]);
+    assert!(
+        plan.program()
+            .relocations()
+            .iter()
+            .any(|relocation| matches!(
+                relocation.target,
+                slinker::ir::RelocationTarget::DataArgument { .. }
+            ))
+    );
+}
+
+#[test]
+fn data_set_named_by_string_or_list_resolves_like_a_bare_name() {
+    for source in [
+        "f <- function() data(\"multi\", package = \"foo\")",
+        "f <- function() data(list = \"multi\", package = \"foo\")",
+        "f <- function() utils::data(multi, package = \"foo\")",
+    ] {
+        let plan = Linker::new(
+            FakeProvider::new(vec![
+                importing_root(source),
+                data_package(false),
+                utils_platform(),
+            ]),
+            1,
+        )
+        .analyze("root")
+        .unwrap();
+        assert!(plan.blockers().is_empty(), "{source}");
+        assert_eq!(carried_sets(&plan, "foo"), ["multi"], "{source}");
+    }
+}
+
+#[test]
+fn dynamic_or_unsupported_data_forms_block() {
+    for (source, code) in [
+        (
+            "f <- function(nm) data(list = nm, package = \"foo\")",
+            RejectCode::DynamicLookup,
+        ),
+        (
+            "f <- function() data(c(\"alpha\", \"beta\"), package = \"foo\")",
+            RejectCode::DynamicLookup,
+        ),
+        (
+            "f <- function() data(package = \"foo\")",
+            RejectCode::DynamicLookup,
+        ),
+        (
+            "f <- function(pkg) data(alpha, package = pkg)",
+            RejectCode::DynamicPackageDiscovery,
+        ),
+        (
+            "f <- function() data(alpha, package = \"foo\", lib.loc = \"x\")",
+            RejectCode::UnsupportedRootTransformation,
+        ),
+        (
+            "f <- function() data(missing_set, package = \"foo\")",
+            RejectCode::UnresolvedBinding,
+        ),
+    ] {
+        let plan = data_use(source);
+        assert!(
+            plan.blockers().iter().any(|blocker| blocker.code == code),
+            "{source}: {:?}",
+            plan.blockers()
+        );
+        assert!(
+            plan.program().dataset_libraries().next().is_none(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn file_backed_data_cannot_be_carried_and_blocks() {
+    let plan = Linker::new(
+        FakeProvider::new(vec![
+            importing_root("f <- function() data(alpha, package = \"foo\")"),
+            data_package(true),
+        ]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|blocker| blocker.code == RejectCode::UnsupportedObject)
+    );
+}
+
+#[test]
+fn exported_binding_wins_over_a_dataset_of_the_same_name() {
+    let root = package("root", &[("f", Some("f <- function() foo::alpha"))]);
+    let foo = with_data(
+        package("foo", &[("alpha", Some("alpha <- function() 1"))]),
+        &[("alpha", &["alpha"])],
+        false,
+    );
+    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
+        .analyze("root")
+        .unwrap();
+
+    assert!(retained_binding(&plan, "foo", "alpha"));
+    assert!(plan.program().dataset_libraries().next().is_none());
+}
+
+#[test]
+fn unreached_datasets_are_never_carried() {
+    let plan = data_use("f <- function() 1");
+
+    assert!(plan.program().dataset_libraries().next().is_none());
 }

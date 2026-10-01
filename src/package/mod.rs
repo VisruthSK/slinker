@@ -17,8 +17,8 @@ pub use image::{
 pub use index::{
     ExportMap, GenericSpec, ImportBinding, ImportSpec, LifecycleMetadata, NameLookup,
     NativeComponent, NativeFacts, NativeInterface, NativeLibrary, NativeRegistration,
-    NativeRoutineSummary, NativeRoutines, NativeSafety, NativeSymbolBinding, PackageIndex,
-    S3Registration,
+    NativeRoutineSummary, NativeRoutines, NativeSafety, NativeSymbolBinding, PackageData,
+    PackageIndex, S3Registration,
 };
 pub use locator::PackageLocator;
 pub(crate) use locator::fingerprint_image;
@@ -27,4 +27,6 @@ pub use store::{
 };
 pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUniverse};
 
-pub use names::{BindingName, ClassName, ComponentName, GenericName, PackageName, ResourcePath};
+pub use names::{
+    BindingName, ClassName, ComponentName, DatasetName, GenericName, PackageName, ResourcePath,
+};

@@ -14,7 +14,7 @@ use protocol::{
     PROTOCOL_VERSION, WorkerErrorCode, WorkerFailure, WorkerPackageIdentity, WorkerPackageIndex,
     WorkerRequest, WorkerResponse,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -257,6 +257,49 @@ impl WorkerRuntime {
         }
         self.binding_value(package, name)
             .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
+    }
+
+    fn data_library(
+        &mut self,
+        package: &protocol::PackageSpec,
+        objects: &[String],
+        sets: &BTreeMap<String, Vec<String>>,
+    ) -> std::result::Result<protocol::DataLibraryFiles, WorkerOperationError> {
+        let forced = |error: InspectionError| {
+            WorkerOperationError::with(WorkerErrorCode::BindingForce)(error)
+        };
+        let root = self
+            .context(package)
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?
+            .image
+            .elt("root")
+            .map_err(InspectionError::from)
+            .map_err(forced)?;
+        let set_lengths = sets
+            .values()
+            .map(|members| f64::from(u32::try_from(members.len()).unwrap_or(u32::MAX)))
+            .collect::<Vec<_>>();
+        let library = harp::RFunction::new("", ".slinker_data_library")
+            .add(root)
+            .add(objects.to_vec())
+            .add(sets.keys().cloned().collect::<Vec<_>>())
+            .add(&set_lengths)
+            .add(sets.values().flatten().cloned().collect::<Vec<_>>())
+            .call()
+            .map_err(InspectionError::from)
+            .map_err(forced)?;
+        let bytes = |name: &str| {
+            library
+                .elt(name)
+                .map_err(InspectionError::from)
+                .and_then(|value| Vec::<u8>::try_from(&value).map_err(InspectionError::from))
+                .map_err(forced)
+        };
+        Ok(protocol::DataLibraryFiles {
+            rdb: bytes("rdb")?,
+            rdx: bytes("rdx")?,
+            rds: bytes("rds")?,
+        })
     }
 
     fn dispatch_generics(
@@ -756,9 +799,23 @@ fn worker_package_index(
             .iter()
             .any(|name| name == ".onLoad"),
         binding_names: strings_field(context, "binding_names")?,
-        datasets: strings_field(context, "dataset_names")?,
+        data_sets: data_sets(context)?,
+        data_files: bool::try_from(field(context, "data_files")?)?,
         has_sysdata: !strings_field(context, "sysdata_names")?.is_empty(),
     })
+}
+
+fn data_sets(
+    context: &harp::object::RObject,
+) -> std::result::Result<BTreeMap<String, Vec<String>>, InspectionError> {
+    let sets = field(context, "data_sets")?;
+    names(sets.sexp)
+        .into_iter()
+        .map(|set| {
+            let objects = strings_field(&sets, &set)?;
+            Ok((set, objects))
+        })
+        .collect()
 }
 
 fn native_library(
@@ -1639,6 +1696,27 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                     "Harp worker must receive hello before semantic requests",
                     Some(&package),
                     Some(name),
+                ),
+            },
+            WorkerRequest::DataLibrary {
+                request_id,
+                package,
+                objects,
+                sets,
+            } => match runtime.as_mut() {
+                Some(runtime) => match runtime.data_library(&package, &objects, &sets) {
+                    Ok(library) => WorkerResponse::DataLibrary {
+                        request_id,
+                        library,
+                    },
+                    Err(error) => operation_failure(Some(request_id), error, Some(&package), None),
+                },
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    Some(&package),
+                    None,
                 ),
             },
             WorkerRequest::DispatchGenerics {

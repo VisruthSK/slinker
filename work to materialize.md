@@ -90,11 +90,6 @@ acceptance cases here.
 Each item can make a successful build behave differently from the original, and each gets a test
 that fails before its fix.
 
-- Linked datasets: nothing requests `Need::Dataset` today, so `pkg::dataset`,
-  `data(x, package = "pkg")`, and lazy data used inside a Linked package are not carried. Demand the
-  reachable datasets, copy them into a lazy-load database under the generated package, attach them
-  as the package's lazy data environment for `::`, and relocate `data(x, package = )`. A dataset
-  reached only dynamically blocks.
 - Lexical S3 retention reaches calls and binary operators only. Dispatch through unary operators,
   `[`, `[[`, `$`, `@`, and replacement forms (`names(x) <- v`) needs Oak call facts for those
   syntax forms; until then a method reached only that way is a stub that fails loudly.

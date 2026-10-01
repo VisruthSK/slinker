@@ -1,10 +1,10 @@
 use crate::package::{CanonicalSyntax, InstalledPackage};
 use crate::r_worker::protocol::{
-    NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization, PayloadSite,
-    PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
+    DataLibraryFiles, NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization,
+    PayloadSite, PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
 };
 use crate::{Error, Result, Target, TargetEnvironment};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -165,6 +165,27 @@ impl WorkerClient {
                 generics,
             } if response_id == request_id => Ok(generics),
             response => Err(worker_error("dispatch generics", response)),
+        }
+    }
+
+    pub(crate) fn data_library(
+        &mut self,
+        package: PackageSpec,
+        objects: Vec<String>,
+        sets: BTreeMap<String, Vec<String>>,
+    ) -> Result<DataLibraryFiles> {
+        let request_id = self.request_id();
+        match self.exchange(&WorkerRequest::DataLibrary {
+            request_id,
+            package,
+            objects,
+            sets,
+        })? {
+            WorkerResponse::DataLibrary {
+                request_id: response_id,
+                library,
+            } if response_id == request_id => Ok(library),
+            response => Err(worker_error("data library", response)),
         }
     }
 
@@ -330,6 +351,16 @@ fn request_context(request: &WorkerRequest) -> String {
             package
                 .as_ref()
                 .map_or("base", |package| package.name.as_str())
+        ),
+        WorkerRequest::DataLibrary {
+            request_id,
+            package,
+            objects,
+            ..
+        } => format!(
+            "request {request_id} data library of {} ({} objects)",
+            package.name,
+            objects.len()
         ),
         WorkerRequest::SerializePayloads {
             request_id,

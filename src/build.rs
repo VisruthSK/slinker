@@ -8,8 +8,8 @@ use crate::ir::{
 use crate::package::{CanonicalSyntax, PackageId};
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{
-    ClosurePatchSpec, NamespaceImageSpec, ObjectStepSpec, PackageSpec, PayloadSerialization,
-    PayloadSite, PayloadSpec, SerializedPayload,
+    ClosurePatchSpec, DataLibraryFiles, NamespaceImageSpec, ObjectStepSpec, PackageSpec,
+    PayloadSerialization, PayloadSite, PayloadSpec, SerializedPayload,
 };
 use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +65,7 @@ pub struct BuildContext {
 struct FrozenInputs {
     bundles: Vec<CheckedPayloadBundle>,
     resources: BTreeMap<ResourceId, PathBuf>,
+    datasets: BTreeMap<PackageId, DataLibraryFiles>,
     code: RelocatedCode,
     _directory: TempDir,
 }
@@ -138,6 +139,22 @@ impl BuildContext {
             bundles = check_payload_bundles(program, serialized)?;
         }
 
+        let mut datasets = BTreeMap::new();
+        for (package, library) in program.dataset_libraries() {
+            let sets = library
+                .sets()
+                .iter()
+                .map(|(set, objects)| {
+                    (
+                        set.clone(),
+                        objects.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let objects = library.objects().iter().map(ToString::to_string).collect();
+            datasets.insert(package, worker.data_library(spec(package), objects, sets)?);
+        }
+
         let directory = tempfile::Builder::new()
             .prefix("slinker-frozen-")
             .tempdir()?;
@@ -155,6 +172,7 @@ impl BuildContext {
             bundles,
             code,
             resources,
+            datasets,
             _directory: directory,
         })
     }
@@ -206,6 +224,10 @@ impl MaterializationContext<'_> {
 
     fn resource(&self, resource: ResourceId) -> &Path {
         &self.frozen.resources[&resource]
+    }
+
+    fn dataset_library(&self, package: PackageId) -> &DataLibraryFiles {
+        &self.frozen.datasets[&package]
     }
 
     fn code(&self) -> &RelocatedCode {
@@ -377,6 +399,7 @@ pub fn materialize(
     validate_r_source(&mut worker, &generated)?;
     fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
     copy_linked_resources(buildable.program, materialization, &package_root)?;
+    copy_dataset_libraries(buildable.program, materialization, &package_root)?;
     fs::rename(&package_root, output)?;
     Ok(GeneratedPackage {
         path: output.to_path_buf(),
@@ -491,6 +514,12 @@ fn generate_r_source(
                 r_string(&native.alias),
                 r_string(library)
             );
+        }
+        if program
+            .dataset_libraries()
+            .any(|(library, _)| library == namespace.package)
+        {
+            emit!(out, "    .slinker_lazydata(ns, {})", r_string(name));
         }
         emit!(
             out,
@@ -969,6 +998,33 @@ fn copy_linked_resources(
     Ok(())
 }
 
+fn copy_dataset_libraries(
+    program: &ProgramIr,
+    context: MaterializationContext<'_>,
+    output: &Path,
+) -> Result<(), std::io::Error> {
+    for (package, _) in program.dataset_libraries() {
+        let identity = program.package(package).identity();
+        let files = context.dataset_library(package);
+        let root = output
+            .join("inst/slinker/datalib")
+            .join(identity.name.as_str());
+        let data = root.join("data");
+        fs::create_dir_all(&data)?;
+        fs::write(
+            root.join("DESCRIPTION"),
+            format!(
+                "Package: {}\nVersion: {}\n",
+                identity.name, identity.version
+            ),
+        )?;
+        fs::write(data.join("Rdata.rdb"), &files.rdb)?;
+        fs::write(data.join("Rdata.rdx"), &files.rdx)?;
+        fs::write(data.join("Rdata.rds"), &files.rds)?;
+    }
+    Ok(())
+}
+
 fn copy_entry(source: &Path, target: &Path) -> Result<(), std::io::Error> {
     if source.is_dir() {
         fs::create_dir_all(target)?;
@@ -1052,10 +1108,17 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
   setNamespaceInfo(namespace, "path", "")
   setNamespaceInfo(namespace, "dynlibs", character())
   setNamespaceInfo(namespace, "DLLs", list())
+  lazydata <- new.env(hash = TRUE, parent = baseenv())
+  attr(lazydata, "name") <- paste0("lazydata:", name)
+  setNamespaceInfo(namespace, "lazydata", lazydata)
   setNamespaceInfo(namespace, "S3methods", matrix(NA_character_, 0L, 4L))
   namespace$.__S3MethodsTable__. <- new.env(hash = TRUE, parent = baseenv())
   .Internal(registerNamespace(key, namespace))
   namespace
+}
+.slinker_lazydata <- function(namespace, package) {
+  directory <- system.file("slinker", "datalib", package, "data", package = .slinker_root_package, mustWork = TRUE)
+  lazyLoad(file.path(directory, "Rdata"), envir = getNamespaceInfo(namespace, "lazydata"))
 }
 .slinker_load_native <- function(namespace, package, component, alias, library, symbols) {
   path <- system.file("slinker", "resources", package, library, package = .slinker_root_package, mustWork = TRUE)

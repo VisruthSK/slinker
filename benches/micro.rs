@@ -186,7 +186,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
             dynlibs: Vec::new(),
             lifecycle: LifecycleMetadata::default(),
             binding_names,
-            datasets: Vec::new(),
+            data: slinker::package::PackageData::default(),
             files: Vec::new(),
             has_sysdata: false,
         }),

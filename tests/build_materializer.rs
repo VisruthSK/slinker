@@ -391,6 +391,162 @@ fn guard_on_a_required_package_that_is_not_imported_runs_its_branch() {
     run_r(&r_home, &runtime, behavior);
 }
 
+fn write_dataset_package(r_home: &Path, root: &Path, name: &str, lazy: bool, code: &str) {
+    write_package(
+        root,
+        name,
+        &format!("LazyData: {}\n", if lazy { "true" } else { "false" }),
+        "export(read_alpha, load_multi)\n",
+        code,
+    );
+    let data = root.join("data");
+    fs::create_dir_all(&data).expect("data directory");
+    let directory = data.display().to_string().replace('\\', "/");
+    run_r(
+        r_home,
+        "",
+        &format!(
+            "alpha <- structure(list(a = 1:3, b = letters[1:3]), class = c('tbl_x', 'data.frame'), row.names = 1:3, note = 'hi'); beta <- c(x = 1.5); gamma <- 3; unused_big <- 1:10; save(alpha, file = '{directory}/alpha.rda'); save(beta, gamma, file = '{directory}/multi.rda'); save(unused_big, file = '{directory}/unused_big.rda')"
+        ),
+    );
+}
+
+const DATASET_FUNCTIONS: &str = concat!(
+    "read_alpha <- function() dsdata::alpha\n",
+    "load_multi <- function(env) {\n",
+    "  data(multi, package = 'dsdata', envir = env)\n",
+    "  mget(c('beta', 'gamma'), envir = env)\n",
+    "}\n",
+);
+
+#[test]
+fn linked_datasets_behave_as_in_the_original_and_only_reached_ones_are_carried() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency = fixture.path().join("dsdata");
+    write_dataset_package(&r_home, &dependency, "dsdata", true, DATASET_FUNCTIONS);
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency, &build_library);
+
+    let root = fixture.path().join("dsroot");
+    write_package(
+        &root,
+        "dsroot",
+        "Imports: dsdata\n",
+        "importFrom(dsdata, read_alpha, load_multi)\nexport(direct, loaded, via_linked, via_linked_data)\n",
+        concat!(
+            "direct <- function() dsdata::alpha\n",
+            "loaded <- function() {\n",
+            "  env <- new.env()\n",
+            "  name <- data(multi, package = 'dsdata', envir = env)\n",
+            "  list(name, sort(ls(env)), env$beta, env$gamma)\n",
+            "}\n",
+            "via_linked <- function() read_alpha()\n",
+            "via_linked_data <- function() load_multi(new.env())\n",
+        ),
+    );
+    let output = fixture.path().join("generated-dsroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root)
+        .output()
+        .expect("run dataset build");
+    assert_success(&result, "slinker build dataset fixture");
+
+    let behavior = concat!(
+        "library(dsroot); ",
+        "expected <- structure(list(a = 1:3, b = letters[1:3]), class = c('tbl_x', 'data.frame'), row.names = 1:3, note = 'hi'); ",
+        "stopifnot(identical(direct(), expected), identical(via_linked(), expected), identical(direct(), direct())); ",
+        "stopifnot(identical(loaded(), list('multi', c('beta', 'gamma'), c(x = 1.5), 3))); ",
+        "stopifnot(identical(via_linked_data(), list(beta = c(x = 1.5), gamma = 3)))",
+    );
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency, &original);
+    install_package(&r_home, &root, &original);
+    run_r(&r_home, &original, behavior);
+
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &output, &validation);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency, &installed);
+    install_package(&r_home, &output, &installed);
+
+    let artifact = concat!(
+        "directory <- system.file('slinker', 'datalib', 'dsdata', 'data', package = 'dsroot'); ",
+        "objects <- new.env(); lazyLoad(file.path(directory, 'Rdata'), envir = objects); ",
+        "stopifnot(identical(sort(ls(objects)), c('alpha', 'beta', 'gamma'))); ",
+        "stopifnot(identical(names(readRDS(file.path(directory, 'Rdata.rds'))), 'multi')); ",
+        "imports <- parent.env(asNamespace('dsroot')); linked <- environment(get('read_alpha', envir = imports)); ",
+        "stopifnot(identical(unname(getNamespaceName(linked)), 'dsdata'), identical(getExportedValue(linked, 'alpha'), direct()))",
+    );
+    run_r(&r_home, &validation, &format!("{behavior}; {artifact}"));
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('dsdata'); {behavior}; {artifact}"),
+    );
+}
+
+#[test]
+fn dynamic_or_file_backed_dataset_access_blocks_the_build() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    for (name, lazy, access, expected) in [
+        (
+            "dsdata",
+            true,
+            "pick <- function(name) data(list = name, package = 'dsdata')\n",
+            "DynamicLookup",
+        ),
+        (
+            "dsfiles",
+            false,
+            "pick <- function() data(alpha, package = 'dsfiles')\n",
+            "UnsupportedObject",
+        ),
+    ] {
+        let dependency = fixture.path().join(name);
+        write_dataset_package(
+            &r_home,
+            &dependency,
+            name,
+            lazy,
+            &DATASET_FUNCTIONS.replace("dsdata", name),
+        );
+        let build_library = fixture.path().join(format!("{name}-library"));
+        fs::create_dir(&build_library).expect("build library");
+        install_package(&r_home, &dependency, &build_library);
+        let root = fixture.path().join(format!("{name}-root"));
+        write_package(
+            &root,
+            &format!("{name}root"),
+            &format!("Imports: {name}\n"),
+            &format!("importFrom({name}, read_alpha)\nexport(pick)\n"),
+            access,
+        );
+        let output = fixture.path().join(format!("generated-{name}"));
+        let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+            .args(["build", "--lib"])
+            .arg(&build_library)
+            .arg("--output")
+            .arg(&output)
+            .arg(&root)
+            .output()
+            .expect("run blocked dataset build");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(!output.exists(), "{name} published a blocked build");
+    }
+}
+
 #[test]
 fn linked_on_load_outside_the_namespace_environment_still_runs() {
     let r_home = discover_r_home();

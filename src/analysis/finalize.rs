@@ -7,10 +7,10 @@ use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
     BindingId, BindingName, ClosureHome, CodeId, ExportTable, ExternalBindingAccess,
     ExternalPackageContract, FinalizedNamespace, GenericHome, ImportRecordIr, ImportSlotIr,
-    InvalidPayloadDependency, InvalidRelocation, MaterializedRole, MaterializedSlot,
-    MaterializedSlotSource, NamespaceId, ObjectStep, PackageRole as LinkedPackageRole,
-    PayloadDependency, ProgramBuilder, ProgramIr, RelocationTarget, RemovedImportIr,
-    RootArtifactIr, TargetContract,
+    InvalidDataset, InvalidPayloadDependency, InvalidRelocation, MaterializedRole,
+    MaterializedSlot, MaterializedSlotSource, NamespaceId, ObjectStep,
+    PackageRole as LinkedPackageRole, PayloadDependency, ProgramBuilder, ProgramIr,
+    RelocationTarget, RemovedImportIr, RootArtifactIr, TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{NativeComponent, PackageAvailability, PackageId, PackageProvider};
@@ -570,6 +570,30 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     package: *package,
                     component: component.clone(),
                 },
+                PendingRelocation::DatasetAccess {
+                    package, dataset, ..
+                } => {
+                    if let Err(invalid) = builder.carry_dataset(*package, dataset.clone()) {
+                        issues.push(FinalizationIssue::InvalidDataset(invalid));
+                        continue;
+                    }
+                    RelocationTarget::Dataset {
+                        package: *package,
+                        dataset: dataset.clone(),
+                    }
+                }
+                PendingRelocation::DataArgument { package, sets, .. } => {
+                    let data = &self.images[package].index.data;
+                    let carried = sets.iter().try_for_each(|set| {
+                        let objects = data.set(set).unwrap_or_default().to_vec();
+                        builder.carry_data_set(*package, set.clone(), objects)
+                    });
+                    if let Err(invalid) = carried {
+                        issues.push(FinalizationIssue::InvalidDataset(invalid));
+                        continue;
+                    }
+                    RelocationTarget::DataArgument { package: *package }
+                }
                 PendingRelocation::DescriptionArgument { package, .. } => {
                     RelocationTarget::DescriptionArgument {
                         description: builder.add_resource(crate::ir::ResourceIr {
@@ -1059,6 +1083,7 @@ pub(super) enum FinalizationIssue {
         requirement: Relation,
     },
     InvalidRelocation(InvalidRelocation),
+    InvalidDataset(InvalidDataset),
     Description(String),
     PayloadOutsideProgram {
         package: String,
@@ -1119,6 +1144,9 @@ impl std::fmt::Display for FinalizationIssue {
                 "External package `{package}` has no declared DESCRIPTION requirement in the retained program"
             ),
             Self::InvalidRelocation(invalid) => invalid.fmt(f),
+            Self::InvalidDataset(InvalidDataset::NotLinked(_)) => {
+                f.write_str("a dataset can be carried only for a Linked package")
+            }
             Self::UnsatisfiedRequirement {
                 identity,
                 requirement,
