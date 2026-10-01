@@ -1,6 +1,6 @@
-use super::{
-    BuildContextError, binding_reference, namespace_expression, namespace_get, native_library,
-    r_string,
+use super::BuildContextError;
+use super::emit::{
+    binding_reference, namespace_expression, namespace_get, native_library, r_string,
 };
 use crate::ir::{CodeId, ExternalBindingAccess, ProgramIr, RelocationTarget};
 use crate::package::{CanonicalSyntax, Digest, SyntaxValidation};
