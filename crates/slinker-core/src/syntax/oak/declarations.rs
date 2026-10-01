@@ -1,6 +1,7 @@
 use super::context::OakParseContext;
 use super::scan::static_arg;
 use super::{LexicalScopes, ast_span, ast_text, identifier_callee, text_offset};
+use crate::package::{BindingName, PackageName};
 use crate::syntax::facts::{
     BindingDeclaration, DeclaredCallable, DeclaredDomain, LexicalScopeId, SemanticIssue,
     SemanticIssueKind, StaticArg,
@@ -162,8 +163,8 @@ pub(super) fn declared_callable(text: &str) -> Option<DeclaredCallable> {
     };
     let symbol = |candidate: &str| matches!(static_arg(candidate), Some(StaticArg::Symbol(symbol)) if symbol == candidate);
     (package.is_none_or(symbol) && symbol(name)).then(|| DeclaredCallable {
-        package: package.map(str::to_owned),
-        name: name.to_owned(),
+        package: package.map(PackageName::from),
+        name: BindingName::from(name),
     })
 }
 

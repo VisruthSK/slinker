@@ -4,9 +4,9 @@ use super::{InspectionError, InspectionResult, field, list_field, string_field, 
 use harp::object::RObject;
 use harp::{RFunctionExt, RObjectExt};
 use slinker_core::package::{
-    BindingName, DataSetName, DatasetName, Digest, ExportMap, ExportName, ImportBinding,
-    ImportSpec, NameLookup, NativeComponent, NativeLibrary, NativeRegistration, NativeRoutines,
-    NativeSafety, NativeSymbolBinding, PackageName, S3Registration,
+    BindingName, DataSetId, DatasetName, Digest, ExportMap, ExportName, ImportBinding, ImportSpec,
+    NameLookup, NativeComponent, NativeLibrary, NativeRegistration, NativeRoutines, NativeSafety,
+    NativeSymbolBinding, PackageName, S3Registration,
 };
 use std::collections::BTreeMap;
 
@@ -203,13 +203,13 @@ fn dynlibs(context: &RObject, namespace: &RObject) -> InspectionResult<Vec<Nativ
         .collect()
 }
 
-fn data_sets(context: &RObject) -> InspectionResult<BTreeMap<DataSetName, Vec<DatasetName>>> {
+fn data_sets(context: &RObject) -> InspectionResult<BTreeMap<DataSetId, Vec<DatasetName>>> {
     let sets = field(context, "data_sets")?;
     names(sets.sexp)
         .into_iter()
         .map(|set| {
             let objects = typed_strings(&sets, &set)?;
-            Ok((DataSetName::from(set), objects))
+            Ok((DataSetId::from(set), objects))
         })
         .collect()
 }

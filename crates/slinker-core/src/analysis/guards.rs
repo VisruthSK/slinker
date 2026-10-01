@@ -1,7 +1,7 @@
 use super::state::{AnalyzerState, ParsedSite};
 use crate::analysis::{NodeId, RejectCode};
 use crate::metadata::{RelationField, relations};
-use crate::package::{ImportSpec, PackageId, PackageImage, PackageProvider};
+use crate::package::{ImportSpec, PackageId, PackageImage, PackageName, PackageProvider};
 use crate::syntax::{PackageGuard, Span};
 use crate::{Error, Result};
 use std::collections::HashSet;
@@ -81,7 +81,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             if self.package_is_suggested_only(owner, package)? {
-                return Ok(GuardVerdict::PrunedByUnselectedOptional(package.to_owned()));
+                return Ok(GuardVerdict::PrunedByUnselectedOptional(package.clone()));
             }
             let imported = image.index.imports.iter().any(|import| match import {
                 ImportSpec::All {
@@ -181,7 +181,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 pub(super) enum GuardVerdict {
     Active,
     Pruned,
-    PrunedByUnselectedOptional(String),
+    PrunedByUnselectedOptional(PackageName),
 }
 
 pub(super) struct DeclaredDependencies {

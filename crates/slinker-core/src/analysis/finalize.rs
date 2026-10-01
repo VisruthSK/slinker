@@ -23,7 +23,8 @@ use crate::package::PackageIdentity;
 use crate::package::PackageImage;
 use crate::package::PackageSources;
 use crate::package::{
-    EnvironmentLabel, NativeComponent, PackageAvailability, PackageId, PackageName, PackageProvider,
+    EnvironmentKind, EnvironmentLabel, NativeComponent, PackageAvailability, PackageId,
+    PackageName, PackageProvider,
 };
 use crate::source::generated_description;
 use crate::syntax::{SourceKey, SourceOrigin, Sources};
@@ -718,12 +719,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .filter(|&(_, &binding)| builder.binding_is_payload(binding))
                 .map(|(binding, _)| binding.as_str());
             for label in reachable_environment_labels(image, payloads) {
-                let Some(target) = label
-                    .strip_prefix("namespace:")
-                    .filter(|&target| target != "base")
-                else {
+                let EnvironmentKind::Namespace(target) = label.kind() else {
                     continue;
                 };
+                if target == "base" {
+                    continue;
+                }
                 let Some(dependency) = namespace_ids.get(target) else {
                     issues.push(FinalizationIssue::PayloadOutsideProgram {
                         package: name.to_owned(),

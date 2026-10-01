@@ -1,3 +1,4 @@
+use crate::package::BindingName;
 use crate::syntax::facts::{
     ActiveBindingDef, CallSite, CalleeKind, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef,
     NameRefKind, NamespaceEnumeration, NamespaceInfoRead, NamespaceInfoReceiver, PackageRef,
@@ -584,7 +585,9 @@ fn namespace_info_receiver(text: &str, receiver: &AnyRExpression) -> NamespaceIn
     match sole_positional_argument(call)
         .and_then(|argument| static_arg(ast_text(text, &argument).trim()))
     {
-        Some(StaticArg::String(package)) if named => NamespaceInfoReceiver::Namespace(package),
+        Some(StaticArg::String(package)) if named => {
+            NamespaceInfoReceiver::Namespace(package.into())
+        }
         _ => NamespaceInfoReceiver::Computed,
     }
 }
@@ -719,9 +722,9 @@ fn name_references(
                 });
             Some(NameRef {
                 name: if replaced {
-                    format!("{}<-", live_use.name)
+                    BindingName::from(format!("{}<-", live_use.name))
                 } else {
-                    live_use.name.clone()
+                    BindingName::from(live_use.name.as_str())
                 },
                 kind,
                 phase: live_use.phase,
@@ -812,8 +815,8 @@ fn namespace_access_facts(
             )
         });
         package_refs.push(PackageRef {
-            package: access.package().to_owned(),
-            symbol: access.symbol().to_owned(),
+            package: access.package().into(),
+            symbol: access.symbol().into(),
             internal,
             guards: Vec::new(),
             span: Span::new(*source, start, access_end),
@@ -885,7 +888,7 @@ fn binary_operator_facts(
         if operator.len() > 2 && operator.starts_with('%') && operator.ends_with('%') {
             let range = operator_token.text_trimmed_range();
             references.push(NameRef {
-                name: operator.clone(),
+                name: BindingName::from(operator.as_str()),
                 kind: NameRefKind::External,
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
@@ -1197,10 +1200,10 @@ fn static_environment(context: &OakParseContext, call: &LiveCall) -> Option<Stat
         call.raw.args.first()?.static_arg.as_ref()?,
     ) {
         ("asNamespace" | "getNamespace", StaticArg::String(package)) => {
-            Some(StaticEnvironment::Namespace(package.clone()))
+            Some(StaticEnvironment::Namespace(package.into()))
         }
         ("environment", StaticArg::Symbol(binding)) => {
-            Some(StaticEnvironment::ClosureBinding(binding.clone()))
+            Some(StaticEnvironment::ClosureBinding(binding.into()))
         }
         _ => None,
     }

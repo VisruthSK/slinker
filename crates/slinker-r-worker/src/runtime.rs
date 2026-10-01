@@ -4,7 +4,7 @@ use super::{Coded, InspectionError, WorkerOperationError, field, protocol};
 use super::{InspectionResult, OperationResult};
 use harp::{RFunctionExt, RObjectExt};
 use protocol::{WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse};
-use slinker_core::package::{BindingName, BindingOrigin, DataSetName, DatasetName};
+use slinker_core::package::{BindingName, BindingOrigin, DataSetId, DatasetName};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 
@@ -241,7 +241,7 @@ impl WorkerRuntime {
         &mut self,
         package: &protocol::PackageSpec,
         objects: &[DatasetName],
-        sets: &BTreeMap<DataSetName, Vec<DatasetName>>,
+        sets: &BTreeMap<DataSetId, Vec<DatasetName>>,
     ) -> OperationResult<protocol::DataLibraryFiles> {
         let root = self
             .context(package)

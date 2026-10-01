@@ -29,7 +29,7 @@ pub use store::{
 pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUniverse};
 
 pub use names::{
-    BindingName, ClassName, ComponentName, DataSetName, DatasetName, EnvironmentKind,
+    BindingName, ClassName, ComponentName, DataSetId, DatasetName, EnvironmentKind,
     EnvironmentLabel, ExportName, GenericLabel, GenericName, MemberPath, PackageName, ResourcePath,
     SymbolName,
 };

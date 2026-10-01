@@ -1,5 +1,5 @@
 use crate::package::SyntaxValidation;
-use crate::package::{CanonicalSyntax, DataSetName, DatasetName, InstalledPackage};
+use crate::package::{CanonicalSyntax, DataSetId, DatasetName, InstalledPackage};
 use crate::worker::protocol::WorkerBinding;
 use crate::worker::protocol::WorkerPackageIndex;
 use crate::worker::protocol::{
@@ -202,7 +202,7 @@ impl WorkerClient {
         &mut self,
         package: PackageSpec,
         objects: Vec<DatasetName>,
-        sets: BTreeMap<DataSetName, Vec<DatasetName>>,
+        sets: BTreeMap<DataSetId, Vec<DatasetName>>,
     ) -> Result<DataLibraryFiles> {
         self.call(
             "data library",

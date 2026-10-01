@@ -1,6 +1,4 @@
-use super::arguments::{
-    matched_arg_index, namespace_formals, namespace_target, reflective_name_formals,
-};
+use super::arguments::{matched_arg_index, namespace_formal, reflective_name_formals};
 use super::guards::GuardVerdict;
 use super::object_world::{ClosureId, EnvironmentId, InstalledObject, ObjectId};
 use super::resolution::{BindingTarget, Resolution};
@@ -840,22 +838,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> AbstractValue {
         let name = call.callee.as_str();
         if context.specialized
-            && let Some(AbstractValue::String(package)) = construction_argument(
-                call,
-                arguments,
-                namespace_formals(name),
-                namespace_target(name),
-            )
+            && let Some(AbstractValue::String(package)) = namespace_formal(name)
+                .and_then(|formal| construction_argument(call, arguments, &[formal], formal))
         {
             self.reflection
                 .record_contextual_namespace_call(span, package);
         }
-        match construction_argument(
-            call,
-            arguments,
-            namespace_formals(name),
-            namespace_target(name),
-        ) {
+        match namespace_formal(name)
+            .and_then(|formal| construction_argument(call, arguments, &[formal], formal))
+        {
             Some(AbstractValue::String(package))
                 if matches!(name, "getNamespace" | "asNamespace")
                     && package == self.packages.name(context.package) =>

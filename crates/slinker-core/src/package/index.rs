@@ -1,6 +1,6 @@
 use crate::Description;
 use crate::package::{
-    BindingName, ClassName, ComponentName, DataSetName, DatasetName, ExportName, GenericName,
+    BindingName, ClassName, ComponentName, DataSetId, DatasetName, ExportName, GenericName,
     PackageIdentity, PackageName, ResourcePath, SymbolName,
 };
 use serde::{Deserialize, Serialize};
@@ -204,12 +204,12 @@ pub struct LifecycleMetadata {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PackageData {
-    sets: BTreeMap<DataSetName, Vec<DatasetName>>,
+    sets: BTreeMap<DataSetId, Vec<DatasetName>>,
     file_backed: bool,
 }
 
 impl PackageData {
-    pub fn new(sets: BTreeMap<DataSetName, Vec<DatasetName>>, file_backed: bool) -> Self {
+    pub fn new(sets: BTreeMap<DataSetId, Vec<DatasetName>>, file_backed: bool) -> Self {
         Self { sets, file_backed }
     }
 

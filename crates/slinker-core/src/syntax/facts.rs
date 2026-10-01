@@ -1,3 +1,4 @@
+use crate::package::{BindingName, PackageName};
 use crate::syntax::source::Span;
 
 use std::collections::BTreeSet;
@@ -11,7 +12,7 @@ pub enum NameRefKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameRef {
-    pub name: String,
+    pub name: BindingName,
     pub kind: NameRefKind,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
@@ -26,13 +27,13 @@ pub enum EvalPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageGuard {
-    Available(String),
-    Loaded(String),
-    Selected(String),
+    Available(PackageName),
+    Loaded(PackageName),
+    Selected(PackageName),
 }
 
 impl PackageGuard {
-    pub fn package(&self) -> &str {
+    pub fn package(&self) -> &PackageName {
         match self {
             Self::Available(package) | Self::Loaded(package) | Self::Selected(package) => package,
         }
@@ -41,8 +42,8 @@ impl PackageGuard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRef {
-    pub package: String,
-    pub symbol: String,
+    pub package: PackageName,
+    pub symbol: BindingName,
     pub internal: bool,
     pub guards: Vec<PackageGuard>,
     pub span: Span,
@@ -95,8 +96,8 @@ pub enum StaticArg {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaticEnvironment {
-    ClosureBinding(String),
-    Namespace(String),
+    ClosureBinding(BindingName),
+    Namespace(PackageName),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -257,7 +258,7 @@ pub struct NamespaceInfoRead {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceEnumeration {
-    pub package: String,
+    pub package: PackageName,
     pub callee: String,
     pub span: Span,
 }
@@ -265,7 +266,7 @@ pub struct NamespaceEnumeration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceInfoReceiver {
     Lexical,
-    Namespace(String),
+    Namespace(PackageName),
     Computed,
 }
 
@@ -303,8 +304,8 @@ pub enum DeclaredDomain {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclaredCallable {
-    pub package: Option<String>,
-    pub name: String,
+    pub package: Option<PackageName>,
+    pub name: BindingName,
 }
 
 impl ParsedRFile {

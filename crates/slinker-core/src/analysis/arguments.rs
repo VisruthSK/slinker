@@ -127,11 +127,8 @@ pub(super) fn native_selector_span(call: &CallSite) -> Option<&Span> {
 pub(super) fn static_string_arg(call: &CallSite) -> Option<&str> {
     let argument = match call.callee.as_str() {
         "requireNamespace" | "loadNamespace" | "getNamespace" | "asNamespace" => {
-            matched_static_arg(
-                call,
-                namespace_formals(&call.callee),
-                namespace_target(&call.callee),
-            )
+            namespace_formal(&call.callee)
+                .and_then(|formal| matched_static_arg(call, &[formal], formal))
         }
         "packageVersion" => matched_static_arg(call, &["pkg"], "pkg"),
         "find.package" => matched_static_arg(call, &["package"], "package"),
@@ -144,21 +141,12 @@ pub(super) fn static_string_arg(call: &CallSite) -> Option<&str> {
     }
 }
 
-pub(super) fn namespace_formals(name: &str) -> &'static [&'static str] {
+pub(super) fn namespace_formal(name: &str) -> Option<&'static str> {
     match name {
-        "requireNamespace" | "loadNamespace" => &["package"],
-        "getNamespace" => &["name"],
-        "asNamespace" => &["ns"],
-        _ => &[],
-    }
-}
-
-pub(super) fn namespace_target(name: &str) -> &'static str {
-    match name {
-        "requireNamespace" | "loadNamespace" => "package",
-        "getNamespace" => "name",
-        "asNamespace" => "ns",
-        _ => "",
+        "requireNamespace" | "loadNamespace" => Some("package"),
+        "getNamespace" => Some("name"),
+        "asNamespace" => Some("ns"),
+        _ => None,
     }
 }
 

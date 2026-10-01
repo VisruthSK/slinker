@@ -614,7 +614,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         expression: &ParsedExpression,
         consumed_native_selectors: &[Span],
     ) -> Result<()> {
-        let enclosure_known = !site.lexical_environment.starts_with("unsupported:");
+        let enclosure_known = !site.lexical_environment.is_unsupported();
         for reference in &expression.references {
             if !self.guards_active(site, &reference.guards, &reference.span)? {
                 continue;
@@ -694,7 +694,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 self.record_escape(CallableId {
                     package: foreign,
-                    binding: reference.symbol.clone().into(),
+                    binding: reference.symbol.clone(),
                 })?;
             }
         }
@@ -823,7 +823,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         site: ParsedSite<'_>,
         expression: &ParsedExpression,
     ) -> Result<()> {
-        let enclosure_known = !site.lexical_environment.starts_with("unsupported:");
+        let enclosure_known = !site.lexical_environment.is_unsupported();
         for effect in &expression.effects {
             if !self.guards_active(site, &effect.guards, &effect.span)? {
                 continue;
@@ -1006,7 +1006,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &EnvironmentLabel,
         active: &ActiveBindingDef,
     ) -> Result<bool> {
-        let expected = format!("namespace:{}", self.packages.name(package));
+        let expected = EnvironmentLabel::namespace(self.packages.name(package));
         Ok(match &active.target {
             StaticEnvironment::Namespace(name) => name == self.packages.name(package),
             StaticEnvironment::ClosureBinding(name) => {
@@ -1121,7 +1121,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Some(effect.span.clone()),
             ),
             Resolution::Static(BindingTarget::Local)
-                if lexical_environment.starts_with("derived:") => {}
+                if lexical_environment.is_derived() => {}
             _ => self.diagnostic(
                 from,
                 package,

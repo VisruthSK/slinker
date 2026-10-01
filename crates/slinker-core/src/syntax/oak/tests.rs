@@ -183,8 +183,8 @@ fn callable_declarations_name_exact_functions() {
         .find(|call| call.callee == "print")
         .unwrap();
     let callable = |package: Option<&str>, name: &str| DeclaredCallable {
-        package: package.map(str::to_owned),
-        name: name.to_owned(),
+        package: package.map(PackageName::from),
+        name: BindingName::from(name),
     };
     assert_eq!(
         parsed.callable_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),

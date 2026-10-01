@@ -77,9 +77,9 @@ pub(super) fn if_guard_regions(
             }
             let guard = match call.site.callee.as_str() {
                 "requireNamespace" => static_first_string(&call.site)
-                    .map(|package| PackageGuard::Available(package.to_owned())),
+                    .map(|package| PackageGuard::Available(package.into())),
                 "isNamespaceLoaded" => static_first_string(&call.site)
-                    .map(|package| PackageGuard::Loaded(package.to_owned())),
+                    .map(|package| PackageGuard::Loaded(package.into())),
                 _ => None,
             };
             if let Some(guard) = guard {
@@ -129,7 +129,7 @@ pub(super) fn hook_guard_regions(
         if event == Some("onLoad") {
             guards.push((
                 callback_argument.value,
-                PackageGuard::Selected(package.to_owned()),
+                PackageGuard::Selected(package.into()),
             ));
         }
     }

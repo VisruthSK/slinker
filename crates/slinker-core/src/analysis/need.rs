@@ -1,10 +1,10 @@
 use crate::analysis::object_world::ClosureId;
 use crate::package::{
-    ClassName, ComponentName, DatasetName, EnvironmentLabel, GenericName, PackageId, ResourcePath,
+    BindingName, ClassName, ComponentName, DatasetName, EnvironmentLabel, GenericName, PackageId,
+    ResourcePath,
 };
 use std::collections::{HashSet, VecDeque};
 
-pub use crate::package::BindingName;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LifecycleHook {
     OnLoad,
@@ -12,7 +12,9 @@ pub enum LifecycleHook {
 
 impl LifecycleHook {
     pub fn binding(self) -> BindingName {
-        BindingName::from(self.to_string())
+        match self {
+            Self::OnLoad => BindingName::from(".onLoad"),
+        }
     }
 }
 

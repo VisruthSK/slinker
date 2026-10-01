@@ -1,5 +1,5 @@
 use super::arguments::{
-    declared_strings, matched_arg_index, matched_static_arg, namespace_formals, namespace_target,
+    declared_strings, matched_arg_index, matched_static_arg, namespace_formal,
     only_package_argument, reflective_name_formals, static_package_arg, static_string_arg,
 };
 use super::discovery::Discovered;
@@ -713,7 +713,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<bool> {
-        if lexical_environment.starts_with("unsupported:") && call.qualified_package.is_none() {
+        if lexical_environment.is_unsupported() && call.qualified_package.is_none() {
             return Ok(false);
         }
         match call.callee_kind {
@@ -863,9 +863,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if self.reflection.is_non_reflective_namespace_use(&call.span) {
                 return Ok(());
             }
-            let formals = namespace_formals(&call.callee);
-            if let Some(names) =
-                declared_strings(parsed, call, formals, namespace_target(&call.callee))
+            if let Some(names) = namespace_formal(&call.callee)
+                .and_then(|formal| declared_strings(parsed, call, &[formal], formal))
             {
                 for name in names {
                     self.declared_namespace_name(from, current, binding, call, operation, &name)?;

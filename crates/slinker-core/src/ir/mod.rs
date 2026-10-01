@@ -6,7 +6,7 @@ pub use crate::package::{
 };
 
 use crate::package::NativeComponent;
-use crate::package::{DataSetName, Digest, SymbolName};
+use crate::package::{DataSetId, Digest, SymbolName};
 use crate::syntax::TextRange;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -517,7 +517,7 @@ pub struct ResourceIr {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DatasetLibraryIr {
     objects: BTreeSet<DatasetName>,
-    sets: BTreeMap<DataSetName, Vec<DatasetName>>,
+    sets: BTreeMap<DataSetId, Vec<DatasetName>>,
 }
 
 impl DatasetLibraryIr {
@@ -525,7 +525,7 @@ impl DatasetLibraryIr {
         &self.objects
     }
 
-    pub fn sets(&self) -> &BTreeMap<DataSetName, Vec<DatasetName>> {
+    pub fn sets(&self) -> &BTreeMap<DataSetId, Vec<DatasetName>> {
         &self.sets
     }
 }
@@ -1164,7 +1164,7 @@ impl ProgramBuilder {
     pub fn carry_data_set(
         &mut self,
         package: PackageId,
-        set: DataSetName,
+        set: DataSetId,
         objects: Vec<DatasetName>,
     ) -> Result<(), InvalidDataset> {
         let library = self.dataset_library(package)?;

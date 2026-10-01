@@ -6,7 +6,7 @@ use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::PackageRole;
-use crate::package::{BindingName, PackageId, PackageProvider};
+use crate::package::{PackageId, PackageProvider};
 use crate::syntax::PackageRef;
 use crate::syntax::ResourceRef;
 use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, ResourcePackage};
@@ -44,14 +44,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         if self.is_root(current) && foreign == current {
             let binding = if reference.internal {
-                BindingName::from(reference.symbol.clone())
+                reference.symbol.clone()
             } else {
                 let index = self.packages.index(foreign)?;
                 index
                     .exports
                     .get(reference.symbol.as_str())
                     .cloned()
-                    .unwrap_or_else(|| BindingName::from(reference.symbol.clone()))
+                    .unwrap_or_else(|| reference.symbol.clone())
             };
             self.require_at(
                 from,
@@ -103,13 +103,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let binding = if reference.internal {
-            BindingName::from(reference.symbol.clone())
+            reference.symbol.clone()
         } else {
             index
                 .exports
                 .get(reference.symbol.as_str())
                 .cloned()
-                .unwrap_or_else(|| BindingName::from(reference.symbol.clone()))
+                .unwrap_or_else(|| reference.symbol.clone())
         };
         self.require_at(
             from,

@@ -17,10 +17,6 @@ macro_rules! name_type {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
-
-            pub fn into_string(self) -> String {
-                self.0
-            }
         }
 
         impl Deref for $name {
@@ -113,7 +109,7 @@ name_type!(ComponentName);
 name_type!(DatasetName);
 name_type!(ResourcePath);
 name_type!(SymbolName);
-name_type!(DataSetName);
+name_type!(DataSetId);
 name_type!(ExportName);
 name_type!(GenericLabel);
 name_type!(EnvironmentLabel);

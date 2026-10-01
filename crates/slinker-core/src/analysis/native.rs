@@ -171,7 +171,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(name) = &callable.package else {
             return self.resolve_lexical_name(current, image, lexical_environment, &callable.name);
         };
-        let binding = callable.name.clone().into();
+        let binding = callable.name.clone();
         Ok(match self.packages.resolve(name)? {
             None => Resolution::OpenDynamic(OpenReason::MissingPackage {
                 package: name.as_str().into(),
