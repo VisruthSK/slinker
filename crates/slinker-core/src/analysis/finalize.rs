@@ -60,7 +60,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let (program, issues) = self.finalize_program(&retained)?;
         let node = self.need_node(&Need::Activation { package: root });
         for issue in issues {
-            self.diagnostic(node, root, None, issue.code(), issue.to_string(), None);
+            self.diagnostic(
+                node,
+                root,
+                None,
+                RejectCode::UnsupportedRootTransformation,
+                issue.to_string(),
+                None,
+            );
         }
         if retained
             .iter()
@@ -1051,7 +1058,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     ),
                 },
                 span: None,
-                node: Some(creator.node),
+                node: creator.node,
                 evidence: Vec::new(),
             };
             let cause = Cause::NameCreator {
@@ -1135,12 +1142,6 @@ pub(super) enum FinalizationIssue {
         package: String,
         import: String,
     },
-}
-
-impl FinalizationIssue {
-    fn code(&self) -> RejectCode {
-        RejectCode::UnsupportedRootTransformation
-    }
 }
 
 impl std::fmt::Display for FinalizationIssue {

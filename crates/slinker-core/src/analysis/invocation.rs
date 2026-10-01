@@ -1,4 +1,4 @@
-use super::arguments::{declared_callables, matched_call_arg_index};
+use super::arguments::{declared_callables, matched_arg_index};
 use super::resolution::ReferenceUse;
 use super::s3::{CallableId, callable_target};
 use super::state::{AnalyzerState, ParsedSite};
@@ -208,7 +208,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let Some(family) = apply_family(&call.callee) else {
                 continue;
             };
-            let Some(function) = matched_call_arg_index(call, family.own_formals, family.function)
+            let Some(function) = matched_arg_index(call, family.own_formals, family.function)
             else {
                 continue;
             };
@@ -225,7 +225,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let own = family
                 .own_formals
                 .iter()
-                .filter_map(|formal| matched_call_arg_index(call, family.own_formals, formal))
+                .filter_map(|formal| matched_arg_index(call, family.own_formals, formal))
                 .collect::<Vec<_>>();
             let named = |index: usize, names: &[&str]| {
                 call.arg_names
@@ -290,11 +290,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         for call in &expression.calls {
             let function = match (call.callee.as_str(), apply_family(&call.callee)) {
                 ("do.call", _) => {
-                    matched_call_arg_index(call, &["what", "args", "quote", "envir"], "what")
+                    matched_arg_index(call, &["what", "args", "quote", "envir"], "what")
                 }
-                (_, Some(family)) => {
-                    matched_call_arg_index(call, family.own_formals, family.function)
-                }
+                (_, Some(family)) => matched_arg_index(call, family.own_formals, family.function),
                 _ => None,
             };
             let Some(function) = function else {

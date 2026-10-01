@@ -58,7 +58,6 @@ pub struct Node {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
-    Root,
     Lexical,
     Import,
     PackageQualified,
@@ -70,7 +69,6 @@ pub enum EdgeKind {
     Dataset,
     Native,
     Callback,
-    ClosureCapture,
     ClosureExecution,
     Discovery,
     Effect,
@@ -103,11 +101,12 @@ impl Graph {
         span: Option<Span>,
     ) -> NodeId {
         let package = package.into();
-        let key = (package.clone(), kind.clone());
-        if let Some(id) = self.keys.get(&key) {
-            return *id;
+        let key = (package, kind);
+        if let Some(&id) = self.keys.get(&key) {
+            return id;
         }
         let id = NodeId(self.nodes.len());
+        let (package, kind) = key.clone();
         self.nodes.push(Node {
             id,
             package,
@@ -127,11 +126,13 @@ impl Graph {
         kind: EdgeKind,
         reason: impl Into<String>,
         span: Option<Span>,
-    ) -> bool {
+    ) {
         let reason = reason.into();
-        let key = (from, to, kind, reason.clone(), span.clone());
-        if !self.edge_keys.insert(key) {
-            return false;
+        if !self
+            .edge_keys
+            .insert((from, to, kind, reason.clone(), span.clone()))
+        {
+            return;
         }
         let index = self.edges.len();
         self.edges.push(Edge {
@@ -143,96 +144,51 @@ impl Graph {
         });
         self.outgoing[from.0].push(index);
         self.incoming[to.0].push(index);
-        true
     }
 
     pub fn binding(&self, package: &str, name: &str) -> Option<NodeId> {
-        self.node_id(
-            package,
-            &NodeKind::Binding {
-                name: name.to_owned(),
-            },
-        )
-    }
-
-    pub fn activation(&self, package: &str) -> Option<NodeId> {
-        self.node_id(package, &NodeKind::Activation)
+        let kind = NodeKind::Binding {
+            name: name.to_owned(),
+        };
+        self.keys.get(&(package.to_owned(), kind)).copied()
     }
 
     pub fn missing_packages(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes
             .iter()
-            .filter(|node| matches!(&node.kind, NodeKind::MissingPackage))
+            .filter(|node| matches!(node.kind, NodeKind::MissingPackage))
             .map(|node| node.id)
     }
 
     pub fn incoming(&self, node: NodeId) -> impl Iterator<Item = &Edge> {
         self.incoming[node.0]
             .iter()
-            .map(|index| &self.edges[*index])
-    }
-
-    pub fn outgoing(&self, node: NodeId) -> impl Iterator<Item = &Edge> {
-        self.outgoing[node.0]
-            .iter()
-            .map(|index| &self.edges[*index])
-    }
-
-    fn node_id(&self, package: &str, kind: &NodeKind) -> Option<NodeId> {
-        self.keys.get(&(package.to_owned(), kind.clone())).copied()
-    }
-
-    pub fn reachable(&self, roots: impl IntoIterator<Item = NodeId>) -> Vec<bool> {
-        let mut seen = vec![false; self.nodes.len()];
-        let mut queue = VecDeque::new();
-        for root in roots {
-            if !seen[root.0] {
-                seen[root.0] = true;
-                queue.push_back(root);
-            }
-        }
-        while let Some(id) = queue.pop_front() {
-            for &edge_index in &self.outgoing[id.0] {
-                let to = self.edges[edge_index].to;
-                if !seen[to.0] {
-                    seen[to.0] = true;
-                    queue.push_back(to);
-                }
-            }
-        }
-        seen
+            .map(|&index| &self.edges[index])
     }
 
     pub fn shortest_path(&self, roots: &[NodeId], target: NodeId) -> Option<Vec<&Edge>> {
-        let mut previous: Vec<Option<(NodeId, usize)>> = vec![None; self.nodes.len()];
+        let mut previous = vec![None::<(NodeId, usize)>; self.nodes.len()];
         let mut seen = vec![false; self.nodes.len()];
         let mut queue = VecDeque::new();
         for &root in roots {
             seen[root.0] = true;
             queue.push_back(root);
         }
-        while let Some(current) = queue.pop_front() {
-            if current == target {
-                break;
-            }
-            for &edge_index in &self.outgoing[current.0] {
-                let edge = &self.edges[edge_index];
-                if !seen[edge.to.0] {
-                    seen[edge.to.0] = true;
-                    previous[edge.to.0] = Some((current, edge_index));
-                    queue.push_back(edge.to);
+        while let Some(current) = queue.pop_front().filter(|&current| current != target) {
+            for &index in &self.outgoing[current.0] {
+                let next = self.edges[index].to;
+                if !std::mem::replace(&mut seen[next.0], true) {
+                    previous[next.0] = Some((current, index));
+                    queue.push_back(next);
                 }
             }
         }
         if !seen[target.0] {
             return None;
         }
-        let mut path = Vec::new();
-        let mut current = target;
-        while let Some((from, edge_index)) = previous[current.0] {
-            path.push(&self.edges[edge_index]);
-            current = from;
-        }
+        let mut path = std::iter::successors(previous[target.0], |&(from, _)| previous[from.0])
+            .map(|(_, index)| &self.edges[index])
+            .collect::<Vec<_>>();
         path.reverse();
         Some(path)
     }

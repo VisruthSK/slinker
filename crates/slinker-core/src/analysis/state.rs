@@ -1,7 +1,7 @@
 use super::arguments::{
-    declared_strings, matched_call_arg_index, matched_static_arg, namespace_formals,
-    namespace_target, native_selector_span, only_package_argument, reflective_name_formals,
-    static_package_arg, static_string_arg,
+    declared_strings, matched_arg_index, matched_static_arg, namespace_formals, namespace_target,
+    native_selector_span, only_package_argument, reflective_name_formals, static_package_arg,
+    static_string_arg,
 };
 use super::diagnostic::{Cause, DiagnosticSink, Evidence};
 use super::dynamic_names::{CreatedName, DynamicNames, NameCreator};
@@ -1750,7 +1750,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let image = self.image(id)?;
-        let index = Arc::new(image.index.clone());
+        let index = Arc::clone(&image.index);
         let node = self.need_node(&Need::Activation { package: id });
 
         for registration in &index.s3 {
@@ -1863,8 +1863,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.external.insert(id);
             return Ok(());
         }
-        let _ = self.image(id)?;
-        let _present = self.packages.resource_exists(id, resource)?;
+        self.image(id)?;
+        self.packages.resource_exists(id, resource)?;
         Ok(())
     }
 
@@ -2595,7 +2595,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         formals: &[&str],
         target: &str,
     ) -> Result<()> {
-        let Some(index) = matched_call_arg_index(call, formals, target) else {
+        let Some(index) = matched_arg_index(call, formals, target) else {
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
@@ -2636,7 +2636,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         formals: &[&str],
         target: &str,
     ) -> Result<()> {
-        let Some(index) = matched_call_arg_index(call, formals, target) else {
+        let Some(index) = matched_arg_index(call, formals, target) else {
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
@@ -2660,7 +2660,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         call: &CallSite,
     ) -> Result<()> {
         let formals = ["pkg", "lib.loc", "fields", "drop", "encoding"];
-        let Some(index) = matched_call_arg_index(call, &formals, "pkg") else {
+        let Some(index) = matched_arg_index(call, &formals, "pkg") else {
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
@@ -2867,7 +2867,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ),
             _ => return Ok(()),
         };
-        let Some(index) = matched_call_arg_index(call, formals, target) else {
+        let Some(index) = matched_arg_index(call, formals, target) else {
             return Ok(());
         };
         let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
@@ -3046,7 +3046,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn builds_function_name(&self, call: &CallSite, formals: &[&str], target: &str) -> bool {
-        matched_call_arg_index(call, formals, target)
+        matched_arg_index(call, formals, target)
             .and_then(|index| call.arg_spans.get(index)?.as_ref())
             .and_then(|span| {
                 let text = self.parses.text(span)?;
@@ -3892,7 +3892,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             code,
             message,
             span,
-            node: Some(node),
+            node,
             evidence: Vec::new(),
         }
     }

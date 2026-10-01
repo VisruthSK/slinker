@@ -54,7 +54,6 @@ pub enum GraphEdgeReasonExport {
     DatasetReference,
     NativeCall,
     NativeCallback,
-    ClosureCapture,
     ClosureExecution,
     SpecializedDiscovery,
     SemanticEffect,
@@ -130,9 +129,9 @@ pub(crate) fn blockers(plan: &LinkIr, node_ids: &[String]) -> Vec<GraphBlockerEx
         .iter()
         .filter(|diagnostic| diagnostic.code != RejectCode::MissingDependency)
         .map(|diagnostic| {
-            let owner = diagnostic
-                .node
-                .and_then(|id| node_ids.get(id.0).cloned())
+            let owner = node_ids
+                .get(diagnostic.node.0)
+                .cloned()
                 .or_else(|| {
                     diagnostic
                         .binding
@@ -209,7 +208,6 @@ pub(crate) fn edge_reason(
     target: &NodeKind,
 ) -> GraphEdgeReasonExport {
     match edge.kind {
-        EdgeKind::Root => GraphEdgeReasonExport::ExportRoot,
         EdgeKind::Lexical => GraphEdgeReasonExport::LexicalReference,
         EdgeKind::Import if matches!(target, NodeKind::Activation) => {
             GraphEdgeReasonExport::NamespaceImport
@@ -227,7 +225,6 @@ pub(crate) fn edge_reason(
         EdgeKind::Dataset => GraphEdgeReasonExport::DatasetReference,
         EdgeKind::Native => GraphEdgeReasonExport::NativeCall,
         EdgeKind::Callback => GraphEdgeReasonExport::NativeCallback,
-        EdgeKind::ClosureCapture => GraphEdgeReasonExport::ClosureCapture,
         EdgeKind::ClosureExecution => GraphEdgeReasonExport::ClosureExecution,
         EdgeKind::Discovery => GraphEdgeReasonExport::SpecializedDiscovery,
         EdgeKind::Effect => GraphEdgeReasonExport::SemanticEffect,

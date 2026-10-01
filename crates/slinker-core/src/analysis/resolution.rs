@@ -12,9 +12,15 @@ use crate::syntax::{
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum Resolution<T> {
-    Static(T),
+pub(super) enum Resolution {
+    Static(BindingTarget),
     OpenDynamic(OpenReason),
+}
+
+impl Resolution {
+    fn unresolved(name: &str) -> Self {
+        Self::OpenDynamic(OpenReason::Unresolved(name.to_owned()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,14 +298,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
         image: &PackageImage,
         lexical_environment: &str,
         name: &str,
-    ) -> Result<Resolution<BindingTarget>> {
+    ) -> Result<Resolution> {
         let mut environment = lexical_environment.to_owned();
         let mut seen = HashSet::new();
         loop {
             if !seen.insert(environment.clone()) {
-                return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                    name.to_owned(),
-                )));
+                return Ok(Resolution::unresolved(name));
             }
             if environment.starts_with("derived:") {
                 if let Some(graph) = self.objects.get(current)
@@ -338,21 +342,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         return Ok(resolved);
                     }
                     if blocked {
-                        return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                            name.to_owned(),
-                        )));
+                        return Ok(Resolution::unresolved(name));
                     }
                     if let Some(parent) = graph.environment(environment_id).parent {
                         environment = graph.environment(parent).label.clone();
                         continue;
                     }
-                    return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                        name.to_owned(),
-                    )));
+                    return Ok(Resolution::unresolved(name));
                 }
-                return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                    name.to_owned(),
-                )));
+                return Ok(Resolution::unresolved(name));
             }
             if let Some(private) = image.private_environment(&environment) {
                 if private.bindings.contains_key(name) {
@@ -389,12 +387,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 return Ok(if self.packages.is_base_binding(name) {
                     Resolution::Static(BindingTarget::Base)
                 } else {
-                    Resolution::OpenDynamic(OpenReason::Unresolved(name.to_owned()))
+                    Resolution::unresolved(name)
                 });
             }
-            return Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                name.to_owned(),
-            )));
+            return Ok(Resolution::unresolved(name));
         }
     }
 
@@ -403,7 +399,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         current: PackageId,
         image: &PackageImage,
         name: &str,
-    ) -> Result<Resolution<BindingTarget>> {
+    ) -> Result<Resolution> {
         if matches!(name, ".packageName" | ".__S3MethodsTable__.") {
             return Ok(Resolution::Static(BindingTarget::Metadata {
                 package: current,
@@ -477,9 +473,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if self.packages.is_base_binding(name) {
             Ok(Resolution::Static(BindingTarget::Base))
         } else {
-            Ok(Resolution::OpenDynamic(OpenReason::Unresolved(
-                name.to_owned(),
-            )))
+            Ok(Resolution::unresolved(name))
         }
     }
 
@@ -488,7 +482,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         from: NodeId,
         requester: PackageId,
         binding: Option<&str>,
-        resolved: Resolution<BindingTarget>,
+        resolved: Resolution,
         span: Span,
         use_kind: ReferenceUse,
     ) {

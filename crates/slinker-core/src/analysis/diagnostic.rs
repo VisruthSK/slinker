@@ -39,7 +39,7 @@ pub struct Diagnostic {
     pub code: RejectCode,
     pub message: String,
     pub span: Option<Span>,
-    pub node: Option<NodeId>,
+    pub node: NodeId,
     #[serde(default)]
     pub evidence: Vec<Evidence>,
 }
@@ -159,7 +159,7 @@ mod tests {
             code: RejectCode::MissingDependency,
             message: String::new(),
             span: None,
-            node: None,
+            node: NodeId(0),
             evidence: sites
                 .iter()
                 .map(|(package, binding)| Evidence {

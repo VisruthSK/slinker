@@ -447,7 +447,7 @@ fn selector_domain(invocation: &Invocation, selector: &str, generic: &S3Generic)
         .and_then(|argument| argument.classes.clone())
 }
 
-pub(super) fn callable_target(resolved: &Resolution<BindingTarget>) -> Option<CallableId> {
+pub(super) fn callable_target(resolved: &Resolution) -> Option<CallableId> {
     match resolved {
         Resolution::Static(
             BindingTarget::Namespace { package, binding }

@@ -90,20 +90,12 @@ where
     assigned[target_index]
 }
 
-pub(super) fn matched_call_arg_index(
-    call: &CallSite,
-    formals: &[&str],
-    target: &str,
-) -> Option<usize> {
-    matched_arg_index(call, formals, target)
-}
-
 pub(super) fn matched_static_arg<'a>(
     call: &'a CallSite,
     formals: &[&str],
     target: &str,
 ) -> Option<&'a StaticArg> {
-    let index = matched_call_arg_index(call, formals, target)?;
+    let index = matched_arg_index(call, formals, target)?;
     call.args.get(index)?.as_ref()
 }
 
@@ -113,7 +105,7 @@ pub(super) fn declared_strings(
     formals: &[&str],
     target: &str,
 ) -> Option<BTreeSet<String>> {
-    let index = matched_call_arg_index(call, formals, target)?;
+    let index = matched_arg_index(call, formals, target)?;
     let binding = call.arg_bindings.get(index)?.as_ref()?;
     parsed.string_domain_for(binding, call.scope)
 }
@@ -128,7 +120,7 @@ pub(super) fn declared_callables(
 }
 
 pub(super) fn native_selector_span(call: &CallSite) -> Option<&Span> {
-    let index = matched_call_arg_index(call, &[".NAME"], ".NAME")?;
+    let index = matched_arg_index(call, &[".NAME"], ".NAME")?;
     call.arg_spans.get(index)?.as_ref()
 }
 
@@ -181,7 +173,7 @@ pub(super) fn native_call_argument_index(call: &CallSite, position: usize) -> Op
     if position == 0 {
         return None;
     }
-    let selector = matched_call_arg_index(call, &[".NAME"], ".NAME")?;
+    let selector = matched_arg_index(call, &[".NAME"], ".NAME")?;
     let mut current = 0;
     for index in 0..call.args.len() {
         if index == selector

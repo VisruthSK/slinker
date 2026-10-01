@@ -1,6 +1,6 @@
 use super::NodeId;
 use super::arguments::{
-    declared_callables, matched_call_arg_index, matched_static_arg, native_call_argument_index,
+    declared_callables, matched_arg_index, matched_static_arg, native_call_argument_index,
 };
 use super::relocation::PendingRelocation;
 use super::resolution::{BindingTarget, OpenReason, Resolution};
@@ -26,7 +26,7 @@ struct CallbackSite<'a> {
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn native_selector(call: &CallSite) -> Option<&str> {
-        let index = matched_call_arg_index(call, &[".NAME"], ".NAME")?;
+        let index = matched_arg_index(call, &[".NAME"], ".NAME")?;
         match call.args.get(index)?.as_ref()? {
             StaticArg::Symbol(name) | StaticArg::String(name) => Some(name.as_str()),
         }
@@ -166,7 +166,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         image: &PackageImage,
         lexical_environment: &str,
         callable: &DeclaredCallable,
-    ) -> Result<Resolution<BindingTarget>> {
+    ) -> Result<Resolution> {
         let Some(name) = &callable.package else {
             return self.resolve_lexical_name(current, image, lexical_environment, &callable.name);
         };
@@ -188,7 +188,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         site: &CallbackSite<'_>,
         callback_name: &str,
-        resolution: Resolution<BindingTarget>,
+        resolution: Resolution,
     ) {
         let &CallbackSite {
             node: native_node,
@@ -276,7 +276,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         call: &CallSite,
         component: &str,
     ) {
-        let Some(index) = matched_call_arg_index(call, &[".NAME"], ".NAME") else {
+        let Some(index) = matched_arg_index(call, &[".NAME"], ".NAME") else {
             return;
         };
         let Some(StaticArg::String(symbol)) = call.args.get(index).and_then(Option::as_ref) else {
@@ -335,7 +335,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         call: &CallSite,
     ) {
         let formals = ["name", "PACKAGE", "unlist", "withRegistrationInfo"];
-        let library = matched_call_arg_index(call, &formals, "PACKAGE");
+        let library = matched_arg_index(call, &formals, "PACKAGE");
         match library.map(|index| (index, call.args.get(index).and_then(Option::as_ref))) {
             None => {
                 let Some(StaticArg::String(symbol)) = matched_static_arg(call, &formals, "name")
@@ -432,7 +432,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         lexical_environment: &str,
         call: &CallSite,
     ) -> Result<Option<NativeCallTarget>> {
-        let Some(selector_index) = matched_call_arg_index(call, &[".NAME"], ".NAME") else {
+        let Some(selector_index) = matched_arg_index(call, &[".NAME"], ".NAME") else {
             return Ok(None);
         };
         let Some(selector) = call.args.get(selector_index).and_then(Option::as_ref) else {
