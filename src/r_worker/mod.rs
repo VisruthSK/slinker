@@ -1,8 +1,3 @@
-//! Hidden target-R worker boundary.
-//!
-//! The process protocol contains only owned Rust/serde data; Harp objects and
-//! raw SEXPs never cross the process boundary.
-
 pub(crate) mod client;
 pub mod protocol;
 
@@ -19,7 +14,7 @@ use protocol::{
     PROTOCOL_VERSION, WorkerErrorCode, WorkerFailure, WorkerPackageIdentity, WorkerPackageIndex,
     WorkerRequest, WorkerResponse,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -38,6 +33,7 @@ impl std::fmt::Display for InspectionEpoch {
 
 struct PackageImageContext {
     image: harp::object::RObject,
+    index: WorkerPackageIndex,
     epoch: InspectionEpoch,
     private_ids: HashMap<libr::SEXP, String>,
 }
@@ -126,6 +122,15 @@ impl WorkerRuntime {
             .map_err(InspectionError::from)
     }
 
+    fn canonical_syntax(
+        &self,
+        source: &str,
+    ) -> std::result::Result<(String, bool), InspectionError> {
+        let normalized = self.normalize_syntax(source)?;
+        let stable = self.normalize_syntax(&normalized)? == normalized;
+        Ok((normalized, stable))
+    }
+
     fn verify_relocation(
         &self,
         original: &str,
@@ -181,10 +186,10 @@ impl WorkerRuntime {
         })
     }
 
-    fn package_index(
+    fn context(
         &mut self,
         package: &protocol::PackageSpec,
-    ) -> std::result::Result<WorkerPackageIndex, InspectionError> {
+    ) -> std::result::Result<&mut PackageImageContext, InspectionError> {
         let key = package.root.to_string_lossy().into_owned();
         if !self.contexts.contains_key(&key) {
             if !package.root.is_dir() {
@@ -194,7 +199,7 @@ impl WorkerRuntime {
                 )
                 .into());
             }
-            let context = harp::RFunction::new("", ".slinker_package_context")
+            let image = harp::RFunction::new("", ".slinker_package_context")
                 .add(package.root.to_string_lossy().into_owned())
                 .add(package.name.clone())
                 .call()
@@ -204,10 +209,12 @@ impl WorkerRuntime {
                         package.name
                     )
                 })?;
+            let index = worker_package_index(&image)?;
             self.contexts.insert(
                 key.clone(),
                 PackageImageContext {
-                    image: context,
+                    image,
+                    index,
                     epoch: InspectionEpoch {
                         worker: self.worker,
                         context: self.contexts.len() + 1,
@@ -216,13 +223,17 @@ impl WorkerRuntime {
                 },
             );
         }
-        let context = self
+        Ok(self
             .contexts
-            .get(&key)
-            .expect("package image context inserted")
-            .image
-            .clone();
-        let mut index = worker_package_index(&context)?;
+            .get_mut(&key)
+            .expect("package image context inserted"))
+    }
+
+    fn package_index(
+        &mut self,
+        package: &protocol::PackageSpec,
+    ) -> std::result::Result<WorkerPackageIndex, InspectionError> {
+        let mut index = self.context(package)?.index.clone();
         index
             .image_fingerprint
             .clone_from(&package.image_fingerprint);
@@ -234,14 +245,9 @@ impl WorkerRuntime {
         package: &protocol::PackageSpec,
         name: &str,
     ) -> std::result::Result<protocol::WorkerBinding, WorkerOperationError> {
-        let index = self
-            .package_index(package)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
-        let key = package.root.to_string_lossy();
         let context = self
-            .contexts
-            .get(key.as_ref())
-            .expect("package context created by index request");
+            .context(package)
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let image_environment = field(&context.image, "image_env")
             .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         if !harp::environment::Environment::new(image_environment).exists(name) {
@@ -249,7 +255,82 @@ impl WorkerRuntime {
                 format!("installed image has no binding {name}").into(),
             ));
         }
-        self.binding_value(package, name, &index)
+        self.binding_value(package, name)
+            .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
+    }
+
+    fn data_library(
+        &mut self,
+        package: &protocol::PackageSpec,
+        objects: &[String],
+        sets: &BTreeMap<String, Vec<String>>,
+    ) -> std::result::Result<protocol::DataLibraryFiles, WorkerOperationError> {
+        let forced = |error: InspectionError| {
+            WorkerOperationError::with(WorkerErrorCode::BindingForce)(error)
+        };
+        let root = self
+            .context(package)
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?
+            .image
+            .elt("root")
+            .map_err(InspectionError::from)
+            .map_err(forced)?;
+        let set_lengths = sets
+            .values()
+            .map(|members| f64::from(u32::try_from(members.len()).unwrap_or(u32::MAX)))
+            .collect::<Vec<_>>();
+        let library = harp::RFunction::new("", ".slinker_data_library")
+            .add(root)
+            .add(objects.to_vec())
+            .add(sets.keys().cloned().collect::<Vec<_>>())
+            .add(&set_lengths)
+            .add(sets.values().flatten().cloned().collect::<Vec<_>>())
+            .call()
+            .map_err(InspectionError::from)
+            .map_err(forced)?;
+        let bytes = |name: &str| {
+            library
+                .elt(name)
+                .map_err(InspectionError::from)
+                .and_then(|value| Vec::<u8>::try_from(&value).map_err(InspectionError::from))
+                .map_err(forced)
+        };
+        Ok(protocol::DataLibraryFiles {
+            rdb: bytes("rdb")?,
+            rdx: bytes("rdx")?,
+            rds: bytes("rds")?,
+        })
+    }
+
+    fn dispatch_generics(
+        &mut self,
+        package: Option<&protocol::PackageSpec>,
+        name: &str,
+    ) -> std::result::Result<Vec<String>, WorkerOperationError> {
+        let metadata = |error: InspectionError| {
+            WorkerOperationError::with(WorkerErrorCode::PackageMetadata)(error)
+        };
+        let environment = match package {
+            Some(package) => {
+                let context = self.context(package).map_err(&metadata)?;
+                field(&context.image, "image_env").map_err(&metadata)?
+            }
+            None => harp::RFunction::new("base", "baseenv")
+                .call()
+                .map_err(InspectionError::from)
+                .map_err(&metadata)?,
+        };
+        if !harp::environment::Environment::new(environment.clone()).exists(name) {
+            return Err(WorkerOperationError::with(WorkerErrorCode::MissingBinding)(
+                format!("installed image has no binding {name}").into(),
+            ));
+        }
+        harp::RFunction::new("", ".slinker_dispatch_generics")
+            .add(environment)
+            .add(name)
+            .call()
+            .and_then(Vec::<String>::try_from)
+            .map_err(InspectionError::from)
             .map_err(WorkerOperationError::with(WorkerErrorCode::BindingForce))
     }
 
@@ -257,13 +338,8 @@ impl WorkerRuntime {
         &mut self,
         package: &protocol::PackageSpec,
         name: &str,
-        index: &WorkerPackageIndex,
     ) -> std::result::Result<protocol::WorkerBinding, InspectionError> {
-        let key = package.root.to_string_lossy();
-        let context = self
-            .contexts
-            .get_mut(key.as_ref())
-            .expect("package context created by index request");
+        let context = self.context(package)?;
         let image_environment = harp::RObjectExt::elt(&context.image, "image_env")
             .map_err(|error| format!("installed image has no image environment: {error}"))?;
         let environment = harp::environment::Environment::new(image_environment);
@@ -285,7 +361,10 @@ impl WorkerRuntime {
         );
         let binding = scanner.top_binding(name, origin, binding.value)?;
         context.private_ids.clone_from(&scanner.private_ids);
-        if binding.name != name || index.name != package.name || index.version != package.version {
+        if binding.name != name
+            || context.index.name != package.name
+            || context.index.version != package.version
+        {
             return Err(format!(
                 "installed binding identity changed while inspecting {}::{name}",
                 package.name
@@ -421,7 +500,6 @@ impl WorkerRuntime {
         Ok(protocol::PayloadSerialization::Serialized { bundles })
     }
 
-    /// The first binding of `payload` whose serialization reaches `reference`.
     fn payload_site(
         &mut self,
         payload: &protocol::PayloadSpec,
@@ -467,12 +545,9 @@ impl WorkerRuntime {
         &mut self,
         package: &protocol::PackageSpec,
     ) -> std::result::Result<harp::object::RObject, WorkerOperationError> {
-        self.package_index(package)
-            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         let context = self
-            .contexts
-            .get(package.root.to_string_lossy().as_ref())
-            .expect("package context created by index request");
+            .context(package)
+            .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))?;
         field(&context.image, "image_env")
             .map_err(WorkerOperationError::with(WorkerErrorCode::PackageMetadata))
     }
@@ -724,9 +799,23 @@ fn worker_package_index(
             .iter()
             .any(|name| name == ".onLoad"),
         binding_names: strings_field(context, "binding_names")?,
-        datasets: strings_field(context, "dataset_names")?,
+        data_sets: data_sets(context)?,
+        data_files: bool::try_from(field(context, "data_files")?)?,
         has_sysdata: !strings_field(context, "sysdata_names")?.is_empty(),
     })
+}
+
+fn data_sets(
+    context: &harp::object::RObject,
+) -> std::result::Result<BTreeMap<String, Vec<String>>, InspectionError> {
+    let sets = field(context, "data_sets")?;
+    names(sets.sexp)
+        .into_iter()
+        .map(|set| {
+            let objects = strings_field(&sets, &set)?;
+            Ok((set, objects))
+        })
+        .collect()
 }
 
 fn native_library(
@@ -1519,8 +1608,12 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                 ),
             },
             WorkerRequest::NormalizeSyntax { request_id, source } => match runtime.as_ref() {
-                Some(runtime) => match runtime.normalize_syntax(&source) {
-                    Ok(source) => WorkerResponse::NormalizedSyntax { request_id, source },
+                Some(runtime) => match runtime.canonical_syntax(&source) {
+                    Ok((source, stable)) => WorkerResponse::NormalizedSyntax {
+                        request_id,
+                        source,
+                        stable,
+                    },
                     Err(error) => operation_failure(
                         Some(request_id),
                         WorkerOperationError::with(WorkerErrorCode::TargetSyntaxRejection)(error),
@@ -1602,6 +1695,49 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
                     WorkerErrorCode::RuntimeStartup,
                     "Harp worker must receive hello before semantic requests",
                     Some(&package),
+                    Some(name),
+                ),
+            },
+            WorkerRequest::DataLibrary {
+                request_id,
+                package,
+                objects,
+                sets,
+            } => match runtime.as_mut() {
+                Some(runtime) => match runtime.data_library(&package, &objects, &sets) {
+                    Ok(library) => WorkerResponse::DataLibrary {
+                        request_id,
+                        library,
+                    },
+                    Err(error) => operation_failure(Some(request_id), error, Some(&package), None),
+                },
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    Some(&package),
+                    None,
+                ),
+            },
+            WorkerRequest::DispatchGenerics {
+                request_id,
+                package,
+                name,
+            } => match runtime.as_mut() {
+                Some(runtime) => match runtime.dispatch_generics(package.as_ref(), &name) {
+                    Ok(generics) => WorkerResponse::DispatchGenerics {
+                        request_id,
+                        generics,
+                    },
+                    Err(error) => {
+                        operation_failure(Some(request_id), error, package.as_ref(), Some(name))
+                    }
+                },
+                None => worker_failure(
+                    Some(request_id),
+                    WorkerErrorCode::RuntimeStartup,
+                    "Harp worker must receive hello before semantic requests",
+                    package.as_ref(),
                     Some(name),
                 ),
             },

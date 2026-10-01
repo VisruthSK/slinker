@@ -52,13 +52,17 @@
     sysdata_names <- character()
   }
 
-  data_env <- new.env(hash = TRUE, parent = emptyenv())
-  data_db <- file.path(root, "data", "Rdata")
-  if (
-    file.exists(paste0(data_db, ".rdx")) && file.exists(paste0(data_db, ".rdb"))
-  ) {
-    base::lazyLoad(data_db, envir = data_env)
+  data_directory <- file.path(root, "data")
+  data_index <- file.path(data_directory, "Rdata.rds")
+  data_sets <- if (file.exists(data_index)) {
+    lapply(readRDS(data_index), as.character)
+  } else {
+    list()
   }
+  data_files <- length(setdiff(
+    list.files(data_directory, all.files = TRUE, no.. = TRUE),
+    c("Rdata.rdb", "Rdata.rdx", "Rdata.rds")
+  )) > 0L
 
   list(
     package = package,
@@ -71,7 +75,8 @@
       c(".__NAMESPACE__.", ".__S3MethodsTable__.", ".packageName")
     )),
     sysdata_names = sort(sysdata_names),
-    dataset_names = sort(ls(data_env, all.names = TRUE))
+    data_sets = data_sets[sort(names(data_sets))],
+    data_files = data_files
   )
 }
 
@@ -398,4 +403,81 @@
   assign("..getNamespace", recorder, envir = baseenv())
   unserialize(bytes)
   unique(found)
+}
+
+.slinker_s3_groups <- list(
+  Math = c(
+    "abs", "sign", "sqrt", "floor", "ceiling", "trunc", "round", "signif",
+    "exp", "log", "expm1", "log1p", "cos", "sin", "tan", "cospi", "sinpi",
+    "tanpi", "acos", "asin", "atan", "cosh", "sinh", "tanh", "acosh", "asinh",
+    "atanh", "lgamma", "gamma", "digamma", "trigamma", "cumsum", "cumprod",
+    "cummax", "cummin", "log2", "log10"
+  ),
+  Ops = c(
+    "+", "-", "*", "/", "^", "%%", "%/%", "&", "|", "!", "==", "!=", "<", "<=",
+    ">=", ">"
+  ),
+  matrixOps = "%*%",
+  Summary = c("all", "any", "sum", "prod", "min", "max", "range"),
+  Complex = c("Arg", "Conj", "Im", "Mod", "Re")
+)
+
+.slinker_s3_aliases <- list(as.numeric = "as.double", seq.int = "seq")
+
+.slinker_use_method_generics <- function(expression) {
+  generics <- character()
+  visit <- function(call) {
+    head <- call[[1L]]
+    is_use_method <- identical(head, quote(UseMethod)) ||
+      identical(head, quote(base::UseMethod))
+    if (
+      is_use_method &&
+        length(call) >= 2L &&
+        is.character(call[[2L]]) &&
+        length(call[[2L]]) == 1L
+    ) {
+      generics <<- c(generics, call[[2L]])
+    }
+    for (index in seq_along(call)) {
+      if (is.call(call[[index]])) visit(call[[index]])
+    }
+  }
+  if (is.call(expression)) visit(expression)
+  unique(generics)
+}
+
+.slinker_dispatch_generics <- function(environment, name) {
+  value <- get(name, envir = environment, inherits = FALSE)
+  if (!is.function(value)) {
+    return(character())
+  }
+  if (is.primitive(value)) {
+    groups <- names(Filter(function(members) name %in% members, .slinker_s3_groups))
+    return(unique(c(name, groups, .slinker_s3_aliases[[name]])))
+  }
+  unique(c(
+    .slinker_use_method_generics(body(value)),
+    if (name %in% .internalGenerics) name
+  ))
+}
+
+.slinker_data_library <- function(root, objects, set_names, set_lengths, set_members) {
+  database <- file.path(root, "data", "Rdata")
+  environment <- new.env(hash = TRUE, parent = emptyenv())
+  base::lazyLoad(database, envir = environment, filter = function(name) name %in% objects)
+  absent <- setdiff(objects, ls(environment, all.names = TRUE))
+  if (length(absent)) {
+    stop(sprintf("installed lazy-load data lacks: %s", toString(absent)), call. = FALSE)
+  }
+  directory <- tempfile("slinker-data-library")
+  dir.create(directory)
+  on.exit(unlink(directory, recursive = TRUE), add = TRUE)
+  tools:::makeLazyLoadDB(environment, file.path(directory, "Rdata"), compress = TRUE)
+  sets <- split(set_members, rep(factor(set_names, levels = set_names), set_lengths))
+  saveRDS(sets, file.path(directory, "Rdata.rds"))
+  read <- function(extension) {
+    path <- file.path(directory, paste0("Rdata.", extension))
+    readBin(path, "raw", file.size(path))
+  }
+  list(rdb = read("rdb"), rdx = read("rdx"), rds = read("rds"))
 }

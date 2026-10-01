@@ -1,5 +1,5 @@
 use crate::analysis::object_world::ClosureId;
-use crate::package::{ClassName, ComponentName, GenericName, PackageId, ResourcePath};
+use crate::package::{ClassName, ComponentName, DatasetName, GenericName, PackageId, ResourcePath};
 use std::collections::{HashSet, VecDeque};
 
 pub use crate::package::BindingName;
@@ -59,7 +59,7 @@ pub enum Need {
     },
     Dataset {
         package: PackageId,
-        dataset: String,
+        dataset: DatasetName,
     },
     S3Registration {
         package: PackageId,

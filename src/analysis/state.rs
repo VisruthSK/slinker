@@ -3,7 +3,7 @@ use super::arguments::{
     namespace_target, native_selector_span, only_package_argument, reflective_name_formals,
     static_package_arg, static_string_arg,
 };
-use super::diagnostic::DiagnosticSink;
+use super::diagnostic::{Cause, DiagnosticSink, Evidence};
 use super::dynamic_names::{CreatedName, DynamicNames, NameCreator};
 use super::execute::{AbstractValue, ConstructionCallKey, ExecutionContext};
 use super::namespace::{NamespaceBuilder, OptionalRegistration};
@@ -21,9 +21,10 @@ use crate::ir::ExternalBindingAccess;
 use crate::ir::NamespaceOperation;
 use crate::metadata::{RelationField, relations};
 use crate::package::{
-    BindingImage, BindingName, BindingRepresentation, ClosureSource, ComponentName, Digest,
-    ImportSpec, NativeLibrary, NativeSafety, ObjectKind, PackageId, PackageImage, PackageProvider,
-    PrivateBindingImage, ResourcePath, SyntaxValidation, TargetUniverse,
+    BindingImage, BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource,
+    ComponentName, DatasetName, Digest, ImportSpec, NativeLibrary, NativeSafety, ObjectKind,
+    PackageId, PackageImage, PackageProvider, PrivateBindingImage, ResourcePath, SyntaxValidation,
+    TargetUniverse,
 };
 use crate::syntax::{
     ActiveBindingDef, CallSite, CalleeKind, NameRefKind, NamespaceImports, NamespaceInfoReceiver,
@@ -65,6 +66,14 @@ pub(super) struct NativeCallbackContext<'a> {
     pub(super) call: &'a CallSite,
 }
 
+pub(super) struct AnalysisOptions {
+    pub(super) jobs: usize,
+    pub(super) provenance: bool,
+    pub(super) extra_packages: HashSet<String>,
+    pub(super) explicit_external_packages: HashSet<String>,
+    pub(super) root_description: Option<Arc<str>>,
+}
+
 pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) packages: TargetUniverse<P>,
     pub(super) extra_packages: HashSet<String>,
@@ -104,12 +113,16 @@ pub(super) struct NativeCallTarget {
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    pub(super) fn new(packages: P, jobs: usize) -> Self {
+    pub(super) fn new(packages: P, root: &str, options: AnalysisOptions) -> Self {
         Self {
-            packages: TargetUniverse::new(packages),
-            extra_packages: HashSet::new(),
-            explicit_external_packages: HashSet::new(),
-            jobs: jobs.max(1),
+            packages: TargetUniverse::new(
+                packages,
+                root,
+                options.explicit_external_packages.clone(),
+            ),
+            extra_packages: options.extra_packages,
+            explicit_external_packages: options.explicit_external_packages,
+            jobs: options.jobs.max(1),
             parse_pool: None,
             graph: Graph::default(),
             roots: Vec::new(),
@@ -129,24 +142,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
             dynamic_names: DynamicNames::default(),
             external_bindings: BTreeMap::new(),
             dependencies: HashMap::new(),
-            provenance: true,
+            provenance: options.provenance,
             root: None,
             declared_dependencies: HashMap::new(),
             namespace_imports: HashMap::new(),
             non_returning_bindings: HashMap::new(),
             namespace_builders: HashMap::new(),
-            root_description: None,
+            root_description: options.root_description,
         }
     }
 
-    pub(super) fn run(mut self, root_name: &str) -> Result<Self> {
-        if self.explicit_external_packages.contains(root_name) {
+    pub(super) fn run(mut self) -> Result<Self> {
+        let root_name = self.packages.root_name().to_owned();
+        if self.explicit_external_packages.contains(&root_name) {
             return Err(Error::Analysis(format!(
                 "root package `{root_name}` cannot be External"
             )));
         }
-        self.packages.set_root(root_name);
-        let root = self.packages.require(root_name)?;
+        let root = self.packages.require(&root_name)?;
         self.root = Some(root);
         self.encountered.insert(root);
         let root_image = self.image(root)?;
@@ -194,9 +207,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
 
-        // New needs discovered while this frontier is processed are deferred
-        // to the next frontier. Every item was already justified by a semantic
-        // edge; batching changes scheduling only, never reachability.
         self.preparse_frontier_bindings(frontier)?;
 
         for _ in 0..frontier {
@@ -1016,12 +1026,55 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     pub(super) fn guards_active(
         &mut self,
+        site: ParsedSite<'_>,
+        guards: &[PackageGuard],
+        span: &Span,
+    ) -> Result<bool> {
+        match self.guard_verdict(site.package, site.image, guards)? {
+            GuardVerdict::Active => Ok(true),
+            GuardVerdict::Pruned => Ok(false),
+            GuardVerdict::PrunedByUnselectedOptional(optional) => {
+                self.optional_availability_blocker(
+                    site.node,
+                    site.package,
+                    site.binding,
+                    &optional,
+                    span,
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    pub(super) fn optional_availability_blocker(
+        &mut self,
+        from: NodeId,
+        current: PackageId,
+        binding: &str,
+        optional: &str,
+        span: &Span,
+    ) {
+        self.diagnostic(
+            from,
+            current,
+            Some(binding),
+            RejectCode::OptionalAvailability,
+            format!(
+                "reachable code depends on whether unselected optional package `{optional}` is installed; `{}` lists it only in Suggests, so the build cannot fix either answer (select it with --extra-pkgs or --external)",
+                self.packages.name(current)
+            ),
+            Some(span.clone()),
+        );
+    }
+
+    pub(super) fn guard_verdict(
+        &mut self,
         owner: PackageId,
         image: &PackageImage,
         guards: &[PackageGuard],
-    ) -> Result<bool> {
+    ) -> Result<GuardVerdict> {
         if guards.is_empty() {
-            return Ok(true);
+            return Ok(GuardVerdict::Active);
         }
 
         let helper_shadowed = |helper: &str, image: &PackageImage| {
@@ -1035,9 +1088,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
             helper_shadowed(helper, image)
         }) {
-            // The probe itself is shadowed by a package/importFrom binding, so
-            // the static availability interpretation is not sound.
-            return Ok(true);
+            return Ok(GuardVerdict::Active);
         }
 
         for guard in guards {
@@ -1046,7 +1097,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             if self.package_is_suggested_only(owner, package)? {
-                return Ok(false);
+                return Ok(GuardVerdict::PrunedByUnselectedOptional(package.to_owned()));
             }
             let imported = image.index.imports.iter().any(|import| match import {
                 ImportSpec::All {
@@ -1057,12 +1108,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 } => imported == package,
             });
             match guard {
-                PackageGuard::Selected(_) => return Ok(false),
+                PackageGuard::Selected(_) => return Ok(GuardVerdict::Pruned),
                 PackageGuard::Loaded(_) => {
-                    // Imports are activated before `.onLoad`; ambient installed
-                    // packages are not assumed to be loaded.
                     if !imported {
-                        return Ok(false);
+                        return Ok(GuardVerdict::Pruned);
                     }
                 }
                 PackageGuard::Available(_) => {
@@ -1073,12 +1122,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         Some(candidate) if self.packages.is_external(candidate) => {
                             self.external.insert(candidate);
                         }
-                        _ => return Ok(false),
+                        Some(_) if self.package_is_required(owner, package)? => {}
+                        _ => return Ok(GuardVerdict::Pruned),
                     }
                 }
             }
         }
-        Ok(true)
+        Ok(GuardVerdict::Active)
     }
 
     pub(super) fn process_parsed(
@@ -1115,7 +1165,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.process_references(site, expression, &consumed_native_selectors)?;
             self.process_package_refs(site, expression)?;
             for resource in &expression.resource_refs {
-                if !self.guards_active(package, image, &resource.guards)? {
+                if !self.guards_active(site, &resource.guards, &resource.span)? {
                     continue;
                 }
                 self.resource_access(node, package, parsed, resource)?;
@@ -1158,7 +1208,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if site.binding != ".onLoad" || !active.certain {
                 continue;
             }
-            if !self.guards_active(site.package, site.image, &active.guards)? {
+            if !self.guards_active(site, &active.guards, &active.span)? {
                 continue;
             }
             if self.active_binding_targets_current_namespace(
@@ -1185,7 +1235,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<Vec<Span>> {
         let mut consumed_native_selectors = Vec::new();
         for call in &expression.calls {
-            if !self.guards_active(site.package, site.image, &call.guards)?
+            if !self.guards_active(site, &call.guards, &call.span)?
                 || !matches!(
                     call.callee.as_str(),
                     ".Call" | ".External" | ".C" | ".Fortran"
@@ -1225,7 +1275,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<()> {
         let enclosure_known = !site.lexical_environment.starts_with("unsupported:");
         for reference in &expression.references {
-            if !self.guards_active(site.package, site.image, &reference.guards)? {
+            if !self.guards_active(site, &reference.guards, &reference.span)? {
                 continue;
             }
             if consumed_native_selectors.contains(&reference.span) {
@@ -1248,6 +1298,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 && matches!(resolved, Resolution::Static(BindingTarget::Base))
             {
                 self.dynamic_names.observe_creator(NameCreator {
+                    node: site.node,
                     package: site.package,
                     binding: site.binding.to_owned(),
                     operation: "environment<-",
@@ -1288,7 +1339,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         expression: &ParsedExpression,
     ) -> Result<()> {
         for reference in &expression.package_refs {
-            if !self.guards_active(site.package, site.image, &reference.guards)? {
+            if !self.guards_active(site, &reference.guards, &reference.span)? {
                 continue;
             }
             self.namespace_access(site.node, site.package, reference)?;
@@ -1329,7 +1380,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         expression: &ParsedExpression,
     ) -> Result<()> {
         for call in &expression.calls {
-            if !self.guards_active(site.package, site.image, &call.guards)? {
+            if !self.guards_active(site, &call.guards, &call.span)? {
                 continue;
             }
             if let Some(callable) =
@@ -1337,6 +1388,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 self.record_invocation(parsed, callable, call)?;
             }
+            self.retain_lexical_s3_methods(site, call)?;
             if matches!(call.callee.as_str(), "UseMethod" | "NextMethod")
                 && call.qualified_package.is_none()
                 && matches!(
@@ -1431,13 +1483,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<()> {
         let enclosure_known = !site.lexical_environment.starts_with("unsupported:");
         for effect in &expression.effects {
-            if !self.guards_active(site.package, site.image, &effect.guards)? {
+            if !self.guards_active(site, &effect.guards, &effect.span)? {
                 continue;
             }
             match effect.kind {
                 SyntaxEffectKind::SuperAssignment => {
                     if !enclosure_known {
                         self.dynamic_names.observe_creator(NameCreator {
+                            node: site.node,
                             package: site.package,
                             binding: site.binding.to_owned(),
                             operation: "<<-",
@@ -1551,9 +1604,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let source = self
             .parses
             .register(key.clone(), self.packages.name(id), text);
-        let normalized = self.packages.normalize_syntax(text)?;
-        let normalized_again = self.packages.normalize_syntax(&normalized)?;
-        if normalized != normalized_again {
+        let CanonicalSyntax::Stable(normalized) = self.packages.canonical_syntax(text)? else {
             self.diagnostic(
                 owner_node,
                 id,
@@ -1566,7 +1617,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             self.parses.block(key);
             return Ok(None);
-        }
+        };
         self.parses.record_shape(key, Digest::of(&normalized));
         Ok(Some(source))
     }
@@ -1679,9 +1730,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let index = Arc::new(image.index.clone());
         let node = self.need_node(&Need::Activation { package: id });
 
-        // Dependency declarations are lookup metadata, not reachability roots.
-        // A retained binding that resolves through an import will demand the
-        // exact foreign activation/binding. Unused Imports/Depends stay cold.
         for registration in &index.s3 {
             if let Some(package_name) = registration.generic.package.as_deref()
                 && self.package_is_suggested_only(id, package_name)?
@@ -1796,13 +1844,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         let _ = self.image(id)?;
         let _present = self.packages.resource_exists(id, resource)?;
-        // An absent system.file() path is a valid result when mustWork is false
-        // (the default). The reference is retained only when the installed
-        // image actually contains the requested path.
         Ok(())
     }
 
-    pub(super) fn process_dataset(&mut self, id: PackageId, dataset: &str) -> Result<()> {
+    pub(super) fn process_dataset(&mut self, id: PackageId, dataset: &DatasetName) -> Result<()> {
         if self.packages.is_external(id) {
             self.external.insert(id);
             return Ok(());
@@ -1810,9 +1855,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let image = self.image(id)?;
         let node = self.need_node(&Need::Dataset {
             package: id,
-            dataset: dataset.to_owned(),
+            dataset: dataset.clone(),
         });
-        if !image.index.datasets.iter().any(|name| name == dataset) {
+        if !image.index.data.defines(dataset) {
             self.diagnostic(
                 node,
                 id,
@@ -2027,10 +2072,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if self.package_is_suggested_only(current, &reference.package)?
             && !self.optional_package_selected(&reference.package)
         {
-            // Suggests-only packages are deliberately outside the selected
-            // link universe. Leave the optional operation in the retained R
-            // source, but do not discover, inspect, internalize, or rewrite
-            // that package unless the user enables it with --extra-pkgs.
             return Ok(());
         }
         let Some(foreign) = self.packages.resolve(&reference.package)? else {
@@ -2102,6 +2143,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let index = self.packages.index(foreign)?;
+        if !reference.internal
+            && !index.exports.contains_key(&reference.symbol)
+            && index.data.defines(&reference.symbol)
+        {
+            self.dataset_access(from, foreign, reference);
+            return Ok(());
+        }
         let binding = if reference.internal {
             BindingName::from(reference.symbol.clone())
         } else {
@@ -2244,8 +2292,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    /// The installed package whose files `system.file(package = name)` must reach through the
-    /// generated package, or `None` when the call already behaves as written.
     fn resource_package(
         &mut self,
         from: NodeId,
@@ -2253,9 +2299,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         resource: &crate::syntax::ResourceRef,
         name: &str,
     ) -> Result<Option<PackageId>> {
-        // The root remains a real installed package. Preserve its own package
-        // path/help/Meta semantics exactly; no synthetic resource rewrite is
-        // required for system.file(..., package = <root>).
         if self.is_root(current) && name == self.packages.name(current) {
             return Ok(None);
         }
@@ -2356,13 +2399,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 if let Some(component) = Self::sole_opaque_registered_native_component(&image.index)
                 {
-                    // With .registration=TRUE the loader creates native-symbol
-                    // variables before .onLoad, but nsInfo.rds does not contain
-                    // the runtime routine table. If native safety is still
-                    // opaque, associate this otherwise-unresolved .onLoad RHS
-                    // with the sole registered DLL. The component remains a
-                    // blocker until native analysis proves its behavior, so
-                    // this cannot turn an unknown symbol into an accepted link.
                     self.require_at(
                         from,
                         Need::Native { package, component: component.to_owned().into() },
@@ -2644,7 +2680,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         Ok(base.then(|| name.clone()))
     }
 
-    fn dynamic_package_name(
+    pub(super) fn dynamic_package_name(
         &mut self,
         from: NodeId,
         current: PackageId,
@@ -2684,7 +2720,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         );
     }
 
-    fn missing_package_call(
+    pub(super) fn missing_package_call(
         &mut self,
         from: NodeId,
         current: PackageId,
@@ -2831,15 +2867,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 &["topic", "package"],
                 "package",
             ),
-            "data"
-                if call
-                    .arg_names
-                    .iter()
-                    .flatten()
-                    .any(|name| name == "package") =>
-            {
-                self.installed_package_query(from, current, binding, call, &["package"], "package")
-            }
+            "data" => self.data_call(from, current, binding, call),
             _ => Ok(()),
         }
     }
@@ -3040,11 +3068,14 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     "rlang" => self.rlang_call(from, current, binding, call)?,
                     _ => {}
                 }
+            } else if self.is_search_path_data_call(current, image, lexical_environment, call)? {
+                self.data_call(from, current, binding, call)?;
             }
             return Ok(());
         }
         if let Some((operation, name)) = created_name(call) {
             self.dynamic_names.observe_creator(NameCreator {
+                node: site.node,
                 package: current,
                 binding: binding.to_owned(),
                 operation,
@@ -3185,12 +3216,6 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         match call.callee_kind {
             CalleeKind::DefinitelyLexical => return Ok(false),
             CalleeKind::ConditionalFallthrough => {
-                // Oak found at least one reaching lexical definition, but also
-                // a path that falls through to the installed namespace. Slinker
-                // must not apply linker-specific effects unless the callee
-                // identity is path-invariant. If the fallthrough target is the
-                // base primitive/function that slinker specializes, block the
-                // rewrite instead of pretending either branch is definitive.
                 if call.qualified_package.is_none()
                     && Self::is_slinker_semantic_callee(&call.callee)
                     && matches!(
@@ -3357,8 +3382,13 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         let target = match self.discovered_package(from, current, call, &name)? {
             Discovered::Linked(target) => target,
             Discovered::Settled => return Ok(()),
-            Discovered::Optional if operation != NamespaceCall::Require => return Ok(()),
-            Discovered::Optional | Discovered::Missing => {
+            Discovered::Optional => {
+                if operation == NamespaceCall::Require {
+                    self.optional_availability_blocker(from, current, binding, &name, &call.span);
+                }
+                return Ok(());
+            }
+            Discovered::Missing => {
                 if operation == NamespaceCall::Require {
                     self.relocations.push(PendingRelocation::RequireNamespace {
                         source: call.span.clone(),
@@ -3427,8 +3457,6 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         Ok(())
     }
 
-    /// A declared value of a computed namespace name reaches the real package at run time, so
-    /// only a name that stays unrewritten as written is accepted.
     fn declared_namespace_name(
         &mut self,
         from: NodeId,
@@ -3472,7 +3500,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         Ok(())
     }
 
-    fn discovered_package(
+    pub(super) fn discovered_package(
         &mut self,
         from: NodeId,
         current: PackageId,
@@ -3711,7 +3739,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 path: resource.to_string(),
             },
             Need::Dataset { dataset, .. } => NodeKind::Dataset {
-                name: dataset.clone(),
+                name: dataset.to_string(),
             },
             Need::S3Registration { registration, .. } => NodeKind::S3Registration {
                 generic: self.generic_label(&registration.generic),
@@ -3756,6 +3784,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             message,
             span,
             node: Some(node),
+            evidence: Vec::new(),
         }
     }
 
@@ -3785,14 +3814,39 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             .add_node(missing, NodeKind::MissingPackage, span.clone());
         self.graph
             .add_edge_at(from, node, kind, reason.clone(), span.clone());
-        self.diagnostic(
+        let primary = self.new_diagnostic(
             node,
             requester,
             None,
             RejectCode::MissingDependency,
-            format!("required package `{missing}` is absent from the selected target library universe ({reason})"),
-            span,
+            format!(
+                "required package `{missing}` is absent from the selected target library universe"
+            ),
+            None,
         );
+        let evidence = Evidence {
+            package: self.packages.name(requester).to_owned(),
+            binding: self.node_binding(from),
+            span,
+            detail: reason,
+        };
+        self.diagnostics.record_derived(
+            Cause::MissingPackage(missing.to_owned()),
+            Diagnostic {
+                package: missing.to_owned(),
+                ..primary
+            },
+            evidence,
+        );
+    }
+
+    fn node_binding(&self, node: NodeId) -> Option<String> {
+        match &self.graph.nodes[node.0].kind {
+            NodeKind::Binding { name } | NodeKind::PrivateBinding { name, .. } => {
+                Some(name.clone())
+            }
+            _ => None,
+        }
     }
 }
 
@@ -3812,8 +3866,6 @@ pub(super) fn is_r_constant(name: &str) -> bool {
     )
 }
 
-/// Whether reading `field` of a `.__NAMESPACE__.` environment observes what a synthetic Linked
-/// namespace reproduces: its spec, export table, imports, dynlibs, and S3 methods.
 fn reproduces_namespace_info(field: Option<&str>) -> bool {
     matches!(
         field,
@@ -3821,7 +3873,6 @@ fn reproduces_namespace_info(field: Option<&str>) -> bool {
     )
 }
 
-/// The run-time name a base binding-creation call can bind, when `call` is one.
 fn created_name(call: &CallSite) -> Option<(&'static str, CreatedName)> {
     let (operation, formals, target): (_, &[&str], _) = match call.callee.as_str() {
         "assign" => (
@@ -3845,7 +3896,14 @@ fn created_name(call: &CallSite) -> Option<(&'static str, CreatedName)> {
     Some((operation, name))
 }
 
-enum Discovered {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GuardVerdict {
+    Active,
+    Pruned,
+    PrunedByUnselectedOptional(String),
+}
+
+pub(super) enum Discovered {
     Linked(PackageId),
     Settled,
     Optional,

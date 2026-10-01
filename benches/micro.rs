@@ -6,12 +6,13 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group};
 use slinker::analysis::Linker;
 use slinker::cache::CacheLocation;
 use slinker::package::{
-    BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClosureSource, Digest,
-    ExportMap, InstalledPackage, LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage,
-    PackageIndex, PackageLocation, PackageLocator, PackageProvider, PackageStore, SyntaxValidation,
+    BindingImage, BindingName, BindingOrigin, BindingRepresentation, CanonicalSyntax,
+    ClosureSource, Digest, DispatchSubject, ExportMap, GenericName, InstalledPackage,
+    LifecycleMetadata, ObjectKind, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
+    PackageLocator, PackageProvider, PackageStore, SyntaxValidation,
 };
 use slinker::syntax::{OakParseContext, OakParser, SourceKey, Sources};
-use slinker::{Description, Result, Target, TargetEnvironment, TargetEnvironmentRequest};
+use slinker::{Description, Result, Target, TargetEnvironment};
 use std::collections::{BTreeSet, HashMap};
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -99,12 +100,19 @@ impl PackageProvider for MemoryProvider {
         Ok(Arc::clone(&self.image))
     }
 
+    fn dispatch_generics(
+        &mut self,
+        _subject: DispatchSubject<'_>,
+    ) -> Result<BTreeSet<GenericName>> {
+        Ok(BTreeSet::new())
+    }
+
     fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {
         Ok(SyntaxValidation::Accepted)
     }
 
-    fn normalize_syntax(&mut self, source: &str) -> Result<String> {
-        Ok(source.to_owned())
+    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+        Ok(CanonicalSyntax::Stable(source.to_owned()))
     }
 }
 
@@ -178,7 +186,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
             dynlibs: Vec::new(),
             lifecycle: LifecycleMetadata::default(),
             binding_names,
-            datasets: Vec::new(),
+            data: slinker::package::PackageData::default(),
             files: Vec::new(),
             has_sysdata: false,
         }),
@@ -231,7 +239,7 @@ fn construction_interpreter(criterion: &mut Criterion) {
 
 fn installed_target() -> (PathBuf, TargetEnvironment) {
     let r_home = common::discover_r_home();
-    let target = TargetEnvironmentRequest::new(r_home.clone())
+    let target = support::target_request(&r_home)
         .capture()
         .expect("capture the target R library universe");
     (r_home, target)

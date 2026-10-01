@@ -1,6 +1,6 @@
 use super::NodeId;
 use crate::ir::NamespaceOperation;
-use crate::package::{BindingName, ComponentName, PackageId};
+use crate::package::{BindingName, ComponentName, DatasetName, PackageId};
 use crate::syntax::Span;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +47,16 @@ pub(super) enum PendingRelocation {
         source: Span,
         package: PackageId,
     },
+    DatasetAccess {
+        source: Span,
+        package: PackageId,
+        dataset: DatasetName,
+    },
+    DataArgument {
+        source: Span,
+        package: PackageId,
+        sets: Vec<String>,
+    },
     NativeSymbol {
         source: Span,
         package: PackageId,
@@ -89,6 +99,8 @@ impl PendingRelocation {
             | Self::PackageVersion { source, .. }
             | Self::LoadedQuery { source, .. }
             | Self::NamespaceArgument { source, .. }
+            | Self::DatasetAccess { source, .. }
+            | Self::DataArgument { source, .. }
             | Self::DescriptionArgument { source, .. }
             | Self::NativeSymbol { source, .. }
             | Self::NativeLibrary { source, .. }
@@ -111,6 +123,8 @@ impl PendingRelocation {
             | Self::NamespaceLoad { package, .. }
             | Self::LoadedQuery { package, .. }
             | Self::NamespaceArgument { package, .. }
+            | Self::DatasetAccess { package, .. }
+            | Self::DataArgument { package, .. }
             | Self::NativeSymbol { package, .. }
             | Self::NativeLibrary { package, .. }
             | Self::InstalledQuery { package, .. } => Some(*package),

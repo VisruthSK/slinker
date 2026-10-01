@@ -39,13 +39,17 @@ fn represtools_suite_passes_with_whisker_linked() {
 }
 
 #[test]
-fn qrcode_suite_passes_with_assertthat_linked() {
+fn qrcode_blocks_on_unselected_optional_package_availability() {
     LinkedSuite {
         package: "qrcode",
         linked: &["assertthat"],
-        checks: &[Check::Testthat],
+        checks: &[],
     }
-    .assert_passes();
+    .assert_blocks(&[
+        "OptionalAvailability in qrcode::generate_svg.qr_logo: reachable code depends on whether unselected optional package `knitr` is installed",
+        "OptionalAvailability in qrcode::read_logo: reachable code depends on whether unselected optional package `png` is installed",
+        "OptionalAvailability in qrcode::validate_qr: reachable code depends on whether unselected optional package `httr` is installed",
+    ]);
 }
 
 #[test]
@@ -94,8 +98,8 @@ fn here_suite_passes_with_rprojroot_linked() {
             Check::Testthat,
             Check::Script(
                 r#"
-                project <- normalizePath(file.path(tempdir(), "project"), winslash = "/", mustWork = FALSE)
-                dir.create(file.path(project, "analysis"), recursive = TRUE)
+                dir.create(file.path(tempdir(), "project", "analysis"), recursive = TRUE)
+                project <- normalizePath(file.path(tempdir(), "project"), winslash = "/")
                 file.create(file.path(project, ".here"))
                 writeLines("", file.path(project, "analysis", "report.R"))
                 setwd(file.path(project, "analysis"))
@@ -395,7 +399,7 @@ impl LinkedSuite<'_> {
                 provide({dependencies}, hard)
                 provide({runtime_library}, runtime)
                 provide({testing_library}, setdiff(testing, linked), setdiff(closure(usable), c(runtime, testing, linked)))
-                if (!dir.exists({source})) {{
+                if (!file.exists(file.path({source}, "DESCRIPTION"))) {{
                   tarball <- download.packages(package, tempdir(), type = "source")[1, 2]
                   untar(tarball, exdir = dirname({source}))
                 }}

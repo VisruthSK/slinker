@@ -1,5 +1,7 @@
 use crate::Description;
-use crate::package::{BindingName, ClassName, GenericName, PackageIdentity, PackageName};
+use crate::package::{
+    BindingName, ClassName, DatasetName, GenericName, PackageIdentity, PackageName,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,17 +50,12 @@ impl std::fmt::Display for GenericSpec {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeFacts {
-    /// Statically named R bindings called by the component regardless of call
-    /// site. Retained for summaries that truly have fixed callbacks.
     pub callbacks: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeRoutineSummary {
-    /// Registered R-side binding or native routine symbol used as the selector.
     pub selector: String,
-    /// One-based native routine argument positions that are invoked as R
-    /// callables. The `.Call`/`.External` selector itself is not counted.
     pub callback_arguments: Vec<usize>,
 }
 
@@ -92,7 +89,6 @@ pub struct NativeComponent {
     pub safety: NativeSafety,
 }
 
-/// The installed compiled library of a native component as the worker found it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum NativeLibrary {
     Missing,
@@ -204,6 +200,32 @@ pub struct LifecycleMetadata {
     pub on_load: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PackageData {
+    sets: BTreeMap<String, Vec<DatasetName>>,
+    file_backed: bool,
+}
+
+impl PackageData {
+    pub fn new(sets: BTreeMap<String, Vec<DatasetName>>, file_backed: bool) -> Self {
+        Self { sets, file_backed }
+    }
+
+    pub fn set(&self, name: &str) -> Option<&[DatasetName]> {
+        self.sets.get(name).map(Vec::as_slice)
+    }
+
+    pub fn defines(&self, object: &str) -> bool {
+        self.sets
+            .values()
+            .any(|objects| objects.iter().any(|candidate| candidate == object))
+    }
+
+    pub fn is_file_backed(&self) -> bool {
+        self.file_backed
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PackageIndex {
     pub identity: PackageIdentity,
@@ -214,9 +236,7 @@ pub struct PackageIndex {
     pub dynlibs: Vec<NativeComponent>,
     pub lifecycle: LifecycleMetadata,
     pub binding_names: Vec<BindingName>,
-    pub datasets: Vec<String>,
-    /// Installed package-relative files/directories. These are metadata for
-    /// resolving resource operations; they are not retained semantic resources.
+    pub data: PackageData,
     pub files: Vec<String>,
     pub has_sysdata: bool,
 }

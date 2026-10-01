@@ -37,7 +37,6 @@ where
     let mut assigned = vec![None; formals.len()];
     let mut consumed = vec![false; arguments.len()];
 
-    // R first performs exact named matching.
     for (arg_index, consumed) in consumed.iter_mut().enumerate() {
         let Some(name) = arguments.name(arg_index) else {
             continue;
@@ -50,8 +49,6 @@ where
         }
     }
 
-    // Then accept an unambiguous partial name. This bounded matcher is used
-    // only for primitives whose relevant formal prefix is known here.
     for (arg_index, consumed) in consumed.iter_mut().enumerate() {
         let Some(name) = arguments.name(arg_index) else {
             continue;
@@ -74,7 +71,6 @@ where
         }
     }
 
-    // Remaining unnamed arguments match the remaining formals positionally.
     let mut next_formal = 0;
     for (arg_index, consumed) in consumed.iter_mut().enumerate() {
         if arguments.name(arg_index).is_some() || *consumed {
@@ -111,7 +107,6 @@ pub(super) fn matched_static_arg<'a>(
     call.args.get(index)?.as_ref()
 }
 
-/// The strings a `strings()` declaration allows for the argument matched to `target`.
 pub(super) fn declared_strings(
     parsed: &ParsedRFile,
     call: &CallSite,
@@ -123,7 +118,6 @@ pub(super) fn declared_strings(
     parsed.string_domain_for(binding, call.scope)
 }
 
-/// The functions a `callables()` declaration allows for the argument at `index`.
 pub(super) fn declared_callables(
     parsed: &ParsedRFile,
     call: &CallSite,

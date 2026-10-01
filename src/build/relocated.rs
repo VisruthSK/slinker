@@ -3,7 +3,7 @@ use super::{
     r_string,
 };
 use crate::ir::{CodeId, ExternalBindingAccess, ProgramIr, RelocationTarget};
-use crate::package::{Digest, SyntaxValidation};
+use crate::package::{CanonicalSyntax, Digest, SyntaxValidation};
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{AppendedArgumentSpec, RelocationSiteSpec};
 use crate::syntax::TextRange;
@@ -32,7 +32,13 @@ impl RelocatedCode {
             let original = code.source();
             let source = match planned.remove(&id) {
                 None => {
-                    let shape = Digest::of(&worker.normalize_syntax(original)?);
+                    let CanonicalSyntax::Stable(normalized) = worker.canonical_syntax(original)?
+                    else {
+                        return Err(BuildContextError::InvalidCode(format!(
+                            "CodeIr {id:?} is not stable across target-R parse/deparse"
+                        )));
+                    };
+                    let shape = Digest::of(&normalized);
                     if &shape != code.normalized_shape() {
                         return Err(BuildContextError::InvalidCode(format!(
                             "CodeIr {id:?} changed normalized shape before emission: expected {}, got {}",
@@ -131,6 +137,21 @@ impl Replacement {
                     }),
                 }
             }
+            RelocationTarget::Dataset { package, dataset } => Self::expression(format!(
+                "base::getExportedValue({}, {})",
+                namespace_expression(program, *package),
+                r_string(dataset)
+            )),
+            RelocationTarget::DataArgument { package } => Self {
+                expression: r_string(&program.package(*package).identity().name),
+                appended_argument: Some(AppendedArgument {
+                    name: "lib.loc",
+                    value: format!(
+                        "base::system.file(\"slinker\", \"datalib\", package = {})",
+                        r_string(&program.package(program.root_package()).identity().name)
+                    ),
+                }),
+            },
             RelocationTarget::PackageVersion { version } => {
                 Self::expression(format!("base::package_version({})", r_string(version)))
             }

@@ -1,10 +1,10 @@
-use crate::package::InstalledPackage;
+use crate::package::{CanonicalSyntax, InstalledPackage};
 use crate::r_worker::protocol::{
-    NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization, PayloadSite,
-    PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
+    DataLibraryFiles, NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization,
+    PayloadSite, PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
 };
 use crate::{Error, Result, Target, TargetEnvironment};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -149,6 +149,46 @@ impl WorkerClient {
         }
     }
 
+    pub(crate) fn dispatch_generics(
+        &mut self,
+        package: Option<&InstalledPackage>,
+        name: &str,
+    ) -> Result<Vec<String>> {
+        let request_id = self.request_id();
+        match self.exchange(&WorkerRequest::DispatchGenerics {
+            request_id,
+            package: package.map(package_spec),
+            name: name.to_owned(),
+        })? {
+            WorkerResponse::DispatchGenerics {
+                request_id: response_id,
+                generics,
+            } if response_id == request_id => Ok(generics),
+            response => Err(worker_error("dispatch generics", response)),
+        }
+    }
+
+    pub(crate) fn data_library(
+        &mut self,
+        package: PackageSpec,
+        objects: Vec<String>,
+        sets: BTreeMap<String, Vec<String>>,
+    ) -> Result<DataLibraryFiles> {
+        let request_id = self.request_id();
+        match self.exchange(&WorkerRequest::DataLibrary {
+            request_id,
+            package,
+            objects,
+            sets,
+        })? {
+            WorkerResponse::DataLibrary {
+                request_id: response_id,
+                library,
+            } if response_id == request_id => Ok(library),
+            response => Err(worker_error("data library", response)),
+        }
+    }
+
     pub(crate) fn serialize_payloads(
         &mut self,
         namespaces: Vec<NamespaceImageSpec>,
@@ -214,7 +254,7 @@ impl WorkerClient {
         syntax_verdict(request_id, response, "relocation verification")
     }
 
-    pub(crate) fn normalize_syntax(&mut self, source: &str) -> Result<String> {
+    pub(crate) fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
         let request_id = self.request_id();
         match self.exchange(&WorkerRequest::NormalizeSyntax {
             request_id,
@@ -223,7 +263,12 @@ impl WorkerClient {
             WorkerResponse::NormalizedSyntax {
                 request_id: response_id,
                 source,
-            } if response_id == request_id => Ok(source),
+                stable,
+            } if response_id == request_id => Ok(if stable {
+                CanonicalSyntax::Stable(source)
+            } else {
+                CanonicalSyntax::Unstable
+            }),
             response => Err(worker_error("syntax normalization", response)),
         }
     }
@@ -296,6 +341,26 @@ fn request_context(request: &WorkerRequest) -> String {
         } => format!(
             "request {request_id} binding {}::{name} {} {}",
             package.name, package.version, package.image_fingerprint
+        ),
+        WorkerRequest::DispatchGenerics {
+            request_id,
+            package,
+            name,
+        } => format!(
+            "request {request_id} dispatch generics of {}::{name}",
+            package
+                .as_ref()
+                .map_or("base", |package| package.name.as_str())
+        ),
+        WorkerRequest::DataLibrary {
+            request_id,
+            package,
+            objects,
+            ..
+        } => format!(
+            "request {request_id} data library of {} ({} objects)",
+            package.name,
+            objects.len()
         ),
         WorkerRequest::SerializePayloads {
             request_id,

@@ -1,3 +1,4 @@
+use super::diagnostic::{Cause, Evidence};
 use super::dynamic_names::{CreatedName, NameCreator};
 use super::object_world::reachable_environment_labels;
 use super::relocation::PendingRelocation;
@@ -7,10 +8,10 @@ use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::{
     BindingId, BindingName, ClosureHome, CodeId, ExportTable, ExternalBindingAccess,
     ExternalPackageContract, FinalizedNamespace, GenericHome, ImportRecordIr, ImportSlotIr,
-    InvalidPayloadDependency, InvalidRelocation, MaterializedRole, MaterializedSlot,
-    MaterializedSlotSource, NamespaceId, ObjectStep, PackageRole as LinkedPackageRole,
-    PayloadDependency, ProgramBuilder, ProgramIr, RelocationTarget, RemovedImportIr,
-    RootArtifactIr, TargetContract,
+    InvalidDataset, InvalidPayloadDependency, InvalidRelocation, MaterializedRole,
+    MaterializedSlot, MaterializedSlotSource, NamespaceId, ObjectStep,
+    PackageRole as LinkedPackageRole, PayloadDependency, ProgramBuilder, ProgramIr,
+    RelocationTarget, RemovedImportIr, RootArtifactIr, TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::{NativeComponent, PackageAvailability, PackageId, PackageProvider};
@@ -570,6 +571,30 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     package: *package,
                     component: component.clone(),
                 },
+                PendingRelocation::DatasetAccess {
+                    package, dataset, ..
+                } => {
+                    if let Err(invalid) = builder.carry_dataset(*package, dataset.clone()) {
+                        issues.push(FinalizationIssue::InvalidDataset(invalid));
+                        continue;
+                    }
+                    RelocationTarget::Dataset {
+                        package: *package,
+                        dataset: dataset.clone(),
+                    }
+                }
+                PendingRelocation::DataArgument { package, sets, .. } => {
+                    let data = &self.images[package].index.data;
+                    let carried = sets.iter().try_for_each(|set| {
+                        let objects = data.set(set).unwrap_or_default().to_vec();
+                        builder.carry_data_set(*package, set.clone(), objects)
+                    });
+                    if let Err(invalid) = carried {
+                        issues.push(FinalizationIssue::InvalidDataset(invalid));
+                        continue;
+                    }
+                    RelocationTarget::DataArgument { package: *package }
+                }
                 PendingRelocation::DescriptionArgument { package, .. } => {
                     RelocationTarget::DescriptionArgument {
                         description: builder.add_resource(crate::ir::ResourceIr {
@@ -639,8 +664,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         ))
     }
 
-    /// Attach every foreign namespace the payload bundles refer to, returning the Linked ones as
-    /// activation-order edges from the bundle owner.
     fn attach_payload_dependencies(
         &self,
         builder: &mut ProgramBuilder,
@@ -963,7 +986,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             })
             .collect::<Vec<_>>();
         for (package, component) in unknown_registrations {
+            let node = self.need_node(&Need::Activation { package });
             self.dynamic_names.observe_creator(NameCreator {
+                node,
                 package,
                 binding: component,
                 operation: "useDynLib(.registration = TRUE)",
@@ -975,29 +1000,43 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .creatable()
             .map(|(unresolved, creator)| {
                 (
-                    unresolved.node,
-                    unresolved.package,
-                    unresolved.binding.clone(),
-                    format!(
-                        "unresolved name `{}` can be bound at run time by `{}` in `{}::{}`",
-                        unresolved.name,
-                        creator.operation,
-                        self.packages.name(creator.package),
-                        creator.binding
-                    ),
-                    unresolved.span.clone(),
+                    creator.clone(),
+                    Evidence {
+                        package: self.packages.name(unresolved.package).to_owned(),
+                        binding: unresolved.binding.clone(),
+                        span: Some(unresolved.span.clone()),
+                        detail: format!("`{}` is bound nowhere", unresolved.name),
+                    },
                 )
             })
             .collect::<Vec<_>>();
-        for (node, package, binding, message, span) in creatable {
-            self.diagnostic(
-                node,
-                package,
-                binding.as_deref(),
-                RejectCode::UnresolvedBinding,
-                message,
-                Some(span),
-            );
+        for (creator, evidence) in creatable {
+            let package = self.packages.name(creator.package).to_owned();
+            let primary = Diagnostic {
+                package: package.clone(),
+                binding: Some(creator.binding.clone()),
+                code: RejectCode::UnresolvedBinding,
+                message: match creator.created_name() {
+                    Some(created) => format!(
+                        "`{}` in `{package}::{}` can bind `{created}` at run time, so a free name bound nowhere may be created by it",
+                        creator.operation, creator.binding
+                    ),
+                    None => format!(
+                        "`{}` in `{package}::{}` can bind any name at run time, so free names bound nowhere may be created by it",
+                        creator.operation, creator.binding
+                    ),
+                },
+                span: None,
+                node: Some(creator.node),
+                evidence: Vec::new(),
+            };
+            let cause = Cause::NameCreator {
+                package: creator.package,
+                created: creator.created_name().map(str::to_owned),
+                operation: creator.operation,
+                binding: creator.binding,
+            };
+            self.diagnostics.record_derived(cause, primary, evidence);
         }
     }
 
@@ -1019,27 +1058,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
 }
 
 impl LinkIr {
-    /// Immutable semantic construction authority produced by finalization.
     pub fn program(&self) -> &ProgramIr {
         &self.program
     }
 
-    /// Successful typed derivations used only by explanation/query consumers.
     pub fn provenance(&self) -> &crate::ir::ProvenanceIr {
         &self.provenance
     }
 
-    /// Every independent semantic blocker, sorted deterministically.
     pub fn blockers(&self) -> &[Diagnostic] {
         &self.blockers
     }
 
-    /// Exact selected installed image and build-time location of every finalized package.
     pub fn package_sources(&self) -> &crate::package::PackageSources {
         &self.packages
     }
 
-    /// Diagnostic source map retained for provenance rendering only.
     pub fn sources(&self) -> &Sources {
         &self.sources
     }
@@ -1066,6 +1100,7 @@ pub(super) enum FinalizationIssue {
         requirement: Relation,
     },
     InvalidRelocation(InvalidRelocation),
+    InvalidDataset(InvalidDataset),
     Description(String),
     PayloadOutsideProgram {
         package: String,
@@ -1126,6 +1161,9 @@ impl std::fmt::Display for FinalizationIssue {
                 "External package `{package}` has no declared DESCRIPTION requirement in the retained program"
             ),
             Self::InvalidRelocation(invalid) => invalid.fmt(f),
+            Self::InvalidDataset(InvalidDataset::NotLinked(_)) => {
+                f.write_str("a dataset can be carried only for a Linked package")
+            }
             Self::UnsatisfiedRequirement {
                 identity,
                 requirement,

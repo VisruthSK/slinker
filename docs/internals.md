@@ -26,7 +26,7 @@ The construction interpreter evaluates an installed closure at most once per req
 
 ## Cache
 
-Disposable typed index and per-binding analysis artifacts are stored under cache schema `slinker-analysis-v7`; corrupt or stale entries are cache misses. Binding fragments that mention worker-local private-environment labels are never cached, because those labels identify objects only within one inspection epoch.
+Disposable typed index and per-binding analysis artifacts are stored under cache schema `slinker-analysis-v10`; corrupt or stale entries are cache misses. Binding fragments that mention worker-local private-environment labels are never cached, because those labels identify objects only within one inspection epoch.
 
 ## Benchmarks
 

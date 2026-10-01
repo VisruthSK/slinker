@@ -4,7 +4,6 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use thiserror::Error;
 
-/// Privately installed root image analyzed as the Root package.
 #[derive(Debug)]
 pub struct StagedRoot {
     library: PathBuf,
@@ -13,18 +12,15 @@ pub struct StagedRoot {
 }
 
 impl StagedRoot {
-    /// Private staging library.
     pub fn library(&self) -> &Path {
         &self.library
     }
 
-    /// Exact installed root package directory.
     pub fn package_root(&self) -> &Path {
         &self.package_root
     }
 }
 
-/// Stage-install a frozen root source package with the selected target R.
 pub fn stage_root(
     snapshot: &SourcePackageSnapshot,
     r_home: &Path,

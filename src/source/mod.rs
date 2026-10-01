@@ -1,5 +1,3 @@
-//! Frozen source-package ingestion and target-R staging.
-
 mod description;
 mod package;
 mod staging;

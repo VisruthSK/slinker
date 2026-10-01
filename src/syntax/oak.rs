@@ -1,15 +1,3 @@
-//! Oak semantic adapter.
-//!
-//! Air owns parsing. Oak owns lexical scopes, definitions, uses, use-def
-//! relationships, lexical fallthrough, and annotated evaluation/NSE effects.
-//! Slinker translates Oak results into the fact types consumed by the existing
-//! demand linker. Source-text inspection below recovers static arguments and
-//! spans at sites Oak has already classified as semantically live. A narrow
-//! refinement can discharge Oak conditional fallthrough only when Oak's own
-//! reaching definitions plus stable repeated predicates or terminating branches
-//! prove that every surviving path is bound. It does not build a parallel lexical
-//! environment or general control-flow evaluator.
-
 use crate::syntax::facts::{
     ActiveBindingDef, BindingDeclaration, CallSite, CalleeKind, ConstructionArgument,
     ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredCallable,
@@ -47,12 +35,6 @@ enum ExternalNameOrigin {
     UnknownImportAll,
 }
 
-/// Resolution result for a name that has already fallen through slinker's
-/// package/private/native bindings into NAMESPACE imports and base.
-///
-/// This table is shared by Oak's effects resolver and the linker's ordinary
-/// name resolver so importFrom/import-all precedence cannot drift between the
-/// two semantic paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NamespaceImportResolution {
     Imported {
@@ -88,8 +70,6 @@ enum NamespaceImport {
     },
     All {
         package: String,
-        /// Exported name -> installed binding name. `None` means the imported
-        /// namespace was unavailable while constructing the resolver table.
         exports: Option<BTreeMap<String, String>>,
         except: BTreeSet<String>,
     },
@@ -101,7 +81,6 @@ impl NamespaceImport {
     }
 }
 
-/// The installed binding one imports-environment name is copied from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportedBinding {
     pub(crate) package: String,
@@ -114,12 +93,6 @@ pub(crate) struct ImportRecord {
     pub(crate) names: Vec<(String, String)>,
 }
 
-/// Immutable NAMESPACE import-resolution table.
-///
-/// Imports keep their installed order and a later import of a name replaces an
-/// earlier one, as R fills a namespace's imports environment. A missing
-/// import-all only makes a name ambiguous once resolution actually reaches
-/// that entry; it does not erase a later package that provides the name.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct NamespaceImports {
     imports: Vec<NamespaceImport>,
@@ -184,8 +157,6 @@ impl NamespaceImports {
                     return NamespaceImportResolution::Imported {
                         package: package.clone(),
                         binding: binding.clone(),
-                        // Effects are attached to the package's exported function
-                        // name, while the linker retains the installed binding name.
                         effect_name: name.to_owned(),
                     };
                 }
@@ -195,8 +166,6 @@ impl NamespaceImports {
         NamespaceImportResolution::BaseFallback
     }
 
-    /// Every name the imports environment holds, with the binding `resolve` answers for it,
-    /// or the package of an import-all whose exports are unknown.
     pub(crate) fn names(&self) -> std::result::Result<BTreeMap<String, ImportedBinding>, &str> {
         let mut names = BTreeMap::new();
         for import in &self.imports {
@@ -263,16 +232,10 @@ impl NamespaceImports {
     }
 }
 
-/// Installed-namespace facts supplied by slinker to Oak's import/effects
-/// resolver. Local lexical state is deliberately absent: Oak owns it.
 #[derive(Debug, Default, Clone)]
 pub struct OakParseContext {
     shadowed_names: BTreeSet<String>,
     imports: NamespaceImports,
-    /// Package-local closures that slinker has conservatively proved cannot
-    /// return to their caller. This is used only to refine Oak conditional
-    /// fallthrough diagnostics after Oak has identified the live use and its
-    /// reaching definitions.
     non_returning_names: BTreeSet<String>,
 }
 
@@ -339,22 +302,11 @@ struct SlinkerImportsResolver<'a> {
 
 impl ImportsResolver for SlinkerImportsResolver<'_> {
     fn resolve_source(&mut self, _path: &str) -> Option<SourceResolution> {
-        // Installed package binding source is self-contained here. Slinker does
-        // not model workspace `source()` injection as part of installed-package
-        // image linking.
         None
     }
 
     fn resolve_effects(&mut self, name: &str, attached: &[String]) -> Option<EffectsHandlers> {
-        // A search-path attach can mask base. The linker rejects supported
-        // attachment calls, so when an attached package has no registered Oak
-        // effect we conservatively refuse to claim the base identity.
         if !attached.is_empty() {
-            // Search-path attachment is outside slinker's supported contract.
-            // Without each attached package's full export table we cannot prove
-            // which package owns a bare name: a later package with no Oak
-            // annotation may still mask an earlier annotated function. Refuse
-            // to assign effects rather than skipping possible maskers.
             return None;
         }
 
@@ -372,9 +324,6 @@ impl ImportsResolver for SlinkerImportsResolver<'_> {
     }
 
     fn package_exists(&mut self, _package: &str) -> bool {
-        // Availability and target-library policy belong to the linker. Returning
-        // true prevents Oak from inventing missing-package diagnostics without
-        // access to slinker's selected package universe.
         true
     }
 }
@@ -946,6 +895,7 @@ fn translate_index(
     };
     let mut package_refs = namespace_access_facts(translation, &live_uses, &mut live_calls);
     binary_operator_facts(translation, &mut references, &mut live_calls);
+    dispatching_syntax_facts(translation, &mut live_calls);
 
     deduplicate_calls(&mut live_calls);
 
@@ -1013,8 +963,6 @@ fn translate_index(
 
 const NAMESPACE_INFO: &str = ".__NAMESPACE__.";
 
-/// Every read of a `.__NAMESPACE__.` information environment through `$` or `[[`, and every
-/// lexical `.__NAMESPACE__.` whose field is extracted.
 fn collect_namespace_info_reads(
     source: SourceId,
     text: &str,
@@ -1051,7 +999,6 @@ fn collect_namespace_info_reads(
     reads
 }
 
-/// The receiver and member of `receiver$member` or `receiver[["member"]]`.
 fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpression, String)> {
     match expression {
         AnyRExpression::RExtractExpression(extract)
@@ -1077,7 +1024,6 @@ fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpress
     }
 }
 
-/// The member extracted from `expression` by the expression that immediately contains it.
 fn extracted_field(text: &str, expression: &AnyRExpression) -> Option<String> {
     let parent = AnyRExpression::cast(expression.syntax().parent()?)?;
     let (receiver, member) = member_access(text, &parent)?;
@@ -1162,11 +1108,6 @@ fn refine_callee_kinds(
     live_uses: &mut [LiveUse],
 ) {
     for live_use in live_uses.iter_mut() {
-        // Oak currently treats a `for` induction definition as sufficient to
-        // bind a later use. R has a zero-iteration path where that assignment
-        // never happens. Put that path back before applying positive slinker
-        // refinements. A pre-existing definitely executed binding still makes
-        // the post-loop use safe.
         if live_use.callee_kind == CalleeKind::DefinitelyLexical
             && post_for_use_may_fall_through(text, index, for_regions, if_regions, live_use)
         {
@@ -1992,10 +1933,6 @@ fn recursive_closure_binding_is_initialized(
         })
 }
 
-/// Whether a use after a `for` loop must retain the loop's zero-iteration
-/// fallthrough. Oak's current use-def map can report the induction variable as
-/// definitely bound after the loop, but R assigns it only when an iteration
-/// actually begins.
 fn post_for_use_may_fall_through(
     text: &str,
     index: &SemanticIndex,
@@ -2084,11 +2021,6 @@ fn scope_has_definite_binding_before(
         })
 }
 
-/// A deliberately structural dominance check used only for local bindings that
-/// Oak has already identified. It does not discover names. A definition is
-/// accepted when every enclosing branch/loop containing the definition also
-/// contains the later position, so reaching the later position implies that
-/// the definition's control region was entered.
 fn definition_must_execute_before_position(
     _text: &str,
     definition_start: usize,
@@ -2161,11 +2093,6 @@ enum SimplePredicate {
     Static(bool),
 }
 
-/// Refine one of Oak's conservative conditional fallthroughs only when the
-/// source proves that every path reaching this use has already executed a
-/// reaching local definition. Oak still supplies the live use and the exact
-/// reaching-definition set. This pass adds a deliberately small path domain
-/// for stable scalar predicates plus definitely terminating branches.
 fn conditional_fallthrough_proven_bound(
     text: &str,
     context: &OakParseContext,
@@ -2229,8 +2156,6 @@ fn conditional_fallthrough_proven_bound(
         &mut use_assumptions,
     );
 
-    // Correlate a repeated stable predicate, including equivalent negations
-    // such as an `else` of `x == "a"` and a later `x != "a"` branch.
     for (_definition, definition_start, defining_scope) in &reaching {
         if !definition_is_direct_in_branch(text, regions, *definition_start) {
             continue;
@@ -2262,10 +2187,6 @@ fn conditional_fallthrough_proven_bound(
         .collect::<Vec<_>>();
     let defining_scope = reaching.first().map(|(_, _, scope)| *scope);
 
-    // Prove an earlier exhaustive dispatch. A chain is sufficient only when
-    // each path that can continue after it has a direct reaching assignment to
-    // this name; a path may omit the assignment only if it exits the function
-    // or invokes a callee already proved non-returning.
     for region in regions {
         let Some(TextRange { end: chain_end, .. }) = region.else_branch else {
             continue;
@@ -2305,10 +2226,6 @@ fn conditional_fallthrough_proven_bound(
         }
     }
 
-    // Preserve the finite alternatives of an earlier exhaustive equality
-    // dispatch instead of collapsing them to one generic "maybe assigned"
-    // state. This is the ISCAM shape where a later branch re-tests the same
-    // unchanged selector and therefore rules out earlier arms.
     for region in regions {
         let Some(TextRange { end: chain_end, .. }) = region.else_branch else {
             continue;
@@ -2929,11 +2846,6 @@ fn condition_symbols_stable(
         return true;
     }
 
-    // Invalidate a predicate fact if any syntactic mutation of one of its
-    // symbols appears between the two sites. Checking descendant scopes as
-    // well is conservative: defining a nested closure does not itself execute
-    // its assignments, but refusing a proof is safer than assuming the closure
-    // cannot run and mutate a captured binding before the repeated predicate.
     for definition_scope in index.scope_ids() {
         for (_, definition) in index.definitions(definition_scope).iter() {
             if !matches!(
@@ -2959,9 +2871,6 @@ fn condition_symbols_stable(
         }
     }
 
-    // `rm()` / `remove()` can destroy a binding without creating an Oak
-    // definition. Refuse the correlation proof if either appears between the
-    // two sites.
     let segment = text.get(start..end).unwrap_or_default();
     !contains_call_named(segment, "rm") && !contains_call_named(segment, "remove")
 }
@@ -3376,12 +3285,6 @@ fn direct_call_expression(
     (trailing >= end).then_some((package, callee, callee_start))
 }
 
-/// Conservative package-local summary used by the linker when constructing an
-/// Oak parse context. This summary is intentionally small: it recognizes only
-/// control flow whose final expression is provably non-returning through base
-/// termination primitives, an exhaustive `if`/`else`, or another package-local
-/// helper already carrying the same summary. Any explicit `return()` elsewhere
-/// in the closure prevents the summary.
 pub(crate) fn closure_definitely_non_returning(text: &str, context: &OakParseContext) -> bool {
     let Some((body_start, body_end)) = function_body_range(text) else {
         return false;
@@ -3888,12 +3791,6 @@ fn superassignment_targets_captured_activation(
     target_start: usize,
     target: &str,
 ) -> bool {
-    // `<<-` skips the current function environment and searches lexical
-    // parents. Oak records the superassignment at its lexical site, but the
-    // index does not expose a point-in-time query for a definition target.
-    // Use Oak to identify bindings, and syntax regions only to identify which
-    // function activation owns those bindings and whether their assignment
-    // must have executed before the nested closure is created.
     if index.scope(scope).kind() != ScopeKind::Function {
         return false;
     }
@@ -3913,16 +3810,10 @@ fn superassignment_targets_captured_activation(
     ancestors.sort_by_key(|region| region.body.end.saturating_sub(region.body.start));
 
     for ancestor in ancestors {
-        // Formal bindings exist in the activation frame from function entry.
         if ancestor.parameters.contains(target) {
             return true;
         }
 
-        // The direct child function on the path to the superassignment is the
-        // conservative closure-creation boundary for assignments in this
-        // ancestor. Assignments after that point may still be safe if the
-        // closure is invoked later, but proving that requires call-context
-        // analysis and is deliberately left unresolved here.
         let child_start = direct_child_function_start(function_regions, ancestor, current_function)
             .unwrap_or(current_function.function_start);
 
@@ -4888,11 +4779,19 @@ fn find_for_regions(text: &str) -> Vec<ForRegion> {
 }
 
 fn find_if_regions(text: &str) -> Vec<IfRegion> {
+    scan_if_regions(text, usize::MAX)
+}
+
+fn first_if_region(text: &str) -> Option<IfRegion> {
+    scan_if_regions(text, 1).into_iter().next()
+}
+
+fn scan_if_regions(text: &str, limit: usize) -> Vec<IfRegion> {
     let mut regions = Vec::new();
     let bytes = text.as_bytes();
     let mut cursor = 0;
     let mut quote = None;
-    while cursor < bytes.len() {
+    while cursor < bytes.len() && regions.len() < limit {
         let byte = bytes[cursor];
         if let Some(delimiter) = quote {
             if byte == b'\\' {
@@ -4965,14 +4864,12 @@ fn expression_end(text: &str, start: usize) -> usize {
     }
     if text.get(start..).is_some_and(|rest| rest.starts_with("if"))
         && word_boundary_after(text, start + 2)
+        && let Some(region) = first_if_region(&text[start..])
     {
-        let regions = find_if_regions(&text[start..]);
-        if let Some(region) = regions.first() {
-            return start
-                + region
-                    .else_branch
-                    .map_or(region.then_branch.end, |branch| branch.end);
-        }
+        return start
+            + region
+                .else_branch
+                .map_or(region.then_branch.end, |branch| branch.end);
     }
 
     let mut cursor = start;
@@ -5109,6 +5006,109 @@ impl RParser for OakParser {
                 path: format!("source:{}", source.0),
                 message,
             })
+    }
+}
+
+fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<LiveCall>) {
+    let Translation {
+        source,
+        root,
+        index,
+        scopes,
+        declarations,
+        ..
+    } = translation;
+    let mut record = |callee: String, qualified: bool, node: &AnyRExpression| {
+        let span = ast_span(source, node);
+        if declarations.is_inert(span.start) {
+            return;
+        }
+        let (scope, _) = index.scope_at(node.syntax().text_trimmed_range().start());
+        let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &[]);
+        live_calls.push(LiveCall {
+            site: CallSite {
+                callee,
+                callee_kind: CalleeKind::DefinitelyExternal,
+                qualified_package: qualified.then(|| "base".into()),
+                args: Vec::new(),
+                arg_names: Vec::new(),
+                arg_spans: Vec::new(),
+                local_closure_args: Vec::new(),
+                scope: lexical_scope,
+                arg_bindings,
+                phase: phase_for_scope(index, scope),
+                guards: Vec::new(),
+                span: span.clone(),
+            },
+            raw: RawCall {
+                start: span.start,
+                end: span.end,
+                args: Vec::new(),
+            },
+        });
+    };
+    for expression in root.syntax().descendants().filter_map(AnyRExpression::cast) {
+        match &expression {
+            AnyRExpression::RUnaryExpression(unary) => {
+                if let Ok(operator) = unary.operator()
+                    && matches!(operator.text_trimmed(), "-" | "+" | "!")
+                {
+                    record(operator.text_trimmed().to_owned(), true, &expression);
+                }
+            }
+            AnyRExpression::RSubset(_) => record("[".into(), true, &expression),
+            AnyRExpression::RSubset2(_) => record("[[".into(), true, &expression),
+            AnyRExpression::RExtractExpression(extract) => {
+                if let Ok(operator) = extract.operator() {
+                    record(operator.text_trimmed().to_owned(), true, &expression);
+                }
+            }
+            AnyRExpression::RBinaryExpression(binary) => {
+                let Ok(operator) = binary.operator() else {
+                    continue;
+                };
+                let target = match operator.text_trimmed() {
+                    "<-" | "=" | "<<-" => binary.left().ok(),
+                    "->" | "->>" => binary.right().ok(),
+                    _ => continue,
+                };
+                let mut target = target;
+                while let Some(current) = target.take() {
+                    match &current {
+                        AnyRExpression::RSubset(subset) => {
+                            record("[<-".into(), true, &current);
+                            target = subset.function().ok();
+                        }
+                        AnyRExpression::RSubset2(subset) => {
+                            record("[[<-".into(), true, &current);
+                            target = subset.function().ok();
+                        }
+                        AnyRExpression::RExtractExpression(extract) => {
+                            let Ok(operator) = extract.operator() else {
+                                break;
+                            };
+                            record(format!("{}<-", operator.text_trimmed()), true, &current);
+                            target = extract.left().ok();
+                        }
+                        AnyRExpression::RCall(call) => {
+                            let Some((name, _)) = identifier_callee(call) else {
+                                break;
+                            };
+                            record(format!("{name}<-"), false, &current);
+                            target = call
+                                .arguments()
+                                .ok()
+                                .and_then(|arguments| {
+                                    arguments.items().iter().find_map(std::result::Result::ok)
+                                })
+                                .and_then(|argument| argument.value());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

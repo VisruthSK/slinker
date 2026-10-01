@@ -13,17 +13,12 @@ pub enum CacheLocation {
     Disabled,
 }
 
-/// Disposable, schema-scoped analysis cache.
 #[derive(Debug)]
 pub struct Cache {
     analysis: Option<PathBuf>,
 }
 
 impl Cache {
-    /// Select and initialize the cache root for one analysis schema.
-    ///
-    /// An explicitly configured root is validated eagerly. Automatically selected caches may
-    /// fall back to a process-private temporary directory.
     pub fn new(location: CacheLocation, schema: &str) -> Result<Self> {
         let (root, explicit) = match location {
             CacheLocation::Disabled => return Ok(Self { analysis: None }),
@@ -55,16 +50,12 @@ impl Cache {
         })
     }
 
-    /// Read a typed cache object. Every I/O or decoding problem is a cache miss.
     pub fn read<T: DeserializeOwned>(&self, name: &str) -> Option<T> {
         fs::read(self.analysis.as_ref()?.join(name))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     }
 
-    /// Publish a typed object atomically without replacing an existing destination.
-    ///
-    /// Publication is best effort because computed semantic data never depends on the cache.
     pub fn publish<T: Serialize>(&self, name: &str, value: &T) {
         let Some(analysis) = &self.analysis else {
             return;

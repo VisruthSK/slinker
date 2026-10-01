@@ -2,10 +2,10 @@ use crate::package::{
     BindingImage, ExportMap, ImportSpec, NativeComponent, PrivateEnvironmentImage, S3Registration,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -37,7 +37,6 @@ pub struct PayloadSpec {
     pub patches: Vec<ClosurePatchSpec>,
 }
 
-/// Outcome of serializing each payload bundle in one R operation, in request order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PayloadSerialization {
@@ -53,11 +52,9 @@ pub enum PayloadSerialization {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SerializedPayload {
     pub bytes: Vec<u8>,
-    /// Namespace spec names restoring `bytes` resolves.
     pub namespaces: Vec<String>,
 }
 
-/// A payload binding, by request index and name, from which a shared reference object is reached.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PayloadSite {
     pub payload: usize,
@@ -116,7 +113,8 @@ pub struct WorkerPackageIndex {
     pub dynlibs: Vec<NativeComponent>,
     pub on_load: bool,
     pub binding_names: Vec<String>,
-    pub datasets: Vec<String>,
+    pub data_sets: BTreeMap<String, Vec<String>>,
+    pub data_files: bool,
     pub has_sysdata: bool,
 }
 
@@ -127,6 +125,13 @@ pub struct WorkerBinding {
     pub image_fingerprint: String,
     pub binding: BindingImage,
     pub private_environments: HashMap<String, PrivateEnvironmentImage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DataLibraryFiles {
+    pub rdb: Vec<u8>,
+    pub rdx: Vec<u8>,
+    pub rds: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -144,6 +149,17 @@ pub enum WorkerRequest {
         request_id: u64,
         package: PackageSpec,
         name: String,
+    },
+    DispatchGenerics {
+        request_id: u64,
+        package: Option<PackageSpec>,
+        name: String,
+    },
+    DataLibrary {
+        request_id: u64,
+        package: PackageSpec,
+        objects: Vec<String>,
+        sets: BTreeMap<String, Vec<String>>,
     },
     SerializePayloads {
         request_id: u64,
@@ -183,6 +199,14 @@ pub enum WorkerResponse {
         request_id: u64,
         binding: WorkerBinding,
     },
+    DispatchGenerics {
+        request_id: u64,
+        generics: Vec<String>,
+    },
+    DataLibrary {
+        request_id: u64,
+        library: DataLibraryFiles,
+    },
     Payloads {
         request_id: u64,
         serialization: PayloadSerialization,
@@ -195,6 +219,7 @@ pub enum WorkerResponse {
     NormalizedSyntax {
         request_id: u64,
         source: String,
+        stable: bool,
     },
     Error {
         error: WorkerFailure,

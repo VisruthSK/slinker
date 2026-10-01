@@ -5,11 +5,11 @@ use crate::ir::{
     NamespaceId, ObjectStep, PayloadBundleId, PayloadBundleIr, PayloadDependency, ProgramIr,
     RegisteredNamespace, RemovedImportIr, ResourceId, Value,
 };
-use crate::package::PackageId;
+use crate::package::{CanonicalSyntax, PackageId};
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{
-    ClosurePatchSpec, NamespaceImageSpec, ObjectStepSpec, PackageSpec, PayloadSerialization,
-    PayloadSite, PayloadSpec, SerializedPayload,
+    ClosurePatchSpec, DataLibraryFiles, NamespaceImageSpec, ObjectStepSpec, PackageSpec,
+    PayloadSerialization, PayloadSite, PayloadSpec, SerializedPayload,
 };
 use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,7 +30,6 @@ macro_rules! emit {
     }};
 }
 
-/// Selected target-R physical handle available to staging and materialization.
 #[derive(Debug)]
 pub struct TargetRuntimeHandle {
     r_home: PathBuf,
@@ -55,7 +54,6 @@ impl TargetRuntimeHandle {
     }
 }
 
-/// Frozen physical inputs used to orchestrate preflight, never passed wholesale to materialization.
 #[derive(Debug)]
 pub struct BuildContext {
     source: SourcePackageSnapshot,
@@ -63,17 +61,15 @@ pub struct BuildContext {
     target_runtime: TargetRuntimeHandle,
 }
 
-/// Exact installed bytes redeemed from the selected images before preflight.
 #[derive(Debug)]
 struct FrozenInputs {
     bundles: Vec<CheckedPayloadBundle>,
     resources: BTreeMap<ResourceId, PathBuf>,
+    datasets: BTreeMap<PackageId, DataLibraryFiles>,
     code: RelocatedCode,
     _directory: TempDir,
 }
 
-/// One payload bundle serialized by the target R whose namespace references match its IR
-/// dependencies and whose reference objects are reached from no other bundle.
 #[derive(Debug)]
 struct CheckedPayloadBundle {
     bundle: PayloadBundleId,
@@ -94,14 +90,6 @@ impl BuildContext {
         }
     }
 
-    /// Redeem every physical input `ProgramIr` needs, then prove that no selected image changed
-    /// since analysis fingerprinted it.
-    ///
-    /// # Errors
-    ///
-    /// Blocks when a serialized payload bundle diverges from its IR entity. Fails when payload
-    /// serialization or resource copying fails, or with
-    /// [`BuildContextError::TargetUniverseChanged`] when a selected image no longer matches.
     fn freeze(&self, ir: &LinkIr) -> Result<FrozenInputs, PreflightError> {
         let program = ir.program();
         let sources = ir.package_sources();
@@ -151,6 +139,22 @@ impl BuildContext {
             bundles = check_payload_bundles(program, serialized)?;
         }
 
+        let mut datasets = BTreeMap::new();
+        for (package, library) in program.dataset_libraries() {
+            let sets = library
+                .sets()
+                .iter()
+                .map(|(set, objects)| {
+                    (
+                        set.clone(),
+                        objects.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let objects = library.objects().iter().map(ToString::to_string).collect();
+            datasets.insert(package, worker.data_library(spec(package), objects, sets)?);
+        }
+
         let directory = tempfile::Builder::new()
             .prefix("slinker-frozen-")
             .tempdir()?;
@@ -168,6 +172,7 @@ impl BuildContext {
             bundles,
             code,
             resources,
+            datasets,
             _directory: directory,
         })
     }
@@ -197,7 +202,6 @@ pub enum BuildContextError {
     InvalidCode(String),
 }
 
-/// Narrow physical view available only after successful preflight.
 #[derive(Clone, Copy)]
 pub struct MaterializationContext<'a> {
     source_files: &'a FrozenSourceFiles,
@@ -222,15 +226,17 @@ impl MaterializationContext<'_> {
         &self.frozen.resources[&resource]
     }
 
+    fn dataset_library(&self, package: PackageId) -> &DataLibraryFiles {
+        &self.frozen.datasets[&package]
+    }
+
     fn code(&self) -> &RelocatedCode {
         &self.frozen.code
     }
 }
 
-/// First exact source-package materialization profile.
 pub enum PureRStatic {}
 
-/// Opaque capability proving full preflight succeeded for one profile.
 pub struct BuildableProgram<'a, Profile> {
     program: &'a ProgramIr,
     description: &'a str,
@@ -240,12 +246,6 @@ pub struct BuildableProgram<'a, Profile> {
 }
 
 impl PureRStatic {
-    /// Check every analysis blocker and profile capability, then freeze the physical inputs of an
-    /// eligible program.
-    ///
-    /// # Errors
-    ///
-    /// Returns one deterministic report of every blocker, or the failure to freeze inputs.
     pub fn check<'a>(
         ir: &'a LinkIr,
         context: &'a BuildContext,
@@ -253,15 +253,21 @@ impl PureRStatic {
         let mut blockers = ir
             .blockers()
             .iter()
-            .map(|blocker| match &blocker.binding {
-                Some(binding) => format!(
-                    "{:?} in {}::{binding}: {}",
-                    blocker.code, blocker.package, blocker.message
-                ),
-                None => format!(
-                    "{:?} in {}: {}",
-                    blocker.code, blocker.package, blocker.message
-                ),
+            .map(|blocker| {
+                let rendered = match &blocker.binding {
+                    Some(binding) => format!(
+                        "{:?} in {}::{binding}: {}",
+                        blocker.code, blocker.package, blocker.message
+                    ),
+                    None => format!(
+                        "{:?} in {}: {}",
+                        blocker.code, blocker.package, blocker.message
+                    ),
+                };
+                match blocker.evidence_summary() {
+                    Some(summary) => format!("{rendered} (reached from {summary})"),
+                    None => rendered,
+                }
             })
             .collect::<BTreeSet<_>>();
         let description = ir.program().root_artifact().description.as_deref();
@@ -312,7 +318,6 @@ impl From<std::io::Error> for PreflightError {
     }
 }
 
-/// Deterministic complete build-preflight failure report.
 #[derive(Clone, Debug, Error)]
 #[error("build preflight failed:\n{rendered}")]
 pub struct BuildReport {
@@ -335,7 +340,6 @@ impl BuildReport {
     }
 }
 
-/// Completed generated source-package artifact.
 #[derive(Debug)]
 pub struct GeneratedPackage {
     path: PathBuf,
@@ -347,7 +351,6 @@ impl GeneratedPackage {
     }
 }
 
-/// Materialize a preflight-approved ProgramIr into a generated R source package.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "consuming the preflight capability makes each approved program materialize once"
@@ -402,6 +405,7 @@ pub fn materialize(
     validate_r_source(&mut worker, &generated)?;
     fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
     copy_linked_resources(buildable.program, materialization, &package_root)?;
+    copy_dataset_libraries(buildable.program, materialization, &package_root)?;
     fs::rename(&package_root, output)?;
     Ok(GeneratedPackage {
         path: output.to_path_buf(),
@@ -516,6 +520,12 @@ fn generate_r_source(
                 r_string(&native.alias),
                 r_string(library)
             );
+        }
+        if program
+            .dataset_libraries()
+            .any(|(library, _)| library == namespace.package)
+        {
+            emit!(out, "    .slinker_lazydata(ns, {})", r_string(name));
         }
         emit!(
             out,
@@ -653,9 +663,6 @@ fn registered_name(program: &ProgramIr, namespace: NamespaceId) -> &str {
         .as_str()
 }
 
-/// Accept the target-R serialization of every IR payload bundle only when no reference object
-/// is shared between bundles and each bundle resolves exactly the namespaces its IR entity
-/// depends on.
 fn check_payload_bundles(
     program: &ProgramIr,
     serialization: PayloadSerialization,
@@ -957,14 +964,11 @@ fn native_library(program: &ProgramIr, package: PackageId, component: &str) -> S
 }
 
 fn validate_r_source(worker: &mut WorkerClient, source: &str) -> Result<(), MaterializeError> {
-    let normalized = worker.normalize_syntax(source)?;
-    let normalized_again = worker.normalize_syntax(&normalized)?;
-    if normalized == normalized_again {
-        Ok(())
-    } else {
-        Err(MaterializeError::InvalidR(
+    match worker.canonical_syntax(source)? {
+        CanonicalSyntax::Stable(_) => Ok(()),
+        CanonicalSyntax::Unstable => Err(MaterializeError::InvalidR(
             "target-R parse/deparse normalization is not stable".into(),
-        ))
+        )),
     }
 }
 
@@ -996,6 +1000,33 @@ fn copy_linked_resources(
             .join(package.name.as_str())
             .join(&resource.path);
         copy_entry(source, &target)?;
+    }
+    Ok(())
+}
+
+fn copy_dataset_libraries(
+    program: &ProgramIr,
+    context: MaterializationContext<'_>,
+    output: &Path,
+) -> Result<(), std::io::Error> {
+    for (package, _) in program.dataset_libraries() {
+        let identity = program.package(package).identity();
+        let files = context.dataset_library(package);
+        let root = output
+            .join("inst/slinker/datalib")
+            .join(identity.name.as_str());
+        let data = root.join("data");
+        fs::create_dir_all(&data)?;
+        fs::write(
+            root.join("DESCRIPTION"),
+            format!(
+                "Package: {}\nVersion: {}\n",
+                identity.name, identity.version
+            ),
+        )?;
+        fs::write(data.join("Rdata.rdb"), &files.rdb)?;
+        fs::write(data.join("Rdata.rdx"), &files.rdx)?;
+        fs::write(data.join("Rdata.rds"), &files.rds)?;
     }
     Ok(())
 }
@@ -1083,10 +1114,17 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
   setNamespaceInfo(namespace, "path", "")
   setNamespaceInfo(namespace, "dynlibs", character())
   setNamespaceInfo(namespace, "DLLs", list())
+  lazydata <- new.env(hash = TRUE, parent = baseenv())
+  attr(lazydata, "name") <- paste0("lazydata:", name)
+  setNamespaceInfo(namespace, "lazydata", lazydata)
   setNamespaceInfo(namespace, "S3methods", matrix(NA_character_, 0L, 4L))
   namespace$.__S3MethodsTable__. <- new.env(hash = TRUE, parent = baseenv())
   .Internal(registerNamespace(key, namespace))
   namespace
+}
+.slinker_lazydata <- function(namespace, package) {
+  directory <- system.file("slinker", "datalib", package, "data", package = .slinker_root_package, mustWork = TRUE)
+  lazyLoad(file.path(directory, "Rdata"), envir = getNamespaceInfo(namespace, "lazydata"))
 }
 .slinker_load_native <- function(namespace, package, component, alias, library, symbols) {
   path <- system.file("slinker", "resources", package, library, package = .slinker_root_package, mustWork = TRUE)
@@ -1105,6 +1143,8 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
   invisible(list2env(readRDS(bundle), envir = namespace))
 }
 .slinker_stub <- function(envir, name, package, binding) {
+  force(package)
+  force(binding)
   makeActiveBinding(name, function(value) {
     stop(sprintf("`%s::%s` was removed by slinker because the build never reached it", package, binding), call. = FALSE)
   }, envir)

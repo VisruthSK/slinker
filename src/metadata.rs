@@ -1,31 +1,8 @@
-//! Typed R package metadata.
-//!
-//! `r-description-parser` owns DESCRIPTION/DCF parsing. `r-metadata` owns the
-//! semantic values. Slinker deliberately does not keep a second DCF parser or
-//! duplicate dependency/version model here.
-
 pub use r_description::Description;
 pub use r_metadata::{Priority, Relation, RequirementVersion, Version, VersionRequirement};
 
 use std::collections::BTreeSet;
 
-/// Intersect every requirement that retained packages place on one runtime package.
-///
-/// # Arguments
-///
-/// * `package` - Name shared by every relation
-/// * `requirements` - Declared relations naming `package`
-///
-/// # Returns
-///
-/// The smallest relation list accepting exactly the versions every input accepts: at most one
-/// lower bound, one upper bound, and the exclusions that remain inside those bounds, or a single
-/// exact requirement.
-///
-/// # Errors
-///
-/// Returns a description of the conflict when no version satisfies every requirement or when a
-/// requirement names an R source revision instead of a package version.
 pub fn intersect_requirements(
     package: &str,
     requirements: &[Relation],
@@ -172,7 +149,6 @@ fn admits_bounds(
         })
 }
 
-/// Standard relationship fields slinker consumes for installed-package policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelationField {
     Imports,
@@ -192,11 +168,6 @@ impl RelationField {
     }
 }
 
-/// Parse one standard dependency field through `r-description-parser`.
-///
-/// The parser recovers valid entries around malformed ones, but slinker cannot
-/// use a partial dependency list without changing package reachability. Treat
-/// any retained issue as a metadata error and only return a complete typed list.
 pub fn relations(
     description: &Description,
     field: RelationField,

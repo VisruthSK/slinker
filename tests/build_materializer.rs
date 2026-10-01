@@ -107,6 +107,447 @@ fn build_links_pure_r_dependency_absent_from_runtime_library() {
 }
 
 #[test]
+fn unregistered_lexical_methods_dispatch_from_linked_code_as_in_the_original() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("lexlinked");
+    write_package(
+        &dependency_source,
+        "lexlinked",
+        "Imports: stats\n",
+        "export(show_format, show_add, show_median, show_print, show_summary_name)\nS3method(print, registered)\n",
+        concat!(
+            "show_format <- function(x) format(x)\n",
+            "show_add <- function(a, b) a + b\n",
+            "show_median <- function(x) stats::median(x)\n",
+            "show_print <- function(x) print(x)\n",
+            "show_summary_name <- function() 'summary.lexical'\n",
+            "format.lexical <- function(x, ...) 'lexical-format'\n",
+            "`+.lexical` <- function(e1, e2) 'lexical-plus'\n",
+            "median.lexical <- function(x, na.rm = FALSE, ...) 'lexical-median'\n",
+            "print.registered <- function(x, ...) cat('registered\n')\n",
+            "print.lexical <- function(x, ...) cat('lexical-print\n')\n",
+            "summary.lexical <- function(object, ...) 'never dispatched'\n",
+        ),
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+
+    let root_source = fixture.path().join("lexroot");
+    write_package(
+        &root_source,
+        "lexroot",
+        "Imports: lexlinked\n",
+        "importFrom(lexlinked, show_format, show_add, show_median, show_print)\nexport(go)\n",
+        concat!(
+            "go <- function() {\n",
+            "  lexical <- structure(1, class = 'lexical')\n",
+            "  registered <- structure(1, class = 'registered')\n",
+            "  list(\n",
+            "    format = show_format(lexical),\n",
+            "    plus = show_add(lexical, lexical),\n",
+            "    median = show_median(lexical),\n",
+            "    lexical_print = utils::capture.output(show_print(lexical)),\n",
+            "    registered_print = utils::capture.output(show_print(registered))\n",
+            "  )\n",
+            "}\n",
+        ),
+    );
+    let output = fixture.path().join("generated-lexroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run lexical dispatch build");
+    assert_success(&result, "slinker build lexical dispatch fixture");
+
+    let behavior = "library(lexroot); stopifnot(identical(go(), list(format = 'lexical-format', plus = 'lexical-plus', median = 'lexical-median', lexical_print = 'lexical-print', registered_print = 'registered')))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &output, &validation);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency_source, &installed);
+    install_package(&r_home, &output, &installed);
+    let demand_driven = "imports <- parent.env(asNamespace('lexroot')); linked <- environment(get('show_format', envir = imports)); stopifnot(is.function(get('format.lexical', envir = linked)), is.function(get('print.lexical', envir = linked))); message <- tryCatch(get('summary.lexical', envir = linked), error = conditionMessage); stopifnot(grepl('`lexlinked::summary.lexical` was removed by slinker', message, fixed = TRUE))";
+    for library in [&validation, &installed] {
+        run_r(&r_home, library, &format!("{behavior}; {demand_driven}"));
+    }
+}
+
+struct OptionalFixture {
+    dependency: PathBuf,
+    optional: PathBuf,
+    root: PathBuf,
+}
+
+fn optional_fixture(fixture: &Path, suggests: &str, mode_code: &str) -> OptionalFixture {
+    let optional = fixture.join("optpkg");
+    write_package(
+        &optional,
+        "optpkg",
+        "",
+        "export(marker)\n",
+        "marker <- function() 'opt-ran'\n",
+    );
+    let dependency = fixture.join("optdep");
+    write_package(&dependency, "optdep", suggests, "export(mode)\n", mode_code);
+    let root = fixture.join("optroot");
+    write_package(
+        &root,
+        "optroot",
+        "Imports: optdep\n",
+        "importFrom(optdep, mode)\nexport(go)\n",
+        "go <- function() mode()\n",
+    );
+    OptionalFixture {
+        dependency,
+        optional,
+        root,
+    }
+}
+
+fn library_with(r_home: &Path, root: &Path, packages: &[&Path]) -> PathBuf {
+    let library = tempfile::Builder::new()
+        .tempdir_in(root)
+        .expect("library")
+        .keep();
+    for package in packages {
+        install_package(r_home, package, &library);
+    }
+    library
+}
+
+fn build_optional_root(
+    fixture: &OptionalFixture,
+    library: &Path,
+    output: &Path,
+    flags: &[&str],
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(library)
+        .args(flags)
+        .arg("--output")
+        .arg(output)
+        .arg(&fixture.root)
+        .output()
+        .expect("run optional-package build")
+}
+
+#[test]
+fn unselected_optional_availability_varies_in_the_original_and_blocks_the_build() {
+    let r_home = discover_r_home();
+    let scratch = tempfile::tempdir().expect("fixture tempdir");
+    let fixture = optional_fixture(
+        scratch.path(),
+        "Suggests: optpkg\n",
+        "mode <- function() if (requireNamespace('optpkg', quietly = TRUE)) 'with-opt' else 'without-opt'\n",
+    );
+    let absent = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.dependency, &fixture.root],
+    );
+    let present = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.dependency, &fixture.root, &fixture.optional],
+    );
+    run_r(
+        &r_home,
+        &absent,
+        "library(optroot); stopifnot(identical(go(), 'without-opt'))",
+    );
+    run_r(
+        &r_home,
+        &present,
+        "library(optroot); stopifnot(identical(go(), 'with-opt'))",
+    );
+
+    for library in [&absent, &present] {
+        let output = scratch.path().join("generated-optroot");
+        let result = build_optional_root(&fixture, library, &output, &[]);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{stderr}");
+        assert!(stderr.contains("OptionalAvailability"), "{stderr}");
+        assert!(
+            stderr.contains("unselected optional package `optpkg`"),
+            "{stderr}"
+        );
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn external_optional_package_builds_and_matches_the_original() {
+    let r_home = discover_r_home();
+    let scratch = tempfile::tempdir().expect("fixture tempdir");
+    let fixture = optional_fixture(
+        scratch.path(),
+        "Suggests: optpkg\n",
+        "mode <- function() if (requireNamespace('optpkg', quietly = TRUE)) paste('with-opt', optpkg::marker()) else 'without-opt'\n",
+    );
+    let build = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.dependency, &fixture.optional],
+    );
+    let original = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.dependency, &fixture.root, &fixture.optional],
+    );
+    let behavior = "library(optroot); stopifnot(identical(go(), 'with-opt opt-ran'))";
+    run_r(&r_home, &original, behavior);
+
+    let external_output = scratch.path().join("generated-external");
+    let external = build_optional_root(
+        &fixture,
+        &build,
+        &external_output,
+        &["--external", "optpkg"],
+    );
+    assert_success(
+        &external,
+        "slinker build with the optional package External",
+    );
+    let external_library = library_with(
+        &r_home,
+        scratch.path(),
+        &[&fixture.optional, &external_output],
+    );
+    run_r(&r_home, &external_library, behavior);
+}
+
+#[test]
+fn unused_suggests_entry_neither_blocks_nor_becomes_a_dependency() {
+    let r_home = discover_r_home();
+    let scratch = tempfile::tempdir().expect("fixture tempdir");
+    let fixture = optional_fixture(
+        scratch.path(),
+        "Suggests: optpkg\n",
+        "mode <- function() 'plain'\n",
+    );
+    let build = library_with(&r_home, scratch.path(), &[&fixture.dependency]);
+    let output = scratch.path().join("generated-optroot");
+    let result = build_optional_root(&fixture, &build, &output, &[]);
+    assert_success(&result, "slinker build with an unused Suggests entry");
+    let description =
+        fs::read_to_string(output.join("DESCRIPTION")).expect("generated DESCRIPTION");
+    assert!(!description.contains("optpkg"), "{description}");
+
+    let runtime = library_with(&r_home, scratch.path(), &[&output]);
+    run_r(
+        &r_home,
+        &runtime,
+        "library(optroot); stopifnot(identical(go(), 'plain'))",
+    );
+}
+
+#[test]
+fn guard_on_a_required_package_that_is_not_imported_runs_its_branch() {
+    let r_home = discover_r_home();
+    let scratch = tempfile::tempdir().expect("fixture tempdir");
+    let required = scratch.path().join("optpkg");
+    write_package(
+        &required,
+        "optpkg",
+        "",
+        "export(marker)\n",
+        "marker <- function() 'opt-ran'\n",
+    );
+    let fixture = optional_fixture(
+        scratch.path(),
+        "Imports: optpkg\n",
+        "mode <- function() if (requireNamespace('optpkg', quietly = TRUE)) optpkg::marker() else 'without-opt'\n",
+    );
+    let build = library_with(&r_home, scratch.path(), &[&required, &fixture.dependency]);
+    let original = library_with(
+        &r_home,
+        scratch.path(),
+        &[&required, &fixture.dependency, &fixture.root],
+    );
+    let behavior = "library(optroot); stopifnot(identical(go(), 'opt-ran'))";
+    run_r(&r_home, &original, behavior);
+
+    let output = scratch.path().join("generated-optroot");
+    let result = build_optional_root(&fixture, &build, &output, &[]);
+    assert_success(
+        &result,
+        "slinker build with a required, unimported guard package",
+    );
+    let runtime = library_with(&r_home, scratch.path(), &[&output]);
+    run_r(&r_home, &runtime, behavior);
+}
+
+fn write_dataset_package(r_home: &Path, root: &Path, name: &str, lazy: bool, code: &str) {
+    write_package(
+        root,
+        name,
+        &format!("LazyData: {}\n", if lazy { "true" } else { "false" }),
+        "export(read_alpha, load_multi)\n",
+        code,
+    );
+    let data = root.join("data");
+    fs::create_dir_all(&data).expect("data directory");
+    let directory = data.display().to_string().replace('\\', "/");
+    run_r(
+        r_home,
+        "",
+        &format!(
+            "alpha <- structure(list(a = 1:3, b = letters[1:3]), class = c('tbl_x', 'data.frame'), row.names = 1:3, note = 'hi'); beta <- c(x = 1.5); gamma <- 3; unused_big <- 1:10; save(alpha, file = '{directory}/alpha.rda'); save(beta, gamma, file = '{directory}/multi.rda'); save(unused_big, file = '{directory}/unused_big.rda')"
+        ),
+    );
+}
+
+const DATASET_FUNCTIONS: &str = concat!(
+    "read_alpha <- function() dsdata::alpha\n",
+    "load_multi <- function(env) {\n",
+    "  data(multi, package = 'dsdata', envir = env)\n",
+    "  mget(c('beta', 'gamma'), envir = env)\n",
+    "}\n",
+);
+
+#[test]
+fn linked_datasets_behave_as_in_the_original_and_only_reached_ones_are_carried() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency = fixture.path().join("dsdata");
+    write_dataset_package(&r_home, &dependency, "dsdata", true, DATASET_FUNCTIONS);
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency, &build_library);
+
+    let root = fixture.path().join("dsroot");
+    write_package(
+        &root,
+        "dsroot",
+        "Imports: dsdata\n",
+        "importFrom(dsdata, read_alpha, load_multi)\nexport(direct, loaded, via_linked, via_linked_data)\n",
+        concat!(
+            "direct <- function() dsdata::alpha\n",
+            "loaded <- function() {\n",
+            "  env <- new.env()\n",
+            "  name <- data(multi, package = 'dsdata', envir = env)\n",
+            "  list(name, sort(ls(env)), env$beta, env$gamma)\n",
+            "}\n",
+            "via_linked <- function() read_alpha()\n",
+            "via_linked_data <- function() load_multi(new.env())\n",
+        ),
+    );
+    let output = fixture.path().join("generated-dsroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root)
+        .output()
+        .expect("run dataset build");
+    assert_success(&result, "slinker build dataset fixture");
+
+    let behavior = concat!(
+        "library(dsroot); ",
+        "expected <- structure(list(a = 1:3, b = letters[1:3]), class = c('tbl_x', 'data.frame'), row.names = 1:3, note = 'hi'); ",
+        "stopifnot(identical(direct(), expected), identical(via_linked(), expected), identical(direct(), direct())); ",
+        "stopifnot(identical(loaded(), list('multi', c('beta', 'gamma'), c(x = 1.5), 3))); ",
+        "stopifnot(identical(via_linked_data(), list(beta = c(x = 1.5), gamma = 3)))",
+    );
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency, &original);
+    install_package(&r_home, &root, &original);
+    run_r(&r_home, &original, behavior);
+
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &output, &validation);
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&installed).expect("library with the real Linked package");
+    install_package(&r_home, &dependency, &installed);
+    install_package(&r_home, &output, &installed);
+
+    let artifact = concat!(
+        "directory <- system.file('slinker', 'datalib', 'dsdata', 'data', package = 'dsroot'); ",
+        "objects <- new.env(); lazyLoad(file.path(directory, 'Rdata'), envir = objects); ",
+        "stopifnot(identical(sort(ls(objects)), c('alpha', 'beta', 'gamma'))); ",
+        "stopifnot(identical(names(readRDS(file.path(directory, 'Rdata.rds'))), 'multi')); ",
+        "imports <- parent.env(asNamespace('dsroot')); linked <- environment(get('read_alpha', envir = imports)); ",
+        "stopifnot(identical(unname(getNamespaceName(linked)), 'dsdata'), identical(getExportedValue(linked, 'alpha'), direct()))",
+    );
+    run_r(&r_home, &validation, &format!("{behavior}; {artifact}"));
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('dsdata'); {behavior}; {artifact}"),
+    );
+}
+
+#[test]
+fn dynamic_or_file_backed_dataset_access_blocks_the_build() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    for (name, lazy, access, expected) in [
+        (
+            "dsdata",
+            true,
+            "pick <- function(name) data(list = name, package = 'dsdata')\n",
+            "DynamicLookup",
+        ),
+        (
+            "dsfiles",
+            false,
+            "pick <- function() data(alpha, package = 'dsfiles')\n",
+            "UnsupportedObject",
+        ),
+    ] {
+        let dependency = fixture.path().join(name);
+        write_dataset_package(
+            &r_home,
+            &dependency,
+            name,
+            lazy,
+            &DATASET_FUNCTIONS.replace("dsdata", name),
+        );
+        let build_library = fixture.path().join(format!("{name}-library"));
+        fs::create_dir(&build_library).expect("build library");
+        install_package(&r_home, &dependency, &build_library);
+        let root = fixture.path().join(format!("{name}-root"));
+        write_package(
+            &root,
+            &format!("{name}root"),
+            &format!("Imports: {name}\n"),
+            &format!("importFrom({name}, read_alpha)\nexport(pick)\n"),
+            access,
+        );
+        let output = fixture.path().join(format!("generated-{name}"));
+        let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+            .args(["build", "--lib"])
+            .arg(&build_library)
+            .arg("--output")
+            .arg(&output)
+            .arg(&root)
+            .output()
+            .expect("run blocked dataset build");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(!output.exists(), "{name} published a blocked build");
+    }
+}
+
+#[test]
 fn linked_on_load_outside_the_namespace_environment_still_runs() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");
@@ -424,7 +865,7 @@ fn blocked_preflight_reports_every_blocker_and_publishes_nothing() {
 fn private_environments_and_registrations_survive_linking() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");
-    let state_code = "counter <- local({\n  n <- 0L\n  function() {\n    n <<- n + 1L\n    n\n  }\n})\nstore <- local({\n  value <- NULL\n  list(get = function() value, set = function(x) value <<- x)\n})\nget_value <- store$get\nset_value <- store$set\nmake <- function() structure(list(), class = 'tinystate')\nformat.tinystate <- function(x, ...) 'formatted tinystate'\nunused <- function() stop('never linked')\n";
+    let state_code = "counter <- local({\n  n <- 0L\n  function() {\n    n <<- n + 1L\n    n\n  }\n})\nstore <- local({\n  value <- NULL\n  list(get = function() value, set = function(x) value <<- x)\n})\nget_value <- store$get\nset_value <- store$set\nmake <- function() structure(list(), class = 'tinystate')\nformat.tinystate <- function(x, ...) 'formatted tinystate'\nunused <- function() stop('never linked')\nzzz_unused <- function() stop('never linked')\n";
     let dependency_source = fixture.path().join("tinystate");
     write_package(
         &dependency_source,
@@ -475,6 +916,8 @@ fn private_environments_and_registrations_survive_linking() {
         stopifnot(exists("unused", envir = linked, inherits = FALSE))
         removed <- tryCatch(get("unused", envir = linked), error = conditionMessage)
         stopifnot(grepl("`tinystate::unused` was removed by slinker", removed, fixed = TRUE))
+        removed_last <- tryCatch(get("zzz_unused", envir = linked), error = conditionMessage)
+        stopifnot(grepl("`tinystate::zzz_unused` was removed by slinker", removed_last, fixed = TRUE))
         stopifnot(setequal(getNamespaceExports(linked), c("counter", "get_value", "set_value", "make", "unused")))
         stopifnot(identical(get(".packageName", envir = linked, inherits = FALSE), "tinystate"))
     "#;
@@ -1583,4 +2026,76 @@ fn enumerating_a_linked_namespace_blocks_the_build() {
     );
     assert_success(&result, "slinker build targeted namespace lookup");
     assert!(output.exists());
+}
+
+#[test]
+fn syntax_forms_dispatch_to_unregistered_lexical_methods_as_in_the_original() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let dependency_source = fixture.path().join("synlinked");
+    write_package(
+        &dependency_source,
+        "synlinked",
+        "",
+        "export(sub, sub2, dollar, negate, assign_sub, assign_dollar, assign_names)\n",
+        concat!(
+            "sub <- function(x) x[1]\n",
+            "sub2 <- function(x) x[[1]]\n",
+            "dollar <- function(x) x$a\n",
+            "negate <- function(x) -x\n",
+            "assign_sub <- function(x) { x[1] <- 0; x }\n",
+            "assign_dollar <- function(x) { x$a <- 0; x }\n",
+            "assign_names <- function(x) { names(x) <- 'n'; x }\n",
+            "`[.syn` <- function(x, ...) 'sub'\n",
+            "`[[.syn` <- function(x, ...) 'sub2'\n",
+            "`$.syn` <- function(x, name) 'dollar'\n",
+            "`-.syn` <- function(e1, e2) 'negate'\n",
+            "`[<-.syn` <- function(x, ..., value) 'assign_sub'\n",
+            "`$<-.syn` <- function(x, name, value) 'assign_dollar'\n",
+            "`names<-.syn` <- function(x, value) 'assign_names'\n",
+            "`[[<-.syn` <- function(x, ..., value) 'never'\n",
+        ),
+    );
+    let build_library = fixture.path().join("build-library");
+    fs::create_dir(&build_library).expect("build library");
+    install_package(&r_home, &dependency_source, &build_library);
+    let root_source = fixture.path().join("synroot");
+    write_package(
+        &root_source,
+        "synroot",
+        "Imports: synlinked\n",
+        "importFrom(synlinked, sub, sub2, dollar, negate, assign_sub, assign_dollar, assign_names)\nexport(go)\n",
+        concat!(
+            "go <- function() {\n",
+            "  x <- structure(list(a = 1), class = 'syn')\n",
+            "  c(sub(x), sub2(x), dollar(x), negate(x), assign_sub(x), assign_dollar(x), assign_names(x))\n",
+            "}\n",
+        ),
+    );
+    let output = fixture.path().join("generated-synroot");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&build_library)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root_source)
+        .output()
+        .expect("run syntax dispatch build");
+    assert_success(&result, "slinker build syntax dispatch fixture");
+    let behavior = "library(synroot); stopifnot(identical(go(), c('sub', 'sub2', 'dollar', 'negate', 'assign_sub', 'assign_dollar', 'assign_names')))";
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency_source, &original);
+    install_package(&r_home, &root_source, &original);
+    run_r(&r_home, &original, behavior);
+    let validation = fixture.path().join("validation");
+    fs::create_dir(&validation).expect("validation library");
+    install_package(&r_home, &output, &validation);
+    run_r(
+        &r_home,
+        &validation,
+        &format!(
+            "{behavior}; linked <- environment(get('sub', envir = parent.env(asNamespace('synroot')))); message <- tryCatch(get('[[<-.syn', envir = linked), error = conditionMessage); stopifnot(grepl('was removed by slinker', message, fixed = TRUE))"
+        ),
+    );
 }

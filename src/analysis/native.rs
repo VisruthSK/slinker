@@ -479,12 +479,6 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             | Resolution::OpenDynamic(OpenReason::MissingPackage { .. }) => return Ok(None),
         }
 
-        // With .registration=TRUE, R creates RegisteredNativeSymbol variables
-        // for every routine reported by the loaded DLL. nsInfo.rds records the
-        // registration policy but not that runtime routine table. A static
-        // symbol selector can therefore be associated with the sole registered
-        // package DLL even when its exact routine name is unavailable until DLL
-        // load. String selectors do not have that lexical binding guarantee.
         let mut registered = image.index.dynlibs.iter().filter(|native| {
             native.registration.is_some() && !matches!(native.safety, NativeSafety::Unsupported(_))
         });

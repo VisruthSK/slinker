@@ -1,9 +1,7 @@
-//! Immutable linked-program representation consumed by build preflight and materialization.
-
 use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{
-    BindingName, ClassName, ComponentName, GenericName, PackageId, PackageIdentity, PackageName,
-    PackageRole,
+    BindingName, ClassName, ComponentName, DatasetName, GenericName, PackageId, PackageIdentity,
+    PackageName, PackageRole,
 };
 
 use crate::package::Digest;
@@ -39,7 +37,6 @@ id_type!(S3RegistrationId);
 id_type!(ResourceId);
 id_type!(PayloadBundleId);
 
-/// Final package runtime contract.
 #[derive(Clone, Debug)]
 pub enum PackageIr {
     Root {
@@ -112,8 +109,6 @@ impl<'a> RegisteredNamespace<'a> {
     }
 }
 
-/// DESCRIPTION-governed runtime requirement for an External package. Platform packages ship with
-/// the selected R, so the target contract already satisfies them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalPackageContract {
     pub package: PackageName,
@@ -121,21 +116,18 @@ pub struct ExternalPackageContract {
     pub requirements: Vec<crate::Relation>,
 }
 
-/// One stable namespace binding slot.
 #[derive(Clone, Debug)]
 pub struct Binding {
     pub name: BindingName,
     pub state: LinkBindingState,
 }
 
-/// Value state before runtime activation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InitialBindingState {
     Unbound,
     Value(ValueId),
 }
 
-/// Physical realization of a final binding slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LinkBindingState {
     Materialized {
@@ -154,7 +146,6 @@ pub enum ExternalBindingAccess {
     Internal,
 }
 
-/// Canonically ordered names of the original export table.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExportTable {
     names: Vec<BindingName>,
@@ -172,7 +163,6 @@ impl ExportTable {
     }
 }
 
-/// Final namespace runtime state.
 #[derive(Clone, Debug)]
 pub enum LinkNamespaceState {
     Root(MaterializedNamespaceState),
@@ -209,15 +199,12 @@ pub struct ImportRecordIr {
     pub names: Vec<(BindingName, BindingName)>,
 }
 
-/// What one name of a namespace's imports environment holds.
 #[derive(Clone, Debug)]
 pub enum ImportSlotIr {
     Bound(BindingId),
     Removed(RemovedImportIr),
 }
 
-/// An original import whose binding the build never reached. Its name stays in the imports
-/// environment and fails loudly when read.
 #[derive(Clone, Debug)]
 pub struct RemovedImportIr {
     pub package: PackageName,
@@ -254,17 +241,12 @@ pub struct Closure {
     pub enclosure: EnvironmentId,
 }
 
-/// Supported persistent runtime value without an Unknown state.
 #[derive(Clone, Debug)]
 pub enum Value {
     Closure(ClosureId),
     Payload(PayloadBundleId),
 }
 
-/// The retained non-source bindings of one Root or Linked namespace, carried by a single R
-/// serialization and restored into that namespace. One serialization preserves sharing, cycles,
-/// private environments with their parents, closure enclosures, and attributes among these
-/// bindings; identity never extends to another bundle.
 #[derive(Clone, Debug)]
 pub struct PayloadBundleIr {
     namespace: NamespaceId,
@@ -286,14 +268,11 @@ impl PayloadBundleIr {
         &self.closure_patches
     }
 
-    /// Foreign namespaces the serialized references resolve to, each activated before restore.
     pub fn dependencies(&self) -> &BTreeSet<PayloadDependency> {
         &self.dependencies
     }
 }
 
-/// A namespace a payload bundle refers to. The Root namespace is activated only after every
-/// Linked bundle is restored, so it is never a dependency.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PayloadDependency {
     Linked(NamespaceId),
@@ -386,6 +365,13 @@ pub enum RelocationTarget {
     DescriptionArgument {
         description: ResourceId,
     },
+    Dataset {
+        package: PackageId,
+        dataset: DatasetName,
+    },
+    DataArgument {
+        package: PackageId,
+    },
     NativeSymbol {
         package: PackageId,
         component: ComponentName,
@@ -422,6 +408,7 @@ pub enum InvalidRelocation {
     OutsideCode,
     Overlap,
     Mismatch(String),
+    UncarriedDataset,
 }
 
 impl std::fmt::Display for InvalidRelocation {
@@ -435,11 +422,13 @@ impl std::fmt::Display for InvalidRelocation {
                     "relocation does not match the syntax it rewrites: `{original}`"
                 )
             }
+            Self::UncarriedDataset => {
+                f.write_str("relocation names a dataset that the program does not carry")
+            }
         }
     }
 }
 
-/// One Linked namespace activation, in the order the Root `.onLoad` wrapper performs them.
 #[derive(Clone, Debug)]
 pub struct NamespaceActivationIr {
     pub namespace: NamespaceId,
@@ -449,9 +438,6 @@ pub struct NamespaceActivationIr {
     pub removed_bindings: Vec<BindingName>,
 }
 
-/// Root source-package transformation decided at finalization: the generated `DESCRIPTION`, the
-/// `NAMESPACE` exports and native libraries, the Root load work on each side of Linked
-/// activation, and the original Root `.onLoad` that the generated wrapper calls last.
 #[derive(Clone, Debug)]
 pub struct RootArtifactIr {
     pub description: Option<Arc<str>>,
@@ -525,6 +511,27 @@ pub struct ResourceIr {
     pub path: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DatasetLibraryIr {
+    objects: BTreeSet<DatasetName>,
+    sets: BTreeMap<String, Vec<DatasetName>>,
+}
+
+impl DatasetLibraryIr {
+    pub fn objects(&self) -> &BTreeSet<DatasetName> {
+        &self.objects
+    }
+
+    pub fn sets(&self) -> &BTreeMap<String, Vec<DatasetName>> {
+        &self.sets
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidDataset {
+    NotLinked(PackageId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObjectStep {
     Environment,
@@ -548,7 +555,6 @@ pub struct PayloadClosurePatch {
     pub code: CodeId,
 }
 
-/// Selected target-R compatibility contract recorded in the artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetContract {
     pub r_version: String,
@@ -556,7 +562,6 @@ pub struct TargetContract {
     pub arch: String,
 }
 
-/// Complete immutable semantic construction authority.
 #[derive(Debug)]
 pub struct ProgramIr {
     target: TargetContract,
@@ -571,6 +576,7 @@ pub struct ProgramIr {
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     resources: Vec<ResourceIr>,
+    dataset_libraries: BTreeMap<PackageId, DatasetLibraryIr>,
     payload_bundles: Vec<PayloadBundleIr>,
     relocations: Vec<Relocation>,
     root_artifact: RootArtifactIr,
@@ -645,6 +651,12 @@ impl ProgramIr {
             .iter()
             .enumerate()
             .map(|(index, resource)| (ResourceId::from_index(index), resource))
+    }
+
+    pub fn dataset_libraries(&self) -> impl Iterator<Item = (PackageId, &DatasetLibraryIr)> {
+        self.dataset_libraries
+            .iter()
+            .map(|(package, library)| (*package, library))
     }
 
     pub fn payload_bundles(&self) -> &[PayloadBundleIr] {
@@ -723,7 +735,6 @@ impl ProgramIr {
     }
 }
 
-/// Analysis finalizer; the only constructor for [`ProgramIr`].
 pub struct ProgramBuilder {
     target: TargetContract,
     packages: BTreeMap<PackageId, PackageIr>,
@@ -736,26 +747,24 @@ pub struct ProgramBuilder {
     activations: Vec<NamespaceActivationIr>,
     s3_registrations: Vec<S3RegistrationIr>,
     resources: Vec<ResourceIr>,
+    dataset_libraries: BTreeMap<PackageId, DatasetLibraryIr>,
     payload_bundles: Vec<PayloadBundleIr>,
     relocations: Vec<Relocation>,
     root_package: PackageId,
 }
 
-/// IDs allocated while a namespace builder closes its final slot universe.
 #[derive(Debug)]
 pub struct FinalizedNamespace {
     pub namespace: NamespaceId,
     pub bindings: BTreeMap<BindingName, BindingId>,
 }
 
-/// Final source of one materialized namespace slot.
 #[derive(Clone, Debug)]
 pub struct MaterializedSlot {
     pub name: BindingName,
     pub source: MaterializedSlotSource,
 }
 
-/// Exact supported pre-activation contents of a namespace slot.
 #[derive(Clone, Debug)]
 pub enum MaterializedSlotSource {
     Unbound,
@@ -785,6 +794,7 @@ impl ProgramBuilder {
             activations: Vec::new(),
             s3_registrations: Vec::new(),
             resources: Vec::new(),
+            dataset_libraries: BTreeMap::new(),
             payload_bundles: Vec::new(),
             relocations: Vec::new(),
             root_package: root,
@@ -1120,8 +1130,6 @@ impl ProgramBuilder {
         code
     }
 
-    /// Record that `bundle` refers to `namespace`; a reference to the owner itself needs no
-    /// activation and yields `None`.
     pub fn attach_payload_dependency(
         &mut self,
         bundle: PayloadBundleId,
@@ -1138,6 +1146,39 @@ impl ProgramBuilder {
         };
         bundle.dependencies.insert(dependency);
         Ok(Some(dependency))
+    }
+
+    pub fn carry_dataset(
+        &mut self,
+        package: PackageId,
+        object: DatasetName,
+    ) -> Result<(), InvalidDataset> {
+        self.dataset_library(package)?.objects.insert(object);
+        Ok(())
+    }
+
+    pub fn carry_data_set(
+        &mut self,
+        package: PackageId,
+        set: String,
+        objects: Vec<DatasetName>,
+    ) -> Result<(), InvalidDataset> {
+        let library = self.dataset_library(package)?;
+        library.objects.extend(objects.iter().cloned());
+        library.sets.insert(set, objects);
+        Ok(())
+    }
+
+    fn dataset_library(
+        &mut self,
+        package: PackageId,
+    ) -> Result<&mut DatasetLibraryIr, InvalidDataset> {
+        match self.packages.get(&package) {
+            Some(PackageIr::Linked { .. }) => {
+                Ok(self.dataset_libraries.entry(package).or_default())
+            }
+            _ => Err(InvalidDataset::NotLinked(package)),
+        }
     }
 
     pub fn add_resource(&mut self, resource: ResourceIr) -> ResourceId {
@@ -1167,6 +1208,9 @@ impl ProgramBuilder {
         if !self.relocation_matches(&target, original) {
             return Err(InvalidRelocation::Mismatch(original.to_owned()));
         }
+        if !self.relocation_carries_artifact(&target) {
+            return Err(InvalidRelocation::UncarriedDataset);
+        }
         let occurrence = CodeOccurrenceId::from_index(code_ir.occurrences.len());
         self.codes[code.index()].occurrences.push(range);
         self.relocations.push(Relocation {
@@ -1174,6 +1218,19 @@ impl ProgramBuilder {
             target,
         });
         Ok(())
+    }
+
+    fn relocation_carries_artifact(&self, target: &RelocationTarget) -> bool {
+        match target {
+            RelocationTarget::Dataset { package, dataset } => self
+                .dataset_libraries
+                .get(package)
+                .is_some_and(|library| library.objects.contains(dataset)),
+            RelocationTarget::DataArgument { package } => {
+                self.dataset_libraries.contains_key(package)
+            }
+            _ => true,
+        }
     }
 
     fn relocation_matches(&self, target: &RelocationTarget, original: &str) -> bool {
@@ -1203,8 +1260,17 @@ impl ProgramBuilder {
             RelocationTarget::LoadedQuery => {
                 callee.starts_with("isNamespaceLoaded(") || original.contains("%in%")
             }
+            RelocationTarget::Dataset { dataset, .. } => {
+                original
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or(original)
+                    .trim_matches('`')
+                    == dataset.as_str()
+            }
             RelocationTarget::NamespaceArgument { .. }
             | RelocationTarget::DescriptionArgument { .. }
+            | RelocationTarget::DataArgument { .. }
             | RelocationTarget::NativeSymbol { .. }
             | RelocationTarget::NativeLibrary { .. } => original.starts_with(['"', '\'']),
         }
@@ -1265,6 +1331,7 @@ impl ProgramBuilder {
             activations: self.activations,
             s3_registrations: self.s3_registrations,
             resources: self.resources,
+            dataset_libraries: self.dataset_libraries,
             payload_bundles: self.payload_bundles,
             relocations: self.relocations,
             root_artifact,
@@ -1272,7 +1339,6 @@ impl ProgramBuilder {
     }
 }
 
-/// Successful semantic provenance sidecar; never consumed by materialization.
 #[derive(Debug, Default)]
 pub struct ProvenanceIr {
     nodes: Vec<Node>,

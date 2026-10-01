@@ -1,7 +1,5 @@
 use crate::metadata::{Description, Relation, RelationField, relations};
 
-/// Fields that describe the original source layout or a distributed tarball, neither of which
-/// survives into a generated package.
 const ARTIFACT_FIELDS: [&str; 8] = [
     "Collate",
     "Collate.unix",
@@ -13,24 +11,6 @@ const ARTIFACT_FIELDS: [&str; 8] = [
     "Built",
 ];
 
-/// Rewrite a Root `DESCRIPTION` for its generated linked source package.
-///
-/// # Arguments
-///
-/// * `source` - Frozen Root `DESCRIPTION` text
-/// * `linked` - Whether a package name is Linked into the generated package
-/// * `imports` - Complete External runtime requirements, in output order
-///
-/// # Returns
-///
-/// The generated `DESCRIPTION` text. `Imports` is exactly `imports`, Linked packages leave
-/// `Suggests`, and source-layout or distribution fields are dropped; every other field keeps its
-/// original text.
-///
-/// # Errors
-///
-/// Returns every unsupported transformation: a Linked package named by attachment-oriented
-/// `Depends` or native `LinkingTo`, or a dependency field that does not parse completely.
 pub fn generated_description(
     source: &str,
     linked: impl Fn(&str) -> bool,

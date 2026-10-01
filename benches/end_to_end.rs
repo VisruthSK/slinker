@@ -2,10 +2,10 @@
 mod common;
 mod support;
 
+use slinker::TargetEnvironment;
 use slinker::analysis::{LinkIr, Linker};
 use slinker::cache::CacheLocation;
 use slinker::package::PackageStore;
-use slinker::{TargetEnvironment, TargetEnvironmentRequest};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,7 +42,7 @@ fn report_analysis(name: &str, elapsed: Duration, plan: &LinkIr) {
 }
 
 fn analyze_installed(r_home: &Path) {
-    let target = TargetEnvironmentRequest::new(r_home.to_path_buf())
+    let target = support::target_request(r_home)
         .capture()
         .expect("capture the target R library universe");
     for root in ANALYZED {
@@ -81,7 +81,7 @@ fn provision(r_home: &Path, package: &str) -> (PathBuf, PathBuf) {
             if (length(missing)) install.packages(missing, lib = {library}, dependencies = FALSE)
             absent <- setdiff(required, rownames(installed.packages({library}, noCache = TRUE)))
             if (length(absent)) stop("could not install: ", toString(absent))
-            if (!dir.exists({source})) {{
+            if (!file.exists(file.path({source}, "DESCRIPTION"))) {{
               tarball <- download.packages(package, tempdir(), type = "source")[1, 2]
               untar(tarball, exdir = dirname({source}))
             }}

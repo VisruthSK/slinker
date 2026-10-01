@@ -361,6 +361,7 @@ impl WorkerProbe {
             WorkerResponse::NormalizedSyntax {
                 request_id: response,
                 source,
+                ..
             } if response == request_id => source,
             response => panic!("unexpected syntax normalization response: {response:?}"),
         }

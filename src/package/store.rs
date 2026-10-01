@@ -1,20 +1,21 @@
 use crate::cache::{Cache, CacheLocation};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary,
-    NativeSafety, PackageIdentity, PackageImage, PackageIndex, PackageLocator,
+    BindingName, DatasetName, GenericName, InstalledPackage, LifecycleMetadata, NativeFacts,
+    NativeRoutineSummary, NativeSafety, PackageData, PackageIdentity, PackageImage, PackageIndex,
+    PackageLocator,
 };
 use crate::r_worker::client::WorkerClient;
 use crate::r_worker::protocol::{WorkerBinding, WorkerPackageIndex};
 use crate::{Error, Result, TargetEnvironment};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-analysis-v9";
+const ANALYSIS_SCHEMA: &str = "slinker-analysis-v10";
 
 #[derive(Deserialize, Serialize)]
 struct CachedIndex {
@@ -191,8 +192,23 @@ pub enum SyntaxValidation {
     Rejected(String),
 }
 
-/// Physical installed-image service. Package roles and name policy belong to
-/// [`TargetUniverse`](crate::package::TargetUniverse).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalSyntax {
+    Stable(String),
+    Unstable,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DispatchSubject<'a> {
+    Base {
+        binding: &'a str,
+    },
+    Installed {
+        package: &'a InstalledPackage,
+        binding: &'a str,
+    },
+}
+
 pub trait PackageProvider {
     fn target_environment(&self) -> &TargetEnvironment;
     fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>>;
@@ -209,14 +225,16 @@ pub trait PackageProvider {
             .iter()
             .any(|candidate| candidate == path))
     }
+    fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>>;
     fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation>;
-    fn normalize_syntax(&mut self, source: &str) -> Result<String>;
+    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax>;
 }
 
 pub struct PackageStore {
     locator: PackageLocator,
     indexes: HashMap<PackageIdentity, Arc<PackageIndex>>,
     bindings: HashMap<(PackageIdentity, String), Arc<PackageImage>>,
+    dispatch: HashMap<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
     cache: Cache,
     r_home: PathBuf,
     target_fingerprint: String,
@@ -244,6 +262,7 @@ impl PackageStore {
             locator: PackageLocator::new(target),
             indexes: HashMap::new(),
             bindings: HashMap::new(),
+            dispatch: HashMap::new(),
             cache: Cache::new(cache, ANALYSIS_SCHEMA)?,
             r_home,
             target_fingerprint,
@@ -282,7 +301,16 @@ impl PackageStore {
                 .into_iter()
                 .map(BindingName::from)
                 .collect(),
-            datasets: worker.datasets,
+            data: PackageData::new(
+                worker
+                    .data_sets
+                    .into_iter()
+                    .map(|(set, objects)| {
+                        (set, objects.into_iter().map(DatasetName::from).collect())
+                    })
+                    .collect(),
+                worker.data_files,
+            ),
             files: Vec::new(),
             has_sysdata: worker.has_sysdata,
         };
@@ -391,8 +419,6 @@ impl PackageStore {
     }
 }
 
-/// Worker private-environment labels identify objects only within one inspection epoch, so a
-/// fragment that mentions them must never be merged with fragments inspected in another epoch.
 fn is_epoch_independent(binding: &WorkerBinding) -> bool {
     let image = &binding.binding;
     binding.private_environments.is_empty()
@@ -498,12 +524,34 @@ impl PackageProvider for PackageStore {
         Ok(package.location.root.join(relative).exists())
     }
 
+    fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
+        let (package, binding) = match subject {
+            DispatchSubject::Base { binding } => (None, binding),
+            DispatchSubject::Installed { package, binding } => (Some(package), binding),
+        };
+        let key = (
+            package.map(|package| package.identity.clone()),
+            binding.to_owned(),
+        );
+        if let Some(generics) = self.dispatch.get(&key) {
+            return Ok(generics.clone());
+        }
+        let generics = self
+            .worker()?
+            .dispatch_generics(package, binding)?
+            .into_iter()
+            .map(GenericName::from)
+            .collect::<BTreeSet<_>>();
+        self.dispatch.insert(key, generics.clone());
+        Ok(generics)
+    }
+
     fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation> {
         self.worker()?.validate_syntax(source)
     }
 
-    fn normalize_syntax(&mut self, source: &str) -> Result<String> {
-        self.worker()?.normalize_syntax(source)
+    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+        self.worker()?.canonical_syntax(source)
     }
 }
 
@@ -534,7 +582,7 @@ mod tests {
             }],
             lifecycle: LifecycleMetadata::default(),
             binding_names: Vec::new(),
-            datasets: Vec::new(),
+            data: PackageData::default(),
             files: Vec::new(),
             has_sysdata: false,
         }

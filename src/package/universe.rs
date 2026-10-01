@@ -1,13 +1,13 @@
 use crate::metadata::Priority;
 use crate::package::{
-    InstalledPackage, PackageId, PackageIdentity, PackageImage, PackageIndex, PackageLocation,
-    PackageProvider, PackageRole, SyntaxValidation, fingerprint_image,
+    CanonicalSyntax, DispatchSubject, GenericName, InstalledPackage, PackageId, PackageIdentity,
+    PackageImage, PackageIndex, PackageLocation, PackageProvider, PackageRole, SyntaxValidation,
+    fingerprint_image,
 };
 use crate::{Error, Result, TargetEnvironment};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-/// Frozen package-name answer for one invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageAvailability {
     Root(PackageId),
@@ -25,47 +25,44 @@ impl PackageAvailability {
     }
 }
 
-/// Invocation-local owner of package resolution, handles, absence, and role policy.
+#[derive(Clone, Copy, Debug)]
+pub enum DispatchCallee<'a> {
+    Base {
+        binding: &'a str,
+    },
+    Package {
+        package: PackageId,
+        binding: &'a str,
+    },
+}
+
 pub struct TargetUniverse<P: PackageProvider> {
     store: P,
-    root: Option<String>,
+    root: String,
     explicit_external: HashSet<String>,
     availability: HashMap<String, PackageAvailability>,
     packages: Vec<(InstalledPackage, PackageRole)>,
 }
 
 impl<P: PackageProvider> TargetUniverse<P> {
-    pub fn new(store: P) -> Self {
+    pub fn new(store: P, root: impl Into<String>, explicit_external: HashSet<String>) -> Self {
         Self {
             store,
-            root: None,
-            explicit_external: HashSet::new(),
+            root: root.into(),
+            explicit_external,
             availability: HashMap::new(),
             packages: Vec::new(),
         }
     }
 
-    pub fn set_root(&mut self, root: impl Into<String>) {
-        assert!(
-            self.availability.is_empty(),
-            "Root policy freezes before resolution"
-        );
-        assert!(self.root.replace(root.into()).is_none(), "Root is set once");
-    }
-
-    pub fn set_explicit_external(&mut self, packages: impl IntoIterator<Item = String>) {
-        assert!(
-            self.availability.is_empty(),
-            "External policy freezes before resolution"
-        );
-        self.explicit_external.extend(packages);
+    pub fn root_name(&self) -> &str {
+        &self.root
     }
 
     pub fn target_environment(&self) -> &TargetEnvironment {
         self.store.target_environment()
     }
 
-    /// Resolve a package name once; later calls return the frozen answer, including absence.
     pub fn resolve(&mut self, name: &str) -> Result<Option<PackageId>> {
         if let Some(availability) = self.availability.get(name) {
             return Ok(availability.package());
@@ -89,7 +86,7 @@ impl<P: PackageProvider> TargetUniverse<P> {
             return None;
         };
         let id = PackageId::from_index(self.packages.len());
-        let (role, availability) = if self.root.as_deref() == Some(name) {
+        let (role, availability) = if self.root == name {
             (PackageRole::Root, PackageAvailability::Root(id))
         } else if self.explicit_external.contains(name) || is_platform(&package) {
             (PackageRole::External, PackageAvailability::External(id))
@@ -125,7 +122,6 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.role(id) == PackageRole::External
     }
 
-    /// Whether the package belongs to the selected R platform rather than a third party.
     pub fn is_platform(&self, id: PackageId) -> bool {
         is_platform(self.package(id))
     }
@@ -142,6 +138,19 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.store.binding_image(&self.packages[id.index()].0, name)
     }
 
+    pub fn dispatch_generics(
+        &mut self,
+        callee: DispatchCallee<'_>,
+    ) -> Result<BTreeSet<GenericName>> {
+        self.store.dispatch_generics(match callee {
+            DispatchCallee::Base { binding } => DispatchSubject::Base { binding },
+            DispatchCallee::Package { package, binding } => DispatchSubject::Installed {
+                package: &self.packages[package.index()].0,
+                binding,
+            },
+        })
+    }
+
     pub fn resource_exists(&mut self, id: PackageId, path: &str) -> Result<bool> {
         self.store
             .resource_exists(&self.packages[id.index()].0, path)
@@ -151,11 +160,10 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.store.validate_syntax(source)
     }
 
-    pub fn normalize_syntax(&mut self, source: &str) -> Result<String> {
-        self.store.normalize_syntax(source)
+    pub fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+        self.store.canonical_syntax(source)
     }
 
-    /// Freeze the selected physical images of the given packages for build orchestration.
     pub fn sources(&self, ids: impl IntoIterator<Item = PackageId>) -> PackageSources {
         PackageSources(
             ids.into_iter()
@@ -175,7 +183,6 @@ fn is_platform(package: &InstalledPackage) -> bool {
     )
 }
 
-/// Exact installed image and physical location selected for each finalized package.
 #[derive(Clone, Debug, Default)]
 pub struct PackageSources(BTreeMap<PackageId, (PackageIdentity, PackageLocation)>);
 
@@ -192,11 +199,6 @@ impl PackageSources {
             .map(|(id, (identity, location))| (*id, identity, location))
     }
 
-    /// Re-fingerprint every frozen image and return the first one whose bytes changed.
-    ///
-    /// # Errors
-    ///
-    /// Fails when an image directory can no longer be read.
     pub fn changed(&self) -> Result<Option<&PackageIdentity>> {
         for (identity, location) in self.0.values() {
             if fingerprint_image(&location.root)? != identity.image_fingerprint {
@@ -242,12 +244,19 @@ mod tests {
             unreachable!("resolution never inspects images")
         }
 
+        fn dispatch_generics(
+            &mut self,
+            _subject: DispatchSubject<'_>,
+        ) -> Result<BTreeSet<GenericName>> {
+            unreachable!("resolution never queries dispatch")
+        }
+
         fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {
             unreachable!("resolution never validates syntax")
         }
 
-        fn normalize_syntax(&mut self, _source: &str) -> Result<String> {
-            unreachable!("resolution never normalizes syntax")
+        fn canonical_syntax(&mut self, _source: &str) -> Result<CanonicalSyntax> {
+            unreachable!("resolution never canonicalizes syntax")
         }
     }
 
@@ -262,19 +271,31 @@ mod tests {
     }
 
     fn universe(library: &Path) -> TargetUniverse<CountingStore> {
-        TargetUniverse::new(CountingStore {
-            locator: PackageLocator::new(TargetEnvironment {
-                r_home: library.to_path_buf(),
-                target: Target {
-                    r_version: String::new(),
-                    os: String::new(),
-                    arch: String::new(),
-                },
-                libraries: vec![library.to_path_buf()],
-                base_bindings: Default::default(),
-            }),
-            located: Vec::new(),
-        })
+        universe_with_policy(library, "unused-root", HashSet::new())
+    }
+
+    fn universe_with_policy(
+        library: &Path,
+        root: &str,
+        explicit_external: HashSet<String>,
+    ) -> TargetUniverse<CountingStore> {
+        TargetUniverse::new(
+            CountingStore {
+                locator: PackageLocator::new(TargetEnvironment {
+                    r_home: library.to_path_buf(),
+                    target: Target {
+                        r_version: String::new(),
+                        os: String::new(),
+                        arch: String::new(),
+                    },
+                    libraries: vec![library.to_path_buf()],
+                    base_bindings: Default::default(),
+                }),
+                located: Vec::new(),
+            },
+            root,
+            explicit_external,
+        )
     }
 
     #[test]
@@ -314,14 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn roles_are_frozen_by_policy_before_resolution() {
+    fn roles_follow_the_policy_given_at_construction() {
         let library = tempfile::tempdir().expect("library");
         for name in ["root", "dependency", "kept"] {
             install(library.path(), name);
         }
-        let mut universe = universe(library.path());
-        universe.set_root("root");
-        universe.set_explicit_external(["kept".to_owned()]);
+        let mut universe =
+            universe_with_policy(library.path(), "root", HashSet::from(["kept".to_owned()]));
 
         let roles = ["root", "dependency", "kept"].map(|name| {
             let package = universe.require(name).expect("installed");
