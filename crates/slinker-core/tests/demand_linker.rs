@@ -355,6 +355,13 @@ impl<'a> PackageFixture<'a> {
     }
 }
 
+fn analyze(images: Vec<PackageImage>) -> slinker_core::analysis::LinkIr {
+    let jobs = images.len();
+    Linker::new(FakeProvider::new(images), jobs)
+        .analyze("root")
+        .unwrap()
+}
+
 fn installed(index: &PackageIndex) -> InstalledPackage {
     let name = &index.identity.name;
     InstalledPackage {
@@ -489,9 +496,7 @@ fn retaining_structured_object_executes_nested_closures() {
             environment: "namespace:root".into(),
         });
 
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(retained_binding(&plan, "root", "nested_dependency"));
 }
 
@@ -587,9 +592,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
         .map(|name| name.as_str().into())
         .collect();
 
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(retained_binding(&plan, "root", "first_dependency"));
     assert!(retained_binding(&plan, "root", "second_dependency"));
@@ -609,9 +612,7 @@ fn unknown_closure_enclosure_reports_root_cause_without_lexical_cascade() {
         .as_mut()
         .unwrap()
         .environment = "unsupported:dynamic".into();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnknownClosureEnclosure
@@ -702,9 +703,7 @@ fn closure_private_environment_is_inventory_not_a_root_set() {
         },
     );
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
-    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 2)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root, foo]);
     assert!(!retained_private_binding(
         &plan,
         "root",
@@ -753,9 +752,7 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
         },
     );
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
-    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 2)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root, foo]);
     assert!(retained_private_binding(
         &plan,
         "root",
@@ -817,9 +814,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
             )]),
         },
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(
         !plan
             .blockers()
@@ -841,9 +836,7 @@ fn onload_can_create_a_missing_exported_active_binding() {
             ),
         ]).exports(export("pb")).build();
     Arc::make_mut(&mut root.index).lifecycle.on_load = true;
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.binding.as_deref() == Some("pb")
@@ -893,9 +886,7 @@ fn runtime_make_active_binding_does_not_satisfy_missing_export() {
         ("pb".into(), "pb".into()),
     ]))
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.binding.as_deref() == Some("pb")
@@ -1179,9 +1170,7 @@ fn namespace_discovery_matches_named_and_mixed_positional_arguments() {
         "f <- function() requireNamespace(quietly = TRUE, \"root\")",
     ] {
         let root = package("root", &[("f", Some(source))]);
-        let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-            .analyze("root")
-            .unwrap();
+        let plan = analyze(vec![root]);
         assert!(
             !plan
                 .blockers()
@@ -1237,9 +1226,7 @@ fn unknown_argument_keeps_public_namespace_helper_dynamic() {
             Some("helper <- function(package) requireNamespace(package)"),
         )],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(
         plan.blockers()
@@ -1287,9 +1274,7 @@ fn unknown_string_index_keeps_namespace_discovery_dynamic() {
                 ),
             ),
         ]).exports(export("f")).build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(
         plan.blockers()
@@ -1385,9 +1370,7 @@ fn library_and_attaching_require_reject() {
         "f <- function() require(foo)",
     ] {
         let root = package("root", &[("f", Some(source))]);
-        let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-            .analyze("root")
-            .unwrap();
+        let plan = analyze(vec![root]);
         assert!(
             plan.blockers()
                 .iter()
@@ -1426,9 +1409,7 @@ fn function_parameter_shadowing_prevents_special_call_semantics() {
             Some("f <- function(library, deparse) { library(foo); deparse(x) }"),
         )],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(!plan.blockers().iter().any(|diagnostic| matches!(
         diagnostic.code,
         RejectCode::PackageAttachmentUnsupported | RejectCode::SyntaxObservation
@@ -1488,9 +1469,7 @@ fn registered_native_symbol_is_not_an_unresolved_r_binding() {
             }),
         }])
         .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("croot_f")
     }));
@@ -1520,9 +1499,7 @@ fn opaque_registered_selector_is_consumed_by_native_call() {
         .exports(export("f"))
         .dynlibs(vec![opaque_registered_component()])
         .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(plan.provenance().nodes().iter().any(|node| {
         node.package == "root"
@@ -1552,9 +1529,7 @@ fn opaque_native_selector_consumption_is_occurrence_specific() {
     .exports(export("f"))
     .dynlibs(vec![opaque_registered_component()])
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert_eq!(unresolved_name_evidence(&plan, "croot_f").count(), 1);
     assert!(
@@ -1574,9 +1549,7 @@ fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
     .exports(export("f"))
     .dynlibs(vec![opaque_registered_component()])
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(retained_binding(&plan, "root", "foo"));
     assert!(
@@ -1595,9 +1568,7 @@ fn shadowed_native_primitive_does_not_consume_selector() {
     .exports(export("f"))
     .dynlibs(vec![opaque_registered_component()])
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     let function = plan
         .provenance()
@@ -1623,9 +1594,7 @@ fn named_opaque_native_selector_is_matched_by_formal_name() {
     .exports(export("f"))
     .dynlibs(vec![opaque_registered_component()])
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(
         plan.provenance()
@@ -1668,9 +1637,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
     .exports(export("by_symbol"))
     .dynlibs(vec![component])
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(
         !plan
@@ -1701,9 +1668,7 @@ fn string_native_selector_matches_routine_symbol_not_r_binding() {
         }),
     }])
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(
         plan.blockers()
             .iter()
@@ -1742,9 +1707,7 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
     .build();
     let mut root = root;
     Arc::make_mut(&mut root.index).lifecycle.on_load = true;
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.message.contains("croot_tick")
@@ -1782,9 +1745,7 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
     }])
     .build();
     Arc::make_mut(&mut root.index).lifecycle.on_load = true;
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.code == RejectCode::UnresolvedBinding
             && diagnostic.message.contains("croot_tick")
@@ -2046,9 +2007,7 @@ fn native_summary_accepts_oak_proven_local_closure_callback() {
         }]),
     }])
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(
         !plan
@@ -2103,9 +2062,7 @@ fn native_callback_positions_ignore_named_package_and_match_named_selector() {
         }]),
     }])
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(retained_binding(&plan, "root", "callback"));
     assert!(!plan.blockers().iter().any(|diagnostic| {
         matches!(
@@ -2168,9 +2125,7 @@ fn missing_native_routine_summary_is_an_effect_blocker_not_lookup_failure() {
             safety: NativeSafety::Summarized(Vec::new()),
         }])
         .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(
         plan.blockers()
             .iter()
@@ -2355,9 +2310,7 @@ fn base_resource_lookup_is_not_a_package_resource() {
         "root",
         &[("f", Some("f <- function() system.file('DESCRIPTION')"))],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(plan.blockers().is_empty());
     assert!(plan.program().resources().is_empty());
 }
@@ -2956,9 +2909,7 @@ fn air_frontend_failure_is_localized_not_package_fatal() {
 #[test]
 fn air_accepted_unknown_name_is_not_a_frontend_error() {
     let root = package("root", &[("f", Some("f <- function() missing_symbol()"))]);
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
 }
@@ -3091,9 +3042,7 @@ fn missing_unused_root_import_is_not_reported() {
         }])
         .exports(export("f"))
         .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     assert!(
         !plan
             .provenance()
@@ -3832,9 +3781,7 @@ fn next_method_is_supported_only_inside_a_closed_method_set() {
             ("stray", Some("stray <- function(x) NextMethod()")),
         ],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     let next_method_blockers = plan
         .blockers()
@@ -3878,9 +3825,7 @@ fn registered_operator_method_is_retained_with_its_dependencies() {
         .object
         .classes = vec!["root_criterion".into()];
 
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
     assert!(retained_binding(&plan, "root", "|.root_criterion"));
@@ -4425,9 +4370,7 @@ fn repeated_predicate_refines_conditional_local_fallthrough() {
             ),
         )],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f") && diagnostic.message.contains("tvalue")
@@ -4458,9 +4401,7 @@ fn non_returning_package_helper_refines_exhaustive_dispatch() {
     )
     .exports(export("f"))
     .build();
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(retained_binding(&plan, "root", ".stop_invalid_direction"));
     assert!(!plan.blockers().iter().any(|diagnostic| {
@@ -4489,9 +4430,7 @@ fn non_returning_summary_does_not_hide_real_invalid_input_fallthrough() {
             ("pvalue", None),
         ],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
     assert!(retained_binding(&plan, "root", "pvalue"));
@@ -4521,9 +4460,7 @@ fn conditional_local_fallthrough_retains_an_enclosing_binding_only_when_one_exis
 #[test]
 fn later_formal_default_does_not_escape_to_package_resolution() {
     let root = package("root", &[("f", Some("f <- function(x = y, y = 1) x"))]);
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f") && diagnostic.message.contains("`y`")
@@ -4536,9 +4473,7 @@ fn for_induction_variable_is_bound_inside_loop_body() {
         "root",
         &[("f", Some("f <- function(xs) { for (x in xs) print(x) }"))],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f") && diagnostic.message.contains("`x`")
@@ -4557,9 +4492,7 @@ fn for_induction_variable_after_loop_keeps_zero_iteration_fallthrough() {
             ("x", None),
         ],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(retained_binding(&plan, "root", "x"));
 }
@@ -4573,9 +4506,7 @@ fn captured_activation_superassignment_does_not_require_package_binding() {
             Some("outer <- function() { x <- 1; inner <- function() x <<- x + 1; inner() }"),
         )],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("outer")
@@ -4590,9 +4521,7 @@ fn uncaptured_superassignment_remains_environment_mutation_blocker() {
         "root",
         &[("outer", Some("outer <- function() { function() x <<- 1 }"))],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("outer")
@@ -4633,9 +4562,7 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
         },
     );
 
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     assert!(retained_private_binding(&plan, "root", "private:1", ".die"));
     assert!(!plan.blockers().iter().any(|diagnostic| {
@@ -4650,9 +4577,7 @@ fn graph_export_is_deterministic_semantic_and_count_consistent() {
         let foo = PackageFixture::new("foo", &[("bar", Some("bar <- function() 1"))])
             .exports(export("bar"))
             .build();
-        Linker::new(FakeProvider::new(vec![root, foo]), 2)
-            .analyze("root")
-            .unwrap()
+        analyze(vec![root, foo])
     };
     let first_plan = analyze();
     let second_plan = analyze();
@@ -4728,9 +4653,7 @@ fn explanation_dag_is_deterministic_coalesced_and_round_trips() {
             &[("f", Some("f <- function() { foo::bar(); foo::bar() }"))],
         );
         let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
-        Linker::new(FakeProvider::new(vec![root, foo]), 2)
-            .analyze("root")
-            .unwrap()
+        analyze(vec![root, foo])
     };
     let first = ExplanationDag::from_plan(&analyze(), &test_target(), "root").unwrap();
     let second = ExplanationDag::from_plan(&analyze(), &test_target(), "root").unwrap();
@@ -4766,9 +4689,7 @@ fn explanation_dag_condenses_cycles_and_remains_acyclic() {
             ("b", Some("b <- function() a()")),
         ],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
     let explanation = ExplanationDag::from_plan(&plan, &test_target(), "root").unwrap();
     let cycle = explanation
         .components
@@ -5600,9 +5521,7 @@ fn one_name_creator_is_one_primary_blocker_for_the_free_names_it_could_bind() {
             ("h", Some("h <- function() epsilon")),
         ],
     );
-    let plan = Linker::new(FakeProvider::new(vec![root]), 1)
-        .analyze("root")
-        .unwrap();
+    let plan = analyze(vec![root]);
 
     let primaries = plan
         .blockers()

@@ -3,6 +3,56 @@ pub use r_metadata::{Priority, Relation, RequirementVersion, Version, VersionReq
 
 use std::collections::BTreeSet;
 
+use std::cmp::Ordering;
+
+#[derive(Clone)]
+struct Bound {
+    version: Version,
+    inclusive: bool,
+}
+
+#[derive(Default)]
+struct Interval {
+    lower: Option<Bound>,
+    upper: Option<Bound>,
+}
+
+impl Interval {
+    fn raise_lower(&mut self, version: Version, inclusive: bool) {
+        tighten(&mut self.lower, version, inclusive, Ordering::Greater);
+    }
+
+    fn cap_upper(&mut self, version: Version, inclusive: bool) {
+        tighten(&mut self.upper, version, inclusive, Ordering::Less);
+    }
+
+    fn admits(&self, candidate: &Version) -> bool {
+        self.lower.as_ref().is_none_or(|bound| {
+            candidate > &bound.version || (bound.inclusive && candidate == &bound.version)
+        }) && self.upper.as_ref().is_none_or(|bound| {
+            candidate < &bound.version || (bound.inclusive && candidate == &bound.version)
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        let (Some(lower), Some(upper)) = (&self.lower, &self.upper) else {
+            return false;
+        };
+        lower.version > upper.version
+            || (lower.version == upper.version && !(lower.inclusive && upper.inclusive))
+    }
+}
+
+fn tighten(bound: &mut Option<Bound>, version: Version, inclusive: bool, stricter: Ordering) {
+    let replace = bound.as_ref().is_none_or(|current| {
+        version.cmp(&current.version) == stricter
+            || (version == current.version && current.inclusive && !inclusive)
+    });
+    if replace {
+        *bound = Some(Bound { version, inclusive });
+    }
+}
+
 pub fn intersect_requirements(
     package: &str,
     requirements: &[Relation],
@@ -15,8 +65,7 @@ pub fn intersect_requirements(
             .join(", ");
         format!("no version of `{package}` satisfies every requirement: {listed}")
     };
-    let mut lower: Option<(Version, bool)> = None;
-    let mut upper: Option<(Version, bool)> = None;
+    let mut interval = Interval::default();
     let mut exact: Option<Version> = None;
     let mut excluded = BTreeSet::new();
     for relation in requirements {
@@ -29,36 +78,16 @@ pub fn intersect_requirements(
         match relation.requirement() {
             VersionRequirement::Any => {}
             VersionRequirement::GreaterThanEqual(required) => {
-                tighten(
-                    &mut lower,
-                    version(required)?,
-                    true,
-                    std::cmp::Ordering::Greater,
-                );
+                interval.raise_lower(version(required)?, true);
             }
             VersionRequirement::GreaterThan(required) => {
-                tighten(
-                    &mut lower,
-                    version(required)?,
-                    false,
-                    std::cmp::Ordering::Greater,
-                );
+                interval.raise_lower(version(required)?, false);
             }
             VersionRequirement::LessThanEqual(required) => {
-                tighten(
-                    &mut upper,
-                    version(required)?,
-                    true,
-                    std::cmp::Ordering::Less,
-                );
+                interval.cap_upper(version(required)?, true);
             }
             VersionRequirement::LessThan(required) => {
-                tighten(
-                    &mut upper,
-                    version(required)?,
-                    false,
-                    std::cmp::Ordering::Less,
-                );
+                interval.cap_upper(version(required)?, false);
             }
             VersionRequirement::Equal(required) => {
                 let required = version(required)?;
@@ -74,38 +103,28 @@ pub fn intersect_requirements(
             }
         }
     }
-    let admits = |candidate: &Version| {
-        admits_bounds(candidate, lower.as_ref(), upper.as_ref()) && !excluded.contains(candidate)
-    };
     let relation = |requirement| {
         Relation::new(package, requirement).expect("package name came from a parsed relation")
     };
     if let Some(exact) = exact {
-        return if admits(&exact) {
+        return if interval.admits(&exact) && !excluded.contains(&exact) {
             Ok(vec![relation(VersionRequirement::Equal(exact.into()))])
         } else {
             Err(conflict())
         };
     }
-    if let (Some((low, low_inclusive)), Some((high, high_inclusive))) = (&lower, &upper)
-        && (low > high || (low == high && !(*low_inclusive && *high_inclusive)))
-    {
+    if interval.is_empty() {
         return Err(conflict());
     }
-    let excluded = excluded
-        .iter()
-        .filter(|version| admits_bounds(version, lower.as_ref(), upper.as_ref()))
-        .cloned()
-        .collect::<Vec<_>>();
     let mut merged = Vec::new();
-    if let Some((version, inclusive)) = lower {
+    if let Some(Bound { version, inclusive }) = interval.lower.clone() {
         merged.push(relation(if inclusive {
             VersionRequirement::GreaterThanEqual(version.into())
         } else {
             VersionRequirement::GreaterThan(version.into())
         }));
     }
-    if let Some((version, inclusive)) = upper {
+    if let Some(Bound { version, inclusive }) = interval.upper.clone() {
         merged.push(relation(if inclusive {
             VersionRequirement::LessThanEqual(version.into())
         } else {
@@ -115,38 +134,13 @@ pub fn intersect_requirements(
     merged.extend(
         excluded
             .into_iter()
+            .filter(|version| interval.admits(version))
             .map(|version| relation(VersionRequirement::NotEqual(version.into()))),
     );
     if merged.is_empty() {
         merged.push(relation(VersionRequirement::Any));
     }
     Ok(merged)
-}
-
-fn tighten(
-    bound: &mut Option<(Version, bool)>,
-    version: Version,
-    inclusive: bool,
-    stricter: std::cmp::Ordering,
-) {
-    let replace = bound.as_ref().is_none_or(|(current, current_inclusive)| {
-        version.cmp(current) == stricter
-            || (version == *current && *current_inclusive && !inclusive)
-    });
-    if replace {
-        *bound = Some((version, inclusive));
-    }
-}
-
-fn admits_bounds(
-    candidate: &Version,
-    lower: Option<&(Version, bool)>,
-    upper: Option<&(Version, bool)>,
-) -> bool {
-    lower.is_none_or(|(bound, inclusive)| candidate > bound || (*inclusive && candidate == bound))
-        && upper.is_none_or(|(bound, inclusive)| {
-            candidate < bound || (*inclusive && candidate == bound)
-        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
