@@ -168,8 +168,8 @@ impl ExplanationDag {
     ) -> Result<Self, ExplanationError> {
         let root_package = root_identity(plan, root_name).map_err(ExplanationError)?;
         let graph = plan.provenance().graph();
-        let node_ids = semantic_node_ids(&graph).map_err(ExplanationError)?;
-        let adjacency = adjacency(&graph);
+        let node_ids = semantic_node_ids(graph).map_err(ExplanationError)?;
+        let adjacency = adjacency(graph);
         let (component_of, component_members) = strongly_connected_components(&adjacency);
         let component_ids = component_members
             .iter()
@@ -281,7 +281,7 @@ impl ExplanationDag {
         let projected_edges =
             project_transparent_paths(&components, &edges, &component_adjacency, &component_ids);
         let roots = explanation_roots(
-            &graph,
+            graph,
             plan.provenance().roots(),
             &component_of,
             &component_ids,

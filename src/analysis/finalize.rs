@@ -100,7 +100,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let blockers = self.diagnostics.into_sorted();
         Ok(LinkIr {
             program,
-            provenance: crate::ir::ProvenanceIr::from_analysis(self.graph, self.roots),
+            provenance: crate::ir::ProvenanceIr::new(self.graph, self.roots),
             blockers,
             sources: self.parses.into_sources(),
             packages: self.packages.sources(retained),

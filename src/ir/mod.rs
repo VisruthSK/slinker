@@ -1341,80 +1341,44 @@ impl ProgramBuilder {
 
 #[derive(Debug, Default)]
 pub struct ProvenanceIr {
-    nodes: Vec<Node>,
-    edges: Vec<Edge>,
+    graph: Graph,
     roots: Vec<NodeId>,
 }
 
 impl ProvenanceIr {
-    pub(crate) fn from_analysis(graph: Graph, roots: Vec<NodeId>) -> Self {
-        Self {
-            nodes: graph.nodes,
-            edges: graph.edges,
-            roots,
-        }
+    pub(crate) fn new(graph: Graph, roots: Vec<NodeId>) -> Self {
+        Self { graph, roots }
+    }
+
+    pub(crate) fn graph(&self) -> &Graph {
+        &self.graph
     }
 
     pub fn nodes(&self) -> &[Node] {
-        &self.nodes
+        &self.graph.nodes
     }
 
     pub fn edges(&self) -> &[Edge] {
-        &self.edges
+        &self.graph.edges
     }
 
     pub fn roots(&self) -> &[NodeId] {
         &self.roots
     }
 
-    pub(crate) fn graph(&self) -> Graph {
-        Graph::from_parts(self.nodes.clone(), self.edges.clone())
-    }
-
     pub fn binding(&self, package: &str, name: &str) -> Option<NodeId> {
-        self.nodes
-            .iter()
-            .find(|node| {
-                node.package == package
-                    && matches!(&node.kind, crate::analysis::NodeKind::Binding { name: candidate } if candidate == name)
-            })
-            .map(|node| node.id)
+        self.graph.binding(package, name)
     }
 
     pub fn incoming(&self, node: NodeId) -> impl Iterator<Item = &Edge> {
-        self.edges.iter().filter(move |edge| edge.to == node)
+        self.graph.incoming(node)
     }
 
     pub fn shortest_path(&self, roots: &[NodeId], target: NodeId) -> Option<Vec<&Edge>> {
-        let graph = self.graph();
-        let indexes = graph
-            .shortest_path(roots, target)?
-            .into_iter()
-            .map(|edge| {
-                self.edges
-                    .iter()
-                    .position(|candidate| {
-                        candidate.from == edge.from
-                            && candidate.to == edge.to
-                            && candidate.kind == edge.kind
-                            && candidate.reason == edge.reason
-                            && candidate.span == edge.span
-                    })
-                    .expect("derived graph edge belongs to provenance")
-            })
-            .collect::<Vec<_>>();
-        Some(
-            indexes
-                .into_iter()
-                .map(|index| &self.edges[index])
-                .collect(),
-        )
+        self.graph.shortest_path(roots, target)
     }
 
     pub fn missing_packages(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.nodes
-            .iter()
-            .filter(|node| matches!(node.kind, crate::analysis::NodeKind::MissingPackage))
-            .map(|node| node.id)
+        self.graph.missing_packages()
     }
 }

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub usize);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeKind {
     Binding {
@@ -50,16 +50,15 @@ pub enum NodeKind {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Node {
     pub id: NodeId,
     pub package: String,
     pub kind: NodeKind,
     pub span: Option<Span>,
-    pub bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     Root,
@@ -80,7 +79,7 @@ pub enum EdgeKind {
     Effect,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Edge {
     pub from: NodeId,
     pub to: NodeId,
@@ -89,31 +88,17 @@ pub struct Edge {
     pub span: Option<Span>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
-    #[serde(skip)]
     outgoing: Vec<Vec<usize>>,
-    #[serde(skip)]
     incoming: Vec<Vec<usize>>,
-    #[serde(skip)]
     keys: HashMap<(String, NodeKind), NodeId>,
-    #[serde(skip)]
     edge_keys: HashSet<(NodeId, NodeId, EdgeKind, String, Option<Span>)>,
 }
 
 impl Graph {
-    pub fn from_parts(nodes: Vec<Node>, edges: Vec<Edge>) -> Self {
-        let mut graph = Self {
-            nodes,
-            edges,
-            ..Self::default()
-        };
-        graph.rebuild_indexes();
-        graph
-    }
-
     pub fn add_node(
         &mut self,
         package: impl Into<String>,
@@ -131,7 +116,6 @@ impl Graph {
             package,
             kind,
             span,
-            bytes: 0,
         });
         self.outgoing.push(Vec::new());
         self.incoming.push(Vec::new());
@@ -139,21 +123,7 @@ impl Graph {
         id
     }
 
-    pub fn set_bytes(&mut self, id: NodeId, bytes: u64) {
-        self.nodes[id.0].bytes = bytes;
-    }
-
     pub fn add_edge(
-        &mut self,
-        from: NodeId,
-        to: NodeId,
-        kind: EdgeKind,
-        reason: impl Into<String>,
-    ) -> bool {
-        self.add_edge_at(from, to, kind, reason, None)
-    }
-
-    pub fn add_edge_at(
         &mut self,
         from: NodeId,
         to: NodeId,
@@ -190,14 +160,6 @@ impl Graph {
 
     pub fn activation(&self, package: &str) -> Option<NodeId> {
         self.node_id(package, &NodeKind::Activation)
-    }
-
-    pub fn nodes_for_package(&self, package: &str) -> impl Iterator<Item = NodeId> + '_ {
-        let package = package.to_owned();
-        self.nodes
-            .iter()
-            .filter(move |node| node.package == package)
-            .map(|node| node.id)
     }
 
     pub fn missing_packages(&self) -> impl Iterator<Item = NodeId> + '_ {
@@ -276,27 +238,5 @@ impl Graph {
         }
         path.reverse();
         Some(path)
-    }
-
-    pub fn rebuild_indexes(&mut self) {
-        self.outgoing = vec![Vec::new(); self.nodes.len()];
-        self.incoming = vec![Vec::new(); self.nodes.len()];
-        self.keys.clear();
-        self.edge_keys.clear();
-        for node in &self.nodes {
-            self.keys
-                .insert((node.package.clone(), node.kind.clone()), node.id);
-        }
-        for (index, edge) in self.edges.iter().enumerate() {
-            self.outgoing[edge.from.0].push(index);
-            self.incoming[edge.to.0].push(index);
-            self.edge_keys.insert((
-                edge.from,
-                edge.to,
-                edge.kind,
-                edge.reason.clone(),
-                edge.span.clone(),
-            ));
-        }
     }
 }

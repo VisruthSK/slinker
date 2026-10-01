@@ -2452,37 +2452,31 @@ impl<P: PackageProvider> AnalyzerState<P> {
             && !is_r_constant(value)
         {
             let resolved = self.resolve_lexical_name(package, image, lexical_environment, value)?;
-            if binding == ".onLoad"
-                && matches!(resolved, Resolution::OpenDynamic(OpenReason::Unresolved(_)))
-            {
-                if let Some(component) = Self::sole_opaque_registered_native_component(&image.index)
-                {
-                    self.require_at(
-                        from,
-                        Need::Native { package, component: component.to_owned().into() },
-                        EdgeKind::Native,
-                        format!(".onLoad may receive registered native symbol `{value}` from `{component}`"),
-                        Some(effect.span.clone()),
-                    );
-                } else {
-                    self.require_resolved(
-                        from,
+            let opaque_native = (binding == ".onLoad"
+                && matches!(resolved, Resolution::OpenDynamic(OpenReason::Unresolved(_))))
+            .then(|| Self::sole_opaque_registered_native_component(&image.index))
+            .flatten();
+            match opaque_native {
+                Some(component) => self.require_at(
+                    from,
+                    Need::Native {
                         package,
-                        Some(binding),
-                        resolved,
-                        effect.span.clone(),
-                        ReferenceUse::Unrecorded,
-                    );
-                }
-            } else {
-                self.require_resolved(
+                        component: component.to_owned().into(),
+                    },
+                    EdgeKind::Native,
+                    format!(
+                        ".onLoad may receive registered native symbol `{value}` from `{component}`"
+                    ),
+                    Some(effect.span.clone()),
+                ),
+                None => self.require_resolved(
                     from,
                     package,
                     Some(binding),
                     resolved,
                     effect.span.clone(),
                     ReferenceUse::Unrecorded,
-                );
+                ),
             }
         }
 
@@ -2503,31 +2497,46 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
 
         match self.resolve_lexical_name(package, image, lexical_environment, target)? {
-            Resolution::Static(BindingTarget::Namespace { package: owner, binding: target_binding }) => self.require_at(
+            Resolution::Static(BindingTarget::Namespace {
+                package: owner,
+                binding: target_binding,
+            }) => self.require_at(
                 from,
-                Need::Binding { package: owner, binding: target_binding.clone() },
+                Need::Binding {
+                    package: owner,
+                    binding: target_binding.clone(),
+                },
                 EdgeKind::Effect,
                 format!("superassignment mutates enclosing binding `{target_binding}`"),
                 Some(effect.span.clone()),
             ),
-            Resolution::Static(BindingTarget::Private { package: owner, environment, binding: target_binding }) => self.require_at(
+            Resolution::Static(BindingTarget::Private {
+                package: owner,
+                environment,
+                binding: target_binding,
+            }) => self.require_at(
                 from,
-                Need::PrivateBinding { package: owner, environment: environment.clone(), binding: target_binding.clone() },
+                Need::PrivateBinding {
+                    package: owner,
+                    environment: environment.clone(),
+                    binding: target_binding.clone(),
+                },
                 EdgeKind::Effect,
-                format!("superassignment mutates private binding `{target_binding}` in {environment}"),
+                format!(
+                    "superassignment mutates private binding `{target_binding}` in {environment}"
+                ),
                 Some(effect.span.clone()),
             ),
-            Resolution::Static(BindingTarget::Local) if lexical_environment.starts_with("derived:") => {}
-            Resolution::Static(BindingTarget::Native { .. } | BindingTarget::Closure { ..
-} | BindingTarget::Imported { .. } | BindingTarget::External { .. } |
-BindingTarget::Metadata { .. } | BindingTarget::Base | BindingTarget::Local) |
-Resolution::OpenDynamic(OpenReason::MissingPackage { .. } |
-OpenReason::Unresolved(_)) => self.diagnostic(
+            Resolution::Static(BindingTarget::Local)
+                if lexical_environment.starts_with("derived:") => {}
+            _ => self.diagnostic(
                 from,
                 package,
                 Some(binding),
                 RejectCode::EnvironmentMutation,
-                format!("superassignment target `{target}` does not resolve to a mutable enclosing lexical/package/private binding"),
+                format!(
+                    "superassignment target `{target}` does not resolve to a mutable enclosing lexical/package/private binding"
+                ),
                 Some(effect.span.clone()),
             ),
         }
@@ -3782,7 +3791,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     ) {
         self.dependencies.entry(from).or_default().insert(to);
         if self.provenance {
-            self.graph.add_edge_at(from, to, kind, reason, span);
+            self.graph.add_edge(from, to, kind, reason, span);
         }
     }
 
@@ -3913,7 +3922,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             .graph
             .add_node(missing, NodeKind::MissingPackage, span.clone());
         self.graph
-            .add_edge_at(from, node, kind, reason.clone(), span.clone());
+            .add_edge(from, node, kind, reason.clone(), span.clone());
         let primary = self.new_diagnostic(
             node,
             requester,
