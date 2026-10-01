@@ -25,7 +25,7 @@ mod s3;
 mod state;
 
 use crate::Result;
-use crate::package::PackageProvider;
+use crate::package::{PackageName, PackageProvider};
 use state::{AnalysisOptions, AnalyzerState};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -73,14 +73,24 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     #[must_use]
-    pub fn with_linked_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
-        self.options.linked_packages.extend(packages);
+    pub fn with_linked_packages(
+        mut self,
+        packages: impl IntoIterator<Item = impl Into<PackageName>>,
+    ) -> Self {
+        self.options
+            .linked_packages
+            .extend(packages.into_iter().map(Into::into));
         self
     }
 
     #[must_use]
-    pub fn with_external_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
-        self.options.explicit_external_packages.extend(packages);
+    pub fn with_external_packages(
+        mut self,
+        packages: impl IntoIterator<Item = impl Into<PackageName>>,
+    ) -> Self {
+        self.options
+            .explicit_external_packages
+            .extend(packages.into_iter().map(Into::into));
         self
     }
 

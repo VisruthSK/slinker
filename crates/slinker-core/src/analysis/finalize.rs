@@ -243,7 +243,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         issues.extend(
             unreached
                 .into_iter()
-                .map(|name| FinalizationIssue::UnreachedExternal(PackageName::from(name))),
+                .map(|name| FinalizationIssue::UnreachedExternal(name.clone())),
         );
         Ok(contracts)
     }

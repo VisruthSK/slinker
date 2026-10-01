@@ -56,15 +56,15 @@ pub(super) struct NativeCallbackContext<'a> {
 pub(super) struct AnalysisOptions {
     pub(super) jobs: usize,
     pub(super) provenance: bool,
-    pub(super) linked_packages: HashSet<String>,
-    pub(super) explicit_external_packages: HashSet<String>,
+    pub(super) linked_packages: HashSet<PackageName>,
+    pub(super) explicit_external_packages: HashSet<PackageName>,
     pub(super) root_description: Option<Arc<str>>,
 }
 
 pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) packages: TargetUniverse<P>,
-    pub(super) linked_packages: HashSet<String>,
-    pub(super) explicit_external_packages: HashSet<String>,
+    pub(super) linked_packages: HashSet<PackageName>,
+    pub(super) explicit_external_packages: HashSet<PackageName>,
     pub(super) jobs: usize,
     pub(super) parse_pool: Option<Arc<rayon::ThreadPool>>,
     pub(super) graph: Graph,

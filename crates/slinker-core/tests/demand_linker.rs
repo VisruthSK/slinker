@@ -1129,7 +1129,7 @@ fn exact_external_package_terminates_internal_traversal() {
     let provider = FakeProvider::new(vec![root, foo]);
     let counts = provider.count_handle();
     let plan = Linker::new(provider, 1)
-        .with_external_packages(["foo".into()])
+        .with_external_packages(["foo"])
         .analyze("root")
         .unwrap();
     assert!(
@@ -1197,7 +1197,7 @@ fn constant_argument_specializes_private_namespace_helper() {
     .build();
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo".into()])
+        .with_external_packages(["foo"])
         .analyze("root")
         .unwrap();
 
@@ -1248,7 +1248,7 @@ fn bounded_string_operations_specialize_namespace_helper() {
         ]).exports(export("f")).build();
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo".into()])
+        .with_external_packages(["foo"])
         .analyze("root")
         .unwrap();
 
@@ -1303,7 +1303,7 @@ fn resolved_null_coalescing_helper_propagates_constant() {
     .build();
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo".into()])
+        .with_external_packages(["foo"])
         .analyze("root")
         .unwrap();
 
@@ -1328,7 +1328,7 @@ fn bounded_switch_propagates_selected_package() {
         ]).exports(export("f")).build();
     let foo = package("foo", &[]);
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo".into()])
+        .with_external_packages(["foo"])
         .analyze("root")
         .unwrap();
 
@@ -2499,7 +2499,7 @@ fn external_internal_access_is_preserved_in_the_program() {
         ],
     );
     let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo".into()])
+        .with_external_packages(["foo"])
         .analyze("root")
         .unwrap();
 
@@ -3750,7 +3750,7 @@ fn external_method_registration_opens_a_closed_generic() {
     }])
     .build();
     let plan = Linker::new(FakeProvider::new(vec![root, bar]), 1)
-        .with_external_packages(["bar".into()])
+        .with_external_packages(["bar"])
         .analyze("root")
         .unwrap();
 
@@ -4816,7 +4816,7 @@ fn rlang_package_queries_on_a_linked_package_are_rewritten() {
             ],
         );
         Linker::new(FakeProvider::new(vec![root, foo, rlang]), 1)
-            .with_external_packages(["rlang".into()])
+            .with_external_packages(["rlang"])
             .analyze("root")
             .unwrap()
     };
@@ -5008,7 +5008,7 @@ fn unregistered_lexical_method_is_retained_for_a_generic_of_an_external_package(
     let provider =
         FakeProvider::new(vec![lexical_root(), foo, ext]).dispatching(Some("ext"), "gen", &["gen"]);
     let plan = Linker::new(provider, 1)
-        .with_external_packages(["ext".into()])
+        .with_external_packages(["ext"])
         .analyze("root")
         .unwrap();
 
@@ -5040,7 +5040,7 @@ fn lexical_method_follows_an_external_reexport_to_the_defining_namespace() {
         &["gen"],
     );
     let plan = Linker::new(provider, 1)
-        .with_external_packages(["ext".into(), "mid".into()])
+        .with_external_packages(["ext", "mid"])
         .analyze("root")
         .unwrap();
 

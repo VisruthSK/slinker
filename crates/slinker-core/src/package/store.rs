@@ -1,9 +1,9 @@
 use crate::cache::{Cache, CacheLocation};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, Digest, GenericName, InstalledPackage, LifecycleMetadata, NativeFacts,
-    NativeRoutineSummary, NativeSafety, PackageData, PackageIdentity, PackageImage, PackageIndex,
-    PackageLocator,
+    BindingName, ComponentName, Digest, GenericName, InstalledPackage, LifecycleMetadata,
+    NativeFacts, NativeRoutineSummary, NativeSafety, PackageData, PackageIdentity, PackageImage,
+    PackageIndex, PackageLocator, PackageName,
 };
 use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{WorkerBinding, WorkerPackageIndex};
@@ -20,7 +20,7 @@ const ANALYSIS_SCHEMA: &str = "slinker-analysis-v10";
 #[derive(Deserialize, Serialize)]
 struct CachedIndex {
     schema: String,
-    target: String,
+    target: Digest,
     package_fingerprint: Digest,
     index: WorkerPackageIndex,
 }
@@ -28,9 +28,9 @@ struct CachedIndex {
 #[derive(Deserialize, Serialize)]
 struct CachedBinding {
     schema: String,
-    target: String,
+    target: Digest,
     package_fingerprint: Digest,
-    binding_name: String,
+    binding_name: BindingName,
     binding: WorkerBinding,
 }
 
@@ -43,7 +43,7 @@ struct NativeSummaryManifest {
 
 #[derive(Debug, Deserialize)]
 struct NativePackageSummary {
-    package: String,
+    package: PackageName,
     version: String,
     image_fingerprint: Digest,
     components: Vec<NativeComponentSummary>,
@@ -51,7 +51,7 @@ struct NativePackageSummary {
 
 #[derive(Debug, Deserialize)]
 struct NativeComponentSummary {
-    component: String,
+    component: ComponentName,
     #[serde(flatten)]
     safety: NativeSummarySafety,
 }
@@ -227,7 +227,7 @@ pub struct PackageStore {
     dispatch: HashMap<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
     cache: Cache,
     r_home: PathBuf,
-    target_fingerprint: String,
+    target_fingerprint: Digest,
     worker: Option<WorkerClient>,
     native_summaries: NativeSummaryManifest,
 }
@@ -246,8 +246,7 @@ impl PackageStore {
                         .iter()
                         .map(|path| path.to_string_lossy().into_owned()),
                 ),
-        )
-        .to_string();
+        );
         Ok(Self {
             locator: PackageLocator::new(target),
             indexes: HashMap::new(),

@@ -68,7 +68,7 @@ struct UniverseArgs {
         value_parser = package_name,
         help = "Keep packages as runtime dependencies; selects declared optional packages"
     )]
-    external: Vec<String>,
+    external: Vec<PackageName>,
     #[arg(
         long = "link",
         value_name = "PKG",
@@ -76,7 +76,7 @@ struct UniverseArgs {
         value_parser = package_name,
         help = "Select declared optional packages and link them in when reachable code uses them"
     )]
-    linked: Vec<String>,
+    linked: Vec<PackageName>,
     #[arg(long, value_name = "N", default_value_t = default_jobs(), help = "Analysis workers")]
     jobs: NonZeroUsize,
 }
@@ -252,11 +252,11 @@ fn run(command: UserCommand) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn package_name(value: &str) -> Result<String, &'static str> {
+fn package_name(value: &str) -> Result<PackageName, &'static str> {
     if value.is_empty() || value.contains(['/', '\\']) {
         return Err("expected an R package name");
     }
-    Ok(value.to_owned())
+    Ok(PackageName::from(value))
 }
 
 fn default_jobs() -> NonZeroUsize {

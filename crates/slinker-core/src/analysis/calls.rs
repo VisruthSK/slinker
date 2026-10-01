@@ -1078,7 +1078,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         } else {
             self.relocations.push(PendingRelocation::PackageVersion {
                 source: call.span.clone(),
-                version: self.packages.identity(target).version.to_string(),
+                version: self.packages.identity(target).version.clone(),
             });
         }
         Ok(())

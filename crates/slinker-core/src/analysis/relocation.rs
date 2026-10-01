@@ -1,4 +1,5 @@
 use super::NodeId;
+use crate::Version;
 use crate::ir::NamespaceOperation;
 use crate::package::{
     BindingName, ComponentName, DataSetName, DatasetName, PackageId, ResourcePath, SymbolName,
@@ -35,7 +36,7 @@ pub(super) enum PendingRelocation {
     },
     PackageVersion {
         source: Span,
-        version: String,
+        version: Version,
     },
     LoadedQuery {
         source: Span,

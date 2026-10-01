@@ -1,3 +1,4 @@
+use crate::Version;
 use crate::analysis::{Edge, Graph, Node, NodeId};
 pub use crate::package::{
     BindingName, ClassName, ComponentName, DatasetName, GenericName, PackageId, PackageIdentity,
@@ -355,7 +356,7 @@ pub enum RelocationTarget {
         operation: NamespaceOperation,
     },
     PackageVersion {
-        version: String,
+        version: Version,
     },
     Resource {
         target: ResourceId,

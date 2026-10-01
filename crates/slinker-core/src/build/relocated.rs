@@ -156,7 +156,7 @@ impl Replacement {
             },
             RelocationTarget::PackageVersion { version } => Self::expression(RExpr::new(format!(
                 "base::package_version({})",
-                r_string(version)
+                r_string(version.as_ref())
             ))),
             RelocationTarget::Resource { target } => {
                 let resource = program.resource(*target);

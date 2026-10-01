@@ -38,14 +38,18 @@ pub enum DispatchCallee<'a> {
 
 pub struct TargetUniverse<P: PackageResolver> {
     store: P,
-    root: String,
-    explicit_external: HashSet<String>,
-    availability: HashMap<String, PackageAvailability>,
+    root: PackageName,
+    explicit_external: HashSet<PackageName>,
+    availability: HashMap<PackageName, PackageAvailability>,
     packages: Vec<(InstalledPackage, PackageRole)>,
 }
 
 impl<P: PackageResolver> TargetUniverse<P> {
-    pub fn new(store: P, root: impl Into<String>, explicit_external: HashSet<String>) -> Self {
+    pub fn new(
+        store: P,
+        root: impl Into<PackageName>,
+        explicit_external: HashSet<PackageName>,
+    ) -> Self {
         Self {
             store,
             root: root.into(),
@@ -55,7 +59,7 @@ impl<P: PackageResolver> TargetUniverse<P> {
         }
     }
 
-    pub fn root_name(&self) -> &str {
+    pub fn root_name(&self) -> &PackageName {
         &self.root
     }
 
@@ -82,7 +86,7 @@ impl<P: PackageResolver> TargetUniverse<P> {
     fn ingest(&mut self, name: &str, package: Option<InstalledPackage>) -> Option<PackageId> {
         let Some(package) = package else {
             self.availability
-                .insert(name.to_owned(), PackageAvailability::Absent);
+                .insert(PackageName::from(name), PackageAvailability::Absent);
             return None;
         };
         let id = PackageId::from_index(self.packages.len());
@@ -94,7 +98,8 @@ impl<P: PackageResolver> TargetUniverse<P> {
             (PackageRole::Linked, PackageAvailability::Linked(id))
         };
         self.packages.push((package, role));
-        self.availability.insert(name.to_owned(), availability);
+        self.availability
+            .insert(PackageName::from(name), availability);
         Some(id)
     }
 
@@ -252,7 +257,7 @@ mod tests {
     fn universe_with_policy(
         library: &Path,
         root: &str,
-        explicit_external: HashSet<String>,
+        explicit_external: HashSet<PackageName>,
     ) -> TargetUniverse<CountingStore> {
         TargetUniverse::new(
             CountingStore {
@@ -316,7 +321,7 @@ mod tests {
             install(library.path(), name);
         }
         let mut universe =
-            universe_with_policy(library.path(), "root", HashSet::from(["kept".to_owned()]));
+            universe_with_policy(library.path(), "root", HashSet::from(["kept".into()]));
 
         let roles = ["root", "dependency", "kept"].map(|name| {
             let package = universe.require(name).expect("installed");
