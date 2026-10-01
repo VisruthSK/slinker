@@ -248,14 +248,9 @@ pub struct WorkerPackageIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerErrorCode {
     Protocol,
-    SharedLibraryLoad,
     RuntimeStartup,
-    ArchitectureMismatch,
-    TargetIdentityMismatch,
     PackageMetadata,
-    LazyLoadDatabase,
     MissingBinding,
     BindingForce,
-    WorkerCrash,
     TargetSyntaxRejection,
 }
