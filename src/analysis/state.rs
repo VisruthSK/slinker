@@ -1046,7 +1046,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    fn optional_availability_blocker(
+    pub(super) fn optional_availability_blocker(
         &mut self,
         from: NodeId,
         current: PackageId,

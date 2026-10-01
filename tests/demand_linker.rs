@@ -5781,6 +5781,36 @@ fn dynamic_or_unsupported_data_forms_block() {
 }
 
 #[test]
+fn data_call_without_a_package_searches_attached_packages_and_blocks() {
+    let plan = data_use("f <- function() data(alpha)");
+
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|blocker| blocker.code == RejectCode::DynamicLookup),
+        "{:?}",
+        plan.blockers()
+    );
+    assert!(plan.program().dataset_libraries().next().is_none());
+}
+
+#[test]
+fn data_call_on_an_unselected_suggested_package_blocks() {
+    let plan = Linker::new(
+        FakeProvider::new(vec![
+            suggesting_root("f <- function() data(alpha, package = \"foo\")"),
+            data_package(false),
+        ]),
+        1,
+    )
+    .analyze("root")
+    .unwrap();
+
+    assert_eq!(optional_availability_blockers(&plan), ["root::f"]);
+    assert!(plan.program().dataset_libraries().next().is_none());
+}
+
+#[test]
 fn file_backed_data_cannot_be_carried_and_blocks() {
     let plan = Linker::new(
         FakeProvider::new(vec![
