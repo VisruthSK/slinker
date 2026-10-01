@@ -1,70 +1,44 @@
-[package]
-name = "slinker"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Target-specific linker for installed R package images"
 license = "MIT OR Apache-2.0"
 publish = false
 
-[[bin]]
-name = "slinker"
-path = "src/main.rs"
-required-features = ["air"]
+[workspace.dependencies]
+slinker-core = { path = "crates/slinker-core" }
+slinker-r-worker = { path = "crates/slinker-r-worker" }
 
-[features]
-default = ["air"]
-air = [
-  "dep:air_r_parser",
-  "dep:air_r_syntax",
-  "dep:biome_rowan",
-  "dep:oak_semantic",
-  "dep:rayon",
-]
-
-[dependencies]
 sha2 = "0.11"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 dunce = "1.0"
 tempfile = "3.23"
 thiserror = "2.0"
-rayon = { version = "1.12", optional = true }
+rayon = "1.12"
+r-description-parser = "0.3.0"
+r-metadata = "0.3.0"
+regex = "1.13.1"
+which = "8.0.6"
+clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 # Keep slinker's direct Air crates on the exact parser revision used by the
 # pinned Ark/Oak revision. Do not reintroduce an independent Air tag/version.
-air_r_parser = { git = "https://github.com/posit-dev/air", rev = "d2659d5b158374bf486b594625ca50abbd0ac879", optional = true }
-air_r_syntax = { git = "https://github.com/posit-dev/air", rev = "d2659d5b158374bf486b594625ca50abbd0ac879", optional = true }
-biome_rowan = { git = "https://github.com/lionel-/biome", rev = "a1296ea6ba363d8b8d8f02181b2a4ce9315c5ef9", optional = true }
+air_r_parser = { git = "https://github.com/posit-dev/air", rev = "d2659d5b158374bf486b594625ca50abbd0ac879" }
+air_r_syntax = { git = "https://github.com/posit-dev/air", rev = "d2659d5b158374bf486b594625ca50abbd0ac879" }
+biome_rowan = { git = "https://github.com/lionel-/biome", rev = "a1296ea6ba363d8b8d8f02181b2a4ce9315c5ef9" }
 
 # Oak semantic analysis only. Do not pull Ark runtime/LSP/Jupyter crates.
-oak_semantic = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a", optional = true }
+oak_semantic = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a" }
 harp = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a" }
 libr = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a" }
 
-# DESCRIPTION parsing and semantic R package metadata.
-r-description-parser = "0.3.0"
-r-metadata = "0.3.0"
-clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
-which = "8.0.6"
-regex = "1.13.1"
-
-[dev-dependencies]
-criterion = { version = "0.8.2", default-features = false, features = [
-  "cargo_bench_support",
-] }
-
-[[bench]]
-name = "micro"
-harness = false
-required-features = ["air"]
-
-[[bench]]
-name = "end_to_end"
-harness = false
-required-features = ["air"]
-
-[lints.clippy]
+[workspace.lints.clippy]
 assigning_clones = "warn"
 cloned_instead_of_copied = "warn"
 explicit_into_iter_loop = "warn"

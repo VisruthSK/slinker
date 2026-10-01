@@ -1,5 +1,7 @@
 # slinker agent instructions
 
+Always use your edit tool instead of trying to rewrite files from memory. Make targeted, clean edits.
+
 ## Project
 
 `slinker` turns an R source package into another source package with selected dependencies linked into it.
@@ -10,7 +12,7 @@ Correctness and semantic soundness come before ecosystem coverage and performanc
 
 ## Sources of truth
 
-`docs/` describes behavior implemented now; `README.md` indexes it.
+`docs/` describes behavior implemented now.
 
 `work to materialize.md` describes unfinished work and intended behavior. Do not assume planned behavior already exists.
 

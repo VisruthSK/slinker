@@ -1,0 +1,665 @@
+use super::dynamic_names::UnresolvedName;
+use super::object_world::{ClosureId, ClosureObject, ClosureOwner, Lookup, ObjectGraph, ObjectId};
+use super::state::AnalyzerState;
+use crate::Result;
+use crate::analysis::{EdgeKind, Need, NodeId, NodeKind, RejectCode};
+use crate::ir::ExternalBindingAccess;
+use crate::package::{
+    BindingName, ClosureSource, ComponentName, EnvironmentKind, EnvironmentLabel, ImportSpec,
+    NativeComponent, PackageId, PackageImage, PackageName, PackageProvider,
+};
+use crate::syntax::{
+    NamespaceImportResolution, NamespaceImports, OakParseContext, SourceKey, Span,
+    closure_definitely_non_returning,
+};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum Resolution {
+    Static(BindingTarget),
+    OpenDynamic(OpenReason),
+}
+
+impl Resolution {
+    fn unresolved(name: &str) -> Self {
+        Self::OpenDynamic(OpenReason::Unresolved(name.into()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum OpenReason {
+    Unresolved(BindingName),
+    MissingPackage {
+        package: PackageName,
+        binding: Option<BindingName>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MetadataBinding {
+    PackageName,
+    S3MethodsTable,
+    Namespace,
+}
+
+impl MetadataBinding {
+    pub(super) const ALL: [Self; 3] = [Self::PackageName, Self::S3MethodsTable, Self::Namespace];
+
+    pub(super) fn of(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|metadata| metadata.name() == name)
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::PackageName => ".packageName",
+            Self::S3MethodsTable => ".__S3MethodsTable__.",
+            Self::Namespace => ".__NAMESPACE__.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum BindingTarget {
+    Local,
+    Base,
+    Namespace {
+        package: PackageId,
+        binding: BindingName,
+    },
+    Imported {
+        package: PackageId,
+        binding: BindingName,
+    },
+    Private {
+        package: PackageId,
+        environment: EnvironmentLabel,
+        binding: BindingName,
+    },
+    Closure {
+        package: PackageId,
+        closure: ClosureId,
+    },
+    Native {
+        package: PackageId,
+        component: ComponentName,
+        binding: BindingName,
+    },
+    External {
+        package: PackageId,
+        binding: BindingName,
+    },
+    Metadata {
+        package: PackageId,
+        binding: MetadataBinding,
+    },
+}
+
+enum DerivedStep {
+    Resolved(Resolution),
+    Parent(EnvironmentLabel),
+}
+
+fn prove_non_returning<'a>(
+    candidates: &(impl Iterator<Item = (&'a BindingName, &'a ClosureSource)> + Clone),
+    shadowed: &BTreeSet<BindingName>,
+    imports: &NamespaceImports,
+    proven: &mut BTreeSet<BindingName>,
+) {
+    loop {
+        let context =
+            OakParseContext::with_imports(shadowed.clone(), imports.clone(), proven.clone());
+        let before = proven.len();
+        for (name, closure) in candidates.clone() {
+            if !proven.contains(name) && closure_definitely_non_returning(&closure.source, &context)
+            {
+                proven.insert(name.clone());
+            }
+        }
+        if proven.len() == before {
+            return;
+        }
+    }
+}
+
+impl<P: PackageProvider> AnalyzerState<P> {
+    pub(super) fn namespace_imports(
+        &mut self,
+        package: PackageId,
+        image: &PackageImage,
+    ) -> Result<NamespaceImports> {
+        if let Some(imports) = self.namespace_imports.get(&package) {
+            return Ok(imports.clone());
+        }
+        let mut imports = NamespaceImports::default();
+        for import in &image.index.imports {
+            match import {
+                ImportSpec::From { package, bindings } => imports.add_import_from(
+                    package.clone(),
+                    bindings
+                        .iter()
+                        .map(|binding| (binding.local.clone(), binding.remote.clone())),
+                ),
+                ImportSpec::All {
+                    package: package_name,
+                    except,
+                } => {
+                    let exports = match self.packages.resolve(package_name)? {
+                        Some(foreign) => Some(self.packages.index(foreign)?.exports.clone()),
+                        None => None,
+                    };
+                    imports.add_import_all(package_name.clone(), exports, except.iter().cloned());
+                }
+            }
+        }
+        self.namespace_imports.insert(package, imports.clone());
+        Ok(imports)
+    }
+
+    fn namespace_shadowed_names<'a>(
+        &mut self,
+        package: PackageId,
+        image: &PackageImage,
+        indexed: impl Iterator<Item = &'a BindingName>,
+    ) -> Result<BTreeSet<BindingName>> {
+        let mut shadowed = indexed.cloned().collect::<BTreeSet<_>>();
+        shadowed.extend(self.loaded(package)?.namespace.bindings.iter().cloned());
+        shadowed.extend(
+            image
+                .index
+                .dynlibs
+                .iter()
+                .flat_map(NativeComponent::bindings)
+                .map(|symbol| symbol.binding),
+        );
+        Ok(shadowed)
+    }
+
+    fn inferred_non_returning_bindings(
+        &mut self,
+        package: PackageId,
+        image: &PackageImage,
+        imports: &NamespaceImports,
+    ) -> Result<BTreeSet<BindingName>> {
+        if let Some(bindings) = self.non_returning_bindings.get(&package) {
+            return Ok(bindings.clone());
+        }
+        let shadowed = self.namespace_shadowed_names(package, image, image.bindings.keys())?;
+        let namespace = EnvironmentLabel::namespace(self.packages.name(package));
+        let candidates = image.bindings.iter().filter_map(|(name, binding)| {
+            let closure = binding.object.closure.as_ref()?;
+            (closure.environment == namespace).then_some((name, closure))
+        });
+        let mut proven = BTreeSet::new();
+        prove_non_returning(&candidates, &shadowed, imports, &mut proven);
+        self.non_returning_bindings.insert(package, proven.clone());
+        Ok(proven)
+    }
+
+    pub(super) fn oak_parse_context(
+        &mut self,
+        package: PackageId,
+        image: &PackageImage,
+        lexical_environment: &EnvironmentLabel,
+    ) -> Result<OakParseContext> {
+        let mut shadowed =
+            self.namespace_shadowed_names(package, image, image.index.binding_names.iter())?;
+        let mut private_shadowed = BTreeSet::new();
+        let mut visible_private = BTreeMap::new();
+        let mut current = Some(lexical_environment.clone());
+        if let Some(graph) = self.objects.get(package)
+            && let Some(mut environment) = graph.environment_id(lexical_environment)
+        {
+            let mut seen = BTreeSet::new();
+            while seen.insert(environment) {
+                let shape = graph.environment(environment);
+                if !shape.is_derived() {
+                    current = Some(shape.label.clone());
+                    break;
+                }
+                for name in shape.bindings.keys() {
+                    private_shadowed.insert(name.clone());
+                    shadowed.insert(name.clone());
+                }
+                match shape.parent {
+                    Some(parent) => environment = parent,
+                    None => {
+                        current = None;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        while let Some(label) = current.take() {
+            let Some(private) = image
+                .private_environment(&label)
+                .filter(|_| seen.insert(label.clone()))
+            else {
+                break;
+            };
+            for (name, binding) in &private.bindings {
+                private_shadowed.insert(name.clone());
+                shadowed.insert(name.clone());
+                visible_private.entry(name).or_insert(binding);
+            }
+            current = Some(private.parent.clone());
+        }
+
+        let imports = self.namespace_imports(package, image)?;
+        let mut non_returning = self.inferred_non_returning_bindings(package, image, &imports)?;
+        non_returning.retain(|name| !private_shadowed.contains(name));
+        let candidates = visible_private
+            .iter()
+            .filter_map(|(&name, binding)| Some((name, binding.object.closure.as_ref()?)));
+        prove_non_returning(&candidates, &shadowed, &imports, &mut non_returning);
+        Ok(OakParseContext::with_imports(
+            shadowed,
+            imports,
+            non_returning,
+        ))
+    }
+
+    pub(super) fn resolve_lexical_name(
+        &mut self,
+        current: PackageId,
+        image: &PackageImage,
+        lexical_environment: &EnvironmentLabel,
+        name: &str,
+    ) -> Result<Resolution> {
+        let mut environment = lexical_environment.clone();
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(environment.clone()) {
+                return Ok(Resolution::unresolved(name));
+            }
+            if environment.is_derived() {
+                match self.resolve_derived(current, &environment, name) {
+                    DerivedStep::Resolved(resolution) => return Ok(resolution),
+                    DerivedStep::Parent(parent) => environment = parent,
+                }
+                continue;
+            }
+            if let Some(private) = image.private_environment(&environment) {
+                if private.bindings.contains_key(name) {
+                    return Ok(Resolution::Static(BindingTarget::Private {
+                        package: current,
+                        environment: private.id.clone(),
+                        binding: name.into(),
+                    }));
+                }
+                environment = private.parent.clone();
+                continue;
+            }
+            return match environment.kind() {
+                EnvironmentKind::Namespace(package) if package == self.packages.name(current) => {
+                    self.resolve_name(current, image, name)
+                }
+                EnvironmentKind::Namespace(package) => {
+                    self.resolve_foreign_namespace(package, name)
+                }
+                EnvironmentKind::Base | EnvironmentKind::Empty
+                    if self.packages.is_base_binding(name) =>
+                {
+                    Ok(Resolution::Static(BindingTarget::Base))
+                }
+                _ => Ok(Resolution::unresolved(name)),
+            };
+        }
+    }
+
+    fn resolve_derived(
+        &self,
+        current: PackageId,
+        environment: &EnvironmentLabel,
+        name: &str,
+    ) -> DerivedStep {
+        let unresolved = || DerivedStep::Resolved(Resolution::unresolved(name));
+        let Some(graph) = self.objects.get(current) else {
+            return unresolved();
+        };
+        let Some(id) = graph.environment_id(environment) else {
+            return unresolved();
+        };
+        match graph.lookup_environment_binding(id, name) {
+            Lookup::Found(object) => DerivedStep::Resolved(Resolution::Static(
+                derived_binding_target(graph, current, object),
+            )),
+            Lookup::Opaque => unresolved(),
+            Lookup::Absent => match graph.environment(id).parent {
+                Some(parent) => DerivedStep::Parent(graph.environment(parent).label.clone()),
+                None => unresolved(),
+            },
+        }
+    }
+
+    fn resolve_foreign_namespace(&mut self, package: &str, name: &str) -> Result<Resolution> {
+        let Some(foreign) = self.packages.resolve(package)? else {
+            return Ok(Resolution::OpenDynamic(OpenReason::MissingPackage {
+                package: package.into(),
+                binding: Some(name.into()),
+            }));
+        };
+        if self.packages.is_external(foreign) {
+            self.external.insert(foreign);
+            return Ok(Resolution::Static(BindingTarget::External {
+                package: foreign,
+                binding: name.into(),
+            }));
+        }
+        let foreign_image = self.image(foreign)?;
+        self.resolve_name(foreign, &foreign_image, name)
+    }
+
+    pub(super) fn closure_execution_source(
+        &self,
+        package: PackageId,
+        closure: ClosureId,
+    ) -> Option<ClosureExecutionSource> {
+        let graph = self.objects.get(package)?;
+        let closure = graph.closure(closure).clone();
+        let environment = graph.environment(closure.enclosure).label.clone();
+        let owner = closure.provenance.owner.source_key();
+        let key = SourceKey::Closure {
+            owner: Box::new(owner.clone()),
+            path: closure.provenance.path.clone(),
+            environment: environment.clone(),
+        };
+        Some(ClosureExecutionSource {
+            closure,
+            owner,
+            key,
+            environment,
+        })
+    }
+
+    pub(super) fn resolve_name(
+        &mut self,
+        current: PackageId,
+        image: &PackageImage,
+        name: &str,
+    ) -> Result<Resolution> {
+        if let Some(binding) = MetadataBinding::of(name) {
+            return Ok(Resolution::Static(BindingTarget::Metadata {
+                package: current,
+                binding,
+            }));
+        }
+        if image
+            .index
+            .binding_names
+            .iter()
+            .any(|binding| binding == name)
+            || self
+                .loaded
+                .get(&current)
+                .is_some_and(|loaded| loaded.namespace.contains(name))
+        {
+            return Ok(Resolution::Static(BindingTarget::Namespace {
+                package: current,
+                binding: name.into(),
+            }));
+        }
+
+        if let Some(component) = Self::native_component_for_binding(&image.index, name) {
+            return Ok(Resolution::Static(BindingTarget::Native {
+                package: current,
+                component: component.into(),
+                binding: name.into(),
+            }));
+        }
+
+        match self.namespace_imports(current, image)?.resolve(name) {
+            NamespaceImportResolution::Imported {
+                package: package_name,
+                binding,
+                ..
+            } => {
+                let Some(foreign) = self.packages.resolve(&package_name)? else {
+                    return Ok(Resolution::OpenDynamic(OpenReason::MissingPackage {
+                        package: package_name,
+                        binding: Some(binding),
+                    }));
+                };
+                return Ok(if self.packages.is_external(foreign) {
+                    self.external.insert(foreign);
+                    Resolution::Static(BindingTarget::External {
+                        package: foreign,
+                        binding,
+                    })
+                } else {
+                    Resolution::Static(BindingTarget::Imported {
+                        package: foreign,
+                        binding,
+                    })
+                });
+            }
+            NamespaceImportResolution::MissingImportAll { package, binding } => {
+                return Ok(Resolution::OpenDynamic(OpenReason::MissingPackage {
+                    package,
+                    binding: Some(binding),
+                }));
+            }
+            NamespaceImportResolution::BaseFallback => {}
+        }
+
+        if self.packages.is_base_binding(name) {
+            Ok(Resolution::Static(BindingTarget::Base))
+        } else {
+            Ok(Resolution::unresolved(name))
+        }
+    }
+
+    pub(super) fn require_resolved(
+        &mut self,
+        from: NodeId,
+        requester: PackageId,
+        binding: Option<&str>,
+        resolved: Resolution,
+        span: Span,
+        use_kind: ReferenceUse,
+    ) {
+        match resolved {
+            Resolution::Static(BindingTarget::Namespace { package, binding }) => self
+                .require_binding_at(
+                    from,
+                    Need::Binding {
+                        package,
+                        binding: binding.clone(),
+                    },
+                    EdgeKind::Lexical,
+                    format!("lexical reference `{binding}`"),
+                    Some(span),
+                    use_kind,
+                ),
+            Resolution::Static(BindingTarget::Private {
+                package,
+                environment,
+                binding,
+            }) => self.require_at(
+                from,
+                Need::PrivateBinding {
+                    package,
+                    environment: environment.clone(),
+                    binding: binding.clone(),
+                },
+                EdgeKind::Lexical,
+                format!("lexical private reference `{binding}` in {environment}"),
+                Some(span),
+            ),
+            Resolution::Static(BindingTarget::Closure { package, closure }) => self.require_at(
+                from,
+                Need::ClosureExecution { package, closure },
+                EdgeKind::ClosureExecution,
+                "reachable lexical reference resolves to an executable retained closure",
+                Some(span),
+            ),
+            Resolution::Static(BindingTarget::Native {
+                package,
+                component,
+                binding: native_binding,
+            }) => self.require_at(
+                from,
+                Need::Native {
+                    package,
+                    component: component.clone(),
+                },
+                EdgeKind::Native,
+                format!("registered native symbol `{native_binding}` is provided by `{component}`"),
+                Some(span),
+            ),
+            Resolution::Static(BindingTarget::Imported { package, binding }) => {
+                self.require_at(
+                    from,
+                    Need::Activation { package },
+                    EdgeKind::Import,
+                    "imported binding requires namespace activation",
+                    Some(span.clone()),
+                );
+                self.require_binding_at(
+                    from,
+                    Need::Binding {
+                        package,
+                        binding: binding.clone(),
+                    },
+                    EdgeKind::Import,
+                    format!("imported binding `{binding}`"),
+                    Some(span),
+                    use_kind,
+                );
+            }
+            Resolution::Static(BindingTarget::External { package, binding }) => {
+                let node = self.external_binding(
+                    package,
+                    &binding,
+                    ExternalBindingAccess::Exported,
+                    Some(span.clone()),
+                );
+                self.depend(
+                    from,
+                    node,
+                    EdgeKind::Import,
+                    format!("External imported binding `{binding}`"),
+                    Some(span),
+                );
+            }
+            Resolution::Static(BindingTarget::Metadata {
+                package,
+                binding: metadata,
+            }) => {
+                let node = self.graph.add_node(
+                    self.packages.name(package).clone(),
+                    NodeKind::PackageMetadata {
+                        name: BindingName::from(metadata.name()),
+                    },
+                    Some(span.clone()),
+                );
+                self.depend(
+                    from,
+                    node,
+                    EdgeKind::Lexical,
+                    format!("package metadata reference `{}`", metadata.name()),
+                    Some(span.clone()),
+                );
+                if metadata == MetadataBinding::Namespace && !self.is_root(package) {
+                    self.diagnostic(
+                        from,
+                        requester,
+                        binding,
+                        RejectCode::DynamicLookup,
+                        "synthetic dependency directly observes .__NAMESPACE__., which is intentionally not constructed",
+                        Some(span),
+                    );
+                }
+            }
+            Resolution::OpenDynamic(OpenReason::MissingPackage { package, binding }) => {
+                let detail = binding.as_deref().map_or_else(
+                    || format!("reachable reference requires missing namespace {package}"),
+                    |name| {
+                        format!("imported binding `{name}` requires missing namespace {package}")
+                    },
+                );
+                self.record_missing_package(
+                    from,
+                    requester,
+                    &package,
+                    EdgeKind::Import,
+                    detail,
+                    Some(span),
+                );
+            }
+            Resolution::Static(BindingTarget::Local | BindingTarget::Base) => {}
+            Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
+                self.dynamic_names.observe_unresolved(UnresolvedName {
+                    package: requester,
+                    binding: binding.map(BindingName::from),
+                    name: BindingName::from(name.as_str()),
+                    span,
+                });
+            }
+        }
+    }
+}
+
+pub(super) struct ClosureExecutionSource {
+    pub(super) closure: ClosureObject,
+    pub(super) owner: SourceKey,
+    pub(super) key: SourceKey,
+    pub(super) environment: EnvironmentLabel,
+}
+
+fn derived_binding_target(
+    graph: &ObjectGraph,
+    current: PackageId,
+    object: ObjectId,
+) -> BindingTarget {
+    let Some(closure) = graph.closure_of(object) else {
+        return BindingTarget::Local;
+    };
+    let closure_object = graph.closure(closure);
+    let provenance = &closure_object.provenance;
+    if closure_object.derived_from.is_some() || !provenance.path.is_root() {
+        return BindingTarget::Closure {
+            package: current,
+            closure,
+        };
+    }
+    match &provenance.owner {
+        ClosureOwner::Namespace(binding) => BindingTarget::Namespace {
+            package: current,
+            binding: binding.clone(),
+        },
+        ClosureOwner::Private {
+            environment,
+            binding,
+        } => BindingTarget::Private {
+            package: current,
+            environment: environment.clone(),
+            binding: binding.clone(),
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReferenceUse {
+    Recorded,
+    Unrecorded,
+}
+
+impl<P: PackageProvider> AnalyzerState<P> {
+    fn require_binding_at(
+        &mut self,
+        from: NodeId,
+        need: Need,
+        kind: EdgeKind,
+        reason: String,
+        span: Option<Span>,
+        use_kind: ReferenceUse,
+    ) {
+        match use_kind {
+            ReferenceUse::Recorded => self.require_classified_at(from, need, kind, reason, span),
+            ReferenceUse::Unrecorded => self.require_at(from, need, kind, reason, span),
+        }
+    }
+}

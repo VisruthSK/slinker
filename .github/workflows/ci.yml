@@ -126,7 +126,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/tmp/cran
-          key: cran-${{ runner.os }}-r-${{ matrix.r }}-${{ hashFiles('tests/cran_packages.rs', 'tests/common/mod.rs') }}
+          key: cran-${{ runner.os }}-r-${{ matrix.r }}-${{ hashFiles('crates/slinker-cli/tests/cran_packages.rs', 'crates/slinker-cli/tests/common/mod.rs') }}
 
       - run: cargo test --locked --all-targets --all-features
 

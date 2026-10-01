@@ -71,11 +71,11 @@ missing fact.
 
 ## Regression corpus
 
-Keep passing: `tests/build_materializer.rs` (synthetic fixtures, vendored `praise`/`pkgconfig`);
-`tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, and `here`, each run
+Keep passing: `crates/slinker-cli/tests/build_materializer.rs` (synthetic fixtures, vendored `praise`/`pkgconfig`);
+`crates/slinker-cli/tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, and `here`, each run
 against one build with its Linked dependencies absent, installed, and loaded; `pkgcond`, `doubt`,
 `config`, `qrcode` (unselected optional packages), and `voucher` with cli and fs Linked block with their
-exact unproven behavior until a sound rule covers it); `tests/harp_runtime.rs` (target-R relocation verification accepts exactly the planned
+exact unproven behavior until a sound rule covers it); `crates/slinker-cli/tests/harp_runtime.rs` (target-R relocation verification accepts exactly the planned
 replacements and rejects parseable unplanned changes and malformed rewrites). Each item adds its own
 acceptance cases here.
 
