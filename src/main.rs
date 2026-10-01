@@ -62,17 +62,17 @@ struct UniverseArgs {
         value_name = "PKG",
         value_delimiter = ',',
         value_parser = package_name,
-        help = "Keep declared packages as runtime dependencies"
+        help = "Keep packages as runtime dependencies; selects declared optional packages"
     )]
     external: Vec<String>,
     #[arg(
-        long = "extra-pkgs",
+        long = "link",
         value_name = "PKG",
         value_delimiter = ',',
         value_parser = package_name,
-        help = "Enable optional packages when reachable"
+        help = "Select declared optional packages and link them in when reachable code uses them"
     )]
-    extra_pkgs: Vec<String>,
+    linked: Vec<String>,
     #[arg(long, value_name = "N", default_value_t = default_jobs(), help = "Analysis workers")]
     jobs: NonZeroUsize,
 }
@@ -214,9 +214,7 @@ fn package_name(value: &str) -> Result<String, &'static str> {
 }
 
 fn default_jobs() -> NonZeroUsize {
-    std::thread::available_parallelism()
-        .unwrap_or(NonZeroUsize::MIN)
-        .min(NonZeroUsize::new(8).expect("8 is nonzero"))
+    std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
 fn link(args: &AnalysisArgs) -> Result<(Session, LinkIr), Box<dyn Error>> {
@@ -614,7 +612,7 @@ mod tests {
             "--lib=two",
             "--external",
             "cli,glue",
-            "--extra-pkgs=foo,bar",
+            "--link=foo,bar",
             "--jobs",
             "3",
             "--json",
@@ -629,7 +627,7 @@ mod tests {
             [Path::new("one"), Path::new("two")]
         );
         assert_eq!(args.analysis.universe.external, ["cli", "glue"]);
-        assert_eq!(args.analysis.universe.extra_pkgs, ["foo", "bar"]);
+        assert_eq!(args.analysis.universe.linked, ["foo", "bar"]);
         assert_eq!(args.analysis.universe.jobs.get(), 3);
         assert!(args.json.json);
     }

@@ -70,14 +70,14 @@ pub(super) struct NativeCallbackContext<'a> {
 pub(super) struct AnalysisOptions {
     pub(super) jobs: usize,
     pub(super) provenance: bool,
-    pub(super) extra_packages: HashSet<String>,
+    pub(super) linked_packages: HashSet<String>,
     pub(super) explicit_external_packages: HashSet<String>,
     pub(super) root_description: Option<Arc<str>>,
 }
 
 pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) packages: TargetUniverse<P>,
-    pub(super) extra_packages: HashSet<String>,
+    pub(super) linked_packages: HashSet<String>,
     pub(super) explicit_external_packages: HashSet<String>,
     pub(super) jobs: usize,
     pub(super) parse_pool: Option<Arc<rayon::ThreadPool>>,
@@ -132,7 +132,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let root = packages.require(root_name)?;
         Ok(Self {
             packages,
-            extra_packages: options.extra_packages,
+            linked_packages: options.linked_packages,
             explicit_external_packages: options.explicit_external_packages,
             jobs: options.jobs.max(1),
             parse_pool: None,
@@ -1065,7 +1065,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Some(binding),
             RejectCode::OptionalAvailability,
             format!(
-                "reachable code depends on whether unselected optional package `{optional}` is installed; `{}` lists it only in Suggests, so the build cannot fix either answer (select it with --extra-pkgs or --external)",
+                "reachable code depends on whether unselected optional package `{optional}` is installed; `{}` lists it only in Suggests, so the build cannot fix either answer (select it with --link or --external)",
                 self.packages.name(current)
             ),
             Some(span.clone()),
@@ -2326,7 +2326,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn optional_package_selected(&self, name: &str) -> bool {
-        self.extra_packages.contains(name) || self.explicit_external_packages.contains(name)
+        self.linked_packages.contains(name) || self.explicit_external_packages.contains(name)
     }
 
     pub(super) fn package_is_suggested_only(

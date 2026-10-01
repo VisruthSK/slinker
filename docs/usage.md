@@ -18,7 +18,7 @@ The report groups blockers by rejection code. Each blocker names its package and
 
 Snapshotting the source tree skips `.git`, `target`, and `renv` at the package root and every entry matched by a `.Rbuildignore` regular expression (case-insensitive, matched against the path relative to the root, as `R CMD build` does). A pattern the regex engine cannot parse, such as lookaround, fails the build. Symlinks and other non-regular entries fail the build.
 
-`--extra-pkgs` applies to `build` and `check` as it does to `analyze`.
+`--lib`, `--external`, `--link`, and `--jobs` are accepted by every command and mean the same thing in each. `--jobs` defaults to the number of available CPUs.
 
 ## Check
 
@@ -35,7 +35,7 @@ slinker check path/to/rootpkg --json
 slinker analyze voucher
 slinker analyze voucher --lib C:/project/renv/library --lib C:/Users/me/AppData/Local/R/win-library/4.6
 slinker analyze voucher --external cli
-slinker analyze voucher --extra-pkgs posterior,distributional
+slinker analyze voucher --link posterior,distributional
 slinker analyze voucher --json
 ```
 
@@ -51,7 +51,7 @@ slinker never installs, rebuilds, or downloads packages outside staging the sour
 
 `Suggests` is not a dependency graph. A package appearing only in `Suggests` contributes no edge and is not inspected merely because it is installed.
 
-`--extra-pkgs PKG[,PKG...]` explicitly enables optional packages for reachable optional-package code paths. Values are comma-separated or repeated, for example `--extra-pkgs foo,bar --extra-pkgs baz`. The flag does not make those packages roots, does not retain their full APIs, and does not recursively follow their `Suggests`. If retained code never reaches an enabled package, that package still stays out of the graph. Reachable code whose behavior depends on whether an unselected `Suggests` package is installed blocks the build, because a build cannot pick one answer for an environment it does not control. That is a `requireNamespace("foo")` call, which would otherwise be frozen to `FALSE`, and a branch guarded by `isNamespaceLoaded("foo")` or an `onLoad` hook for `foo`, which would otherwise be pruned. `foo` stops blocking once it is selected, External, or required by the package's effective imports or `Depends`. Queries slinker leaves as written (`asNamespace`, `packageVersion`, an unguarded `isNamespaceLoaded`) ask the real installation in the original and in the generated package alike, so they do not block.
+`--link PKG[,PKG...]` selects declared optional packages and links them in, for reachable optional-package code paths. It is the counterpart of `--external`, which selects them and keeps them external. Values are comma-separated or repeated, for example `--link foo,bar --link baz`. The flag does not make those packages roots, does not retain their full APIs, and does not recursively follow their `Suggests`. Like every Linked package, one that retained code never reaches stays out of the graph. Packages that are already Linked by default are unaffected. Reachable code whose behavior depends on whether an unselected `Suggests` package is installed blocks the build, because a build cannot pick one answer for an environment it does not control. That is a `requireNamespace("foo")` call, which would otherwise be frozen to `FALSE`, and a branch guarded by `isNamespaceLoaded("foo")` or an `onLoad` hook for `foo`, which would otherwise be pruned. `foo` stops blocking once it is selected, External, or required by the package's effective imports or `Depends`. Queries slinker leaves as written (`asNamespace`, `packageVersion`, an unguarded `isNamespaceLoaded`) ask the real installation in the original and in the generated package alike, so they do not block.
 
 `--external` leaves named third-party namespaces external after resolving their exact installed identity. Base packages remain part of the target R platform.
 

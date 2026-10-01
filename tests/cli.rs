@@ -30,6 +30,14 @@ fn help_lists_public_commands_only() {
 }
 
 #[test]
+fn mistyped_command_suggests_the_closest_one() {
+    let output = slinker(&["biuld"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(stderr.contains("'build'"), "{stderr}");
+}
+
+#[test]
 fn unknown_option_is_rejected_before_analysis() {
     let output = slinker(&["analyze", "glue", "--bogus", "yaml"]);
     assert!(!output.status.success());

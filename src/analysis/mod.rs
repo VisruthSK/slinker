@@ -53,7 +53,7 @@ impl<P: PackageProvider> Linker<P> {
             options: AnalysisOptions {
                 jobs,
                 provenance: true,
-                extra_packages: HashSet::new(),
+                linked_packages: HashSet::new(),
                 explicit_external_packages: HashSet::new(),
                 root_description: None,
             },
@@ -67,8 +67,8 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     #[must_use]
-    pub fn with_extra_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
-        self.options.extra_packages.extend(packages);
+    pub fn with_linked_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
+        self.options.linked_packages.extend(packages);
         self
     }
 

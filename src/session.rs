@@ -120,7 +120,7 @@ impl Session {
         let store = PackageStore::new(self.r_home.clone(), self.target.clone(), cache_location())?;
         let mut linker = Linker::new(store, universe.jobs.get())
             .with_external_packages(universe.external.iter().cloned())
-            .with_extra_packages(universe.extra_pkgs.iter().cloned());
+            .with_linked_packages(universe.linked.iter().cloned());
         if !provenance {
             linker = linker.without_provenance();
         }
