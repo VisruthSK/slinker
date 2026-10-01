@@ -9,6 +9,39 @@ use crate::ir::{
 
 const GENERATED_RUNTIME: &str = include_str!("runtime.R");
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RExpr(String);
+
+impl RExpr {
+    pub(super) fn new(source: String) -> Self {
+        Self(source)
+    }
+
+    pub(super) fn into_source(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for RExpr {
+    fn from(source: &str) -> Self {
+        Self(source.to_owned())
+    }
+}
+
+impl std::fmt::Display for RExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn comma_separated<T: std::fmt::Display>(items: impl IntoIterator<Item = T>) -> String {
+    items
+        .into_iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 macro_rules! emit {
     ($out:expr, $($argument:tt)*) => {{
         $out.push_str(&format!($($argument)*));
@@ -251,7 +284,7 @@ fn payload_bundle<'a>(
     }
 }
 
-fn external_payload_dependencies(program: &ProgramIr, bundle: &PayloadBundleIr) -> String {
+fn external_payload_dependencies(program: &ProgramIr, bundle: &PayloadBundleIr) -> RExpr {
     r_vector(bundle.dependencies().iter().filter_map(|dependency| {
         match dependency {
             PayloadDependency::External(namespace) => Some(
@@ -276,7 +309,7 @@ fn initial_value(program: &ProgramIr, binding: BindingId) -> Option<ValueId> {
     }
 }
 
-pub(super) fn binding_reference(program: &ProgramIr, binding: BindingId) -> String {
+pub(super) fn binding_reference(program: &ProgramIr, binding: BindingId) -> RExpr {
     let namespace = program.namespace(program.binding_namespace(binding));
     let package = program.package(namespace.package);
     let exported_external = matches!(
@@ -287,18 +320,18 @@ pub(super) fn binding_reference(program: &ProgramIr, binding: BindingId) -> Stri
         }
     );
     if exported_external {
-        format!(
+        RExpr::new(format!(
             "base::getExportedValue({}, {})",
             r_string(&package.identity().name),
             r_string(&program.binding(binding).name)
-        )
+        ))
     } else {
         namespace_get(program, binding)
     }
 }
 
-pub(super) fn namespace_get(program: &ProgramIr, binding: BindingId) -> String {
-    format!(
+pub(super) fn namespace_get(program: &ProgramIr, binding: BindingId) -> RExpr {
+    RExpr::new(format!(
         "base::get({}, envir = {}, inherits = FALSE)",
         r_string(&program.binding(binding).name),
         namespace_expression(
@@ -307,19 +340,19 @@ pub(super) fn namespace_get(program: &ProgramIr, binding: BindingId) -> String {
                 .namespace(program.binding_namespace(binding))
                 .package
         )
-    )
+    ))
 }
 
-pub(super) fn namespace_expression(program: &ProgramIr, package: PackageId) -> String {
+pub(super) fn namespace_expression(program: &ProgramIr, package: PackageId) -> RExpr {
     let root = program.package(program.root_package());
-    match program.package(package).registered_namespace() {
+    RExpr::new(match program.package(package).registered_namespace() {
         RegisteredNamespace::Package(name) => format!("base::asNamespace({})", r_string(name)),
         RegisteredNamespace::Private(key) => format!(
             "base::asNamespace({})[[\".slinker_runtime\"]][[\"namespaces\"]][[{}]]",
             r_string(&root.identity().name),
             r_string(key.as_str())
         ),
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -328,11 +361,7 @@ enum S3Column4 {
     Original,
 }
 
-fn s3_matrix(
-    program: &ProgramIr,
-    registrations: &[S3RegistrationId],
-    column4: S3Column4,
-) -> String {
+fn s3_matrix(program: &ProgramIr, registrations: &[S3RegistrationId], column4: S3Column4) -> RExpr {
     let rows = registrations
         .iter()
         .map(|registration| program.s3_registration(*registration))
@@ -346,7 +375,7 @@ fn s3_matrix(
                 .map(|row| r_string(&program.binding(row.method).name)),
         )
         .chain(rows.iter().map(|row| match &row.generic.home {
-            GenericHome::Lexical => "NA_character_".to_owned(),
+            GenericHome::Lexical => RExpr::from("NA_character_"),
             GenericHome::Program(package) => match column4 {
                 S3Column4::Registry => {
                     r_string(program.package(*package).registered_namespace().as_str())
@@ -356,25 +385,16 @@ fn s3_matrix(
             GenericHome::Optional(package) => r_string(package),
         }))
         .collect::<Vec<_>>();
-    format!("matrix(as.character(c({})), ncol = 4L)", cells.join(", "))
+    RExpr::new(format!(
+        "matrix(as.character(c({})), ncol = 4L)",
+        comma_separated(cells)
+    ))
 }
 
-fn imports_info(namespace: &Namespace) -> String {
+fn imports_info(namespace: &Namespace) -> RExpr {
     let records = namespace.import_records.iter().map(|record| {
-        let locals = record
-            .names
-            .iter()
-            .map(|(local, _)| local)
-            .map(|local| r_string(local))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let remotes = record
-            .names
-            .iter()
-            .map(|(_, remote)| remote)
-            .map(|remote| r_string(remote))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let locals = comma_separated(record.names.iter().map(|(local, _)| r_string(local)));
+        let remotes = comma_separated(record.names.iter().map(|(_, remote)| r_string(remote)));
         format!(
             "{} = structure(as.character(c({remotes})), names = as.character(c({locals})))",
             r_string(&record.package)
@@ -383,14 +403,14 @@ fn imports_info(namespace: &Namespace) -> String {
     let entries = std::iter::once("base = TRUE".to_owned())
         .chain(records)
         .collect::<Vec<_>>();
-    format!("list({})", entries.join(", "))
+    RExpr::new(format!("list({})", entries.join(", ")))
 }
 
-fn r_vector<'a>(values: impl Iterator<Item = &'a str>) -> String {
-    format!(
+fn r_vector<'a>(values: impl Iterator<Item = &'a str>) -> RExpr {
+    RExpr::new(format!(
         "as.character(c({}))",
-        values.map(r_string).collect::<Vec<_>>().join(", ")
-    )
+        comma_separated(values.map(r_string))
+    ))
 }
 
 pub(super) fn render_namespace(program: &ProgramIr) -> String {
@@ -428,7 +448,7 @@ pub(super) fn render_namespace(program: &ProgramIr) -> String {
         emit!(
             out,
             "useDynLib({})",
-            std::iter::once(r_binding_name(&native.name))
+            std::iter::once(r_binding_name(&native.name).into_source())
                 .chain(registration)
                 .chain(symbols)
                 .collect::<Vec<_>>()
@@ -448,7 +468,7 @@ pub(super) fn render_namespace(program: &ProgramIr) -> String {
                 r_binding_name(package),
                 r_binding_name(&registration.generic.name)
             ),
-            GenericHome::Lexical => r_string(&registration.generic.name),
+            GenericHome::Lexical => r_string(&registration.generic.name).into_source(),
         };
         emit!(
             out,
@@ -460,12 +480,12 @@ pub(super) fn render_namespace(program: &ProgramIr) -> String {
     out
 }
 
-pub(super) fn native_library(program: &ProgramIr, package: PackageId, component: &str) -> String {
-    format!(
+pub(super) fn native_library(program: &ProgramIr, package: PackageId, component: &str) -> RExpr {
+    RExpr::new(format!(
         "base::getNamespaceInfo({}, \"DLLs\")[[{}]]",
         namespace_expression(program, package),
         r_string(component)
-    )
+    ))
 }
 
 fn removed_import(local: &str, removed: &RemovedImportIr) -> String {
@@ -477,18 +497,18 @@ fn removed_import(local: &str, removed: &RemovedImportIr) -> String {
     )
 }
 
-pub(super) fn r_string(value: &str) -> String {
-    format!(
+pub(super) fn r_string(value: &str) -> RExpr {
+    RExpr::new(format!(
         "\"{}\"",
         value
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('\n', "\\n")
             .replace('\r', "\\r")
-    )
+    ))
 }
 
-fn r_binding_name(value: &str) -> String {
+fn r_binding_name(value: &str) -> RExpr {
     let simple = !value.is_empty()
         && value.bytes().enumerate().all(|(index, byte)| {
             if index == 0 {
@@ -498,9 +518,9 @@ fn r_binding_name(value: &str) -> String {
             }
         })
         && !(value.starts_with('.') && value.as_bytes().get(1).is_some_and(u8::is_ascii_digit));
-    if simple {
+    RExpr::new(if simple {
         value.into()
     } else {
         format!("`{}`", value.replace('`', "\\`"))
-    }
+    })
 }

@@ -1,6 +1,6 @@
 use super::BuildContextError;
 use super::emit::{
-    binding_reference, namespace_expression, namespace_get, native_library, r_string,
+    RExpr, binding_reference, namespace_expression, namespace_get, native_library, r_string,
 };
 use crate::ir::{CodeId, ExternalBindingAccess, ProgramIr, RelocationTarget};
 use crate::package::{CanonicalSyntax, Digest, SyntaxValidation};
@@ -76,17 +76,17 @@ impl RelocatedCode {
 }
 
 struct Replacement {
-    expression: String,
+    expression: RExpr,
     appended_argument: Option<AppendedArgument>,
 }
 
 struct AppendedArgument {
     name: &'static str,
-    value: String,
+    value: RExpr,
 }
 
 impl Replacement {
-    fn expression(expression: String) -> Self {
+    fn expression(expression: RExpr) -> Self {
         Self {
             expression,
             appended_argument: None,
@@ -100,27 +100,27 @@ impl Replacement {
                 ExternalBindingAccess::Internal => namespace_get(program, *target),
             }),
             RelocationTarget::RequireNamespace { result } => {
-                Self::expression(if *result { "TRUE" } else { "FALSE" }.into())
+                Self::expression(RExpr::from(if *result { "TRUE" } else { "FALSE" }))
             }
             RelocationTarget::Namespace { package, .. }
             | RelocationTarget::NamespaceArgument { package } => {
                 Self::expression(namespace_expression(program, *package))
             }
             RelocationTarget::LoadedQuery | RelocationTarget::InstalledQuery { check: false } => {
-                Self::expression("TRUE".into())
+                Self::expression(RExpr::from("TRUE"))
             }
             RelocationTarget::InstalledQuery { check: true } => {
-                Self::expression("base::invisible(NULL)".into())
+                Self::expression(RExpr::from("base::invisible(NULL)"))
             }
             RelocationTarget::NativeSymbol {
                 package,
                 component,
                 symbol,
-            } => Self::expression(format!(
+            } => Self::expression(RExpr::new(format!(
                 "base::getNativeSymbolInfo({}, {})",
                 r_string(symbol),
                 native_library(program, *package, component)
-            )),
+            ))),
             RelocationTarget::NativeLibrary { package, component } => {
                 Self::expression(native_library(program, *package, component))
             }
@@ -130,47 +130,50 @@ impl Replacement {
                     expression: r_string(&package.identity().name),
                     appended_argument: Some(AppendedArgument {
                         name: "lib.loc",
-                        value: format!(
+                        value: RExpr::new(format!(
                             "base::system.file(\"slinker\", \"resources\", package = {})",
                             r_string(&program.package(program.root_package()).identity().name)
-                        ),
+                        )),
                     }),
                 }
             }
-            RelocationTarget::Dataset { package, dataset } => Self::expression(format!(
-                "base::getExportedValue({}, {})",
-                namespace_expression(program, *package),
-                r_string(dataset)
-            )),
+            RelocationTarget::Dataset { package, dataset } => {
+                Self::expression(RExpr::new(format!(
+                    "base::getExportedValue({}, {})",
+                    namespace_expression(program, *package),
+                    r_string(dataset)
+                )))
+            }
             RelocationTarget::DataArgument { package } => Self {
                 expression: r_string(&program.package(*package).identity().name),
                 appended_argument: Some(AppendedArgument {
                     name: "lib.loc",
-                    value: format!(
+                    value: RExpr::new(format!(
                         "base::system.file(\"slinker\", \"datalib\", package = {})",
                         r_string(&program.package(program.root_package()).identity().name)
-                    ),
+                    )),
                 }),
             },
-            RelocationTarget::PackageVersion { version } => {
-                Self::expression(format!("base::package_version({})", r_string(version)))
-            }
+            RelocationTarget::PackageVersion { version } => Self::expression(RExpr::new(format!(
+                "base::package_version({})",
+                r_string(version)
+            ))),
             RelocationTarget::Resource { target } => {
                 let resource = program.resource(*target);
                 let package = program.package(resource.package).identity();
-                Self::expression(format!(
+                Self::expression(RExpr::new(format!(
                     "base::system.file(\"slinker\", \"resources\", {}, {}, package = {})",
                     r_string(&package.name),
                     r_string(&resource.path),
                     r_string(&program.package(program.root_package()).identity().name)
-                ))
+                )))
             }
         }
     }
 
     fn text(&self) -> String {
         match &self.appended_argument {
-            None => self.expression.clone(),
+            None => self.expression.to_string(),
             Some(argument) => format!(
                 "{}, {} = {}",
                 self.expression, argument.name, argument.value
@@ -182,10 +185,10 @@ impl Replacement {
         RelocationSiteSpec {
             start: range.start,
             end: range.end,
-            replacement: self.expression,
+            replacement: self.expression.into_source(),
             appended_argument: self.appended_argument.map(|argument| AppendedArgumentSpec {
                 name: argument.name.into(),
-                value: argument.value,
+                value: argument.value.into_source(),
             }),
         }
     }
