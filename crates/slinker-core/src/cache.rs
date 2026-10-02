@@ -188,6 +188,56 @@ impl Cache {
         serde_json::from_slice(self.shared.loaded.get(name)?).ok()
     }
 
+    #[must_use]
+    pub fn entries(&self) -> Vec<(String, usize)> {
+        let mut entries = self
+            .shared
+            .loaded
+            .entries
+            .iter()
+            .map(|(name, (_, start, end))| (name.clone(), end - start))
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    pub fn remove_where(&self, remove: impl Fn(&str) -> bool) -> Result<usize> {
+        let Some(directory) = &self.shared.directory else {
+            return Ok(0);
+        };
+        let loaded = &self.shared.loaded;
+        let kept = loaded
+            .entries
+            .keys()
+            .filter(|name| !remove(name))
+            .filter_map(|name| Some((name.as_str(), loaded.get(name)?)))
+            .collect::<BTreeMap<_, _>>();
+        let removed = loaded.entries.len() - kept.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        if !kept.is_empty() {
+            let stem = format!("{}-retained", std::process::id());
+            let temporary = directory.join(format!("{stem}.tmp"));
+            let published = directory.join(format!("{stem}.{PACK_EXTENSION}"));
+            fs::write(&temporary, encode_pack(kept.into_iter())).map_err(|source| Error::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+            fs::rename(&temporary, &published).map_err(|source| Error::Io {
+                path: published,
+                source,
+            })?;
+        }
+        for file in &loaded.files {
+            fs::remove_file(file).map_err(|source| Error::Io {
+                path: file.clone(),
+                source,
+            })?;
+        }
+        Ok(removed)
+    }
+
     pub fn publish_deferred<T: Serialize + Send + 'static>(&self, name: String, value: T) {
         if self.shared.directory.is_none() {
             return;
@@ -275,6 +325,84 @@ impl Drop for Cache {
         self.writer.finish();
         self.shared.flush();
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaDirectory {
+    pub schema: String,
+    pub directory: PathBuf,
+    pub packs: usize,
+    pub bytes: u64,
+}
+
+#[must_use]
+pub fn cache_root(location: &CacheLocation) -> Option<PathBuf> {
+    match location {
+        CacheLocation::Disabled => None,
+        CacheLocation::Directory(root) => Some(root.clone()),
+        CacheLocation::Default => Some(default_root()),
+    }
+}
+
+fn analysis_directory(location: &CacheLocation) -> Option<PathBuf> {
+    cache_root(location).map(|root| root.join("analysis"))
+}
+
+#[must_use]
+pub fn schema_directories(location: &CacheLocation) -> Vec<SchemaDirectory> {
+    let Some(analysis) = analysis_directory(location) else {
+        return Vec::new();
+    };
+    let Ok(listing) = fs::read_dir(&analysis) else {
+        return Vec::new();
+    };
+    let mut schemas = listing
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| {
+            let files = fs::read_dir(entry.path())
+                .map(|listing| {
+                    listing
+                        .filter_map(std::result::Result::ok)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            SchemaDirectory {
+                schema: entry.file_name().to_string_lossy().into_owned(),
+                directory: entry.path(),
+                packs: files
+                    .iter()
+                    .filter(|file| {
+                        file.path()
+                            .extension()
+                            .is_some_and(|value| value == PACK_EXTENSION)
+                    })
+                    .count(),
+                bytes: files
+                    .iter()
+                    .filter_map(|file| file.metadata().ok())
+                    .map(|metadata| metadata.len())
+                    .sum(),
+            }
+        })
+        .collect::<Vec<_>>();
+    schemas.sort_by(|left, right| left.schema.cmp(&right.schema));
+    schemas
+}
+
+pub fn clear_schemas(location: &CacheLocation, keep: impl Fn(&str) -> bool) -> Result<u64> {
+    let mut removed = 0;
+    for schema in schema_directories(location) {
+        if keep(&schema.schema) {
+            continue;
+        }
+        fs::remove_dir_all(&schema.directory).map_err(|source| Error::Io {
+            path: schema.directory.clone(),
+            source,
+        })?;
+        removed += schema.bytes;
+    }
+    Ok(removed)
 }
 
 fn default_root() -> PathBuf {

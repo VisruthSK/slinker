@@ -1,3 +1,5 @@
+mod cache_names;
+mod cache_report;
 mod identity;
 mod image;
 mod index;
@@ -7,6 +9,11 @@ mod names;
 mod store;
 mod universe;
 
+pub use cache_names::EntryKind;
+pub use cache_report::{
+    CacheReport, ClearOutcome, ClearScope, KindTotals, PackageCacheReport, SchemaCacheReport,
+    clear_cache, inspect_cache,
+};
 pub use identity::{
     Digest, InstalledPackage, PackageId, PackageIdentity, PackageLocation, PackageRole,
 };

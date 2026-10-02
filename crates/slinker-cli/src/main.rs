@@ -15,6 +15,7 @@ use slinker_core::analysis::{
 use slinker_core::build::{BuildReport, PreflightError, PureRStatic, materialize};
 use slinker_core::package::{BindingName, PackageName};
 
+mod cache_command;
 mod session;
 
 use session::{RootSpec, Session, SourceSession};
@@ -51,6 +52,8 @@ enum UserCommand {
     Why(QueryArgs),
     #[command(about = "Show semantic paths from ROOT into TARGET")]
     Path(QueryArgs),
+    #[command(about = "Inspect and manage the persistent analysis cache")]
+    Cache(cache_command::CacheArgs),
 }
 
 #[derive(Debug, Args)]
@@ -205,7 +208,8 @@ impl UserCommand {
             Self::Build(args) => args.json.format(),
             Self::Check(args) => args.json.format(),
             Self::Analyze(args) => args.json.format(),
-            Self::Why(_) | Self::Path(_) => OutputFormat::Text,
+            Self::Cache(args) if args.wants_json() => OutputFormat::Json,
+            Self::Why(_) | Self::Path(_) | Self::Cache(_) => OutputFormat::Text,
         }
     }
 }
@@ -270,6 +274,7 @@ fn run(command: UserCommand) -> Result<(), Box<dyn Error>> {
         UserCommand::Analyze(args) => analyze(&args),
         UserCommand::Why(args) => explain_why(&args),
         UserCommand::Path(args) => explain_paths(&args),
+        UserCommand::Cache(args) => cache_command::run(&args, &session::cache_location()),
     }
 }
 

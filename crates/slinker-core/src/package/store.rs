@@ -1,4 +1,5 @@
 use crate::cache::{Cache, CacheLocation};
+use crate::package::cache_names::EntryKind;
 use crate::package::inspection::{Batcher, Lanes, Slot};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-analysis-v11";
+pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v11";
 const MAX_R_WORKERS: usize = 4;
 const SOURCES_PER_WORKER: usize = 48;
 
@@ -416,20 +417,12 @@ impl PackageStore {
     }
 
     fn index_cache_name(&self, identity: &PackageIdentity) -> String {
-        format!(
-            "{}-{}.index.slinker",
-            identity.name,
-            self.cache_key(identity)
-        )
+        EntryKind::index_name(identity.name.as_str(), &self.cache_key(identity))
     }
 
     fn binding_cache_name(&self, identity: &PackageIdentity, binding: &str) -> String {
         let binding = fingerprint_strings([binding]).to_string();
-        format!(
-            "{}-{}-{binding}.binding.slinker",
-            identity.name,
-            self.cache_key(identity)
-        )
+        EntryKind::Binding.member_name(identity.name.as_str(), &self.cache_key(identity), &binding)
     }
 
     fn load_cached_index(&self, package: &InstalledPackage) -> Option<Arc<PackageIndex>> {
@@ -450,10 +443,10 @@ impl PackageStore {
         label: &EnvironmentLabel,
     ) -> String {
         let label = fingerprint_strings([label.as_str()]).to_string();
-        format!(
-            "{}-{}-{label}.environment.slinker",
-            identity.name,
-            self.cache_key(identity)
+        EntryKind::Environment.member_name(
+            identity.name.as_str(),
+            &self.cache_key(identity),
+            &label,
         )
     }
 
@@ -568,13 +561,12 @@ impl PackageStore {
             || self.target_fingerprint.to_string(),
             |identity| self.cache_key(identity),
         );
-        let key = fingerprint_strings([owner.as_str(), binding]);
-        format!("dispatch-{key}.dispatch.slinker")
+        EntryKind::dispatch_name(&fingerprint_strings([owner.as_str(), binding]).to_string())
     }
 
     fn normalization_cache_name(&self, source: &str) -> String {
         let key = fingerprint_strings([self.target_fingerprint.as_str(), ANALYSIS_SCHEMA, source]);
-        format!("normalized-{key}.syntax.slinker")
+        EntryKind::normalization_name(&key.to_string())
     }
 
     fn load_cached_normalization(&self, source: &str) -> Option<CanonicalSyntax> {

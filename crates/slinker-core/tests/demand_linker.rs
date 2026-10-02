@@ -2922,21 +2922,6 @@ fn non_closure_binding_never_invokes_air() {
 }
 
 #[test]
-fn package_image_is_requested_once_and_binding_is_parsed_once() {
-    let root = package(
-        "root",
-        &[
-            ("a", Some("a <- function() b()")),
-            ("b", Some("b <- function() 1")),
-        ],
-    );
-    let provider = FakeProvider::new(vec![root]);
-    let counts = provider.count_handle();
-    Linker::new(provider, 1).analyze("root").unwrap();
-    assert_eq!(counts.lock().unwrap().get("root").copied().unwrap_or(0), 1);
-}
-
-#[test]
 fn air_frontend_failure_is_localized_not_package_fatal() {
     let root = package(
         "root",

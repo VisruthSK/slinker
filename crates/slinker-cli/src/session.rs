@@ -225,7 +225,7 @@ fn resolve_libraries(
     }
 }
 
-fn cache_location() -> CacheLocation {
+pub(crate) fn cache_location() -> CacheLocation {
     std::env::var_os("SLINKER_CACHE_DIR").map_or(CacheLocation::Default, |root| {
         CacheLocation::Directory(PathBuf::from(root))
     })

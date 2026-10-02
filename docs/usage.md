@@ -81,6 +81,20 @@ slinker path touchstone otelsdk
 
 Provenance explains a result and never decides one: finalization reads typed requirements and External binding uses, not the explanation graph, and `build` does not record provenance edges.
 
+## Cache
+
+Slinker keeps a persistent cache of installed-package inspection results (package indexes, binding images, private environments, syntax normalizations, dispatch queries). Entries are content-addressed by the exact installed image, the target R, and the analyzer schema, so a stale entry is never read. Each run adds one packed file.
+
+```text
+slinker cache                  summary plus every cached package (version, image fingerprint, cache key, counts, size)
+slinker cache --full           full fingerprints and keys
+slinker cache --json           the same as one JSON document
+slinker cache path             the cache directory
+slinker cache clear            delete everything
+slinker cache clear PKG...     delete the entries of the named packages
+slinker cache clear --obsolete delete caches written by older analyzer versions
+```
+
 ## Environment
 
 ```text
