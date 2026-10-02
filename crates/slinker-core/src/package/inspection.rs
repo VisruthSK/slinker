@@ -90,6 +90,10 @@ impl Lanes {
         }
     }
 
+    pub(super) fn prime(&self, client: WorkerClient) {
+        *self.lanes[0].client.lock().expect("lane lock") = Some(client);
+    }
+
     pub(super) fn count(&self) -> usize {
         self.lanes.len()
     }

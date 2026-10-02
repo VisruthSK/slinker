@@ -6,8 +6,11 @@ use harp::{RFunctionExt, RObjectExt};
 use protocol::{
     NormalizedSource, WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse,
 };
-use slinker_core::package::{BindingName, BindingOrigin, DataSetId, DatasetName, EnvironmentLabel};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use slinker_core::package::{
+    BindingImage, BindingName, BindingOrigin, DataSetId, DatasetName, EnvironmentLabel,
+    PrivateEnvironmentImage,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
 
 struct PackageImageContext {
@@ -361,13 +364,44 @@ impl WorkerRuntime {
             )
             .into());
         }
+        let normalizations = self.normalizations(&binding, &outcome.private_environments)?;
         Ok(protocol::WorkerBinding {
             package_name: package.name.clone(),
             package_version: package.version.clone(),
             image_fingerprint: package.image_fingerprint.clone(),
             binding,
             private_environments: outcome.private_environments,
+            normalizations,
         })
+    }
+
+    fn normalizations(
+        &self,
+        binding: &BindingImage,
+        private_environments: &HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
+    ) -> InspectionResult<Vec<protocol::WorkerNormalization>> {
+        binding
+            .object
+            .closure_sources()
+            .chain(
+                private_environments
+                    .values()
+                    .flat_map(|environment| environment.bindings.values())
+                    .flat_map(|private| private.object.closure_sources()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|source| {
+                let (canonical, stable) = self.canonical_syntax(source)?;
+                Ok(protocol::WorkerNormalization {
+                    original: source.to_owned(),
+                    canonical: protocol::NormalizedSource {
+                        source: canonical,
+                        stable,
+                    },
+                })
+            })
+            .collect()
     }
 
     pub(super) fn image_environment(

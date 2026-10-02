@@ -126,6 +126,17 @@ pub struct ObjectImage {
 }
 
 impl ObjectImage {
+    pub fn closure_sources(&self) -> impl Iterator<Item = &str> {
+        self.closure
+            .iter()
+            .map(|closure| closure.source.as_ref())
+            .chain(
+                self.embedded_closures
+                    .iter()
+                    .map(|closure| closure.source.as_ref()),
+            )
+    }
+
     pub fn absorb_members(&mut self, member: ObjectImage) {
         self.embedded_closures.extend(member.embedded_closures);
         self.embedded_environments

@@ -1,4 +1,5 @@
-use std::sync::{Mutex, MutexGuard};
+use crate::profile::{self, Probe};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 pub(super) struct Guarded<T>(Mutex<T>);
 
@@ -8,9 +9,16 @@ impl<T> Guarded<T> {
     }
 
     pub(super) fn lock(&self) -> MutexGuard<'_, T> {
-        self.0
-            .lock()
-            .expect("analysis state lock is never poisoned")
+        match self.0.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                let _waiting = profile::span(Probe::LockWait);
+                self.0
+                    .lock()
+                    .expect("analysis state lock is never poisoned")
+            }
+            Err(TryLockError::Poisoned(_)) => panic!("analysis state lock is never poisoned"),
+        }
     }
 
     pub(super) fn into_inner(self) -> T {

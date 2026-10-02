@@ -119,6 +119,14 @@ pub struct WorkerBinding {
     pub image_fingerprint: Digest,
     pub binding: BindingImage,
     pub private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
+    #[serde(default)]
+    pub normalizations: Vec<WorkerNormalization>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerNormalization {
+    pub original: String,
+    pub canonical: NormalizedSource,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

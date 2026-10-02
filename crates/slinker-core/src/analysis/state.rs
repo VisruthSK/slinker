@@ -16,6 +16,7 @@ use super::scheduler::{Claim, Machine};
 use super::summary::{Assumption, SummaryTable};
 use crate::analysis::{Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
+use crate::package::ObjectImage;
 use crate::package::{
     BindingName, ComponentName, EnvironmentLabel, GenericLabel, PackageId, PackageImage,
     PackageName, PackageProvider, TargetUniverse,
@@ -377,18 +378,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         environment.bindings.values().map(|binding| &binding.object)
                     }),
             )
-            .flat_map(|object| {
-                object
-                    .closure
-                    .iter()
-                    .map(|closure| closure.source.as_ref())
-                    .chain(
-                        object
-                            .embedded_closures
-                            .iter()
-                            .map(|closure| closure.source.as_ref()),
-                    )
-            })
+            .flat_map(ObjectImage::closure_sources)
             .collect::<Vec<_>>();
         self.packages.prefetch_canonical_syntax(&sources)?;
         drop(image);

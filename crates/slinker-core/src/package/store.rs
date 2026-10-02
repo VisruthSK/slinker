@@ -5,11 +5,14 @@ use crate::package::locator::fingerprint_strings;
 use crate::package::{
     BindingName, ComponentName, Digest, EnvironmentKind, EnvironmentLabel, GenericName,
     InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
-    PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocator, PackageName,
-    PrivateEnvironmentImage,
+    ObjectImage, PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocator,
+    PackageName, PrivateEnvironmentImage,
 };
+use crate::target_env::PrimedWorker;
 use crate::worker::client::WorkerClient;
-use crate::worker::protocol::{WorkerBinding, WorkerPackageIndex};
+use crate::worker::protocol::{
+    NormalizedSource, WorkerBinding, WorkerNormalization, WorkerPackageIndex,
+};
 use crate::{Error, Result, TargetEnvironment};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -19,6 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const AIR_VERSION: &str = "0.11.0";
+fn identifiers(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .split(|character: char| !(character.is_alphanumeric() || matches!(character, '.' | '_')))
+        .filter(|word| !word.is_empty())
+}
+
 pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v11";
 
 #[must_use]
@@ -219,6 +228,25 @@ pub enum CanonicalSyntax {
     Unstable,
 }
 
+impl From<NormalizedSource> for CanonicalSyntax {
+    fn from(normalized: NormalizedSource) -> Self {
+        if normalized.stable {
+            Self::Stable(normalized.source)
+        } else {
+            Self::Unstable
+        }
+    }
+}
+
+impl CanonicalSyntax {
+    fn stable_form(&self) -> Option<&str> {
+        match self {
+            Self::Stable(canonical) => Some(canonical),
+            Self::Unstable => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum DispatchSubject<'a> {
     Base {
@@ -296,6 +324,7 @@ pub struct PackageStore {
     delivered:
         Mutex<HashMap<PackageIdentity, HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>>>>,
     published_environments: Mutex<HashSet<(PackageIdentity, EnvironmentLabel)>>,
+    demanded: Mutex<HashSet<(PackageIdentity, String)>>,
     dispatch: Memo<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
     normalizer: Batcher<String, CanonicalSyntax>,
     cache: Cache,
@@ -326,12 +355,21 @@ impl PackageStore {
             bindings: Mutex::new(HashMap::new()),
             delivered: Mutex::new(HashMap::new()),
             published_environments: Mutex::new(HashSet::new()),
+            demanded: Mutex::new(HashSet::new()),
             dispatch: Memo::default(),
             normalizer: Batcher::default(),
             cache: Cache::new(cache, ANALYSIS_SCHEMA)?,
             target_fingerprint,
             native_summaries: NativeSummaryManifest::load()?,
         })
+    }
+
+    #[must_use]
+    pub fn with_primed_worker(self, worker: PrimedWorker) -> Self {
+        if worker.target == *self.locator.target() {
+            self.lanes.prime(worker.client);
+        }
+        self
     }
 
     #[must_use]
@@ -598,20 +636,33 @@ impl PackageStore {
         let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
         let results = client.canonical_syntax_batch(&refs)?;
         for (source, result) in sources.iter().zip(&results) {
-            self.cache.publish_deferred(
-                self.normalization_cache_name(source),
-                CachedNormalization {
-                    schema: ANALYSIS_SCHEMA.into(),
-                    target: self.target_fingerprint.clone(),
-                    source: source.clone(),
-                    canonical: match result {
-                        CanonicalSyntax::Stable(canonical) => Some(canonical.clone()),
-                        CanonicalSyntax::Unstable => None,
-                    },
-                },
-            );
+            self.persist_normalization(source, result);
         }
         Ok(results)
+    }
+
+    fn persist_normalization(&self, source: &str, result: &CanonicalSyntax) {
+        self.cache.publish_deferred(
+            self.normalization_cache_name(source),
+            CachedNormalization {
+                schema: ANALYSIS_SCHEMA.into(),
+                target: self.target_fingerprint.clone(),
+                source: source.to_owned(),
+                canonical: result.stable_form().map(str::to_owned),
+            },
+        );
+    }
+
+    fn adopt_worker_normalizations(&self, normalizations: Vec<WorkerNormalization>) {
+        for WorkerNormalization {
+            original,
+            canonical,
+        } in normalizations
+        {
+            let canonical = CanonicalSyntax::from(canonical);
+            self.persist_normalization(&original, &canonical);
+            self.normalizer.seed(&original, canonical);
+        }
     }
 
     fn seed_cached_normalization(&self, source: &str) -> bool {
@@ -620,6 +671,58 @@ impl PackageStore {
         };
         self.normalizer.seed(&source.to_owned(), cached);
         true
+    }
+
+    fn load_binding(&self, package: &InstalledPackage, name: &str) -> Result<Arc<PackageImage>> {
+        let batcher = self.binding_batcher(&package.identity);
+        let query = name.to_owned();
+        if let Some(known) = batcher.known(&query) {
+            return known;
+        }
+        let index = self.index(package)?;
+        let Some(slot) = self.submit_binding(&batcher, package, &index, name) else {
+            return batcher.known(&query).expect("a seeded binding is known");
+        };
+        batcher.drive(&self.lanes, &slot, &|client, names| {
+            self.execute_bindings(package, &index, client, names)
+        })
+    }
+
+    fn look_ahead(
+        &self,
+        package: &InstalledPackage,
+        name: &str,
+        image: &PackageImage,
+    ) -> Result<()> {
+        let first_demand = self
+            .demanded
+            .lock()
+            .expect("demanded bindings")
+            .insert((package.identity.clone(), name.to_owned()));
+        if !first_demand {
+            return Ok(());
+        }
+        let index = self.index(package)?;
+        let batcher = self.binding_batcher(&package.identity);
+        let referenced = image
+            .bindings
+            .values()
+            .map(|binding| &binding.object)
+            .chain(
+                image
+                    .private_environments
+                    .values()
+                    .flat_map(|environment| environment.bindings.values())
+                    .map(|private| &private.object),
+            )
+            .flat_map(ObjectImage::closure_sources)
+            .flat_map(identifiers)
+            .filter(|word| index.binding_names.contains(word))
+            .collect::<BTreeSet<_>>();
+        for word in referenced {
+            self.submit_binding(&batcher, package, &index, word);
+        }
+        Ok(())
     }
 
     fn binding_batcher(&self, identity: &PackageIdentity) -> Arc<BindingBatcher> {
@@ -691,6 +794,7 @@ impl PackageStore {
             .zip(names)
             .map(|(mut binding, name)| {
                 let privates = self.deliver(&package.identity, &mut binding);
+                self.adopt_worker_normalizations(std::mem::take(&mut binding.normalizations));
                 self.publish_binding(package, name, &binding, &privates);
                 Self::package_image(&package.identity, Arc::clone(index), binding, privates)
             })
@@ -750,18 +854,9 @@ impl PackageProvider for PackageStore {
     }
 
     fn binding_image(&self, package: &InstalledPackage, name: &str) -> Result<Arc<PackageImage>> {
-        let batcher = self.binding_batcher(&package.identity);
-        let query = name.to_owned();
-        if let Some(known) = batcher.known(&query) {
-            return known;
-        }
-        let index = self.index(package)?;
-        let Some(slot) = self.submit_binding(&batcher, package, &index, name) else {
-            return batcher.known(&query).expect("a seeded binding is known");
-        };
-        batcher.drive(&self.lanes, &slot, &|client, names| {
-            self.execute_bindings(package, &index, client, names)
-        })
+        let image = self.load_binding(package, name)?;
+        self.look_ahead(package, name, &image)?;
+        Ok(image)
     }
 
     fn prefetch_binding_images(&self, package: &InstalledPackage, names: &[&str]) -> Result<()> {

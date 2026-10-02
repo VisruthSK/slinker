@@ -16,6 +16,7 @@ use tempfile::TempPath;
 
 const RESPONSE_SPIN: std::time::Duration = std::time::Duration::from_millis(2);
 
+#[derive(Debug)]
 pub(crate) struct WorkerClient {
     child: Child,
     input: BufWriter<ChildStdin>,
@@ -42,9 +43,9 @@ impl WorkerClient {
     pub(crate) fn capture_target(
         r_home: std::path::PathBuf,
         libraries: Vec<std::path::PathBuf>,
-    ) -> Result<TargetEnvironment> {
-        let (_, target) = Self::connect(r_home, libraries, 0)?;
-        Ok(target)
+    ) -> Result<(TargetEnvironment, Self)> {
+        let (client, target) = Self::connect(r_home, libraries, 0)?;
+        Ok((target, client))
     }
 
     fn connect(
@@ -336,18 +337,7 @@ impl WorkerClient {
             },
             |response| match response {
                 WorkerResponse::NormalizedSyntax { results, .. } if results.len() == expected => {
-                    Some(
-                        results
-                            .into_iter()
-                            .map(|result| {
-                                if result.stable {
-                                    CanonicalSyntax::Stable(result.source)
-                                } else {
-                                    CanonicalSyntax::Unstable
-                                }
-                            })
-                            .collect(),
-                    )
+                    Some(results.into_iter().map(CanonicalSyntax::from).collect())
                 }
                 _ => None,
             },

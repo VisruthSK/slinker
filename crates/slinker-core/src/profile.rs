@@ -67,6 +67,7 @@ probes! {
     ProcessCalls => "process_calls",
     GuardVerdict => "guard_verdict",
     ProcessEffects => "process_effects",
+    LockWait => "lock_wait",
 }
 
 counters! {
