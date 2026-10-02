@@ -328,10 +328,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<Resolution> {
         let _span = profile::span(Probe::ResolveLexicalName);
         let mut environment = lexical_environment.clone();
-        let mut seen = HashSet::new();
+        let mut checkpoint: Option<EnvironmentLabel> = None;
+        let (mut steps, mut window) = (0_usize, 1_usize);
         loop {
-            if !seen.insert(environment.clone()) {
+            if checkpoint.as_ref() == Some(&environment) {
                 return Ok(Resolution::unresolved(name));
+            }
+            steps += 1;
+            if steps == window {
+                checkpoint = Some(environment.clone());
+                window *= 2;
+                steps = 0;
             }
             if environment.is_derived() {
                 match self.resolve_derived(current, &environment, name) {

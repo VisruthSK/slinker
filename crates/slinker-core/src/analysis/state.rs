@@ -8,7 +8,7 @@ use super::namespace::NamespaceBuilder;
 use super::native::NativeBindingIndex;
 use super::need::{Schedule, WorkKey};
 use super::object_world::ObjectWorld;
-use super::parse_cache::{ParseCache, ParseKey};
+use super::parse_cache::ParseCache;
 use super::reflection::ReflectionFacts;
 use super::relocation::RelocationPlan;
 use super::s3::{CallableId, S3Model};
@@ -95,7 +95,6 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) encountered: Guarded<HashSet<PackageId>>,
     pub(super) external: Guarded<HashSet<PackageId>>,
     pub(super) parses: Guarded<ParseCache>,
-    pub(super) parse_flights: Guarded<HashMap<ParseKey, Arc<Guarded<()>>>>,
     pub(super) loaded: RwLock<HashMap<PackageId, Arc<LoadedPackage>>>,
     load_gate: Guarded<()>,
     pub(super) objects: ObjectWorld,
@@ -159,7 +158,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             encountered: Guarded::new(HashSet::from([root])),
             external: Guarded::default(),
             parses: Guarded::default(),
-            parse_flights: Guarded::default(),
             loaded: RwLock::new(HashMap::new()),
             load_gate: Guarded::default(),
             objects: ObjectWorld::default(),
