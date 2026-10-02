@@ -128,38 +128,22 @@ testthat with every testthat dependency Linked.
 
 Cold analysis is the priority because it sets worst-case CI and first-run cost. Warm-cache and edit-and-rerun performance must use the same query architecture. No optimization may weaken analysis or make program semantics depend on scheduling.
 
-Baseline on `slinker analyze rlang` on 2026-09-26: about 41 s wall time. Current hot counts are about 323k `evaluate_installed_function`, 833k `resolve_lexical_name`, 107k `parsed_source`, 7.1k `binding_image`, and 1.7k construction evaluations. A cold run on 2026-09-30 (Windows) took about 55 s, of which the R worker accounts for about 4 s of binding inspection and about 3 s of syntax normalization, so the target is the Rust-side repeated `evaluate_installed_function` and `resolve_lexical_name`. The Oak parser benchmark is dominated by Air and Oak themselves (about 50 ms of 155 ms at 400 statements).
+Landed: the opt-in profiler; indexed package binding names and native binding owners; semantic construction summaries keyed without `NodeId` with per-caller effect replay and read/write invalidation; bottom-seeded recursion and unknown-branch joins; batched binding inspection and syntax normalization over up to four R workers; a sealed `.onLoad` namespace surface; deferred contextual-namespace decisions; monotone environment writes; order-free S3 retention edges; and a schedule-permutation oracle (`schedule_equivalence` in `demand_linker.rs`). On `slinker analyze rlang` (cold cache, Windows) wall time fell from about 38 s to about 9 s. One schedule-dependent provenance edge (a `closure_execution` edge from `cnd_signal` to the `cnd` closure) was still observed on rlang with permuted need orders when this was last measured.
 
-Semantic model and scheduler:
-- Make analysis an explicit least-fixed-point computation over finite monotone domains. Add a real bottom/no-information state distinct from `Unknown`/top. Concurrently published semantic facts merge with associative, commutative, idempotent joins. Use bounded exact domains and explicit widening where needed.
-- Facts based on absence or completion are not published until their dependencies are sealed. `.onLoad` and other soundness-critical package activation facts become local readiness dependencies, not global barriers.
-- Replace global frontiers with a concurrent dependency-aware worklist on Rayon's work-stealing runtime. Stable semantic `WorkKey`s deduplicate work, but a transfer may run again when an input fact grows. Coalesce updates and propagate only newly learned deltas.
-- Solve recursive regions with SCC/local fixed-point iteration. Do not seed recursion with semantic `Unknown` or repeatedly reevaluate an entire recursive region when only one fact changed.
-- Workers publish mergeable `AnalysisDelta`s instead of mutating one locked `AnalyzerState`. Keep worker-local buffers, immutable snapshots, atomic scheduling state, and exact quiescence accounting. Do not replace the frontier with `Arc<Mutex<AnalyzerState>>`.
-- Scheduling order is semantically invisible. Different schedules and `--jobs` values must produce the same `ProgramIr` semantics modulo invocation-local IDs, the same diagnostics, and the same provenance graph after canonicalization. Raw numeric IDs, internal table order, and nonsemantic `LinkIr` metrics are not cross-run identities.
-
-Remove repeated semantic work:
-- Intern analyzer names and environment identities. Build immutable indexes for package bindings, imports, native bindings, mutations, and other hot membership queries. Interning pays only if a profile shows name hashing matters; once names are interned, audit the `.clone()` calls on hot paths. Tie each closure id to its package's object graph so `need_node` needs no `expect` for a closure-execution need.
-- Memoize lexical resolution, parsed-source work, parse contexts, and installed-function construction summaries by semantic inputs and epochs. `NodeId` and call-site provenance must never prevent semantic reuse.
-- Separate semantic construction summaries from call-site effects and provenance. Instantiate fresh allocation effects where required.
-- Record query dependencies on the cold path. Recomputed queries whose semantic result is unchanged must stop invalidation propagation. Support stable result fingerprints/backdating and durability so edits to the Root do not force validation of unchanged installed-package work.
-- Persist only reusable semantic summaries keyed by exact source/package inputs, target R identity, analyzer/schema versions, and every semantic context input. Never persist worker-local R object identities.
-
-R/package inspection:
-- Batch binding inspection and syntax-normalization traffic (IPC is about 2 ms per round trip, so batching alone saves at most a few seconds; several worker processes inspecting different packages in parallel are the larger unmeasured candidate).
-- Use a reusable R worker pool with stable package affinity so one installed package stays on one worker during an inspection epoch and private-environment identity remains valid. Reuse initialized workers across analysis/build phases where their target identity permits it.
-- Keep expensive package inspection demand-driven. Instrument package hashing, bytes read, R startup count, protocol bytes, and accidental full-structure cloning so semantic speedups do not merely expose a new I/O bottleneck.
-
-Profiling and benchmarks:
-- `SLINKER_PROFILE=1` prints deterministic inclusive/exclusive timings, calls versus unique query keys, memo/cache hits, lattice growth/SCC iterations, queue depth/steals, worker utilization, R requests/batch sizes/bytes, package bytes hashed, and R startup count. Detailed tracing remains opt-in.
-- Benchmark cold analysis/build with persistent analysis caches disabled, warm unchanged rerun, and one-source edit rerun. Record before/after numbers; do not add a fixed time threshold.
+Still to do:
+- Replace the serial need queue and `preparse_frontier_bindings` with a concurrent dependency-aware worklist on Rayon: stable semantic `WorkKey`s, an `Idle/Queued/Running/RunningAndDirty` state machine with coalesced wakeups, exact quiescence accounting, and mergeable `AnalysisDelta`s from workers instead of mutation of one `AnalyzerState`. Object identities (`ObjectId`, `ClosureId`, derived environment labels) must first become canonical allocation-site identities so schedules cannot change them.
+- Allocation effects in construction summaries: evaluations that allocate environments or closures are still memoized per requesting node; instantiate fresh allocation identities per call site so they can share a summary.
+- A query dependency graph with fingerprint backdating and durability, used by warm unchanged and one-source-edit reruns, and persistence of semantic summaries keyed by exact inputs, target R identity, and analyzer schema versions. Parsed-source results hold invocation-local `SourceId`s and need a relocatable form first.
+- R worker pool with package affinity for binding inspection (today only normalization is spread over workers, because private-environment identity is worker-local), and reuse of the initialized target-capture worker across capture, analysis, and preflight.
+- Audit demand-driven package inspection; reduce full-package fingerprinting if it becomes a material share.
+- Profiler additions: queue depth, steals, worker utilization, and a warm and one-source-edit benchmark mode beside the cold one.
+- Make the remaining order dependencies (see the schedule oracle) structurally impossible: private environment delivery in pieces, the parse context captured before namespace growth, and guard shadowing that reads a partial image.
 
 Done when:
 - the global frontier/preparse-frontier scheduler is gone and semantic work uses the monotone query/worklist model;
 - lattice and delta merge laws are tested, including order/permutation tests;
-- adversarial scheduler tests cover cycles, lost wakeups, repeated scheduling, `.onLoad` readiness, private environments, construction recursion, and several `--jobs` values;
-- those schedules produce semantically equivalent `ProgramIr`, diagnostics, and provenance without requiring identical invocation-local IDs;
-- cold `rlang` analysis is materially faster from fewer semantic evaluations plus real CPU/R-worker overlap;
+- adversarial scheduler tests cover lost wakeups, repeated scheduling, and quiescence while publishing children, besides the cycle, `.onLoad`, private-environment, and recursion cases the oracle already covers;
+- cold `rlang` analysis overlaps CPU and R-worker work in parallel;
 - warm and one-file edit reruns use the same dependency graph, prune propagation when recomputation is unchanged, and invalidate only semantic dependents;
 - the existing soundness, three-way installation, and build-materializer corpus remains unchanged.
 
