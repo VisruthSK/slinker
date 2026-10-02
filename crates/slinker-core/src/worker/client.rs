@@ -1,5 +1,5 @@
 use crate::package::SyntaxValidation;
-use crate::package::{CanonicalSyntax, DataSetId, DatasetName, InstalledPackage};
+use crate::package::{CanonicalSyntax, DataSetId, DatasetName, InstalledPackage, Normalization};
 use crate::profile::{self, Counter, Probe};
 use crate::worker::protocol::WorkerBinding;
 use crate::worker::protocol::WorkerPackageIndex;
@@ -320,13 +320,18 @@ impl WorkerClient {
     pub(crate) fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
         self.canonical_syntax_batch(&[source])?
             .pop()
-            .ok_or_else(|| Error::Analysis("Harp worker returned no syntax normalization".into()))
+            .ok_or_else(|| Error::Analysis("Harp worker returned no syntax normalization".into()))?
+            .map_err(|rejection| {
+                Error::Analysis(format!(
+                    "Harp worker syntax normalization failed (TargetSyntaxRejection) for target: {rejection}"
+                ))
+            })
     }
 
     pub(crate) fn canonical_syntax_batch(
         &mut self,
         sources: &[&str],
-    ) -> Result<Vec<CanonicalSyntax>> {
+    ) -> Result<Vec<Normalization>> {
         profile::add(Counter::RBatchItems, sources.len() as u64);
         let expected = sources.len();
         self.call(
@@ -337,7 +342,7 @@ impl WorkerClient {
             },
             |response| match response {
                 WorkerResponse::NormalizedSyntax { results, .. } if results.len() == expected => {
-                    Some(results.into_iter().map(CanonicalSyntax::from).collect())
+                    Some(results.into_iter().map(Normalization::from).collect())
                 }
                 _ => None,
             },

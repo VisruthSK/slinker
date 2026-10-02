@@ -5,7 +5,7 @@ use crate::cache::{
 use crate::package::cache_names::{EntryKind, EntryName};
 use crate::package::store::ANALYSIS_SCHEMA;
 use crate::{Error, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -69,6 +69,17 @@ pub struct ClearOutcome {
     pub bytes_removed: u64,
 }
 
+#[derive(Deserialize)]
+struct IndexHeader {
+    index: IndexIdentity,
+}
+
+#[derive(Deserialize)]
+struct IndexIdentity {
+    version: String,
+    image_fingerprint: String,
+}
+
 fn schema_report(location: &CacheLocation, schema: SchemaDirectory) -> Result<SchemaCacheReport> {
     let root =
         cache_root(location).ok_or_else(|| Error::Analysis("the cache is disabled".into()))?;
@@ -104,11 +115,9 @@ fn schema_report(location: &CacheLocation, schema: SchemaDirectory) -> Result<Sc
             EntryKind::Binding => report.bindings += 1,
             EntryKind::Environment => report.environments += 1,
             EntryKind::Index => {
-                if let Some(entry) = cache.read::<serde_json::Value>(name) {
-                    report.version = entry["index"]["version"].as_str().map(str::to_owned);
-                    report.image_fingerprint = entry["index"]["image_fingerprint"]
-                        .as_str()
-                        .map(str::to_owned);
+                if let Some(header) = cache.read::<IndexHeader>(name) {
+                    report.version = Some(header.index.version);
+                    report.image_fingerprint = Some(header.index.image_fingerprint);
                 }
             }
             EntryKind::Normalization | EntryKind::Dispatch => {}

@@ -11,7 +11,7 @@ use crate::package::{
 use crate::target_env::PrimedWorker;
 use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{
-    NormalizedSource, WorkerBinding, WorkerNormalization, WorkerPackageIndex,
+    NormalizeOutcome, NormalizedSource, WorkerBinding, WorkerNormalization, WorkerPackageIndex,
 };
 use crate::{Error, Result, TargetEnvironment};
 use serde::{Deserialize, Serialize};
@@ -228,6 +228,26 @@ pub enum CanonicalSyntax {
     Unstable,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyntaxRejection(String);
+
+impl std::fmt::Display for SyntaxRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+pub type Normalization = std::result::Result<CanonicalSyntax, SyntaxRejection>;
+
+impl From<NormalizeOutcome> for Normalization {
+    fn from(outcome: NormalizeOutcome) -> Self {
+        match outcome {
+            NormalizeOutcome::Normalized(normalized) => Ok(normalized.into()),
+            NormalizeOutcome::Rejected(message) => Err(SyntaxRejection(message)),
+        }
+    }
+}
+
 impl From<NormalizedSource> for CanonicalSyntax {
     fn from(normalized: NormalizedSource) -> Self {
         if normalized.stable {
@@ -326,7 +346,7 @@ pub struct PackageStore {
     published_environments: Mutex<HashSet<(PackageIdentity, EnvironmentLabel)>>,
     demanded: Mutex<HashSet<(PackageIdentity, String)>>,
     dispatch: Memo<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
-    normalizer: Batcher<String, CanonicalSyntax>,
+    normalizer: Batcher<String, Normalization>,
     cache: Cache,
     target_fingerprint: Digest,
     lanes: Lanes,
@@ -612,7 +632,7 @@ impl PackageStore {
         EntryKind::normalization_name(&key.to_string())
     }
 
-    fn load_cached_normalization(&self, source: &str) -> Option<CanonicalSyntax> {
+    fn load_cached_normalization(&self, source: &str) -> Option<Normalization> {
         let cached = self
             .cache
             .read::<CachedNormalization>(&self.normalization_cache_name(source))
@@ -621,22 +641,22 @@ impl PackageStore {
                     && entry.target == self.target_fingerprint
                     && entry.source == source
             })?;
-        Some(
-            cached
-                .canonical
-                .map_or(CanonicalSyntax::Unstable, CanonicalSyntax::Stable),
-        )
+        Some(Ok(cached
+            .canonical
+            .map_or(CanonicalSyntax::Unstable, CanonicalSyntax::Stable)))
     }
 
     fn execute_normalizations(
         &self,
         client: &mut WorkerClient,
         sources: &[String],
-    ) -> Result<Vec<CanonicalSyntax>> {
+    ) -> Result<Vec<Normalization>> {
         let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
         let results = client.canonical_syntax_batch(&refs)?;
         for (source, result) in sources.iter().zip(&results) {
-            self.persist_normalization(source, result);
+            if let Ok(canonical) = result {
+                self.persist_normalization(source, canonical);
+            }
         }
         Ok(results)
     }
@@ -661,7 +681,7 @@ impl PackageStore {
         {
             let canonical = CanonicalSyntax::from(canonical);
             self.persist_normalization(&original, &canonical);
-            self.normalizer.seed(&original, canonical);
+            self.normalizer.seed(&original, Ok(canonical));
         }
     }
 
@@ -934,19 +954,25 @@ impl PackageProvider for PackageStore {
 
     fn canonical_syntax(&self, source: &str) -> Result<CanonicalSyntax> {
         let query = source.to_owned();
-        if let Some(known) = self.normalizer.known(&query) {
-            return known;
-        }
-        if self.seed_cached_normalization(source)
-            && let Some(known) = self.normalizer.known(&query)
-        {
-            return known;
-        }
-        let slot = self.normalizer.submit(&query);
-        self.normalizer
-            .drive(&self.lanes, &slot, &|client, sources| {
-                self.execute_normalizations(client, sources)
-            })
+        let known = match self.normalizer.known(&query) {
+            Some(known) => known,
+            None if self.seed_cached_normalization(source) => self
+                .normalizer
+                .known(&query)
+                .expect("a seeded normalization is known"),
+            None => {
+                let slot = self.normalizer.submit(&query);
+                self.normalizer
+                    .drive(&self.lanes, &slot, &|client, sources| {
+                        self.execute_normalizations(client, sources)
+                    })
+            }
+        };
+        known?.map_err(|rejection| {
+            Error::Analysis(format!(
+                "Harp worker syntax normalization failed (TargetSyntaxRejection) for target: {rejection}"
+            ))
+        })
     }
 
     fn prefetch_canonical_syntax(&self, sources: &[&str]) -> Result<()> {

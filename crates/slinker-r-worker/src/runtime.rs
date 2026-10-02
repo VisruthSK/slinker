@@ -4,7 +4,8 @@ use super::{Coded, InspectionError, WorkerOperationError, field, protocol};
 use super::{InspectionResult, OperationResult};
 use harp::{RFunctionExt, RObjectExt};
 use protocol::{
-    NormalizedSource, WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse,
+    NormalizeOutcome, NormalizedSource, WorkerErrorCode, WorkerPackageIndex, WorkerRequest,
+    WorkerResponse,
 };
 use slinker_core::package::{
     BindingImage, BindingName, BindingOrigin, DataSetId, DatasetName, EnvironmentLabel,
@@ -364,7 +365,7 @@ impl WorkerRuntime {
             )
             .into());
         }
-        let normalizations = self.normalizations(&binding, &outcome.private_environments)?;
+        let normalizations = self.normalizations(&binding, &outcome.private_environments);
         Ok(protocol::WorkerBinding {
             package_name: package.name.clone(),
             package_version: package.version.clone(),
@@ -379,7 +380,7 @@ impl WorkerRuntime {
         &self,
         binding: &BindingImage,
         private_environments: &HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
-    ) -> InspectionResult<Vec<protocol::WorkerNormalization>> {
+    ) -> Vec<protocol::WorkerNormalization> {
         binding
             .object
             .closure_sources()
@@ -391,9 +392,9 @@ impl WorkerRuntime {
             )
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .map(|source| {
-                let (canonical, stable) = self.canonical_syntax(source)?;
-                Ok(protocol::WorkerNormalization {
+            .filter_map(|source| {
+                let (canonical, stable) = self.canonical_syntax(source).ok()?;
+                Some(protocol::WorkerNormalization {
                     original: source.to_owned(),
                     canonical: protocol::NormalizedSource {
                         source: canonical,
@@ -425,12 +426,13 @@ impl WorkerRuntime {
             } => {
                 let results = sources
                     .iter()
-                    .map(|source| {
-                        self.canonical_syntax(source)
-                            .map(|(source, stable)| NormalizedSource { source, stable })
+                    .map(|source| match self.canonical_syntax(source) {
+                        Ok((source, stable)) => {
+                            NormalizeOutcome::Normalized(NormalizedSource { source, stable })
+                        }
+                        Err(error) => NormalizeOutcome::Rejected(error.to_string()),
                     })
-                    .collect::<InspectionResult<Vec<_>>>()
-                    .coded(WorkerErrorCode::TargetSyntaxRejection)?;
+                    .collect();
                 WorkerResponse::NormalizedSyntax {
                     request_id,
                     results,

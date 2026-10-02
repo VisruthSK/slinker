@@ -222,7 +222,7 @@ fn render_schema(out: &mut String, schema: &SchemaCacheReport, full: bool) {
             let totals = schema.by_kind.get(kind)?;
             Some(format!(
                 "{} {} ({})",
-                serde_json::to_value(kind).ok()?.as_str().unwrap_or("?"),
+                kind,
                 totals.entries,
                 size(totals.bytes as u64)
             ))

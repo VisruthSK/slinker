@@ -32,8 +32,8 @@ pub use locator::PackageLocator;
 pub use locator::tree_digest;
 pub(crate) use locator::{fingerprint_image, fingerprint_strings};
 pub use store::{
-    CanonicalSyntax, DispatchSubject, PackageProvider, PackageResolver, PackageStore,
-    SyntaxValidation, analysis_schema,
+    CanonicalSyntax, DispatchSubject, Normalization, PackageProvider, PackageResolver,
+    PackageStore, SyntaxValidation, analysis_schema,
 };
 pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUniverse};
 

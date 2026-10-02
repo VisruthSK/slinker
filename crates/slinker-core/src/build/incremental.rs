@@ -9,9 +9,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityToken {
+    pub version: String,
+    pub image_fingerprint: Digest,
+}
+
+impl From<&PackageIdentity> for IdentityToken {
+    fn from(identity: &PackageIdentity) -> Self {
+        Self {
+            version: identity.version.to_string(),
+            image_fingerprint: identity.image_fingerprint.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConsultedPackage {
     pub name: String,
-    pub identity: Option<String>,
+    pub identity: Option<IdentityToken>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -24,15 +39,6 @@ pub struct BuildRecord {
 }
 
 #[must_use]
-pub fn identity_token(identity: &PackageIdentity) -> String {
-    format!(
-        "{}:{}",
-        identity.version,
-        identity.image_fingerprint.as_str()
-    )
-}
-
-#[must_use]
 pub fn consulted_packages(
     consulted: &[(PackageName, Option<PackageIdentity>)],
     root_package: &str,
@@ -42,7 +48,7 @@ pub fn consulted_packages(
         .filter(|(name, _)| name.as_str() != root_package)
         .map(|(name, identity)| ConsultedPackage {
             name: name.as_str().to_owned(),
-            identity: identity.as_ref().map(identity_token),
+            identity: identity.as_ref().map(IdentityToken::from),
         })
         .collect()
 }
@@ -195,7 +201,7 @@ pub fn is_up_to_date(
     for consulted in &record.consulted {
         let current = locator
             .locate(&consulted.name)?
-            .map(|package| identity_token(&package.identity));
+            .map(|package| IdentityToken::from(&package.identity));
         if current != consulted.identity {
             return Ok(false);
         }

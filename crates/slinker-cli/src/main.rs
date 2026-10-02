@@ -338,7 +338,12 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
             &package,
         )?
     {
-        print_built(args.json.format(), &package, &output, true);
+        print_built(
+            args.json.format(),
+            &package,
+            &output,
+            BuildOutcome::UpToDate,
+        );
         return Ok(());
     }
     let session = SourceSession::stage(prepared)?;
@@ -354,21 +359,46 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
         consulted,
         output_digest: tree_digest(generated.path())?.as_str().to_owned(),
     })?;
-    print_built(args.json.format(), &package, generated.path(), false);
+    print_built(
+        args.json.format(),
+        &package,
+        generated.path(),
+        BuildOutcome::Built,
+    );
     Ok(())
 }
 
-fn print_built(format: OutputFormat, package: &str, output: &std::path::Path, up_to_date: bool) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildOutcome {
+    Built,
+    UpToDate,
+}
+
+impl BuildOutcome {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Built => "built",
+            Self::UpToDate => "up_to_date",
+        }
+    }
+}
+
+fn print_built(
+    format: OutputFormat,
+    package: &str,
+    output: &std::path::Path,
+    outcome: BuildOutcome,
+) {
     if format == OutputFormat::Json {
         let rendered = json!({
-            "status": if up_to_date { "up_to_date" } else { "built" },
+            "status": outcome.status(),
             "package": package,
             "output": output,
         });
         println!("{rendered:#}");
     } else {
         println!("{}", output.display());
-        if up_to_date {
+        if outcome == BuildOutcome::UpToDate {
             eprintln!("up to date");
         }
     }

@@ -1,6 +1,6 @@
 use slinker_core::worker::protocol::{
-    AppendedArgumentSpec, PROTOCOL_VERSION, RelocationSiteSpec, TargetSpec, WorkerRequest,
-    WorkerResponse,
+    AppendedArgumentSpec, NormalizeOutcome, PROTOCOL_VERSION, RelocationSiteSpec, TargetSpec,
+    WorkerRequest, WorkerResponse,
 };
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -361,7 +361,10 @@ impl WorkerProbe {
             WorkerResponse::NormalizedSyntax {
                 request_id: response,
                 mut results,
-            } if response == request_id && results.len() == 1 => results.remove(0).source,
+            } if response == request_id && results.len() == 1 => match results.remove(0) {
+                NormalizeOutcome::Normalized(normalized) => normalized.source,
+                NormalizeOutcome::Rejected(message) => panic!("normalization rejected: {message}"),
+            },
             response => panic!("unexpected syntax normalization response: {response:?}"),
         }
     }

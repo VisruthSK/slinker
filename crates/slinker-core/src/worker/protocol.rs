@@ -229,7 +229,7 @@ pub enum WorkerResponse {
     },
     NormalizedSyntax {
         request_id: u64,
-        results: Vec<NormalizedSource>,
+        results: Vec<NormalizeOutcome>,
     },
     Error {
         error: WorkerFailure,
@@ -251,6 +251,13 @@ impl WorkerResponse {
             Self::Hello { .. } | Self::Error { .. } | Self::Shutdown => None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizeOutcome {
+    Normalized(NormalizedSource),
+    Rejected(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

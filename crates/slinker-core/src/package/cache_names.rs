@@ -10,6 +10,18 @@ pub enum EntryKind {
     Dispatch,
 }
 
+impl std::fmt::Display for EntryKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Index => "index",
+            Self::Binding => "binding",
+            Self::Environment => "environment",
+            Self::Normalization => "normalization",
+            Self::Dispatch => "dispatch",
+        })
+    }
+}
+
 impl EntryKind {
     pub const ALL: [Self; 5] = [
         Self::Index,
