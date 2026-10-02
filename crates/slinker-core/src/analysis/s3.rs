@@ -268,7 +268,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let (from, current, binding) = (site.node, site.package, site.binding);
         let namespace_generic = site
             .lexical_environment
-            .is_namespace_of(self.packages.name(current));
+            .is_namespace_of(&self.packages.name(current));
         let selector = match (parameters, call.args.get(1)) {
             (Some(parameters), None) => parameters.first().cloned(),
             (Some(parameters), Some(Some(StaticArg::Symbol(object))))

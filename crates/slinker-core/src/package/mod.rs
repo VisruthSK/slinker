@@ -1,4 +1,5 @@
 mod identity;
+mod inspection;
 mod image;
 mod index;
 mod locator;

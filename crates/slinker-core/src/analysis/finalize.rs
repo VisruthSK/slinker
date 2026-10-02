@@ -180,7 +180,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 removed_bindings,
             });
         }
-        let root_namespace = namespaces.ids[self.packages.name(root)].namespace;
+        let root_namespace = namespaces.ids[&self.packages.name(root)].namespace;
         let root_on_load = namespaces
             .on_load
             .get(&root_namespace)
@@ -287,7 +287,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 namespace: namespace_builder,
                 ..
             } = self.loaded_ref(package)?;
-            let namespace_label = EnvironmentLabel::namespace(package_name);
+            let namespace_label = EnvironmentLabel::namespace(&package_name);
             let mut names = retained_bindings.remove(&package).unwrap_or_default();
             names.extend(
                 namespace_builder
@@ -398,7 +398,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             let package_name = self.packages.name(package);
-            let owner = namespace_ids[package_name].namespace;
+            let owner = namespace_ids[&package_name].namespace;
             let table = &self.namespace_imports[&package];
             let (names, records) = match table
                 .names()
@@ -470,7 +470,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             let index = &self.loaded_ref(package)?.image.index;
             let exports = ExportTable::new(index.exports.values().cloned().collect());
-            let finalized = &namespace_ids[self.packages.name(package)];
+            let finalized = &namespace_ids[&self.packages.name(package)];
             if self.packages.role(package) == LinkedPackageRole::Linked {
                 let removed_bindings = index
                     .binding_names
@@ -536,7 +536,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     internal,
                     ..
                 } => {
-                    let Some(target_namespace) = namespace_ids.get(self.packages.name(*package))
+                    let Some(target_namespace) = namespace_ids.get(&self.packages.name(*package))
                     else {
                         continue;
                     };
@@ -707,7 +707,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let mut linked = Vec::new();
         for &package in retained {
             let name = self.packages.name(package);
-            let owner = &namespace_ids[name];
+            let owner = &namespace_ids[&name];
             let (Some(bundle), Some(image)) = (
                 builder.payload_bundle(owner.namespace),
                 self.loaded.get(&package).map(|loaded| &loaded.image),
@@ -828,8 +828,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn declared_external_requirements(
         &self,
         ordered: &[(PackageId, LinkedPackageRole)],
-    ) -> Result<HashMap<&str, Vec<Relation>>> {
-        let mut declared = HashMap::<&str, Vec<Relation>>::new();
+    ) -> Result<HashMap<PackageName, Vec<Relation>>> {
+        let mut declared = HashMap::<PackageName, Vec<Relation>>::new();
         for (package, role) in ordered {
             if *role == LinkedPackageRole::External {
                 declared.entry(self.packages.name(*package)).or_default();

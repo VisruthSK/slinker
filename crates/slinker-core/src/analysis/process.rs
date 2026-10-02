@@ -922,7 +922,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let key = (id, source_key.clone());
         let source = self
             .parses
-            .register(key.clone(), self.packages.name(id), text);
+            .register(key.clone(), &self.packages.name(id), text);
         let CanonicalSyntax::Stable(normalized) = self.packages.canonical_syntax(text)? else {
             self.diagnostic(
                 owner_node,
@@ -1021,9 +1021,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &EnvironmentLabel,
         active: &ActiveBindingDef,
     ) -> Result<bool> {
-        let expected = EnvironmentLabel::namespace(self.packages.name(package));
+        let expected = EnvironmentLabel::namespace(&self.packages.name(package));
         Ok(match &active.target {
-            StaticEnvironment::Namespace(name) => name == self.packages.name(package),
+            StaticEnvironment::Namespace(name) => name.as_str() == self.packages.name(package).as_str(),
             StaticEnvironment::ClosureBinding(name) => {
                 match self.resolve_lexical_name(package, image, lexical_environment, name)? {
                     Resolution::Static(BindingTarget::Namespace {

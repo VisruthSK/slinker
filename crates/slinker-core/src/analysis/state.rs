@@ -142,7 +142,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 "root package `{root_name}` cannot be External"
             )));
         }
-        let mut packages = TargetUniverse::new(
+        let packages = TargetUniverse::new(
             packages,
             root_name,
             options.explicit_external_packages.clone(),

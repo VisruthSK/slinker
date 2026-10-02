@@ -362,7 +362,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<()> {
         let graph = self.objects.graph(context.package);
         let namespace = graph.environment_id(&EnvironmentLabel::namespace(
-            self.packages.name(context.package),
+            &self.packages.name(context.package),
         ));
         if namespace.is_some() && graph.environment_of(object) == namespace {
             self.binding_image(context.package, name, Counter::BindingLoadConstruction)?;
@@ -378,7 +378,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<()> {
         let graph = self.objects.graph(context.package);
         let namespace = graph.environment_id(&EnvironmentLabel::namespace(
-            self.packages.name(context.package),
+            &self.packages.name(context.package),
         ));
         if namespace.is_none() || graph.environment_of(object) != namespace {
             return Ok(());
@@ -434,7 +434,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn own_namespace_object(&mut self, context: ExecutionContext<'_>) -> AbstractValue {
-        let label = EnvironmentLabel::namespace(self.packages.name(context.package));
+        let label = EnvironmentLabel::namespace(&self.packages.name(context.package));
         let graph = self.objects.graph_mut(context.package);
         graph
             .environment_id(&label)
@@ -1030,7 +1030,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         {
             Some(AbstractValue::String(package))
                 if matches!(name, "getNamespace" | "asNamespace")
-                    && package == self.packages.name(context.package) =>
+                    && package.as_str() == self.packages.name(context.package).as_str() =>
             {
                 self.own_namespace_object(context)
             }

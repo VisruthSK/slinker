@@ -189,7 +189,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(bindings.clone());
         }
         let shadowed = self.namespace_shadowed_names(package, image, image.bindings.keys())?;
-        let namespace = EnvironmentLabel::namespace(self.packages.name(package));
+        let namespace = EnvironmentLabel::namespace(&self.packages.name(package));
         let candidates = image.bindings.iter().filter_map(|(name, binding)| {
             let closure = binding.object.closure.as_ref()?;
             (closure.environment == namespace).then_some((name, closure))

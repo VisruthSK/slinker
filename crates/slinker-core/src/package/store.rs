@@ -5,20 +5,21 @@ use crate::package::{
     NativeFacts, NativeRoutineSummary, NativeSafety, PackageData, PackageIdentity, PackageImage,
     PackageIndex, PackageLocator, PackageName,
 };
+use crate::package::inspection::{Batcher, Lanes, Placement, Slot};
 use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{WorkerBinding, WorkerPackageIndex};
 use crate::{Error, Result, TargetEnvironment};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const AIR_VERSION: &str = "0.11.0";
 const ANALYSIS_SCHEMA: &str = "slinker-analysis-v10";
 const MAX_R_WORKERS: usize = 4;
 const SOURCES_PER_WORKER: usize = 48;
-const BINDING_BATCH: usize = 64;
 
 #[derive(Deserialize, Serialize)]
 struct CachedIndex {
@@ -199,52 +200,74 @@ pub enum DispatchSubject<'a> {
     },
 }
 
-pub trait PackageResolver {
+pub trait PackageResolver: Send + Sync {
     fn target_environment(&self) -> &TargetEnvironment;
-    fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>>;
+    fn locate(&self, name: &str) -> Result<Option<InstalledPackage>>;
 }
 
 pub trait PackageProvider: PackageResolver {
-    fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>>;
-    fn binding_image(
-        &mut self,
-        package: &InstalledPackage,
-        name: &str,
-    ) -> Result<Arc<PackageImage>>;
-    fn resource_exists(&mut self, package: &InstalledPackage, path: &str) -> Result<bool> {
+    fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>>;
+    fn binding_image(&self, package: &InstalledPackage, name: &str) -> Result<Arc<PackageImage>>;
+    fn resource_exists(&self, package: &InstalledPackage, path: &str) -> Result<bool> {
         Ok(self
             .index(package)?
             .files
             .iter()
             .any(|candidate| candidate == path))
     }
-    fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>>;
-    fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation>;
-    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax>;
-    fn prefetch_canonical_syntax(&mut self, _sources: &[&str]) -> Result<()> {
+    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>>;
+    fn validate_syntax(&self, source: &str) -> Result<SyntaxValidation>;
+    fn canonical_syntax(&self, source: &str) -> Result<CanonicalSyntax>;
+    fn prefetch_canonical_syntax(&self, _sources: &[&str]) -> Result<()> {
         Ok(())
     }
-    fn prefetch_binding_images(
-        &mut self,
-        _package: &InstalledPackage,
-        _names: &[&str],
-    ) -> Result<()> {
+    fn prefetch_binding_images(&self, _package: &InstalledPackage, _names: &[&str]) -> Result<()> {
         Ok(())
     }
 }
 
+struct Memo<K, V> {
+    cells: Mutex<HashMap<K, Arc<Mutex<Option<V>>>>>,
+}
+
+impl<K, V> Default for Memo<K, V> {
+    fn default() -> Self {
+        Self {
+            cells: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> Memo<K, V> {
+    fn get_or_compute(&self, key: &K, compute: impl FnOnce() -> Result<V>) -> Result<V> {
+        let cell = Arc::clone(
+            self.cells
+                .lock()
+                .expect("memo cells")
+                .entry(key.clone())
+                .or_default(),
+        );
+        let mut slot = cell.lock().expect("memo cell");
+        if let Some(value) = slot.as_ref() {
+            return Ok(value.clone());
+        }
+        let value = compute()?;
+        *slot = Some(value.clone());
+        Ok(value)
+    }
+}
+
+type BindingBatcher = Batcher<String, Arc<PackageImage>>;
+
 pub struct PackageStore {
     locator: PackageLocator,
-    indexes: HashMap<PackageIdentity, Arc<PackageIndex>>,
-    bindings: HashMap<(PackageIdentity, String), Arc<PackageImage>>,
-    dispatch: HashMap<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
+    indexes: Memo<PackageIdentity, Arc<PackageIndex>>,
+    bindings: Mutex<HashMap<PackageIdentity, Arc<BindingBatcher>>>,
+    dispatch: Memo<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
+    normalizer: Batcher<String, CanonicalSyntax>,
     cache: Cache,
-    r_home: PathBuf,
     target_fingerprint: Digest,
-    worker: Option<WorkerClient>,
-    extra_workers: Vec<WorkerClient>,
-    worker_limit: usize,
-    syntax: HashMap<String, CanonicalSyntax>,
+    lanes: Lanes,
     native_summaries: NativeSummaryManifest,
 }
 
@@ -264,25 +287,30 @@ impl PackageStore {
                 ),
         );
         Ok(Self {
+            lanes: Lanes::new(r_home, target.clone(), 1),
             locator: PackageLocator::new(target),
-            indexes: HashMap::new(),
-            bindings: HashMap::new(),
-            dispatch: HashMap::new(),
+            indexes: Memo::default(),
+            bindings: Mutex::new(HashMap::new()),
+            dispatch: Memo::default(),
+            normalizer: Batcher::default(),
             cache: Cache::new(cache, ANALYSIS_SCHEMA)?,
-            r_home,
             target_fingerprint,
-            worker: None,
-            extra_workers: Vec::new(),
-            worker_limit: 1,
-            syntax: HashMap::new(),
             native_summaries: NativeSummaryManifest::load()?,
         })
     }
 
     #[must_use]
     pub fn with_worker_limit(mut self, limit: usize) -> Self {
-        self.worker_limit = limit.clamp(1, MAX_R_WORKERS);
+        let target = self.locator.target().clone();
+        let r_home = self.lanes.r_home().to_path_buf();
+        self.lanes = Lanes::new(r_home, target, limit.clamp(1, MAX_R_WORKERS));
         self
+    }
+
+    fn affine_lane(&self, identity: &PackageIdentity) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        identity.name.hash(&mut hasher);
+        usize::try_from(hasher.finish() % self.lanes.count() as u64).unwrap_or(0)
     }
 
     fn package_index(
@@ -374,16 +402,6 @@ impl PackageStore {
         )
     }
 
-    fn worker(&mut self) -> Result<&mut WorkerClient> {
-        match &mut self.worker {
-            Some(worker) => Ok(worker),
-            empty => {
-                let target = self.locator.target();
-                Ok(empty.insert(WorkerClient::spawn(self.r_home.clone(), target, 1)?))
-            }
-        }
-    }
-
     fn load_cached_index(&self, package: &InstalledPackage) -> Option<Arc<PackageIndex>> {
         let cached = self
             .cache
@@ -411,11 +429,12 @@ impl PackageStore {
     }
 
     fn load_cached_binding(
-        &mut self,
+        &self,
         package: &InstalledPackage,
+        index: &Arc<PackageIndex>,
         binding: &str,
-    ) -> Result<Option<Arc<PackageImage>>> {
-        let Some(cached) = self
+    ) -> Option<Arc<PackageImage>> {
+        let cached = self
             .cache
             .read::<CachedBinding>(&self.binding_cache_name(&package.identity, binding))
             .filter(|entry| {
@@ -424,12 +443,55 @@ impl PackageStore {
                     && entry.package_fingerprint == package.identity.image_fingerprint
                     && entry.binding_name == binding
                     && is_epoch_independent(&entry.binding)
+            })?;
+        Self::package_image(&package.identity, Arc::clone(index), cached.binding).ok()
+    }
+
+    fn binding_batcher(&self, identity: &PackageIdentity) -> Arc<BindingBatcher> {
+        Arc::clone(
+            self.bindings
+                .lock()
+                .expect("binding batchers")
+                .entry(identity.clone())
+                .or_default(),
+        )
+    }
+
+    fn execute_bindings(
+        &self,
+        package: &InstalledPackage,
+        index: &Arc<PackageIndex>,
+        client: &mut WorkerClient,
+        names: &[String],
+    ) -> Result<Vec<Arc<PackageImage>>> {
+        let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        client
+            .bindings(package, &refs)?
+            .into_iter()
+            .zip(names)
+            .map(|(binding, name)| {
+                self.publish_binding(package, name, &binding);
+                Self::package_image(&package.identity, Arc::clone(index), binding)
             })
-        else {
-            return Ok(None);
-        };
-        let index = self.index(package)?;
-        Self::package_image(&package.identity, index, cached.binding).map(Some)
+            .collect()
+    }
+
+    fn submit_binding(
+        &self,
+        batcher: &BindingBatcher,
+        package: &InstalledPackage,
+        index: &Arc<PackageIndex>,
+        name: &str,
+    ) -> Option<Arc<Slot<Arc<PackageImage>>>> {
+        let query = name.to_owned();
+        if batcher.known(&query).is_some() {
+            return None;
+        }
+        if let Some(image) = self.load_cached_binding(package, index, name) {
+            batcher.seed(query, image);
+            return None;
+        }
+        Some(batcher.submit(&query))
     }
 }
 
@@ -459,97 +521,80 @@ fn is_epoch_independent(binding: &WorkerBinding) -> bool {
             .all(|label| !label.starts_with("private:"))
 }
 
+
 impl PackageResolver for PackageStore {
     fn target_environment(&self) -> &TargetEnvironment {
         self.locator.target()
     }
 
-    fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
+    fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
         self.locator.locate(name)
     }
 }
 
 impl PackageProvider for PackageStore {
-    fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
-        if let Some(index) = self.indexes.get(&package.identity) {
-            return Ok(Arc::clone(index));
-        }
-        let index = match self.load_cached_index(package) {
-            Some(index) => index,
-            None => {
-                let worker = self.worker()?.package_index(package)?;
-                let index = self.package_index(worker.clone(), package)?;
-                let cached = CachedIndex {
-                    schema: ANALYSIS_SCHEMA.into(),
-                    target: self.target_fingerprint.clone(),
-                    package_fingerprint: package.identity.image_fingerprint.clone(),
-                    index: worker,
-                };
-                self.cache
-                    .publish(&self.index_cache_name(&package.identity), &cached);
-                index
-            }
-        };
+    fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         self.indexes
-            .insert(package.identity.clone(), Arc::clone(&index));
-        Ok(index)
-    }
-
-    fn binding_image(
-        &mut self,
-        package: &InstalledPackage,
-        name: &str,
-    ) -> Result<Arc<PackageImage>> {
-        let key = (package.identity.clone(), name.to_owned());
-        if let Some(image) = self.bindings.get(&key) {
-            return Ok(Arc::clone(image));
-        }
-        let image = match self.load_cached_binding(package, name)? {
-            Some(image) => image,
-            None => {
-                let index = self.index(package)?;
-                let binding = self.worker()?.binding(package, name)?;
-                self.publish_binding(package, name, &binding);
-                Self::package_image(&package.identity, index, binding)?
-            }
-        };
-        self.bindings.insert(key, Arc::clone(&image));
-        Ok(image)
-    }
-
-    fn prefetch_binding_images(
-        &mut self,
-        package: &InstalledPackage,
-        names: &[&str],
-    ) -> Result<()> {
-        let mut pending = Vec::new();
-        let mut seen = HashSet::new();
-        for name in names {
-            let key = (package.identity.clone(), (*name).to_owned());
-            if self.bindings.contains_key(&key) || !seen.insert(*name) {
-                continue;
-            }
-            match self.load_cached_binding(package, name)? {
-                Some(image) => {
-                    self.bindings.insert(key, image);
+            .get_or_compute(&package.identity, || match self.load_cached_index(package) {
+                Some(index) => Ok(index),
+                None => {
+                    let lane = self.affine_lane(&package.identity);
+                    let worker = self
+                        .lanes
+                        .lane(lane)
+                        .client()?
+                        .package_index(package)?;
+                    let index = self.package_index(worker.clone(), package)?;
+                    let cached = CachedIndex {
+                        schema: ANALYSIS_SCHEMA.into(),
+                        target: self.target_fingerprint.clone(),
+                        package_fingerprint: package.identity.image_fingerprint.clone(),
+                        index: worker,
+                    };
+                    self.cache
+                        .publish(&self.index_cache_name(&package.identity), &cached);
+                    Ok(index)
                 }
-                None => pending.push(*name),
-            }
+            })
+    }
+
+    fn binding_image(&self, package: &InstalledPackage, name: &str) -> Result<Arc<PackageImage>> {
+        let batcher = self.binding_batcher(&package.identity);
+        let query = name.to_owned();
+        if let Some(known) = batcher.known(&query) {
+            return known;
         }
-        for chunk in pending.chunks(BINDING_BATCH) {
-            let index = self.index(package)?;
-            let inspected = self.worker()?.bindings(package, chunk)?;
-            for (name, binding) in chunk.iter().zip(inspected) {
-                self.publish_binding(package, name, &binding);
-                let image = Self::package_image(&package.identity, Arc::clone(&index), binding)?;
-                self.bindings
-                    .insert((package.identity.clone(), (*name).to_owned()), image);
-            }
+        let index = self.index(package)?;
+        let slot = match self.submit_binding(&batcher, package, &index, name) {
+            Some(slot) => slot,
+            None => return batcher.known(&query).expect("a seeded binding is known"),
+        };
+        let lane = self.affine_lane(&package.identity);
+        batcher.drive(
+            &self.lanes,
+            &Placement::Lane(lane),
+            &slot,
+            &|client, names| self.execute_bindings(package, &index, client, names),
+        )
+    }
+
+    fn prefetch_binding_images(&self, package: &InstalledPackage, names: &[&str]) -> Result<()> {
+        let batcher = self.binding_batcher(&package.identity);
+        let index = self.index(package)?;
+        let mut submitted = false;
+        for name in names {
+            submitted |= self.submit_binding(&batcher, package, &index, name).is_some();
+        }
+        if submitted {
+            let lane = self.affine_lane(&package.identity);
+            batcher.lead(&self.lanes, &Placement::Lane(lane), &|client, names| {
+                self.execute_bindings(package, &index, client, names)
+            });
         }
         Ok(())
     }
 
-    fn resource_exists(&mut self, package: &InstalledPackage, path: &str) -> Result<bool> {
+    fn resource_exists(&self, package: &InstalledPackage, path: &str) -> Result<bool> {
         use std::path::Component;
         if path.is_empty() {
             return Ok(package.location.root.is_dir());
@@ -565,7 +610,7 @@ impl PackageProvider for PackageStore {
         Ok(package.location.root.join(relative).exists())
     }
 
-    fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
+    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
         let (package, binding) = match subject {
             DispatchSubject::Base { binding } => (None, binding),
             DispatchSubject::Installed { package, binding } => (Some(package), binding),
@@ -574,116 +619,63 @@ impl PackageProvider for PackageStore {
             package.map(|package| package.identity.clone()),
             binding.to_owned(),
         );
-        if let Some(generics) = self.dispatch.get(&key) {
-            return Ok(generics.clone());
-        }
-        let generics = self
-            .worker()?
-            .dispatch_generics(package, binding)?
-            .into_iter()
-            .map(GenericName::from)
-            .collect::<BTreeSet<_>>();
-        self.dispatch.insert(key, generics.clone());
-        Ok(generics)
+        self.dispatch.get_or_compute(&key, || {
+            let lane = package.map_or(0, |package| self.affine_lane(&package.identity));
+            Ok(self
+                .lanes
+                .lane(lane)
+                .client()?
+                .dispatch_generics(package, binding)?
+                .into_iter()
+                .map(GenericName::from)
+                .collect::<BTreeSet<_>>())
+        })
     }
 
-    fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation> {
-        self.worker()?.validate_syntax(source)
+    fn validate_syntax(&self, source: &str) -> Result<SyntaxValidation> {
+        self.lanes.lane(0).client()?.validate_syntax(source)
     }
 
-    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
-        if let Some(known) = self.syntax.get(source) {
-            return Ok(known.clone());
+    fn canonical_syntax(&self, source: &str) -> Result<CanonicalSyntax> {
+        let query = source.to_owned();
+        if let Some(known) = self.normalizer.known(&query) {
+            return known;
         }
-        let canonical = self.worker()?.canonical_syntax(source)?;
-        self.syntax.insert(source.to_owned(), canonical.clone());
-        Ok(canonical)
+        let slot = self.normalizer.submit(&query);
+        self.normalizer.drive(&self.lanes, &Placement::Any, &slot, &|client, sources| {
+            let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+            client.canonical_syntax_batch(&refs)
+        })
     }
 
-    fn prefetch_canonical_syntax(&mut self, sources: &[&str]) -> Result<()> {
-        let mut seen = HashSet::new();
-        let mut unknown = sources
-            .iter()
-            .copied()
-            .filter(|source| !self.syntax.contains_key(*source) && seen.insert(*source))
-            .collect::<Vec<_>>();
-        if unknown.is_empty() {
-            return Ok(());
+    fn prefetch_canonical_syntax(&self, sources: &[&str]) -> Result<()> {
+        let mut submitted = 0usize;
+        for source in sources {
+            let query = (*source).to_owned();
+            if self.normalizer.known(&query).is_none() {
+                self.normalizer.submit(&query);
+                submitted += 1;
+            }
         }
-        unknown.sort_by_key(|source| std::cmp::Reverse(source.len()));
-        let lanes = self
-            .worker_limit
-            .min(unknown.len().div_ceil(SOURCES_PER_WORKER))
+        let leaders = self
+            .lanes
+            .count()
+            .min(submitted.div_ceil(SOURCES_PER_WORKER))
             .max(1);
-        let mut chunks = vec![Vec::new(); lanes];
-        for (position, source) in unknown.into_iter().enumerate() {
-            chunks[position % lanes].push(source);
-        }
-        let mut clients = Vec::with_capacity(lanes);
-        clients.push(self.worker.take());
-        clients.extend(self.extra_workers.drain(..).map(Some));
-        clients.resize_with(clients.len().max(lanes), || None);
-        chunks.resize(clients.len(), Vec::new());
-        let r_home = &self.r_home;
-        let target = self.locator.target();
-        let outcomes = std::thread::scope(|scope| {
-            clients
-                .into_iter()
-                .zip(chunks)
-                .enumerate()
-                .map(|(position, (client, chunk))| {
-                    scope.spawn(move || {
-                        let client = match client {
-                            Some(client) => Ok(client),
-                            None if chunk.is_empty() => return (None, Ok(Vec::new())),
-                            None => {
-                                WorkerClient::spawn(r_home.clone(), target, position as u64 + 1)
-                            }
-                        };
-                        match client {
-                            Ok(mut client) => {
-                                let canonical = client.canonical_syntax_batch(&chunk);
-                                (
-                                    Some(client),
-                                    canonical
-                                        .map(|results| (chunk, results))
-                                        .map(|pair| vec![pair]),
-                                )
-                            }
-                            Err(error) => (None, Err(error)),
-                        }
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| Error::Analysis("R worker thread panicked".into()))
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        let mut first = None;
-        let mut failure = None;
-        for (position, (client, result)) in outcomes.into_iter().enumerate() {
-            match (position, client) {
-                (0, client) => first = client,
-                (_, Some(client)) => self.extra_workers.push(client),
-                (_, None) => {}
-            }
-            match result {
-                Ok(batches) => {
-                    for (chunk, results) in batches {
-                        for (source, canonical) in chunk.into_iter().zip(results) {
-                            self.syntax.insert(source.to_owned(), canonical);
-                        }
-                    }
+        if submitted > 0 {
+            std::thread::scope(|scope| {
+                for _ in 0..leaders {
+                    scope.spawn(|| {
+                        self.normalizer
+                            .lead(&self.lanes, &Placement::Any, &|client, sources| {
+                                let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+                                client.canonical_syntax_batch(&refs)
+                            });
+                    });
                 }
-                Err(error) => failure = failure.or(Some(error)),
-            }
+            });
         }
-        self.worker = first;
-        failure.map_or(Ok(()), Err)
+        Ok(())
     }
 }
 

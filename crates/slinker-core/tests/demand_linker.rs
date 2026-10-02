@@ -154,7 +154,7 @@ impl PackageResolver for FakeProvider {
         &self.target_environment
     }
 
-    fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
+    fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
         *self
             .optional_locate_counts
             .lock()
@@ -166,7 +166,7 @@ impl PackageResolver for FakeProvider {
 }
 
 impl PackageProvider for FakeProvider {
-    fn index(&mut self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
+    fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         self.packages
             .get(package.identity.name.as_str())
             .map(|image| Arc::clone(&image.index))
@@ -174,7 +174,7 @@ impl PackageProvider for FakeProvider {
     }
 
     fn binding_image(
-        &mut self,
+        &self,
         package: &InstalledPackage,
         _name: &str,
     ) -> Result<Arc<PackageImage>> {
@@ -190,7 +190,7 @@ impl PackageProvider for FakeProvider {
             .ok_or_else(|| Error::Analysis(format!("missing fake image {}", package.identity.name)))
     }
 
-    fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
+    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
         let key = match subject {
             DispatchSubject::Base { binding } => (None, binding.to_owned()),
             DispatchSubject::Installed { package, binding } => {
@@ -200,11 +200,11 @@ impl PackageProvider for FakeProvider {
         Ok(self.dispatch.get(&key).cloned().unwrap_or_default())
     }
 
-    fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {
+    fn validate_syntax(&self, _source: &str) -> Result<SyntaxValidation> {
         Ok(self.validation.clone())
     }
 
-    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+    fn canonical_syntax(&self, source: &str) -> Result<CanonicalSyntax> {
         Ok(CanonicalSyntax::Stable(source.to_owned()))
     }
 }

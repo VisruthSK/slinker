@@ -192,27 +192,6 @@ impl WorkerClient {
         )
     }
 
-    pub(crate) fn binding(
-        &mut self,
-        package: &InstalledPackage,
-        name: &str,
-    ) -> Result<WorkerBinding> {
-        self.call(
-            "binding",
-            |request_id| WorkerRequest::Binding {
-                request_id,
-                package: package_spec(package),
-                name: name.into(),
-            },
-            |response| match response {
-                WorkerResponse::Binding { binding, .. } if binding.binding.name == name => {
-                    Some(binding)
-                }
-                _ => None,
-            },
-        )
-    }
-
     pub(crate) fn dispatch_generics(
         &mut self,
         package: Option<&InstalledPackage>,

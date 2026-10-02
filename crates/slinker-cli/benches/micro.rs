@@ -85,18 +85,18 @@ impl PackageResolver for MemoryProvider {
         &self.target
     }
 
-    fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
+    fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
         Ok((self.image.index.identity.name == name).then(|| self.installed()))
     }
 }
 
 impl PackageProvider for MemoryProvider {
-    fn index(&mut self, _package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
+    fn index(&self, _package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         Ok(Arc::clone(&self.image.index))
     }
 
     fn binding_image(
-        &mut self,
+        &self,
         _package: &InstalledPackage,
         _name: &str,
     ) -> Result<Arc<PackageImage>> {
@@ -104,17 +104,17 @@ impl PackageProvider for MemoryProvider {
     }
 
     fn dispatch_generics(
-        &mut self,
+        &self,
         _subject: DispatchSubject<'_>,
     ) -> Result<BTreeSet<GenericName>> {
         Ok(BTreeSet::new())
     }
 
-    fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {
+    fn validate_syntax(&self, _source: &str) -> Result<SyntaxValidation> {
         Ok(SyntaxValidation::Accepted)
     }
 
-    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+    fn canonical_syntax(&self, source: &str) -> Result<CanonicalSyntax> {
         Ok(CanonicalSyntax::Stable(source.to_owned()))
     }
 }
