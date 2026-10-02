@@ -16,8 +16,10 @@ pub struct CacheArgs {
 
 #[derive(Debug, Subcommand)]
 enum CacheCommand {
-    #[command(about = "Summarize the cache and list every cached package (default)")]
-    Info {
+    #[command(about = "Show where the cache is and how large it is (default)")]
+    Info,
+    #[command(about = "List every cached package with version, fingerprint, key and size")]
+    List {
         #[arg(long, help = "Print full fingerprints and cache keys")]
         full: bool,
     },
@@ -43,12 +45,9 @@ impl CacheArgs {
 }
 
 pub fn run(args: &CacheArgs, location: &CacheLocation) -> Result<(), Box<dyn Error>> {
-    match args
-        .command
-        .as_ref()
-        .unwrap_or(&CacheCommand::Info { full: false })
-    {
-        CacheCommand::Info { full } => info(location, args.json, *full),
+    match args.command.as_ref().unwrap_or(&CacheCommand::Info) {
+        CacheCommand::Info => info(location, args.json, None),
+        CacheCommand::List { full } => info(location, args.json, Some(*full)),
         CacheCommand::Path => {
             let root = cache_root(location).ok_or("the cache is disabled")?;
             if args.json {
@@ -64,14 +63,52 @@ pub fn run(args: &CacheArgs, location: &CacheLocation) -> Result<(), Box<dyn Err
     }
 }
 
-fn info(location: &CacheLocation, json: bool, full: bool) -> Result<(), Box<dyn Error>> {
+fn info(location: &CacheLocation, json: bool, listing: Option<bool>) -> Result<(), Box<dyn Error>> {
     let report = inspect_cache(location)?;
     if json {
         println!("{:#}", serde_json::to_value(&report)?);
-    } else {
+    } else if let Some(full) = listing {
         print!("{}", render(&report, full));
+    } else {
+        print!("{}", summarize(&report));
     }
     Ok(())
+}
+
+fn summarize(report: &CacheReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match &report.location {
+        Some(location) => {
+            let _ = writeln!(out, "cache: {}", location.display());
+        }
+        None => out.push_str(
+            "cache: disabled
+",
+        ),
+    }
+    let total: u64 = report.schemas.iter().map(|schema| schema.pack_bytes).sum();
+    let _ = writeln!(out, "size:  {}", size(total));
+    for schema in &report.schemas {
+        let state = if schema.current {
+            "current"
+        } else {
+            "obsolete"
+        };
+        let _ = writeln!(
+            out,
+            "  {} ({state}): {}, {} entries, {} packages",
+            schema.schema,
+            size(schema.pack_bytes),
+            schema.entries,
+            schema.packages.len()
+        );
+    }
+    out.push_str(
+        "run `slinker cache list` for packages, `slinker cache --json` for everything
+",
+    );
+    out
 }
 
 fn clear(

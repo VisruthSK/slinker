@@ -86,9 +86,10 @@ Provenance explains a result and never decides one: finalization reads typed req
 Slinker keeps a persistent cache of installed-package inspection results (package indexes, binding images, private environments, syntax normalizations, dispatch queries). Entries are content-addressed by the exact installed image, the target R, and the analyzer schema, so a stale entry is never read. Each run adds one packed file.
 
 ```text
-slinker cache                  summary plus every cached package (version, image fingerprint, cache key, counts, size)
-slinker cache --full           full fingerprints and keys
-slinker cache --json           the same as one JSON document
+slinker cache                  location and total size per analyzer schema
+slinker cache list             every cached package: version, image fingerprint, cache key, counts, size
+slinker cache list --full      untruncated fingerprints and keys
+slinker cache --json           everything above as one JSON document
 slinker cache path             the cache directory
 slinker cache clear            delete everything
 slinker cache clear PKG...     delete the entries of the named packages
