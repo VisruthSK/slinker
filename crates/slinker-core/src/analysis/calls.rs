@@ -4,6 +4,7 @@ use super::arguments::{
 };
 use super::discovery::Discovered;
 use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
+use super::reflection::PendingNamespaceOperation;
 use super::relocation::{NamespaceCall, PendingRelocation, SyntaxObservation};
 use super::resolution::{BindingTarget, OpenReason, ReferenceUse, Resolution};
 use super::state::{AnalyzerState, Caller, NativeCallbackContext, ParsedSite};
@@ -844,22 +845,72 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 return Ok(());
             }
-            self.diagnostic(
-                from,
-                current,
-                Some(binding),
-                RejectCode::DynamicPackageDiscovery,
-                format!("{}() with a dynamic namespace name", call.callee),
-                Some(call.span.clone()),
-            );
+            self.reflection
+                .defer_namespace_operation(PendingNamespaceOperation {
+                    node: from,
+                    package: current,
+                    binding: binding.to_owned(),
+                    call: call.clone(),
+                    operation,
+                });
             return Ok(());
         };
-        let target = match self.discovered_package(from, current, call, &name)? {
+        self.namespace_operation_named(caller, call, operation, &name, literal.is_some())
+    }
+
+    pub(super) fn settle_namespace_operations(&mut self) -> Result<bool> {
+        let mut settled = false;
+        for pending in self.reflection.take_pending_namespace_operations() {
+            let contextual = self
+                .reflection
+                .contextual_namespace(&pending.call.span)
+                .map(str::to_owned);
+            let Some(name) = contextual else {
+                self.reflection.defer_namespace_operation(pending);
+                continue;
+            };
+            settled = true;
+            let caller = Caller {
+                node: pending.node,
+                package: pending.package,
+                binding: &pending.binding,
+            };
+            self.namespace_operation_named(caller, &pending.call, pending.operation, &name, false)?;
+        }
+        Ok(settled)
+    }
+
+    pub(super) fn report_dynamic_namespace_operations(&mut self) {
+        for pending in self.reflection.take_pending_namespace_operations() {
+            self.diagnostic(
+                pending.node,
+                pending.package,
+                Some(&pending.binding),
+                RejectCode::DynamicPackageDiscovery,
+                format!("{}() with a dynamic namespace name", pending.call.callee),
+                Some(pending.call.span.clone()),
+            );
+        }
+    }
+
+    fn namespace_operation_named(
+        &mut self,
+        caller @ Caller {
+            node: from,
+            package: current,
+            binding,
+        }: Caller<'_>,
+        call: &CallSite,
+        operation: NamespaceCall,
+        name: &str,
+        literal: bool,
+    ) -> Result<()> {
+        let target = match self.discovered_package(from, current, call, name)? {
             Discovered::Linked(target) => target,
             Discovered::Settled => return Ok(()),
             Discovered::Optional => {
                 if operation == NamespaceCall::Require {
-                    self.optional_availability_blocker(caller, &name, &call.span);
+                    self.optional_availability_blocker(caller, name, &call.span);
                 }
                 return Ok(());
             }
@@ -873,7 +924,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     self.record_missing_package(
                         from,
                         current,
-                        &name,
+                        name,
                         EdgeKind::Discovery,
                         format!("{} requires unavailable namespace {name}", call.callee),
                         Some(call.span.clone()),
@@ -882,7 +933,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 return Ok(());
             }
         };
-        if literal.is_none() {
+        if !literal {
             self.diagnostic(
                 from,
                 current,

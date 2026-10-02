@@ -1025,9 +1025,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 name: CreatedName::Any,
             });
         }
+        let packages = &self.packages;
         let creatable = self
             .dynamic_names
-            .creatable()
+            .creatable(|creator| {
+                (
+                    packages.name(creator.package).clone(),
+                    creator.binding.clone(),
+                    creator.operation,
+                    creator.created_name().cloned(),
+                )
+            })
             .map(|(unresolved, creator)| {
                 (
                     creator.clone(),

@@ -25,6 +25,7 @@ pub(super) enum Effect {
         need: Need,
         kind: EdgeKind,
         reason: String,
+        span: Option<Span>,
     },
     ReflectiveName {
         name: String,
@@ -69,6 +70,8 @@ pub(super) struct SummaryTable {
     readers: HashMap<(PackageId, EnvironmentId), HashMap<BindingName, Vec<SummaryKey>>>,
     write_cursors: HashMap<PackageId, usize>,
     frames: Vec<Frame>,
+    suspended: Vec<Vec<Frame>>,
+    namespace_grew: bool,
     epoch: u64,
 }
 
@@ -78,7 +81,20 @@ impl SummaryTable {
     }
 
     pub(super) fn is_active(&self) -> bool {
-        !self.frames.is_empty()
+        !self.frames.is_empty() || !self.suspended.is_empty()
+    }
+
+    pub(super) fn suspend(&mut self) {
+        self.suspended.push(std::mem::take(&mut self.frames));
+    }
+
+    pub(super) fn resume(&mut self) {
+        self.frames = self.suspended.pop().unwrap_or_default();
+        if std::mem::take(&mut self.namespace_grew) {
+            for frame in &mut self.frames {
+                frame.cut = true;
+            }
+        }
     }
 
     pub(super) fn absorb_writes(&mut self, package: PackageId, writes: &[WriteSite]) {
@@ -265,6 +281,7 @@ impl SummaryTable {
 
 impl SummaryTable {
     pub(super) fn invalidate_package(&mut self, package: PackageId) {
+        self.namespace_grew = true;
         self.summaries.retain(|key, _| key.package != package);
         self.readers.retain(|(owner, _), _| *owner != package);
     }

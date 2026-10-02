@@ -43,13 +43,8 @@ pub(super) struct GenericDefinition {
 
 pub(super) enum DispatchChange {
     Unchanged,
-    Opened {
-        from: NodeId,
-    },
-    Added {
-        from: NodeId,
-        classes: BTreeSet<ClassName>,
-    },
+    Opened,
+    Added { classes: BTreeSet<ClassName> },
 }
 
 #[derive(Default)]
@@ -57,7 +52,8 @@ pub(super) struct S3Model {
     generics: BTreeMap<S3GenericKey, S3Generic>,
     callable_generics: HashMap<CallableId, BTreeSet<S3GenericKey>>,
     closed_methods: HashSet<(PackageId, BindingName)>,
-    lexical_demands: HashSet<(PackageId, GenericName)>,
+    retained: BTreeMap<GenericName, BTreeMap<(PackageId, BindingName), EdgeKind>>,
+    lexical_methods: HashMap<(PackageId, GenericName), BTreeMap<BindingName, EdgeKind>>,
     next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
 }
 
@@ -125,10 +121,9 @@ impl S3Model {
                 .collect::<Option<Vec<_>>>(),
             _ => None,
         };
-        let from = generic.sites[0].0;
         let Some(classes) = classes else {
             generic.dispatch = S3Dispatch::Open;
-            return DispatchChange::Opened { from };
+            return DispatchChange::Opened;
         };
         let classes = classes
             .into_iter()
@@ -145,25 +140,33 @@ impl S3Model {
         let added = classes.difference(&known).cloned().collect::<BTreeSet<_>>();
         generic.dispatch = S3Dispatch::Classes(known.union(&classes).cloned().collect());
         if was_pending || !added.is_empty() {
-            DispatchChange::Added {
-                from,
-                classes: added,
-            }
+            DispatchChange::Added { classes: added }
         } else {
             DispatchChange::Unchanged
         }
     }
 
-    fn dispatches(&self) -> Vec<(GenericName, NodeId, S3Dispatch)> {
+    fn dispatches(&self) -> Vec<(GenericName, S3Dispatch)> {
         self.generics
             .iter()
-            .map(|(key, generic)| {
-                (
-                    key.name.clone(),
-                    generic.sites[0].0,
-                    generic.dispatch.clone(),
-                )
-            })
+            .map(|(key, generic)| (key.name.clone(), generic.dispatch.clone()))
+            .collect()
+    }
+
+    fn sites_named(&self, name: &str) -> BTreeSet<NodeId> {
+        self.generics
+            .iter()
+            .filter(|(key, _)| key.name == name)
+            .flat_map(|(_, generic)| generic.sites.iter().map(|(node, _, _)| *node))
+            .collect()
+    }
+
+    fn retained_methods(&self, name: &str) -> Vec<((PackageId, BindingName), EdgeKind)> {
+        self.retained
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|(method, kind)| (method.clone(), *kind))
             .collect()
     }
 
@@ -189,10 +192,6 @@ impl S3Model {
 
     pub(super) fn take_next_method_calls(&mut self) -> Vec<(NodeId, PackageId, String, Span)> {
         std::mem::take(&mut self.next_method_calls)
-    }
-
-    fn first_lexical_demand(&mut self, package: PackageId, generic: &GenericName) -> bool {
-        self.lexical_demands.insert((package, generic.clone()))
     }
 
     pub(super) fn is_closed_method(&self, package: PackageId, binding: &str) -> bool {
@@ -296,6 +295,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             });
         self.s3
             .observe_use_method(&key, (from, current, call.span.clone()), definition);
+        self.connect_generic_site(from, generic);
         self.refresh_s3_generic(&key)
     }
 
@@ -332,16 +332,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Some(callable) => self.is_externally_callable(&callable)?,
             None => false,
         };
-        let (from, classes) = match self
+        let classes = match self
             .s3
             .refresh(key, callable_is_external, &self.invocations)
         {
             DispatchChange::Unchanged => return Ok(()),
-            DispatchChange::Opened { from } => (from, None),
-            DispatchChange::Added { from, classes } => (from, Some(classes)),
+            DispatchChange::Opened => None,
+            DispatchChange::Added { classes } => Some(classes),
         };
         for namespace in self.retained_namespaces() {
-            self.retain_s3_methods(from, namespace, &key.name, classes.as_ref())?;
+            self.retain_s3_methods(namespace, &key.name, classes.as_ref())?;
         }
         Ok(())
     }
@@ -368,25 +368,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn retain_s3_methods_on_activation(&mut self, package: PackageId) -> Result<()> {
-        for (name, from, dispatch) in self.s3.dispatches() {
+        for (name, dispatch) in self.s3.dispatches() {
             match dispatch {
                 S3Dispatch::Pending => {}
                 S3Dispatch::Classes(classes) => {
-                    self.retain_s3_methods(from, package, &name, Some(&classes))?;
+                    self.retain_s3_methods(package, &name, Some(&classes))?;
                 }
-                S3Dispatch::Open => self.retain_s3_methods(from, package, &name, None)?,
+                S3Dispatch::Open => self.retain_s3_methods(package, &name, None)?,
             }
         }
         Ok(())
     }
 
-    fn retain_s3_methods(
+    fn s3_method_candidates(
         &mut self,
-        from: NodeId,
         package: PackageId,
         generic: &str,
         classes: Option<&BTreeSet<ClassName>>,
-    ) -> Result<()> {
+    ) -> Result<BTreeMap<BindingName, EdgeKind>> {
         let image = self.image(package)?;
         let prefix = format!("{generic}.");
         let wanted = |class: &str| classes.is_none_or(|classes| classes.contains(class));
@@ -398,28 +397,80 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .filter(|registration| {
                 registration.generic.name == generic && wanted(&registration.class)
             })
-            .map(|registration| (registration.method.clone(), EdgeKind::S3Registration));
-        let methods = image
+            .map(|registration| registration.method.clone());
+        let indexed_registrations = image
+            .index
+            .s3
+            .iter()
+            .filter(|registration| {
+                registration.generic.name == generic && wanted(&registration.class)
+            })
+            .map(|registration| registration.method.clone())
+            .collect::<BTreeSet<_>>();
+        let kind = |method: &BindingName| {
+            if indexed_registrations.contains(method) {
+                EdgeKind::S3Registration
+            } else {
+                EdgeKind::Lexical
+            }
+        };
+        Ok(image
             .index
             .binding_names
             .iter()
             .filter(|name| name.strip_prefix(&prefix).is_some_and(wanted))
-            .map(|name| (name.clone(), EdgeKind::Lexical))
+            .cloned()
             .chain(registered)
-            .collect::<BTreeMap<_, _>>();
+            .map(|method| (kind(&method), method))
+            .map(|(kind, method)| (method, kind))
+            .collect())
+    }
+
+    fn demand_s3_method(
+        &mut self,
+        from: NodeId,
+        package: PackageId,
+        generic: &str,
+        method: &BindingName,
+        kind: EdgeKind,
+    ) {
+        self.s3.closed_methods.insert((package, method.clone()));
+        self.require(
+            from,
+            Need::Binding {
+                package,
+                binding: method.clone(),
+            },
+            kind,
+            format!("S3 generic `{generic}` can dispatch to `{method}`"),
+        );
+    }
+
+    fn retain_s3_methods(
+        &mut self,
+        package: PackageId,
+        generic: &str,
+        classes: Option<&BTreeSet<ClassName>>,
+    ) -> Result<()> {
+        let methods = self.s3_method_candidates(package, generic, classes)?;
+        let sites = self.s3.sites_named(generic);
         for (method, kind) in methods {
-            self.s3.closed_methods.insert((package, method.clone()));
-            self.require(
-                from,
-                Need::Binding {
-                    package,
-                    binding: method.clone(),
-                },
-                kind,
-                format!("S3 generic `{generic}` can dispatch to `{method}`"),
-            );
+            self.s3
+                .retained
+                .entry(generic.into())
+                .or_default()
+                .insert((package, method.clone()), kind);
+            for from in &sites {
+                self.demand_s3_method(*from, package, generic, &method, kind);
+            }
         }
         Ok(())
+    }
+
+    fn connect_generic_site(&mut self, from: NodeId, generic: &str) {
+        for ((package, method), kind) in self.s3.retained_methods(generic) {
+            self.demand_s3_method(from, package, generic, &method, kind);
+        }
     }
 }
 
@@ -498,8 +549,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         let generics = self.packages.dispatch_generics(owner.as_callee())?;
         for generic in generics {
-            if self.s3.first_lexical_demand(site.package, &generic) {
-                self.retain_s3_methods(site.node, site.package, &generic, None)?;
+            let key = (site.package, generic.clone());
+            if !self.s3.lexical_methods.contains_key(&key) {
+                let methods = self.s3_method_candidates(site.package, &generic, None)?;
+                self.s3.lexical_methods.insert(key.clone(), methods);
+            }
+            let methods = self.s3.lexical_methods[&key].clone();
+            for (method, kind) in methods {
+                self.demand_s3_method(site.node, site.package, &generic, &method, kind);
             }
         }
         Ok(())

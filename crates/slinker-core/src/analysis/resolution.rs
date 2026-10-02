@@ -165,6 +165,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         image: &PackageImage,
         indexed: impl Iterator<Item = &'a BindingName>,
     ) -> Result<BTreeSet<BindingName>> {
+        self.seal_namespace(package)?;
         let mut shadowed = indexed.cloned().collect::<BTreeSet<_>>();
         shadowed.extend(self.loaded(package)?.namespace.bindings.iter().cloned());
         shadowed.extend(
@@ -384,6 +385,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         image: &PackageImage,
         name: &str,
     ) -> Result<Resolution> {
+        self.seal_namespace(current)?;
         if let Some(binding) = MetadataBinding::of(name) {
             return Ok(Resolution::Static(BindingTarget::Metadata {
                 package: current,

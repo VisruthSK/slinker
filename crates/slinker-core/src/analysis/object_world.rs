@@ -106,6 +106,7 @@ pub struct ObjectGraph {
     write_log: Vec<(EnvironmentId, Option<BindingName>)>,
     read_log: RefCell<Vec<(EnvironmentId, BindingName)>>,
     namespace_environment: Option<EnvironmentId>,
+    opaque: Option<ObjectId>,
     merging: bool,
     derived_objects: HashSet<ObjectId>,
 }
@@ -421,8 +422,15 @@ impl ObjectGraph {
         }
     }
 
-    pub fn abstract_value(&mut self) -> ObjectId {
-        self.push_object(InstalledObject::Atom)
+    pub fn opaque_value(&mut self) -> ObjectId {
+        if let Some(opaque) = self.opaque {
+            return opaque;
+        }
+        let merging = std::mem::replace(&mut self.merging, true);
+        let opaque = self.push_object(InstalledObject::Atom);
+        self.merging = merging;
+        self.opaque = Some(opaque);
+        opaque
     }
 
     fn note_environment_write(&mut self, environment: EnvironmentId, name: Option<&str>) {
@@ -535,7 +543,7 @@ impl ObjectGraph {
         for (offset, name) in names.iter().enumerate() {
             let value = match indexed.get(&(offset + 1)) {
                 Some(value) => *value,
-                None => self.abstract_value(),
+                None => self.opaque_value(),
             };
             self.set_environment_binding(environment, name.as_str(), value);
         }

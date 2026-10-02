@@ -1,3 +1,5 @@
+mod support;
+
 use slinker_core::analysis::{
     EdgeKind, ExplanationDag, GraphEdgeReasonExport, Linker, NodeKind, RejectCode,
 };
@@ -5612,5 +5614,633 @@ fn syntax_forms_that_dispatch_retain_their_lexical_methods() {
         let plan = link(provider);
         assert!(retained_binding(&plan, "foo", method), "{source}");
         assert!(!retained_binding(&plan, "foo", "other.cls"), "{source}");
+    }
+}
+
+mod schedule_equivalence {
+    use super::support::canonical::Canonical;
+    use super::{
+        FakeProvider, PackageFixture, analyze_images, export, package, private_closure, test_target,
+    };
+    use slinker_core::analysis::{ExplanationDag, LinkIr, Linker, Schedule};
+    use slinker_core::package::{
+        EmbeddedClosureSource, ImportBinding, ImportSpec, MemberPath, NativeComponent, NativeFacts,
+        NativeLibrary, NativeRegistration, NativeSafety, NativeSymbolBinding, ObjectKind,
+        PackageImage, PrivateEnvironmentImage, S3Registration,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct Scenario {
+        name: &'static str,
+        images: Vec<PackageImage>,
+        external: &'static [&'static str],
+    }
+
+    fn scenarios() -> Vec<Scenario> {
+        vec![
+            cycle_chain(),
+            diamond(),
+            onload_active_binding(),
+            s3_activation(),
+            reenclosed_derived_environment(),
+            recursion(),
+            private_environment(),
+            imports(),
+            closed_generic(),
+            name_creators(),
+            contextual_namespace_chain(),
+            native_registered(),
+            guarded_optional(),
+            resources(),
+            blocked(),
+        ]
+    }
+
+    fn cycle_chain() -> Scenario {
+        let root = PackageFixture::new("root", &[("f", Some("f <- function() dep::g()"))])
+            .exports(export("f"))
+            .build();
+        let dep = PackageFixture::new("dep", &[("g", Some("g <- function() leaf::h()"))])
+            .exports(export("g"))
+            .build();
+        let leaf = PackageFixture::new(
+            "leaf",
+            &[
+                ("h", Some("h <- function() a()")),
+                ("a", Some("a <- function() b()")),
+                ("b", Some("b <- function() { c <- a; c() }")),
+            ],
+        )
+        .exports(export("h"))
+        .build();
+        Scenario {
+            name: "cycle_chain",
+            images: vec![root, dep, leaf],
+            external: &[],
+        }
+    }
+
+    fn diamond() -> Scenario {
+        let root =
+            PackageFixture::new("root", &[("f", Some("f <- function() { p::x(); q::y() }"))])
+                .exports(export("f"))
+                .build();
+        let p = PackageFixture::new("p", &[("x", Some("x <- function() shared::z()"))])
+            .exports(export("x"))
+            .build();
+        let q = PackageFixture::new("q", &[("y", Some("y <- function() shared::z()"))])
+            .exports(export("y"))
+            .build();
+        let shared = PackageFixture::new(
+            "shared",
+            &[
+                ("z", Some("z <- function() w()")),
+                ("w", Some("w <- function() 1")),
+            ],
+        )
+        .exports(export("z"))
+        .build();
+        Scenario {
+            name: "diamond",
+            images: vec![root, p, q, shared],
+            external: &[],
+        }
+    }
+
+    fn onload_active_binding() -> Scenario {
+        let root = PackageFixture::new("root", &[("f", Some("f <- function() foo::pb"))])
+            .exports(export("f"))
+            .description("Imports: foo\n")
+            .build();
+        let mut dependency = PackageFixture::new(
+            "foo",
+            &[
+                ("dummy", Some("dummy <- function() NULL")),
+                ("get_pb", Some("get_pb <- function() helper()")),
+                ("helper", Some("helper <- function() 1")),
+                (
+                    ".onLoad",
+                    Some(
+                        ".onLoad <- function(lib, pkg) { pkgenv <- environment(dummy); makeActiveBinding(\"pb\", get_pb, pkgenv) }",
+                    ),
+                ),
+            ],
+        )
+        .exports(export("pb"))
+        .build();
+        Arc::make_mut(&mut dependency.index).lifecycle.on_load = true;
+        Scenario {
+            name: "onload_active_binding",
+            images: vec![root, dependency],
+            external: &[],
+        }
+    }
+
+    fn s3_activation() -> Scenario {
+        let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
+        let registration = |generic: &str, method: &str| S3Registration {
+            generic: slinker_core::package::GenericSpec {
+                package: None,
+                name: generic.into(),
+            },
+            class: "foo".into(),
+            method: method.into(),
+        };
+        let dependency = PackageFixture::new(
+            "foo",
+            &[
+                ("x", Some("x <- function() 1")),
+                ("print.foo", Some("print.foo <- function(x, ...) helper(x)")),
+                ("format.foo", Some("format.foo <- function(x, ...) x")),
+                ("helper", Some("helper <- function(x) x")),
+            ],
+        )
+        .exports(export("x"))
+        .s3(vec![
+            registration("print", "print.foo"),
+            registration("format", "format.foo"),
+        ])
+        .build();
+        Scenario {
+            name: "s3_activation",
+            images: vec![root, dependency],
+            external: &[],
+        }
+    }
+
+    fn reenclosed_derived_environment() -> Scenario {
+        let mut root = PackageFixture::new(
+            "root",
+            &[
+                (
+                    "f",
+                    Some(
+                        "f <- function() { generator <- new.env(parent = capsule); generator$self <- generator; methods <- assign_func_envs(templates, generator); list2env2(methods, generator); generator }",
+                    ),
+                ),
+                ("capsule", None),
+                ("templates", None),
+                ("first_dependency", Some("first_dependency <- function() 1")),
+                (
+                    "second_dependency",
+                    Some("second_dependency <- function() 1"),
+                ),
+            ],
+        )
+        .exports(export("f"))
+        .build();
+        root.bindings
+            .get_mut("f")
+            .unwrap()
+            .object
+            .closure
+            .as_mut()
+            .unwrap()
+            .environment = "private:1".into();
+        let capsule = root.bindings.get_mut("capsule").unwrap();
+        capsule.object.object_kind = ObjectKind::Environment;
+        capsule.object.environment = Some("private:1".into());
+        let templates = root.bindings.get_mut("templates").unwrap();
+        templates.object.object_kind = ObjectKind::List;
+        for name in ["first", "second"] {
+            templates
+                .object
+                .embedded_closures
+                .push(EmbeddedClosureSource {
+                    path: MemberPath::root().field(name),
+                    source: Arc::from(format!(
+                        ".slinker_embedded <- function() {{ self; {name}_dependency() }}"
+                    )),
+                    environment: "namespace:root".into(),
+                });
+        }
+        root.private_environments.insert(
+            "private:1".into(),
+            PrivateEnvironmentImage {
+                id: "private:1".into(),
+                parent: "namespace:root".into(),
+                bindings: HashMap::from([
+                    (
+                        "assign_func_envs".into(),
+                        private_closure(
+                            "assign_func_envs",
+                            "private:1",
+                            "assign_func_envs <- function(objs, target_env) { if (is.null(target_env)) return(objs); lapply(objs, function(x) { if (is.function(x)) environment(x) <- target_env; x }) }",
+                        ),
+                    ),
+                    (
+                        "list2env2".into(),
+                        private_closure(
+                            "list2env2",
+                            "private:1",
+                            "list2env2 <- function(x, envir = NULL) { if (is.null(envir)) envir <- new.env(); if (length(x) == 0L) return(NULL); list2env(x, envir) }",
+                        ),
+                    ),
+                ]),
+            },
+        );
+        Scenario {
+            name: "reenclosed_derived_environment",
+            images: vec![root],
+            external: &[],
+        }
+    }
+
+    fn recursion() -> Scenario {
+        let root = PackageFixture::new(
+            "root",
+            &[
+                ("f", Some("f <- function() helper(ping(\"x\"))")),
+                (
+                    "helper",
+                    Some("helper <- function(package) requireNamespace(package)"),
+                ),
+                (
+                    "ping",
+                    Some("ping <- function(n) if (print(n)) pong(n) else \"foo\""),
+                ),
+                ("pong", Some("pong <- function(n) ping(n)")),
+            ],
+        )
+        .exports(export("f"))
+        .build();
+        Scenario {
+            name: "recursion",
+            images: vec![root, package("foo", &[])],
+            external: &["foo"],
+        }
+    }
+
+    fn private_environment() -> Scenario {
+        let mut root = PackageFixture::new(
+            "root",
+            &[
+                ("public", Some("public <- function() used()")),
+                ("other", Some("other <- function() used()")),
+            ],
+        )
+        .exports(export("public"))
+        .build();
+        for name in ["public", "other"] {
+            root.bindings
+                .get_mut(name)
+                .unwrap()
+                .object
+                .closure
+                .as_mut()
+                .unwrap()
+                .environment = "private:1".into();
+        }
+        root.private_environments.insert(
+            "private:1".into(),
+            PrivateEnvironmentImage {
+                id: "private:1".into(),
+                parent: "namespace:root".into(),
+                bindings: HashMap::from([
+                    (
+                        "used".into(),
+                        private_closure("used", "private:1", "used <- function() deeper()"),
+                    ),
+                    (
+                        "deeper".into(),
+                        private_closure("deeper", "private:1", "deeper <- function() 1"),
+                    ),
+                    (
+                        "unused".into(),
+                        private_closure("unused", "private:1", "unused <- function() 2"),
+                    ),
+                ]),
+            },
+        );
+        Scenario {
+            name: "private_environment",
+            images: vec![root],
+            external: &[],
+        }
+    }
+
+    fn imports() -> Scenario {
+        let root = PackageFixture::new(
+            "root",
+            &[("f", Some("f <- function() { renamed(); bar() }"))],
+        )
+        .exports(export("f"))
+        .imports(vec![
+            ImportSpec::From {
+                package: "foo".into(),
+                bindings: vec![ImportBinding {
+                    local: "renamed".into(),
+                    remote: "orig".into(),
+                }],
+            },
+            ImportSpec::All {
+                package: "baz".into(),
+                except: Vec::new(),
+            },
+        ])
+        .description("Imports: foo, baz\n")
+        .build();
+        let dependency = PackageFixture::new("foo", &[("orig", Some("orig <- function() 1"))])
+            .exports(export("orig"))
+            .build();
+        let wide = PackageFixture::new(
+            "baz",
+            &[
+                ("bar", Some("bar <- function() baz_helper()")),
+                ("baz_helper", Some("baz_helper <- function() 1")),
+            ],
+        )
+        .exports(export("bar"))
+        .build();
+        Scenario {
+            name: "imports",
+            images: vec![root, dependency, wide],
+            external: &[],
+        }
+    }
+
+    fn closed_generic() -> Scenario {
+        let root = package("root", &[("f", Some("f <- function(x) foo::criterion(x)"))]);
+        let dependency = PackageFixture::new(
+            "foo",
+            &[
+                (
+                    "criterion",
+                    Some("criterion <- function(x) UseMethod(\"criterion\")"),
+                ),
+                (
+                    "criterion.character",
+                    Some("criterion.character <- function(x) helper(x)"),
+                ),
+                (
+                    "criterion.default",
+                    Some("criterion.default <- function(x) x"),
+                ),
+                ("as_criterion", Some("as_criterion <- function(x) x")),
+                ("helper", Some("helper <- function(x) x")),
+                ("unrelated", Some("unrelated <- function() 1")),
+            ],
+        )
+        .exports(export("criterion"))
+        .s3(vec![S3Registration {
+            generic: slinker_core::package::GenericSpec {
+                package: None,
+                name: "criterion".into(),
+            },
+            class: "root_criterion".into(),
+            method: "as_criterion".into(),
+        }])
+        .build();
+        Scenario {
+            name: "closed_generic",
+            images: vec![root, dependency],
+            external: &[],
+        }
+    }
+
+    fn name_creators() -> Scenario {
+        let root = package(
+            "root",
+            &[
+                (
+                    "f",
+                    Some("f <- function(n) { assign(n, 1); alpha + beta + gamma }"),
+                ),
+                ("g", Some("g <- function(n) { delayedAssign(n, 2); delta }")),
+                ("h", Some("h <- function() epsilon")),
+            ],
+        );
+        Scenario {
+            name: "name_creators",
+            images: vec![root],
+            external: &[],
+        }
+    }
+
+    fn contextual_namespace_chain() -> Scenario {
+        let root = PackageFixture::new(
+            "root",
+            &[
+                ("f", Some("f <- function() outer(\"foo\")")),
+                ("outer", Some("outer <- function(package) inner(package)")),
+                (
+                    "inner",
+                    Some("inner <- function(package) requireNamespace(package)"),
+                ),
+                ("g", Some("g <- function() inner(\"foo\")")),
+            ],
+        )
+        .exports(export("f"))
+        .build();
+        Scenario {
+            name: "contextual_namespace_chain",
+            images: vec![root, package("foo", &[])],
+            external: &["foo"],
+        }
+    }
+
+    fn native_registered() -> Scenario {
+        let root = PackageFixture::new(
+            "root",
+            &[
+                ("f", Some("f <- function(x) .Call(croot_f, x)")),
+                ("g", Some("g <- function(x) .Call(croot_g, x)")),
+            ],
+        )
+        .exports(export("f"))
+        .dynlibs(vec![NativeComponent {
+            name: "root".into(),
+            alias: String::new(),
+            registration: Some(NativeRegistration {
+                prefix: "c".into(),
+                suffix: String::new(),
+            }),
+            symbols: vec![
+                NativeSymbolBinding {
+                    binding: "croot_f".into(),
+                    symbol: "root_f".into(),
+                },
+                NativeSymbolBinding {
+                    binding: "croot_g".into(),
+                    symbol: "root_g".into(),
+                },
+            ],
+            library: NativeLibrary::Missing,
+            safety: NativeSafety::Safe(NativeFacts {
+                callbacks: Vec::new(),
+            }),
+        }])
+        .build();
+        Scenario {
+            name: "native_registered",
+            images: vec![root],
+            external: &[],
+        }
+    }
+
+    fn guarded_optional() -> Scenario {
+        let root = PackageFixture::new(
+            "root",
+            &[
+                (
+                    "f",
+                    Some("f <- function() if (requireNamespace(\"foo\", quietly = TRUE)) foo::bar() else helper()"),
+                ),
+                ("helper", Some("helper <- function() 1")),
+            ],
+        )
+        .exports(export("f"))
+        .description("Suggests: foo\n")
+        .build();
+        let dependency = PackageFixture::new("foo", &[("bar", Some("bar <- function() 2"))])
+            .exports(export("bar"))
+            .build();
+        Scenario {
+            name: "guarded_optional",
+            images: vec![root, dependency],
+            external: &[],
+        }
+    }
+
+    fn resources() -> Scenario {
+        let root = PackageFixture::new(
+            "root",
+            &[(
+                "f",
+                Some("f <- function() system.file(\"data\", \"x.json\", package = \"foo\")"),
+            )],
+        )
+        .exports(export("f"))
+        .build();
+        let dependency = PackageFixture::new("foo", &[])
+            .files(vec!["data/x.json".into(), "data/y.json".into()])
+            .build();
+        Scenario {
+            name: "resources",
+            images: vec![root, dependency],
+            external: &[],
+        }
+    }
+
+    fn blocked() -> Scenario {
+        let root = PackageFixture::new(
+            "root",
+            &[
+                (
+                    "f",
+                    Some(
+                        "f <- function(p) { library(foo); requireNamespace(p); undefined_name() }",
+                    ),
+                ),
+                ("g", Some("g <- function() getNamespace(\"foo\")")),
+            ],
+        )
+        .exports(export("f"))
+        .build();
+        Scenario {
+            name: "blocked",
+            images: vec![root, package("foo", &[])],
+            external: &[],
+        }
+    }
+
+    struct Observation {
+        program: String,
+        explanation: String,
+        blockers: Vec<String>,
+    }
+
+    fn observe(scenario: &Scenario, schedule: Schedule, jobs: usize) -> Observation {
+        let provider = FakeProvider::new(scenario.images.clone());
+        let plan: LinkIr = Linker::new(provider, jobs)
+            .with_external_packages(scenario.external.iter().copied())
+            .with_schedule(schedule)
+            .analyze("root")
+            .unwrap();
+        let explanation = ExplanationDag::from_plan(&plan, &test_target(), "root").unwrap();
+        let mut blockers = plan
+            .blockers()
+            .iter()
+            .map(|diagnostic| {
+                format!(
+                    "{:?} {} {:?} {}",
+                    diagnostic.code, diagnostic.package, diagnostic.binding, diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>();
+        blockers.sort();
+        Observation {
+            program: Canonical::new(plan.program()).render(),
+            explanation: serde_json::to_string_pretty(&explanation).unwrap(),
+            blockers,
+        }
+    }
+
+    fn first_difference(left: &str, right: &str) -> String {
+        left.lines()
+            .zip(right.lines())
+            .find(|(left, right)| left != right)
+            .map_or_else(
+                || {
+                    format!(
+                        "length {} vs {}",
+                        left.lines().count(),
+                        right.lines().count()
+                    )
+                },
+                |(left, right)| format!("`{left}` vs `{right}`"),
+            )
+    }
+
+    #[test]
+    fn every_legal_need_order_yields_the_same_program_provenance_and_blockers() {
+        let schedules = [Schedule::Fifo, Schedule::Lifo]
+            .into_iter()
+            .chain((1..=24).map(Schedule::Seeded))
+            .collect::<Vec<_>>();
+        for scenario in scenarios() {
+            let reference = observe(&scenario, Schedule::Fifo, 1);
+            for schedule in &schedules {
+                for jobs in [1, 2, 8] {
+                    let observed = observe(&scenario, *schedule, jobs);
+                    assert!(
+                        reference.program == observed.program,
+                        "{} program under {schedule:?} jobs={jobs}: {}",
+                        scenario.name,
+                        first_difference(&reference.program, &observed.program)
+                    );
+                    assert!(
+                        reference.explanation == observed.explanation,
+                        "{} provenance under {schedule:?} jobs={jobs}: {}",
+                        scenario.name,
+                        first_difference(&reference.explanation, &observed.explanation)
+                    );
+                    assert!(
+                        reference.blockers == observed.blockers,
+                        "{} blockers under {schedule:?} jobs={jobs}: {:?} vs {:?}",
+                        scenario.name,
+                        reference.blockers,
+                        observed.blockers
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schedule_scenarios_are_not_vacuous() {
+        for scenario in scenarios() {
+            let plan = analyze_images(scenario.images.clone());
+            assert!(
+                !plan.program().namespaces().is_empty(),
+                "{} produces a program",
+                scenario.name
+            );
+        }
+        let blocked = observe(&blocked(), Schedule::Fifo, 1);
+        assert!(!blocked.blockers.is_empty());
+        let rendered = observe(&cycle_chain(), Schedule::Fifo, 1).program;
+        assert!(rendered.contains("leaf") && rendered.contains("binding"));
     }
 }

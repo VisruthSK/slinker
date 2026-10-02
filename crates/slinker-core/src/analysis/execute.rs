@@ -301,6 +301,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             context.lexical_environment,
             name,
         )?;
+        if let Resolution::Static(BindingTarget::Namespace { package, binding }) = &resolved
+            && *package == context.package
+        {
+            self.binding_image(*package, binding, Counter::BindingLoadConstruction)?;
+        }
         let graph = self.objects.graph(context.package);
         let object = match resolved {
             Resolution::Static(BindingTarget::Namespace { package, binding })
@@ -335,6 +340,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(AbstractValue::Unknown);
         };
         self.retain_namespace_member(context, object, name)?;
+        self.load_namespace_member(context, object, name)?;
         let graph = self.objects.graph(context.package);
         let member = match graph.object(object) {
             InstalledObject::Environment(environment) => {
@@ -346,6 +352,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
             InstalledObject::Closure(_) | InstalledObject::Atom => None,
         };
         Ok(member.map_or(AbstractValue::Unknown, AbstractValue::Object))
+    }
+
+    fn load_namespace_member(
+        &mut self,
+        context: ExecutionContext<'_>,
+        object: ObjectId,
+        name: &str,
+    ) -> Result<()> {
+        let graph = self.objects.graph(context.package);
+        let namespace = graph.environment_id(&EnvironmentLabel::namespace(
+            self.packages.name(context.package),
+        ));
+        if namespace.is_some() && graph.environment_of(object) == namespace {
+            self.binding_image(context.package, name, Counter::BindingLoadConstruction)?;
+        }
+        Ok(())
     }
 
     fn retain_namespace_member(
@@ -371,6 +393,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     },
                     kind: EdgeKind::Lexical,
                     reason: format!("namespace member access `${name}`"),
+                    span: None,
                 },
             )?;
         }
@@ -379,8 +402,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn emit_effect(&mut self, context: ExecutionContext<'_>, effect: Effect) -> Result<()> {
         match &effect {
-            Effect::Require { need, kind, reason } => {
-                self.require(context.node, need.clone(), *kind, reason.clone());
+            Effect::Require {
+                need,
+                kind,
+                reason,
+                span,
+            } => {
+                self.require_at(
+                    context.node,
+                    need.clone(),
+                    *kind,
+                    reason.clone(),
+                    span.clone(),
+                );
             }
             Effect::ReflectiveName {
                 name,
@@ -486,13 +520,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     | AbstractValue::String(_)
                     | AbstractValue::Vector(_)
                     | AbstractValue::Function { .. } => {
-                        self.objects.graph_mut(context.package).abstract_value()
+                        self.objects.graph_mut(context.package).opaque_value()
                     }
                 };
                 self.objects
                     .graph_mut(context.package)
                     .set_environment_binding(environment, name, object);
-                self.schedule_executable_object(context, object, span);
+                self.schedule_executable_object(context, object, span)?;
             }
             ConstructionTarget::ClosureEnvironment { closure } => {
                 let closure_value = self.evaluate_construction(context, state, closure)?.value;
@@ -530,19 +564,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
         context: ExecutionContext<'_>,
         object: ObjectId,
         span: &Span,
-    ) {
+    ) -> Result<()> {
         if let Some(closure) = self.objects.graph(context.package).closure_of(object) {
-            self.require_at(
-                context.node,
-                Need::ClosureExecution {
-                    package: context.package,
-                    closure,
+            self.emit_effect(
+                context,
+                Effect::Require {
+                    need: Need::ClosureExecution {
+                        package: context.package,
+                        closure,
+                    },
+                    kind: EdgeKind::ClosureExecution,
+                    reason: "runtime construction installs an executable closure".to_owned(),
+                    span: Some(span.clone()),
                 },
-                EdgeKind::ClosureExecution,
-                "runtime construction installs an executable closure",
-                Some(span.clone()),
-            );
+            )?;
         }
+        Ok(())
     }
 
     fn evaluate_construction_call(

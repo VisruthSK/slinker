@@ -39,7 +39,9 @@ impl<'a> Canonical<'a> {
 
     fn environment(&self, id: EnvironmentId) -> String {
         match self.program.environment(id).kind {
-            EnvironmentKind::Namespace(namespace) => format!("ns-env({})", self.namespace(namespace)),
+            EnvironmentKind::Namespace(namespace) => {
+                format!("ns-env({})", self.namespace(namespace))
+            }
             EnvironmentKind::Imports(namespace) => {
                 format!("imports-env({})", self.namespace(namespace))
             }
@@ -67,7 +69,11 @@ impl<'a> Canonical<'a> {
 
     fn resource(&self, id: ResourceId) -> String {
         let resource = self.program.resource(id);
-        format!("resource({}:{})", self.package(resource.package), resource.path)
+        format!(
+            "resource({}:{})",
+            self.package(resource.package),
+            resource.path
+        )
     }
 
     fn s3(&self, id: S3RegistrationId) -> String {
@@ -106,7 +112,10 @@ impl<'a> Canonical<'a> {
                 package,
                 component,
                 symbol,
-            } => format!("native-symbol {} {component} {symbol}", self.package(*package)),
+            } => format!(
+                "native-symbol {} {component} {symbol}",
+                self.package(*package)
+            ),
             RelocationTarget::NativeLibrary { package, component } => {
                 format!("native-library {} {component}", self.package(*package))
             }
@@ -132,13 +141,14 @@ impl<'a> Canonical<'a> {
                         "namespace {key} materialized {} {} payload={:?}",
                         self.environment(state.namespace_environment),
                         self.environment(state.imports_environment),
-                        state
-                            .payload
-                            .map(|bundle| self.namespace(program.payload_bundle(bundle).namespace())),
+                        state.payload.map(
+                            |bundle| self.namespace(program.payload_bundle(bundle).namespace())
+                        ),
                     )),
-                LinkNamespaceState::External { package } => {
-                    lines.insert(format!("namespace {key} external {}", self.package(*package)))
-                }
+                LinkNamespaceState::External { package } => lines.insert(format!(
+                    "namespace {key} external {}",
+                    self.package(*package)
+                )),
             };
             for (name, binding) in &namespace.bindings {
                 let state = match &program.binding(*binding).state {

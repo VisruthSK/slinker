@@ -6,7 +6,7 @@ use crate::syntax::source::{SourceKey, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]

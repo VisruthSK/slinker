@@ -122,7 +122,7 @@ impl NeedQueue {
         Self {
             schedule,
             state: match schedule {
-                Schedule::Seeded(seed) => seed | 1,
+                Schedule::Seeded(seed) => seed.wrapping_mul(2).wrapping_add(1),
                 Schedule::Fifo | Schedule::Lifo => 0,
             },
             ..Self::default()

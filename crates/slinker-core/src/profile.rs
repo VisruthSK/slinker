@@ -88,6 +88,7 @@ counters! {
     BindingLoadPrepare => "binding_load_prepare_construction",
     BindingLoadProcess => "binding_load_process_binding",
     BindingLoadPreparse => "binding_load_preparse",
+    BindingLoadConstruction => "binding_load_construction",
     BindingImageMisses => "binding_image_misses",
     NeedsStarted => "needs_started",
     LatticeJoins => "lattice_joins",

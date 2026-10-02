@@ -120,6 +120,14 @@ pub(super) struct LoadedPackage {
     pub(super) image: Arc<PackageImage>,
     pub(super) namespace: NamespaceBuilder,
     pub(super) native_bindings: NativeBindingIndex,
+    pub(super) surface: NamespaceSurface,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NamespaceSurface {
+    Open,
+    Sealing,
+    Sealed,
 }
 
 pub(super) struct NativeCallTarget {
@@ -180,9 +188,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let root_image = self.image(root)?;
 
         self.require_root(Need::Activation { package: root });
-        while !self.needs.is_empty() {
-            self.process_frontier()?;
-        }
+        self.settle()?;
 
         let mut entry_bindings = root_image
             .index
@@ -210,9 +216,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
 
-        while !self.needs.is_empty() {
-            self.process_frontier()?;
-        }
+        self.settle()?;
+        self.report_dynamic_namespace_operations();
         let materialized = self
             .encountered
             .iter()
@@ -224,6 +229,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.namespace_imports(package, &image)?;
         }
         Ok(self)
+    }
+
+    fn settle(&mut self) -> Result<()> {
+        loop {
+            while !self.needs.is_empty() {
+                self.process_frontier()?;
+            }
+            if !self.settle_namespace_operations()? {
+                return Ok(());
+            }
+        }
     }
 
     fn process_frontier(&mut self) -> Result<()> {
@@ -259,9 +275,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     image,
                     namespace: NamespaceBuilder::new(&index),
                     native_bindings: NativeBindingIndex::new(&index),
+                    surface: NamespaceSurface::Open,
                 }))
             }
         }
+    }
+
+    pub(super) fn seal_namespace(&mut self, package: PackageId) -> Result<()> {
+        if self.loaded(package)?.surface != NamespaceSurface::Open {
+            return Ok(());
+        }
+        self.loaded(package)?.surface = NamespaceSurface::Sealing;
+        self.ensure_on_load_analyzed(package)?;
+        self.loaded(package)?.surface = NamespaceSurface::Sealed;
+        Ok(())
     }
 
     pub(super) fn image(&mut self, package: PackageId) -> Result<Arc<PackageImage>> {

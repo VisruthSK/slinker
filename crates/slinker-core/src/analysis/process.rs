@@ -984,11 +984,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    fn ensure_on_load_analyzed(&mut self, id: PackageId) -> Result<()> {
+    pub(super) fn ensure_on_load_analyzed(&mut self, id: PackageId) -> Result<()> {
         if self.packages.is_external(id) || !self.image(id)?.index.lifecycle.on_load {
             return Ok(());
         }
 
+        self.summaries.suspend();
+        let analyzed = self.analyze_on_load(id);
+        self.summaries.resume();
+        analyzed
+    }
+
+    fn analyze_on_load(&mut self, id: PackageId) -> Result<()> {
         let lifecycle = Need::Lifecycle {
             package: id,
             hook: LifecycleHook::OnLoad,
