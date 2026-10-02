@@ -118,6 +118,63 @@ fn build(r_home: &Path, package: &str) {
     );
 }
 
+fn analyze_edit(r_home: &Path, package: &str) {
+    let (source, library) = provision(r_home, package);
+    let work = tempfile::tempdir().expect("edit work directory");
+    let edited = work.path().join(package);
+    copy_directory(&source, &edited);
+    let cache = work.path().join("cache");
+    let timed = |label: &str| {
+        let start = Instant::now();
+        let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+            .arg("analyze")
+            .arg(&edited)
+            .arg("--lib")
+            .arg(&library)
+            .env("SLINKER_CACHE_DIR", &cache)
+            .output()
+            .expect("run slinker analyze");
+        let elapsed = start.elapsed();
+        common::assert_success(&result, &format!("slinker analyze {package}"));
+        println!(
+            "{:<32} {:>9.3} s",
+            format!("analyze {package} {label}"),
+            elapsed.as_secs_f64()
+        );
+    };
+    timed("source cold");
+    timed("source warm");
+    let entry = std::fs::read_dir(edited.join("R"))
+        .expect("package R directory")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .min()
+        .expect("a source file to edit");
+    let mut text = std::fs::read_to_string(&entry).expect("read source file");
+    text.push_str(
+        "
+.slinker_bench_edit <- function() NULL
+",
+    );
+    std::fs::write(&entry, text).expect("edit source file");
+    timed("one-edit");
+}
+
+fn copy_directory(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create directory");
+    for entry in std::fs::read_dir(from)
+        .expect("list directory")
+        .filter_map(std::result::Result::ok)
+    {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_directory(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy file");
+        }
+    }
+}
+
 fn r_string(value: impl AsRef<OsStr>) -> String {
     let value = value.as_ref().to_string_lossy().replace('\\', "/");
     format!("\"{}\"", value.replace('"', "\\\""))
@@ -128,6 +185,7 @@ fn run() {
     analyze_installed(&r_home);
     for package in BUILT {
         build(&r_home, package);
+        analyze_edit(&r_home, package);
     }
 }
 

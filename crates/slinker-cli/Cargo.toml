@@ -23,6 +23,10 @@ which.workspace = true
 criterion.workspace = true
 tempfile.workspace = true
 
+[[test]]
+name = "schedule_determinism"
+harness = false
+
 [[bench]]
 name = "micro"
 harness = false
