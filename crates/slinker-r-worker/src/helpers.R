@@ -20,7 +20,7 @@
   info <- new.env(hash = TRUE, parent = baseenv())
   info$spec <- c(name = package, version = version)
   assign(".__NAMESPACE__.", info, envir = image_env)
-  if (is.null(.Internal(getRegisteredNamespace(package)))) {
+  if (is.null(.getNamespace(package))) {
     .Internal(registerNamespace(package, image_env))
   }
   code_db <- file.path(root, "R", package)
@@ -338,7 +338,7 @@
 
 .slinker_payloads <- function(images, packages, registered, sources, names) {
   for (index in seq_along(images)) {
-    if (!identical(.Internal(getRegisteredNamespace(packages[[index]])), images[[index]])) {
+    if (!identical(.getNamespace(packages[[index]]), images[[index]])) {
       stop(
         sprintf("namespace %s is not registered as its installed image", packages[[index]]),
         call. = FALSE

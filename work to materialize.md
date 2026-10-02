@@ -83,22 +83,15 @@ acceptance cases here.
 
 ---
 
-## Track D: Build infrastructure and frontend
-
-- Linux worker startup: the worker now exports `R_SHARE_DIR`, `R_INCLUDE_DIR`, `R_DOC_DIR` as the R
-  launcher reports them. Confirm on Linux CI that `package 'methods' in options("defaultPackages") was
-  not found` is gone; no Linux R has run it yet.
-
 ## Track E: Retire heuristics
 
 - Invocation model: `InvocationModel` records direct calls and base
   `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` `FUN` uses with their forwarded `...`; any
   other retention of a binding (exports, S3 registrations and dispatch, lifecycle hooks, native
   callbacks, reflective names, namespace member access) marks it unclassified, and value
-  references are escapes. Still to record as invocations with their arguments: `do.call` with
-  literal `list()` arguments (which would keep a closed S3 generic closed, including through
-  `callables()`), S3 dispatch to methods, lifecycle hooks, native callbacks, and condition
-  handlers, `on.exit`, and finalizers. Narrowing unclassified retention to these typed
+  references are escapes. `do.call` with literal `list()` arguments is recorded with those
+  arguments. Still to record as invocations with their arguments: S3 dispatch to methods,
+  lifecycle hooks, native callbacks, and condition handlers, `on.exit`, and finalizers. Narrowing unclassified retention to these typed
   invocations is what lets default-argument specialization cover more than directly called and
   applied functions.
 

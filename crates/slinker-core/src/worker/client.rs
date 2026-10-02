@@ -337,17 +337,17 @@ impl WorkerClient {
             path: "<r-worker-stdin>".into(),
             source,
         })?;
-        let mut line = String::new();
+        let mut line = Vec::new();
         let waiting = std::time::Instant::now();
         loop {
             let bytes = self
                 .output
-                .read_line(&mut line)
+                .read_until(b'\n', &mut line)
                 .map_err(|source| Error::Io {
                     path: self.protocol_path.to_path_buf(),
                     source,
                 })?;
-            if bytes != 0 && line.ends_with('\n') {
+            if bytes != 0 && line.ends_with(b"\n") {
                 break;
             }
             if let Some(status) = self.child.try_wait().ok().flatten() {
@@ -361,9 +361,10 @@ impl WorkerClient {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
-        serde_json::from_str(&line).map_err(|error| {
+        serde_json::from_slice(&line).map_err(|error| {
             Error::Analysis(format!(
-                "invalid Harp worker response: {error}; payload {line:?}"
+                "invalid Harp worker response: {error}; payload {:?}",
+                String::from_utf8_lossy(&line)
             ))
         })
     }
