@@ -1,4 +1,4 @@
-use crate::package::BindingName;
+use crate::package::{Atom, BindingName};
 use crate::syntax::facts::{
     ActiveBindingDef, CallSite, CalleeKind, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef,
     NameRefKind, NamespaceEnumeration, NamespaceInfoRead, NamespaceInfoReceiver, PackageRef,
@@ -74,7 +74,7 @@ struct LiveCall {
 #[derive(Debug, Clone)]
 struct SuperAssignmentParts {
     span: TextRange,
-    value_symbol: Option<(String, usize, usize)>,
+    value_symbol: Option<(Atom, usize, usize)>,
 }
 
 impl OakParser {
@@ -115,38 +115,43 @@ impl OakParser {
 }
 
 fn evaluated_quotation_text(text: &str, root: &RRoot, context: &OakParseContext) -> Option<String> {
+    if !text.contains("eval") {
+        return None;
+    }
     let mut blanks = Vec::new();
     for call in root.syntax().descendants().filter_map(RCall::cast) {
-        let Some((callee, callee_range)) = base_callee(&call, context) else {
+        let Some(callee) = base_callee(&call, context) else {
             continue;
         };
+        let callee_range = callee.range.clone();
         let Some(argument) = sole_positional_argument(&call) else {
             continue;
         };
-        match callee.as_str() {
+        match callee.name() {
             "evalq" => blanks.push(callee_range),
             "eval" => {
                 let AnyRExpression::RCall(quotation) = argument else {
                     continue;
                 };
-                let Some((quoter, quoter_range)) = base_callee(&quotation, context) else {
+                let Some(quoter) = base_callee(&quotation, context) else {
                     continue;
                 };
-                if !matches!(quoter.as_str(), "quote" | "bquote")
+                let quoter_range = quoter.range.clone();
+                if !matches!(quoter.name(), "quote" | "bquote")
                     || sole_positional_argument(&quotation).is_none()
                 {
                     continue;
                 }
                 blanks.extend([callee_range, quoter_range]);
-                if quoter == "bquote" {
+                if quoter.name() == "bquote" {
                     blanks.extend(
                         quotation
                             .syntax()
                             .descendants()
                             .filter_map(RCall::cast)
                             .filter_map(|splice| identifier_callee(&splice))
-                            .filter(|(name, _)| name == ".")
-                            .map(|(_, range)| range),
+                            .filter(|callee| callee.name() == ".")
+                            .map(|callee| callee.range),
                     );
                 }
             }
@@ -163,13 +168,23 @@ fn evaluated_quotation_text(text: &str, root: &RRoot, context: &OakParseContext)
     Some(String::from_utf8(bytes).expect("ASCII identifiers are replaced by ASCII spaces"))
 }
 
-fn data_mask_ranges(root: &RRoot, context: &OakParseContext) -> Vec<std::ops::Range<usize>> {
+fn data_mask_ranges(
+    text: &str,
+    root: &RRoot,
+    context: &OakParseContext,
+) -> Vec<std::ops::Range<usize>> {
+    if !["with", "subset", "transform"]
+        .iter()
+        .any(|callee| text.contains(callee))
+    {
+        return Vec::new();
+    }
     root.syntax()
         .descendants()
         .filter_map(RCall::cast)
         .filter(|call| {
-            base_callee(call, context).is_some_and(|(name, _)| {
-                matches!(name.as_str(), "with" | "within" | "subset" | "transform")
+            base_callee(call, context).is_some_and(|callee| {
+                matches!(callee.name(), "with" | "within" | "subset" | "transform")
             })
         })
         .filter_map(|call| call.arguments().ok())
@@ -258,15 +273,17 @@ fn pinned_defaults(
         .filter_map(|parameter| {
             let name = ast_text(text, &parameter.name().ok()?);
             let default = parameter.default()?.value().ok()?;
-            let Some(StaticArg::String(value)) = static_arg(&ast_text(text, &default)) else {
+            let Some(StaticArg::String(value)) = static_arg(ast_str(text, &default)) else {
                 return None;
             };
             let rebound = effects.iter().any(|effect| {
                 effect.kind == SyntaxEffectKind::SuperAssignment
                     && effect.target.as_deref() == Some(name.as_str())
             });
-            (!rebound && definition_count(index, &name) == 1)
-                .then_some(PinnedDefault { name, value })
+            (!rebound && definition_count(index, &name) == 1).then_some(PinnedDefault {
+                name: Atom::from(name),
+                value,
+            })
         })
         .collect()
 }
@@ -298,22 +315,30 @@ fn is_dots_element(name: &str) -> bool {
         .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-fn identifier_callee(call: &RCall) -> Option<(String, std::ops::Range<usize>)> {
+struct Callee {
+    token: air_r_syntax::RSyntaxToken,
+    range: std::ops::Range<usize>,
+}
+
+impl Callee {
+    fn name(&self) -> &str {
+        self.token.text_trimmed()
+    }
+}
+
+fn identifier_callee(call: &RCall) -> Option<Callee> {
     let AnyRExpression::RIdentifier(identifier) = call.function().ok()? else {
         return None;
     };
     let range = identifier.syntax().text_trimmed_range();
-    Some((
-        identifier.syntax().text_trimmed().to_string(),
-        text_offset(range.start())..text_offset(range.end()),
-    ))
+    Some(Callee {
+        token: identifier.name_token().ok()?,
+        range: text_offset(range.start())..text_offset(range.end()),
+    })
 }
 
-fn base_callee(
-    call: &RCall,
-    context: &OakParseContext,
-) -> Option<(String, std::ops::Range<usize>)> {
-    identifier_callee(call).filter(|(name, _)| context.resolves_to_base(name))
+fn base_callee(call: &RCall, context: &OakParseContext) -> Option<Callee> {
+    identifier_callee(call).filter(|callee| context.resolves_to_base(callee.name()))
 }
 
 struct LexicalScopes {
@@ -355,7 +380,7 @@ impl LexicalScopes {
             .resolve(name, scope)
             .map(|(owner, _, _)| LexicalBindingId {
                 defining_scope: self.ids[&owner],
-                name: name.to_owned(),
+                name: Atom::from(name),
             })
     }
 
@@ -484,8 +509,8 @@ fn translate_index(
     ParsedRFile {
         expressions: vec![ParsedExpression {
             span: Span::new(source, 0, text.len()),
-            parameters,
-            used_parameters,
+            parameters: parameters.into_iter().map(Atom::from).collect(),
+            used_parameters: used_parameters.into_iter().map(Atom::from).collect(),
             pinned_defaults,
             references,
             package_refs,
@@ -528,7 +553,7 @@ fn collect_namespace_info_reads(
                 span: ast_span(&source, &expression),
             });
         } else if let AnyRExpression::RIdentifier(_) = &expression
-            && unquoted(&ast_text(text, &expression)) == NAMESPACE_INFO
+            && unquoted(ast_str(text, &expression)) == NAMESPACE_INFO
             && let Some(field) = extracted_field(text, &expression)
         {
             reads.push(NamespaceInfoRead {
@@ -548,7 +573,7 @@ fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpress
         {
             Some((
                 extract.left().ok()?,
-                unquoted(&ast_text(text, &extract.right().ok()?)),
+                unquoted(ast_str(text, &extract.right().ok()?)),
             ))
         }
         AnyRExpression::RSubset2(subset) => {
@@ -557,8 +582,10 @@ fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpress
             if arguments.next().is_some() {
                 return None;
             }
-            match static_arg(ast_text(text, &index).trim())? {
-                StaticArg::String(member) => Some((subset.function().ok()?, member)),
+            match static_arg(ast_str(text, &index).trim())? {
+                StaticArg::String(member) => {
+                    Some((subset.function().ok()?, member.as_str().to_owned()))
+                }
                 StaticArg::Symbol(_) => None,
             }
         }
@@ -577,14 +604,14 @@ fn namespace_info_receiver(text: &str, receiver: &AnyRExpression) -> NamespaceIn
         return NamespaceInfoReceiver::Computed;
     };
     let named = call.function().ok().is_some_and(|function| {
-        let callee = ast_text(text, &function);
+        let callee = ast_str(text, &function);
         matches!(
             callee.trim_start_matches("base::"),
             "asNamespace" | "getNamespace"
         )
     });
     match sole_positional_argument(call)
-        .and_then(|argument| static_arg(ast_text(text, &argument).trim()))
+        .and_then(|argument| static_arg(ast_str(text, &argument).trim()))
     {
         Some(StaticArg::String(package)) if named => {
             NamespaceInfoReceiver::Namespace(package.into())
@@ -694,7 +721,7 @@ fn name_references(
     index: &SemanticIndex,
     live_uses: &[LiveUse],
 ) -> Vec<NameRef> {
-    let data_masks = data_mask_ranges(root, context);
+    let data_masks = data_mask_ranges(text, root, context);
     live_uses
         .iter()
         .filter_map(|live_use| {
@@ -753,14 +780,14 @@ fn lexical_calls(
         let (scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
         live_calls.push(LiveCall {
             site: CallSite {
-                callee: live_use.name.clone(),
+                callee: Atom::from(live_use.name.as_str()),
                 callee_kind: live_use.callee_kind,
                 qualified_package: None,
                 args,
                 arg_names: raw
                     .args
                     .iter()
-                    .map(|argument| argument.name.clone())
+                    .map(|argument| argument.name.as_deref().map(Atom::from))
                     .collect(),
                 arg_spans: argument_spans(source, &raw.args),
                 local_closure_args: local_closure_arguments(text, index, live_uses, &raw.args),
@@ -829,14 +856,14 @@ fn namespace_access_facts(
             let (lexical_scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
             live_calls.push(LiveCall {
                 site: CallSite {
-                    callee: access.symbol().to_owned(),
+                    callee: Atom::from(access.symbol()),
                     callee_kind: CalleeKind::DefinitelyExternal,
-                    qualified_package: Some(access.package().to_owned()),
+                    qualified_package: Some(Atom::from(access.package())),
                     args,
                     arg_names: raw
                         .args
                         .iter()
-                        .map(|argument| argument.name.clone())
+                        .map(|argument| argument.name.as_deref().map(Atom::from))
                         .collect(),
                     arg_spans: argument_spans(source, &raw.args),
                     local_closure_args: local_closure_arguments(text, index, live_uses, &raw.args),
@@ -913,7 +940,7 @@ fn binary_operator_facts(
         let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &args);
         live_calls.push(LiveCall {
             site: CallSite {
-                callee: operator.clone(),
+                callee: Atom::from(operator.as_str()),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
                 args,
@@ -938,14 +965,14 @@ fn binary_operator_facts(
 fn suppress_superassignment_references(
     effects: &mut [SyntaxEffect],
     references: &mut Vec<NameRef>,
-    suppressed_reference_spans: &[(String, usize, usize)],
+    suppressed_reference_spans: &[(Atom, usize, usize)],
 ) {
-    let is_suppressed = |reference: &NameRef, (name, start, end): &(String, usize, usize)| {
+    let is_suppressed = |reference: &NameRef, (name, start, end): &(Atom, usize, usize)| {
         reference.name == *name && reference.span.start == *start && reference.span.end == *end
     };
     for effect in effects.iter_mut() {
         let span = &effect.span;
-        let free = |symbol: &String| {
+        let free = |symbol: &Atom| {
             suppressed_reference_spans.iter().any(|value| {
                 value.0 == *symbol
                     && span.start <= value.1
@@ -973,6 +1000,18 @@ fn ast_span(source: &SourceId, node: &impl AstNode<Language = air_r_syntax::RLan
         text_offset(range.start()),
         text_offset(range.end()),
     )
+}
+
+fn ast_str<'a>(text: &'a str, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> &'a str {
+    let span = node.syntax().text_trimmed_range();
+    &text[text_offset(span.start())..text_offset(span.end())]
+}
+
+fn ast_atom(
+    text: &str,
+    node: &impl AstNode<Language = air_r_syntax::RLanguage>,
+) -> crate::package::Atom {
+    crate::package::Atom::from(ast_str(text, node))
 }
 
 fn ast_text(text: &str, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> String {
@@ -1181,7 +1220,7 @@ fn environment_target(
     aliases: &BTreeMap<String, StaticEnvironment>,
 ) -> Option<StaticEnvironment> {
     if let Some(StaticArg::Symbol(name)) = &argument.static_arg
-        && let Some(target) = aliases.get(name)
+        && let Some(target) = aliases.get(name.as_str())
     {
         return Some(target.clone());
     }
@@ -1264,7 +1303,7 @@ fn collect_namespace_enumerations(
             continue;
         };
         let environment = match &argument.static_arg {
-            Some(StaticArg::Symbol(name)) => aliases.get(name).cloned(),
+            Some(StaticArg::Symbol(name)) => aliases.get(name.as_str()).cloned(),
             _ => calls
                 .iter()
                 .find(|nested| nested.site.span.range() == argument.value)
@@ -1288,7 +1327,7 @@ fn collect_superassignments(
     function_regions: &[FunctionRegion],
     for_regions: &[ForRegion],
     if_regions: &[IfRegion],
-) -> (Vec<SyntaxEffect>, Vec<(String, usize, usize)>) {
+) -> (Vec<SyntaxEffect>, Vec<(Atom, usize, usize)>) {
     let mut effects = Vec::new();
     let mut suppressed = Vec::new();
 
@@ -1333,7 +1372,7 @@ fn collect_superassignments(
             );
             effects.push(SyntaxEffect {
                 kind: SyntaxEffectKind::SuperAssignment,
-                target: Some(target),
+                target: Some(Atom::from(target)),
                 target_enclosing_local,
                 value_symbol,
                 phase: phase_for_scope(index, scope),
@@ -1521,7 +1560,7 @@ fn static_first_string(call: &CallSite) -> Option<&str> {
 fn named_static_string(arguments: &[RawArgument], name: &str) -> Option<String> {
     arguments.iter().find_map(|argument| {
         (argument.name.as_deref() == Some(name)).then(|| match &argument.static_arg {
-            Some(StaticArg::String(value)) => Some(value.clone()),
+            Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
             _ => None,
         })?
     })
@@ -1649,7 +1688,7 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
         let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &[]);
         live_calls.push(LiveCall {
             site: CallSite {
-                callee,
+                callee: Atom::from(callee),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: qualified.then(|| "base".into()),
                 args: Vec::new(),
@@ -1713,10 +1752,10 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
                             target = extract.left().ok();
                         }
                         AnyRExpression::RCall(call) => {
-                            let Some((name, _)) = identifier_callee(call) else {
+                            let Some(callee) = identifier_callee(call) else {
                                 break;
                             };
-                            record(format!("{name}<-"), false, &current);
+                            record(format!("{}<-", callee.name()), false, &current);
                             target = call
                                 .arguments()
                                 .ok()

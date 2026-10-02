@@ -19,6 +19,11 @@ use slinker_core::build::{BuildReport, PreflightError, PureRStatic, materialize}
 use slinker_core::package::{BindingName, PackageName};
 use slinker_core::package::{PackageLocator, tree_digest};
 
+#[cfg(feature = "profile")]
+#[global_allocator]
+static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
+    slinker_core::profile::heap::CountingAllocator;
+
 mod cache_command;
 mod session;
 
@@ -219,6 +224,10 @@ impl UserCommand {
 }
 
 fn main() -> ExitCode {
+    #[cfg(feature = "profile")]
+    if slinker_core::profile::heap::sampling_requested() {
+        slinker_core::profile::heap::enable_site_sampling();
+    }
     match Cli::parse().command {
         Command::RWorker { protocol } => report(
             slinker_r_worker::run(&protocol).map_err(Into::into),

@@ -11,7 +11,7 @@ use super::summary::{Advance, Effect, SummaryKey};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId};
 use crate::package::{
-    BindingName, ClosureSource, EnvironmentLabel, MemberPath, PackageId, PackageImage,
+    Atom, BindingName, ClosureSource, EnvironmentLabel, MemberPath, PackageId, PackageImage,
     PackageProvider,
 };
 use crate::profile::{self, Counter, Probe};
@@ -32,13 +32,13 @@ pub(super) enum AbstractValue {
     Null,
     Logical(bool),
     Integer(i64),
-    String(String),
+    String(Atom),
     Vector(Vec<AbstractValue>),
     Object(ObjectId),
     Function {
-        parameters: Vec<String>,
-        body: ConstructionExpr,
-        captures: BTreeMap<String, AbstractValue>,
+        parameters: Arc<[Atom]>,
+        body: Arc<ConstructionExpr>,
+        captures: BTreeMap<Atom, AbstractValue>,
     },
 }
 
@@ -47,12 +47,12 @@ pub(super) struct ConstructionCallKey {
     node: NodeId,
     package: PackageId,
     owner: SourceKey,
-    arguments: Vec<(Option<String>, AbstractValue)>,
+    arguments: Vec<(Option<Atom>, AbstractValue)>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ExecutionState {
-    pub(super) locals: BTreeMap<String, AbstractValue>,
+    pub(super) locals: BTreeMap<Atom, AbstractValue>,
 }
 
 impl Lattice for AbstractValue {
@@ -178,7 +178,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         expressions: &[ConstructionExpr],
     ) -> Result<()> {
         let mut state = ExecutionState::default();
-        for expression in expressions {
+        for expression in expressions.iter() {
             if self
                 .evaluate_construction(context, &mut state, expression)?
                 .returned
@@ -218,7 +218,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             )),
             ConstructionExprKind::Sequence { expressions } => {
                 let mut outcome = ExecutionOutcome::value(AbstractValue::Null);
-                for expression in expressions {
+                for expression in expressions.iter() {
                     outcome = self.evaluate_construction(context, state, expression)?;
                     if outcome.returned {
                         break;
@@ -294,7 +294,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ConstructionExprKind::Function { parameters, body } => {
                 Ok(ExecutionOutcome::value(AbstractValue::Function {
                     parameters: parameters.clone(),
-                    body: body.as_ref().clone(),
+                    body: Arc::clone(body),
                     captures: state.locals.clone(),
                 }))
             }
@@ -614,7 +614,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         span: &Span,
     ) -> Result<ExecutionOutcome> {
         let mut arguments = Vec::with_capacity(call.arguments.len());
-        for argument in &call.arguments {
+        for argument in call.arguments.iter() {
             arguments.push(match &argument.value {
                 Some(value) => self.evaluate_construction(context, state, value)?.value,
                 None => AbstractValue::Unknown,
@@ -680,9 +680,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
-        parameters: &[String],
+        parameters: &[Atom],
         body: &ConstructionExpr,
-        captures: BTreeMap<String, AbstractValue>,
+        captures: BTreeMap<Atom, AbstractValue>,
     ) -> Result<ExecutionOutcome> {
         let mut nested = ExecutionState { locals: captures };
         bind_construction_arguments(&mut nested, parameters, call, arguments);
@@ -1165,7 +1165,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 if name.is_empty() || name.chars().any(|character| "$[]".contains(character)) {
                     return None;
                 }
-                names.push(AbstractValue::String(name.to_owned()));
+                names.push(AbstractValue::String(Atom::from(name)));
             }
             Some(names)
         })
@@ -1204,7 +1204,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let ConstructionExprKind::Sequence { expressions } = &body.kind else {
             return None;
         };
-        let [condition, result] = expressions.as_slice() else {
+        let [condition, result] = &expressions[..] else {
             return None;
         };
         if !matches!(
@@ -1337,7 +1337,7 @@ fn fold_paste0(arguments: &[AbstractValue]) -> AbstractValue {
                     output
                 })
         })
-        .map(AbstractValue::String)
+        .map(|text| AbstractValue::String(Atom::from(text)))
         .collect::<Vec<_>>();
     match values.as_slice() {
         [value] => value.clone(),
@@ -1379,9 +1379,9 @@ fn fold_strsplit(call: &ConstructionCall, arguments: &[AbstractValue]) -> Abstra
             .into_iter()
             .map(|input| {
                 let parts = input
-                    .split(separator)
+                    .split(separator.as_str())
                     .take(33)
-                    .map(|part| AbstractValue::String(part.to_owned()))
+                    .map(|part| AbstractValue::String(Atom::from(part)))
                     .collect::<Vec<_>>();
                 if parts.len() > 32 {
                     AbstractValue::Unknown
@@ -1420,7 +1420,7 @@ fn construction_argument<'a>(
 
 fn bind_construction_arguments(
     state: &mut ExecutionState,
-    parameters: &[String],
+    parameters: &[Atom],
     call: &ConstructionCall,
     values: &[AbstractValue],
 ) {
@@ -1498,14 +1498,15 @@ mod tests {
     use super::{ConstructionExpr, ConstructionExprKind};
     use crate::syntax::{SourceId, Span};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn function(parameter: &str) -> AbstractValue {
         AbstractValue::Function {
-            parameters: vec![parameter.to_owned()],
-            body: ConstructionExpr {
+            parameters: vec![crate::package::Atom::from(parameter)].into(),
+            body: Arc::new(ConstructionExpr {
                 kind: ConstructionExprKind::Null,
                 span: Span::new(SourceId(0), 0, 0),
-            },
+            }),
             captures: BTreeMap::new(),
         }
     }

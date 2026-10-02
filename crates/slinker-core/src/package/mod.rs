@@ -4,6 +4,7 @@ mod identity;
 mod image;
 mod index;
 mod inspection;
+mod intern;
 mod locator;
 mod names;
 mod store;
@@ -38,7 +39,7 @@ pub use store::{
 pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUniverse};
 
 pub use names::{
-    BindingName, ClassName, ComponentName, DataSetId, DatasetName, EnvironmentKind,
+    Atom, BindingName, ClassName, ComponentName, DataSetId, DatasetName, EnvironmentKind,
     EnvironmentLabel, ExportName, GenericLabel, GenericName, MemberPath, PackageName, ResourcePath,
     SymbolName,
 };

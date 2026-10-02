@@ -1,6 +1,7 @@
 use super::arguments::native_selector_span;
 use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
 use super::execute::ExecutionContext;
+use super::guarded::Guarded;
 use super::need::WorkKey;
 use super::object_world::{ClosureId, ObjectId};
 use super::parse_cache::ParseState;
@@ -872,15 +873,30 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let ParseRequest { source_key } = request;
         let key = (id, source_key.clone());
         if let Some(state) = self.parses.lock().state(&key) {
+            profile::count(Counter::ParseMemoHits);
             return Ok(match state {
                 ParseState::Parsed(parsed) => Some(Arc::clone(parsed)),
                 ParseState::Blocked => None,
             });
         }
+        profile::count(Counter::ParseMemoMisses);
         let Some(source) = self.admit_source(id, source_key, source_text)? else {
             return Ok(None);
         };
         let context = self.oak_parse_context(id, image, lexical_environment)?;
+        let flight = Arc::clone(
+            self.parse_flights
+                .lock()
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Guarded::default())),
+        );
+        let _flight = flight.lock();
+        if let Some(state) = self.parses.lock().state(&key) {
+            return Ok(match state {
+                ParseState::Parsed(parsed) => Some(Arc::clone(parsed)),
+                ParseState::Blocked => None,
+            });
+        }
         match OakParser.parse_binding_with_context(source, source_text.as_ref(), &context) {
             Ok(parsed) => {
                 let parsed = Arc::new(parsed);

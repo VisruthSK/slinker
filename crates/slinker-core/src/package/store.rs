@@ -34,7 +34,7 @@ pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v11";
 pub fn analysis_schema() -> &'static str {
     ANALYSIS_SCHEMA
 }
-const MAX_R_WORKERS: usize = 4;
+const MAX_R_WORKERS: usize = 2;
 const SOURCES_PER_WORKER: usize = 48;
 
 #[derive(Deserialize, Serialize)]

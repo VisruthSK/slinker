@@ -1,5 +1,6 @@
 use super::scan::static_arg;
-use super::{LiveCall, ast_span, ast_text};
+use super::{LiveCall, ast_atom, ast_span, ast_text};
+use crate::package::Atom;
 use crate::syntax::facts::{
     CalleeKind, ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
     ConstructionTarget, StaticArg,
@@ -9,6 +10,7 @@ use air_r_syntax::{
     AnyRExpression, RBinaryExpression, RCall, RFunctionDefinition, RIfStatement, RRoot,
 };
 use biome_rowan::{AstNode, AstNodeList, AstSeparatedList};
+use std::sync::Arc;
 
 pub(super) fn collect_construction(
     source: SourceId,
@@ -89,7 +91,7 @@ pub(super) fn construction_expr(
         AnyRExpression::RTrueExpression(_) => ConstructionExprKind::Logical { value: true },
         AnyRExpression::RFalseExpression(_) => ConstructionExprKind::Logical { value: false },
         AnyRExpression::RIdentifier(identifier) => ConstructionExprKind::Symbol {
-            name: identifier.name_token().ok()?.text_trimmed().to_owned(),
+            name: Atom::from(identifier.name_token().ok()?.text_trimmed()),
         },
         AnyRExpression::AnyRValue(_) => construction_value(text.get(span.start..span.end)?.trim()),
         AnyRExpression::RBracedExpressions(block) => ConstructionExprKind::Sequence {
@@ -109,13 +111,13 @@ pub(super) fn construction_expr(
             return construction_call(source, text, &call, span, calls);
         }
         AnyRExpression::RExtractExpression(extract) => ConstructionExprKind::Member {
-            object: Box::new(construction_expr(
+            object: Arc::new(construction_expr(
                 source,
                 text,
                 extract.left().ok()?,
                 calls,
             )?),
-            name: extract.right().ok().map(|name| ast_text(text, &name)),
+            name: extract.right().ok().map(|name| ast_atom(text, &name)),
         },
         AnyRExpression::RSubset2(subset) => {
             let index = subset
@@ -138,15 +140,15 @@ pub(super) fn construction_expr(
             construction_index(source, text, subset.function().ok()?, index, calls)?
         }
         AnyRExpression::RUnaryExpression(unary) => ConstructionExprKind::Call {
-            call: ConstructionCall {
-                callee: unary.operator().ok()?.text_trimmed().to_owned(),
+            call: Arc::new(ConstructionCall {
+                callee: Atom::from(unary.operator().ok()?.text_trimmed()),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: Some("base".into()),
-                arguments: vec![ConstructionArgument {
+                arguments: Arc::from([ConstructionArgument {
                     name: None,
                     value: construction_expr(source, text, unary.argument().ok()?, calls),
-                }],
-            },
+                }]),
+            }),
         },
         AnyRExpression::RIfStatement(statement) => {
             construction_if(source, text, &statement, calls)?
@@ -166,7 +168,7 @@ pub(super) fn construction_value(value: &str) -> ConstructionExprKind {
         ConstructionExprKind::Integer { value: integer }
     } else {
         ConstructionExprKind::Double {
-            value: value.to_owned(),
+            value: Atom::from(value),
         }
     }
 }
@@ -183,15 +185,15 @@ pub(super) fn construction_binary(
     Some(if operator == "<-" || operator == "=" {
         ConstructionExprKind::Assign {
             target: construction_target(source, text, left, calls),
-            value: Box::new(construction_expr(source, text, right, calls)?),
+            value: Arc::new(construction_expr(source, text, right, calls)?),
         }
     } else {
         ConstructionExprKind::Call {
-            call: ConstructionCall {
+            call: Arc::new(ConstructionCall {
                 qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
-                callee: operator,
+                callee: operator.into(),
                 callee_kind: CalleeKind::DefinitelyExternal,
-                arguments: vec![
+                arguments: Arc::from([
                     ConstructionArgument {
                         name: None,
                         value: construction_expr(source, text, left, calls),
@@ -200,8 +202,8 @@ pub(super) fn construction_binary(
                         name: None,
                         value: construction_expr(source, text, right, calls),
                     },
-                ],
-            },
+                ]),
+            }),
         }
     })
 }
@@ -235,9 +237,9 @@ pub(super) fn construction_call(
             span,
         });
     }
-    let callee = site.map_or_else(|| ast_text(text, &function), |site| site.callee.clone());
+    let callee = site.map_or_else(|| ast_atom(text, &function), |site| site.callee.clone());
     let kind = ConstructionExprKind::Call {
-        call: ConstructionCall {
+        call: Arc::new(ConstructionCall {
             callee,
             callee_kind: site.map_or(CalleeKind::DefinitelyLexical, |site| site.callee_kind),
             qualified_package: site.and_then(|site| site.qualified_package.clone()),
@@ -251,13 +253,13 @@ pub(super) fn construction_call(
                     name: argument
                         .name_clause()
                         .and_then(|clause| clause.name().ok())
-                        .map(|name| ast_text(text, &name)),
+                        .map(|name| ast_atom(text, &name)),
                     value: argument
                         .value()
                         .and_then(|value| construction_expr(source, text, value, calls)),
                 })
                 .collect(),
-        },
+        }),
     };
     Some(ConstructionExpr { kind, span })
 }
@@ -270,8 +272,8 @@ pub(super) fn construction_index(
     calls: &[LiveCall],
 ) -> Option<ConstructionExprKind> {
     Some(ConstructionExprKind::Index {
-        object: Box::new(construction_expr(source, text, object, calls)?),
-        index: Box::new(construction_expr(source, text, index, calls)?),
+        object: Arc::new(construction_expr(source, text, object, calls)?),
+        index: Arc::new(construction_expr(source, text, index, calls)?),
     })
 }
 
@@ -282,13 +284,13 @@ pub(super) fn construction_if(
     calls: &[LiveCall],
 ) -> Option<ConstructionExprKind> {
     Some(ConstructionExprKind::If {
-        condition: Box::new(construction_expr(
+        condition: Arc::new(construction_expr(
             source,
             text,
             statement.condition().ok()?,
             calls,
         )?),
-        consequence: Box::new(construction_expr(
+        consequence: Arc::new(construction_expr(
             source,
             text,
             statement.consequence().ok()?,
@@ -298,7 +300,7 @@ pub(super) fn construction_if(
             .else_clause()
             .and_then(|clause| clause.alternative().ok())
             .and_then(|alternative| construction_expr(source, text, alternative, calls))
-            .map(Box::new),
+            .map(Arc::new),
     })
 }
 
@@ -316,9 +318,9 @@ pub(super) fn construction_function(
             .iter()
             .filter_map(std::result::Result::ok)
             .filter_map(|parameter| parameter.name().ok())
-            .map(|name| ast_text(text, &name))
+            .map(|name| ast_atom(text, &name))
             .collect(),
-        body: Box::new(construction_expr(
+        body: Arc::new(construction_expr(
             source,
             text,
             function.body().ok()?,
@@ -340,19 +342,19 @@ pub(super) fn construction_target(
                 .ok()
                 .map_or(ConstructionTarget::Unknown, |name| {
                     ConstructionTarget::Local {
-                        name: name.text_trimmed().to_owned(),
+                        name: Atom::from(name.text_trimmed()),
                     }
                 })
         }
         AnyRExpression::RExtractExpression(extract) => ConstructionTarget::Member {
-            object: Box::new(
+            object: Arc::new(
                 extract
                     .left()
                     .ok()
                     .and_then(|object| construction_expr(source, text, object, calls))
                     .unwrap_or_else(|| unknown_construction(source, &extract)),
             ),
-            name: extract.right().ok().map(|name| ast_text(text, &name)),
+            name: extract.right().ok().map(|name| ast_atom(text, &name)),
         },
         AnyRExpression::RSubset2(subset) => {
             let name = subset
@@ -372,7 +374,7 @@ pub(super) fn construction_target(
                     _ => None,
                 });
             ConstructionTarget::Member {
-                object: Box::new(
+                object: Arc::new(
                     subset
                         .function()
                         .ok()
@@ -401,7 +403,7 @@ pub(super) fn construction_target(
                 .and_then(|closure| construction_expr(source, text, closure, calls));
             closure.map_or(ConstructionTarget::Unknown, |closure| {
                 ConstructionTarget::ClosureEnvironment {
-                    closure: Box::new(closure),
+                    closure: Arc::new(closure),
                 }
             })
         }

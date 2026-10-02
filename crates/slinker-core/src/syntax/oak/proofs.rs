@@ -563,7 +563,7 @@ pub(super) fn prior_membership_guard_values(
             let values = split_arguments(&condition, open + 1, close)
                 .into_iter()
                 .map(|argument| match argument.static_arg {
-                    Some(StaticArg::String(value)) => Some(value),
+                    Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
                     Some(StaticArg::Symbol(_)) | None => None,
                 })
                 .collect::<Option<BTreeSet<_>>>()?;

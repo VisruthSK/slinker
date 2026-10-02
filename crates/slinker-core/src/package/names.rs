@@ -1,3 +1,4 @@
+use super::intern::intern;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::fmt;
@@ -5,13 +6,20 @@ use std::ops::Deref;
 
 macro_rules! name_type {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
         #[serde(transparent)]
-        pub struct $name(String);
+        pub struct $name(std::sync::Arc<str>);
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+                Ok(Self(intern(&text)))
+            }
+        }
 
         impl $name {
             pub fn new(name: impl Into<String>) -> Self {
-                Self(name.into())
+                Self(intern(&name.into()))
             }
 
             pub fn as_str(&self) -> &str {
@@ -41,37 +49,37 @@ macro_rules! name_type {
 
         impl PartialEq<str> for $name {
             fn eq(&self, other: &str) -> bool {
-                self.0 == other
+                &*self.0 == other
             }
         }
 
         impl PartialEq<&str> for $name {
             fn eq(&self, other: &&str) -> bool {
-                self.0 == *other
+                &*self.0 == *other
             }
         }
 
         impl PartialEq<String> for $name {
             fn eq(&self, other: &String) -> bool {
-                &self.0 == other
+                &*self.0 == other.as_str()
             }
         }
 
         impl PartialEq<$name> for str {
             fn eq(&self, other: &$name) -> bool {
-                self == other.0
+                self == &*other.0
             }
         }
 
         impl PartialEq<$name> for &str {
             fn eq(&self, other: &$name) -> bool {
-                *self == other.0
+                *self == &*other.0
             }
         }
 
         impl PartialEq<$name> for String {
             fn eq(&self, other: &$name) -> bool {
-                *self == other.0
+                *self == &*other.0
             }
         }
 
@@ -83,19 +91,19 @@ macro_rules! name_type {
 
         impl From<String> for $name {
             fn from(name: String) -> Self {
-                Self(name)
+                Self(intern(&name))
             }
         }
 
         impl From<&String> for $name {
             fn from(name: &String) -> Self {
-                Self(name.clone())
+                Self(intern(name))
             }
         }
 
         impl From<&str> for $name {
             fn from(name: &str) -> Self {
-                Self(name.to_owned())
+                Self(intern(name))
             }
         }
     };
@@ -113,6 +121,7 @@ name_type!(DataSetId);
 name_type!(ExportName);
 name_type!(GenericLabel);
 name_type!(EnvironmentLabel);
+name_type!(Atom);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnvironmentKind<'a> {
@@ -127,7 +136,7 @@ pub enum EnvironmentKind<'a> {
 
 impl EnvironmentLabel {
     pub fn namespace(package: &str) -> Self {
-        Self(format!("namespace:{package}"))
+        Self(intern(&format!("namespace:{package}")))
     }
 
     pub fn base() -> Self {
@@ -139,19 +148,19 @@ impl EnvironmentLabel {
     }
 
     pub fn private(key: impl fmt::Display) -> Self {
-        Self(format!("private:{key}"))
+        Self(intern(&format!("private:{key}")))
     }
 
     pub fn derived(sequence: usize) -> Self {
-        Self(format!("derived:{sequence}"))
+        Self(intern(&format!("derived:{sequence}")))
     }
 
     pub fn unsupported(detail: &str) -> Self {
-        Self(format!("unsupported:{detail}"))
+        Self(intern(&format!("unsupported:{detail}")))
     }
 
     pub fn kind(&self) -> EnvironmentKind<'_> {
-        let label = self.0.as_str();
+        let label = &*self.0;
         if let Some(package) = label.strip_prefix("namespace:") {
             EnvironmentKind::Namespace(package)
         } else if let Some(detail) = label.strip_prefix("unsupported:") {
@@ -190,16 +199,16 @@ impl MemberPath {
 
     #[must_use]
     pub fn field(&self, name: &str) -> Self {
-        Self(format!("{}${name}", self.0))
+        Self(intern(&format!("{}${name}", self.0)))
     }
 
     #[must_use]
     pub fn element(&self, position: usize) -> Self {
-        Self(format!("{}[[{position}]]", self.0))
+        Self(intern(&format!("{}[[{position}]]", self.0)))
     }
 
     pub fn is_root(&self) -> bool {
-        self.0 == "$"
+        &*self.0 == "$"
     }
 
     pub fn direct_field(&self) -> Option<&str> {
@@ -214,3 +223,54 @@ impl MemberPath {
             .flatten()
     }
 }
+
+macro_rules! from_atom {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl From<Atom> for $name {
+                fn from(atom: Atom) -> Self {
+                    Self(atom.0)
+                }
+            }
+
+            impl From<&Atom> for $name {
+                fn from(atom: &Atom) -> Self {
+                    Self(std::sync::Arc::clone(&atom.0))
+                }
+            }
+
+            impl From<$name> for Atom {
+                fn from(name: $name) -> Self {
+                    Self(name.0)
+                }
+            }
+
+            impl From<&$name> for Atom {
+                fn from(name: &$name) -> Self {
+                    Self(std::sync::Arc::clone(&name.0))
+                }
+            }
+
+            impl PartialEq<Atom> for $name {
+                fn eq(&self, other: &Atom) -> bool {
+                    *self.0 == *other.0
+                }
+            }
+        )+
+    };
+}
+
+from_atom!(
+    BindingName,
+    ClassName,
+    GenericName,
+    PackageName,
+    ComponentName,
+    DatasetName,
+    ResourcePath,
+    SymbolName,
+    DataSetId,
+    ExportName,
+    GenericLabel,
+    EnvironmentLabel,
+);

@@ -1,3 +1,4 @@
+use crate::package::Atom;
 use crate::syntax::facts::StaticArg;
 use crate::syntax::source::{SourceId, Span, TextRange};
 use std::collections::BTreeSet;
@@ -199,7 +200,7 @@ pub(super) fn static_symbol_range(
     text: &str,
     start: usize,
     end: usize,
-) -> Option<(String, usize, usize)> {
+) -> Option<(Atom, usize, usize)> {
     let start = skip_trivia(text, start);
     let end = trim_end_offset(text, end);
     let value = text.get(start..end)?;
@@ -389,9 +390,9 @@ pub(super) fn static_arg(value: &str) -> Option<StaticArg> {
         return None;
     }
     if let Some(string) = static_string(value) {
-        return Some(StaticArg::String(string));
+        return Some(StaticArg::String(Atom::from(string)));
     }
-    static_symbol(value).map(StaticArg::Symbol)
+    static_symbol(value).map(|symbol| StaticArg::Symbol(Atom::from(symbol)))
 }
 
 pub(super) fn static_string(value: &str) -> Option<String> {

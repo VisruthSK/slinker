@@ -3,7 +3,7 @@ use super::lattice::{Bounded, Lattice};
 use super::need::Need;
 use super::object_world::{EnvironmentId, GraphStamps};
 use crate::analysis::EdgeKind;
-use crate::package::{BindingName, EnvironmentLabel, PackageId};
+use crate::package::{Atom, BindingName, EnvironmentLabel, PackageId};
 use crate::profile::{self, Counter};
 use crate::syntax::{SourceKey, Span};
 use std::cell::RefCell;
@@ -20,7 +20,7 @@ pub(super) type WriteSite = (EnvironmentId, Option<BindingName>);
 pub(super) struct SummaryKey {
     pub(super) package: PackageId,
     pub(super) owner: SourceKey,
-    pub(super) arguments: Vec<(Option<String>, AbstractValue)>,
+    pub(super) arguments: Vec<(Option<Atom>, AbstractValue)>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,7 +32,7 @@ pub(super) enum Effect {
         span: Option<Span>,
     },
     ReflectiveName {
-        name: String,
+        name: Atom,
         span: Span,
         lexical_environment: EnvironmentLabel,
     },

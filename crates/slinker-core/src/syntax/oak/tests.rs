@@ -341,7 +341,11 @@ fn superassigned_value_is_a_dependency_only_when_free() {
             .all(|effect| *effect == (SyntaxEffectKind::SuperAssignment, None))
     );
     assert!(free.iter().all(|effect| {
-        *effect == (SyntaxEffectKind::SuperAssignment, Some("other".to_owned()))
+        *effect
+            == (
+                SyntaxEffectKind::SuperAssignment,
+                Some(crate::package::Atom::from("other")),
+            )
     }));
 }
 

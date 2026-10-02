@@ -4,8 +4,8 @@ use super::s3::{CallableId, callable_target};
 use super::state::{AnalyzerState, ParsedSite};
 use crate::Result;
 use crate::analysis::NodeId;
-use crate::package::PackageId;
 use crate::package::PackageProvider;
+use crate::package::{Atom, PackageId};
 use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, Span, StaticArg};
 use std::collections::{HashMap, HashSet};
 
@@ -13,7 +13,7 @@ pub(super) type ClassDomain = Option<Vec<Vec<String>>>;
 
 #[derive(Clone, Debug)]
 pub(super) struct InvocationArgument {
-    pub(super) name: Option<String>,
+    pub(super) name: Option<Atom>,
     pub(super) classes: ClassDomain,
     forwards_dots: bool,
 }

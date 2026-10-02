@@ -244,7 +244,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ),
             _ => false,
         };
-        Ok(base.then(|| name.clone()))
+        Ok(base.then(|| name.as_str().to_owned()))
     }
 
     fn external_callee(

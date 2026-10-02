@@ -4,9 +4,9 @@ use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
-use crate::package::EnvironmentLabel;
 use crate::package::PackageAvailability;
 use crate::package::PackageImage;
+use crate::package::{Atom, EnvironmentLabel};
 use crate::package::{
     BindingName, ClassName, DispatchCallee, GenericName, ImportSpec, PackageId, PackageProvider,
 };
@@ -223,7 +223,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &self,
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
-        parameters: Option<&[String]>,
+        parameters: Option<&[Atom]>,
         call: &CallSite,
     ) -> Result<()> {
         let (from, current, binding) = (site.node, site.package, site.binding);
@@ -237,7 +237,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let generics = match call.args.first() {
-            Some(Some(StaticArg::String(generic))) => BTreeSet::from([generic.clone()]),
+            Some(Some(StaticArg::String(generic))) => BTreeSet::from([generic.as_str().to_owned()]),
             Some(Some(StaticArg::Symbol(_))) => {
                 declared_strings(parsed, call, &["generic", "object"], "generic")
                     .unwrap_or_default()
@@ -264,7 +264,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn observe_generic(
         &self,
         site: ParsedSite<'_>,
-        parameters: Option<&[String]>,
+        parameters: Option<&[Atom]>,
         call: &CallSite,
         generic: &str,
     ) -> Result<()> {
@@ -293,8 +293,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .filter(|_| namespace_generic)
             .map(|selector| GenericDefinition {
                 callable,
-                selector,
-                formals: parameters.map(<[String]>::to_vec).unwrap_or_default(),
+                selector: selector.as_str().to_owned(),
+                formals: parameters.map_or_else(Vec::new, |parameters| {
+                    parameters
+                        .iter()
+                        .map(|parameter| parameter.as_str().to_owned())
+                        .collect()
+                }),
             });
         self.s3
             .lock()

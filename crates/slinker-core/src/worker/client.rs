@@ -73,6 +73,7 @@ impl WorkerClient {
         ] {
             command.env_remove(variable);
         }
+        command.env("R_DEFAULT_PACKAGES", "methods");
         #[cfg(all(unix, not(target_os = "macos")))]
         command.env("LD_LIBRARY_PATH", target_library_path(&r_home)?);
         #[cfg(unix)]

@@ -180,9 +180,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             package: current,
                             binding: site.binding.into(),
                         },
-                        formals: expression.parameters.clone(),
-                        formal: pinned.name.clone(),
-                        value: pinned.value.clone(),
+                        formals: expression
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.as_str().to_owned())
+                            .collect(),
+                        formal: pinned.name.as_str().to_owned(),
+                        value: pinned.value.as_str().to_owned(),
                         span: resource.span.clone(),
                     });
                     let names_linked = self
