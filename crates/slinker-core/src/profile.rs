@@ -72,6 +72,9 @@ probes! {
 
 counters! {
     ConstructionEvaluations => "construction_evaluations",
+    SummariesStored => "summaries_stored",
+    SummaryEffectsStored => "summary_effects_stored",
+    SummaryReadsStored => "summary_reads_stored",
     ConstructionMemoHits => "construction_memo_hits",
     ConstructionSummaryHits => "construction_summary_hits",
     SummaryRejectedArguments => "summary_rejected_unstable_arguments",
@@ -165,6 +168,7 @@ pub fn enabled() -> bool {
 }
 
 struct Frame {
+    probe: Probe,
     child_nanos: u64,
     child_allocations: u64,
     child_bytes: u64,
@@ -173,6 +177,18 @@ struct Frame {
 thread_local! {
     static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
     static ACTIVE: RefCell<[u32; PROBE_COUNT]> = const { RefCell::new([0; PROBE_COUNT]) };
+}
+
+fn innermost_probe() -> Option<&'static str> {
+    STACK
+        .try_with(|stack| {
+            stack
+                .try_borrow()
+                .ok()
+                .and_then(|stack| stack.last().map(|frame| frame.probe.name()))
+        })
+        .ok()
+        .flatten()
 }
 
 pub struct Span {
@@ -189,6 +205,7 @@ pub fn span(probe: Probe) -> Span {
         .fetch_add(1, Ordering::Relaxed);
     STACK.with(|stack| {
         stack.borrow_mut().push(Frame {
+            probe,
             child_nanos: 0,
             child_allocations: 0,
             child_bytes: 0,
@@ -378,6 +395,25 @@ pub mod heap {
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     static PEAK: AtomicUsize = AtomicUsize::new(0);
     static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static MILESTONE: AtomicUsize = AtomicUsize::new(0);
+    static GROWTH: std::sync::Mutex<Vec<(usize, &'static str)>> = std::sync::Mutex::new(Vec::new());
+
+    const MILESTONE_STEP: usize = 3 << 20;
+
+    fn record_growth(live: usize) {
+        let seen = MILESTONE.load(Ordering::Relaxed);
+        if live < seen + MILESTONE_STEP
+            || MILESTONE
+                .compare_exchange(seen, live, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let probe = super::innermost_probe().unwrap_or("-");
+        if let Ok(mut growth) = GROWTH.lock() {
+            growth.push((live, probe));
+        }
+    }
 
     thread_local! {
         static THREAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -463,6 +499,7 @@ pub mod heap {
     fn grew(by: usize) {
         let live = LIVE.fetch_add(by, Ordering::Relaxed) + by;
         PEAK.fetch_max(live, Ordering::Relaxed);
+        record_growth(live);
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
         let _ = THREAD_BYTES.try_with(|total| total.set(total.get() + by as u64));
@@ -504,8 +541,20 @@ pub mod heap {
     }
 
     pub fn summary() -> String {
+        let growth = GROWTH
+            .lock()
+            .map(|growth| {
+                growth
+                    .iter()
+                    .map(|(live, probe)| {
+                        format!("{:.0} MiB in {probe}", *live as f64 / 1_048_576.0)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
         format!(
-            "heap: peak {:.1} MiB, live {:.1} MiB, {} allocations\n",
+            "heap: peak {:.1} MiB, live {:.1} MiB, {} allocations\nheap growth: {growth}\n",
             PEAK.load(Ordering::Relaxed) as f64 / 1_048_576.0,
             LIVE.load(Ordering::Relaxed) as f64 / 1_048_576.0,
             ALLOCATIONS.load(Ordering::Relaxed)

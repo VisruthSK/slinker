@@ -512,20 +512,25 @@ fn translate_index(
             parameters: parameters.into_iter().map(Atom::from).collect(),
             used_parameters: used_parameters.into_iter().map(Atom::from).collect(),
             pinned_defaults,
-            references,
-            package_refs,
-            resource_refs,
-            calls,
+            references: exact(references),
+            package_refs: exact(package_refs),
+            resource_refs: exact(resource_refs),
+            calls: exact(calls),
             active_bindings,
-            effects,
-            construction,
+            effects: exact(effects),
+            construction: exact(construction),
             namespace_info_reads,
             namespace_enumerations,
         }],
         issues,
-        scope_parents: scopes.parents,
-        declarations: declarations.declarations,
+        scope_parents: exact(scopes.parents),
+        declarations: exact(declarations.declarations),
     }
+}
+
+fn exact<T>(mut values: Vec<T>) -> Vec<T> {
+    values.shrink_to_fit();
+    values
 }
 
 const NAMESPACE_INFO: &str = ".__NAMESPACE__.";

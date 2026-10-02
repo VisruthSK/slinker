@@ -19,8 +19,27 @@ pub(super) type WriteSite = (EnvironmentId, Option<BindingName>);
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SummaryKey {
     pub(super) package: PackageId,
-    pub(super) owner: SourceKey,
-    pub(super) arguments: Vec<(Option<Atom>, AbstractValue)>,
+    pub(super) owner: Arc<SourceKey>,
+    pub(super) arguments: Arc<[(Option<Atom>, AbstractValue)]>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum RequireReason {
+    ExecutableClosure,
+    NamespaceMember(BindingName),
+}
+
+impl std::fmt::Display for RequireReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExecutableClosure => {
+                formatter.write_str("runtime construction installs an executable closure")
+            }
+            Self::NamespaceMember(name) => {
+                write!(formatter, "namespace member access `${name}`")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -28,7 +47,7 @@ pub(super) enum Effect {
     Require {
         need: Need,
         kind: EdgeKind,
-        reason: String,
+        reason: RequireReason,
         span: Option<Span>,
     },
     ReflectiveName {
@@ -41,14 +60,14 @@ pub(super) enum Effect {
 #[derive(Clone, Debug)]
 pub(super) struct Summary {
     pub(super) value: AbstractValue,
-    pub(super) effects: Arc<[Effect]>,
+    pub(super) effects: Arc<[Arc<Effect>]>,
     pub(super) reads: Arc<[ReadSite]>,
 }
 
 struct Frame {
     id: u64,
     key: SummaryKey,
-    effects: Vec<Effect>,
+    effects: Vec<Arc<Effect>>,
     before: GraphStamps,
     inherited_reads: Vec<ReadSite>,
     pending: Vec<(SummaryKey, Summary)>,
@@ -174,7 +193,7 @@ impl SummaryTable {
             local
                 .frames
                 .iter()
-                .any(|frame| frame.key.package == package && &frame.key.owner == owner)
+                .any(|frame| frame.key.package == package && *frame.key.owner == *owner)
         })
     }
 
@@ -291,7 +310,7 @@ impl SummaryTable {
         });
     }
 
-    pub(super) fn record(&self, effect: Effect) {
+    pub(super) fn record(&self, effect: Arc<Effect>) {
         local(|local| {
             if let Some(top) = local.frames.last_mut() {
                 top.effects.push(effect);
@@ -381,6 +400,9 @@ impl SummaryTable {
                 reads: reads.into(),
             };
             if cacheable {
+                profile::count(Counter::SummariesStored);
+                profile::add(Counter::SummaryEffectsStored, summary.effects.len() as u64);
+                profile::add(Counter::SummaryReadsStored, summary.reads.len() as u64);
                 let mut shared = self.shared();
                 for (key, summary) in std::mem::take(&mut frame.pending)
                     .into_iter()

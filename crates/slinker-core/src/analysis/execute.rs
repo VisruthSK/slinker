@@ -7,7 +7,7 @@ use super::object_world::{
 };
 use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParseRequest};
-use super::summary::{Advance, Effect, SummaryKey};
+use super::summary::{Advance, Effect, RequireReason, SummaryKey};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId};
 use crate::package::{
@@ -46,8 +46,8 @@ pub(super) enum AbstractValue {
 pub(super) struct ConstructionCallKey {
     node: NodeId,
     package: PackageId,
-    owner: SourceKey,
-    arguments: Vec<(Option<Atom>, AbstractValue)>,
+    owner: Arc<SourceKey>,
+    arguments: Arc<[(Option<Atom>, AbstractValue)]>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -403,22 +403,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if context.image.index.binding_names.contains(name) {
             self.emit_effect(
                 context,
-                Effect::Require {
+                Arc::new(Effect::Require {
                     need: Need::Binding {
                         package: context.package,
                         binding: name.to_owned().into(),
                     },
                     kind: EdgeKind::Lexical,
-                    reason: format!("namespace member access `${name}`"),
+                    reason: RequireReason::NamespaceMember(name.to_owned().into()),
                     span: None,
-                },
+                }),
             )?;
         }
         Ok(())
     }
 
-    fn emit_effect(&self, context: ExecutionContext<'_>, effect: Effect) -> Result<()> {
-        match &effect {
+    fn emit_effect(&self, context: ExecutionContext<'_>, effect: Arc<Effect>) -> Result<()> {
+        match &*effect {
             Effect::Require {
                 need,
                 kind,
@@ -429,7 +429,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     context.node,
                     need.clone(),
                     *kind,
-                    reason.clone(),
+                    reason.to_string(),
                     span.clone(),
                 );
             }
@@ -592,15 +592,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
         {
             self.emit_effect(
                 context,
-                Effect::Require {
+                Arc::new(Effect::Require {
                     need: Need::ClosureExecution {
                         package: context.package,
                         closure,
                     },
                     kind: EdgeKind::ClosureExecution,
-                    reason: "runtime construction installs an executable closure".to_owned(),
+                    reason: RequireReason::ExecutableClosure,
                     span: Some(span.clone()),
-                },
+                }),
             )?;
         }
         Ok(())
@@ -709,6 +709,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         else {
             return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
         };
+        let owner = Arc::new(owner);
         let widened;
         let arguments = if self.summaries.callee_active(context.package, &owner) {
             widened = vec![AbstractValue::Unknown; arguments.len()];
@@ -721,7 +722,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .any(|value| !matches!(value, AbstractValue::Unknown));
         let key = SummaryKey {
             package: context.package,
-            owner: owner.clone(),
+            owner: Arc::clone(&owner),
             arguments: call
                 .arguments
                 .iter()
@@ -745,7 +746,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             profile::count(Counter::ConstructionSummaryHits);
             self.summaries.inherit_reads(&reads);
             for effect in effects.iter() {
-                self.emit_effect(context, effect.clone())?;
+                self.emit_effect(context, Arc::clone(effect))?;
             }
             return Ok(ExecutionOutcome::value(value));
         }
@@ -755,8 +756,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let memo = ConstructionCallKey {
             node: context.node,
             package: context.package,
-            owner: owner.clone(),
-            arguments: key.arguments.clone(),
+            owner: Arc::clone(&owner),
+            arguments: Arc::clone(&key.arguments),
         };
         let remembered = self.construction_calls.lock().get(&memo).cloned();
         if let Some((value, assumed)) = remembered
@@ -1101,11 +1102,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let name = name.clone();
             self.emit_effect(
                 context,
-                Effect::ReflectiveName {
+                Arc::new(Effect::ReflectiveName {
                     name,
                     span: span.clone(),
                     lexical_environment: context.lexical_environment.clone(),
-                },
+                }),
             )?;
         }
         Ok(AbstractValue::Unknown)

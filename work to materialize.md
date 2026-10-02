@@ -1,7 +1,5 @@
 # slinker plan
 
-Updated: 2026-09-26 (America/Los_Angeles)
-
 This file is the forward plan: what remains and how to know each piece is done. It does not
 describe what the code already does (`docs/` documents behavior). Delete finished items instead
 of turning them into status notes. Breaking changes are always allowed: any item may delete or

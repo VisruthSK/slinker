@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -115,15 +116,24 @@ impl Loaded {
     }
 }
 
-fn encode_pack<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8])>) -> Vec<u8> {
-    let mut bytes = PACK_MAGIC.to_vec();
+fn write_pack<'a>(
+    writer: &mut impl Write,
+    entries: impl Iterator<Item = (&'a str, &'a [u8])>,
+) -> io::Result<()> {
+    writer.write_all(PACK_MAGIC)?;
     for (name, data) in entries {
         for part in [name.as_bytes(), data] {
             let length = u32::try_from(part.len()).unwrap_or(u32::MAX);
-            bytes.extend_from_slice(&length.to_le_bytes());
-            bytes.extend_from_slice(part);
+            writer.write_all(&length.to_le_bytes())?;
+            writer.write_all(part)?;
         }
     }
+    Ok(())
+}
+
+fn encode_pack<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8])>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_pack(&mut bytes, entries).expect("writing to a Vec never fails");
     bytes
 }
 
@@ -278,25 +288,17 @@ impl Shared {
             return;
         }
         let compact = self.loaded.files.len() >= COMPACTION_THRESHOLD;
-        let merged = compact.then(|| {
-            let mut entries = pending
-                .iter()
-                .map(|(name, data)| (name.as_str(), data.as_slice()))
-                .collect::<BTreeMap<_, _>>();
+        let mut entries = pending
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect::<BTreeMap<_, _>>();
+        if compact {
             for name in self.loaded.entries.keys() {
                 if let Some(data) = self.loaded.get(name) {
                     entries.entry(name.as_str()).or_insert(data);
                 }
             }
-            encode_pack(entries.into_iter())
-        });
-        let bytes = merged.unwrap_or_else(|| {
-            encode_pack(
-                pending
-                    .iter()
-                    .map(|(name, data)| (name.as_str(), data.as_slice())),
-            )
-        });
+        }
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let stem = format!(
             "{}-{}",
@@ -305,7 +307,12 @@ impl Shared {
         );
         let temporary = directory.join(format!("{stem}.tmp"));
         let published = directory.join(format!("{stem}.{PACK_EXTENSION}"));
-        if fs::write(&temporary, &bytes)
+        if fs::File::create(&temporary)
+            .map(BufWriter::new)
+            .and_then(|mut file| {
+                write_pack(&mut file, entries.into_iter())?;
+                file.flush()
+            })
             .and_then(|()| fs::rename(&temporary, &published))
             .is_err()
         {
