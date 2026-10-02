@@ -448,16 +448,7 @@ fn translate_index(
     let (function_regions, for_regions, if_regions) =
         (&census.functions, &census.fors, &census.ifs);
     profile::scoped(Probe::ParseRegions, || {
-        refine_callee_kinds(
-            text,
-            root,
-            context,
-            index,
-            function_regions,
-            for_regions,
-            if_regions,
-            &mut live_uses,
-        );
+        refine_callee_kinds(text, root, context, index, &census, &mut live_uses);
     });
 
     let mut references = profile::scoped(Probe::ParseReferences, || {
@@ -703,11 +694,11 @@ fn refine_callee_kinds(
     root: &RRoot,
     context: &OakParseContext,
     index: &SemanticIndex,
-    function_regions: &[FunctionRegion],
-    for_regions: &[ForRegion],
-    if_regions: &[IfRegion],
+    census: &Census,
     live_uses: &mut [LiveUse],
 ) {
+    let (function_regions, for_regions, if_regions) =
+        (&census.functions, &census.fors, &census.ifs);
     for live_use in live_uses.iter_mut() {
         if live_use.callee_kind == CalleeKind::DefinitelyLexical
             && post_for_use_may_fall_through(text, index, for_regions, if_regions, live_use)
