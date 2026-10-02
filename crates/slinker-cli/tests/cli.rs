@@ -102,3 +102,37 @@ fn cache_commands_report_and_clear_the_persistent_cache() {
         String::from_utf8_lossy(&path.stdout).contains(cache.path().to_string_lossy().as_ref())
     );
 }
+
+#[test]
+fn package_roles_form_a_retention_tree_without_escapes_when_piped() {
+    let cache = tempfile::tempdir().expect("cache directory");
+    let output = slinker_with_cache(&["analyze", "rlang"], cache.path());
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("utf-8 output");
+    assert!(!text.contains('\u{1b}'));
+    let tree = text
+        .split("package roles\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("package roles section");
+    let lines = tree.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines[0],
+        format!("rlang {} root", lines[0].split(' ').nth(1).unwrap())
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("└── winch ") && line.ends_with(" linked"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("    ├── lifecycle "))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("    │   └── cli "))
+    );
+}

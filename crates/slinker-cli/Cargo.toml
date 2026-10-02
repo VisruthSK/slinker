@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 slinker-core.workspace = true
 slinker-r-worker.workspace = true
+anstream.workspace = true
 clap.workspace = true
 dunce.workspace = true
 serde_json.workspace = true

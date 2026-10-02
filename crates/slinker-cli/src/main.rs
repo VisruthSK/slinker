@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode};
 
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use slinker_core::TargetEnvironment;
@@ -25,13 +26,24 @@ static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
     slinker_core::profile::heap::CountingAllocator;
 
 mod cache_command;
+mod roles;
 mod session;
 
 use session::{RootSpec, Session, SourceSession};
 
+const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default())
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Yellow.on_default());
+
 #[derive(Debug, Parser)]
 #[command(
     name = "slinker",
+    styles = STYLES,
     version,
     about = "Link R package dependencies into a generated source package",
     after_help = "Environment:\n  R_HOME             fallback R installation when `R RHOME` is unavailable\n  SLINKER_CACHE_DIR  persistent installed-image analysis cache"
@@ -626,15 +638,7 @@ fn print_analysis(target: &TargetEnvironment, plan: &LinkIr) {
         target.target.r_version, target.target.os, target.target.arch
     );
     println!();
-    println!("package roles");
-    for (_, package) in program.packages() {
-        println!(
-            "  {} {}: {:?}",
-            package.identity().name,
-            package.identity().version,
-            package.role()
-        );
-    }
+    roles::print_package_roles(plan);
     println!();
     println!("linked program");
     println!("  namespaces: {}", program.namespaces().len());

@@ -41,6 +41,8 @@ slinker analyze voucher --link posterior,distributional
 slinker analyze voucher --json
 ```
 
+The human report lists package roles as a tree. Each package appears once, under the package whose analyzed code first reached it by the shortest recorded path, so the tree shows why a Linked or External package is in the program rather than what DESCRIPTION declares. Root, Linked, and External are coloured; a package with no recorded path from the root is listed after the tree. Colour follows the terminal: it is off when output is piped, and `NO_COLOR` and `CLICOLOR_FORCE` are honoured, as is the coloured `--help`.
+
 `ROOT` (also the first argument of `why` and `path`) is one of:
 
 - an installed package name, resolved in the library order below;
