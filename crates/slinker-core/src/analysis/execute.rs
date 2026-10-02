@@ -155,6 +155,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
         parsed: &ParsedRFile,
     ) -> Result<Arc<PackageImage>> {
         let bindings = self.construction_bindings(package, image, lexical_environment, parsed)?;
+        let missing = bindings
+            .iter()
+            .filter(|binding| {
+                image.binding(binding).is_none()
+                    && image.index.binding_names.contains(binding.as_str())
+            })
+            .map(BindingName::as_str)
+            .collect::<Vec<_>>();
+        if missing.len() > 1 {
+            self.packages.prefetch_binding_images(package, &missing)?;
+        }
         for binding in bindings {
             self.binding_image(package, &binding, Counter::BindingLoadPrepare)?;
         }
