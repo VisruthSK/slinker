@@ -260,7 +260,7 @@ fn installed_images(criterion: &mut Criterion) {
         target.clone(),
         CacheLocation::Directory(warm.path().to_path_buf()),
     )
-    .and_then(|mut store| store.index(&package))
+    .and_then(|store| store.index(&package))
     .expect("populate the warm cache");
 
     let mut group = criterion.benchmark_group("installed");
@@ -271,7 +271,7 @@ fn installed_images(criterion: &mut Criterion) {
     group.bench_function("index_read_rlang_uncached", |bench| {
         bench.iter(|| {
             PackageStore::new(r_home.clone(), target.clone(), CacheLocation::Disabled)
-                .and_then(|mut store| store.index(&package))
+                .and_then(|store| store.index(&package))
                 .expect("read the installed index through the worker")
         });
     });
@@ -282,7 +282,7 @@ fn installed_images(criterion: &mut Criterion) {
                 target.clone(),
                 CacheLocation::Directory(warm.path().to_path_buf()),
             )
-            .and_then(|mut store| store.index(&package))
+            .and_then(|store| store.index(&package))
             .expect("read the cached index")
         });
     });
