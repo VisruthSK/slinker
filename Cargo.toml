@@ -43,7 +43,7 @@ harp = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5
 libr = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a" }
 
 # DESCRIPTION parsing and semantic R package metadata.
-r-description-parser = "0.3.0"
+r-description-parser = "0.4.0"
 r-metadata = "0.3.0"
 clap = { version = "4.6.7", features = ["derive"] }
 which = "8.0.6"
