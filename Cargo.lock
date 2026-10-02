@@ -1159,7 +1159,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46036879a5c0c30f1a6e2c47f1ad12c9ce7dac9af4ba13334f02d7c8018d6f13"
 dependencies = [
  "r-dcf-syntax",
- "r-metadata",
+ "r-metadata 0.3.0",
  "thiserror",
 ]
 
@@ -1174,6 +1174,16 @@ name = "r-metadata"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab9d8c76ea04ccdd60d9be7aa380a2ab0b65f21cd147ddc348660414f2c9b6c5"
+dependencies = [
+ "thiserror",
+ "url",
+]
+
+[[package]]
+name = "r-metadata"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4662195d8f1221bbe4bc2b7965c395684dc2fe9018883fbf9c613304f938fffd"
 dependencies = [
  "thiserror",
  "url",
@@ -1449,7 +1459,7 @@ dependencies = [
  "libr",
  "oak_semantic",
  "r-description-parser",
- "r-metadata",
+ "r-metadata 0.4.0",
  "rayon",
  "serde",
  "serde_json",
