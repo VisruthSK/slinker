@@ -51,6 +51,9 @@ struct Frame {
     effects: Vec<Effect>,
     before: GraphStamps,
     inherited_reads: Vec<ReadSite>,
+    pending: Vec<(SummaryKey, Summary)>,
+    inner: HashMap<SummaryKey, AbstractValue>,
+    dirty: bool,
     assumed: Vec<Assumption>,
     cut: bool,
     approximation: AbstractValue,
@@ -178,15 +181,24 @@ impl SummaryTable {
     pub(super) fn begin(&self, key: SummaryKey, before: GraphStamps) {
         let id = self.next_frame.fetch_add(1, Ordering::Relaxed);
         local(|local| {
+            let approximation = local
+                .frames
+                .iter()
+                .find_map(|frame| frame.inner.get(&key))
+                .cloned()
+                .unwrap_or_else(AbstractValue::bottom);
             local.frames.push(Frame {
                 id,
                 key,
                 effects: Vec::new(),
                 before,
                 inherited_reads: Vec::new(),
+                pending: Vec::new(),
+                inner: HashMap::new(),
+                dirty: false,
                 assumed: Vec::new(),
                 cut: false,
-                approximation: AbstractValue::bottom(),
+                approximation,
                 recursive: false,
                 reach: 0,
                 iterations: 0,
@@ -222,10 +234,16 @@ impl SummaryTable {
     pub(super) fn advance(&self, produced: AbstractValue) -> Advance {
         local(|local| {
             let own_index = local.frames.len().saturating_sub(1);
+            let leader_index = local.frames.last().and_then(|frame| {
+                local.frames.iter().position(|candidate| {
+                    candidate.id != frame.id
+                        && frame.assumed.iter().any(|(id, _)| *id == candidate.id)
+                })
+            });
             let Some(frame) = local.frames.last_mut() else {
                 return Advance::Done(produced);
             };
-            if !frame.recursive {
+            if !frame.recursive && !frame.dirty {
                 return Advance::Done(produced);
             }
             if frame.iterations == 0 {
@@ -239,13 +257,28 @@ impl SummaryTable {
             );
             profile::count(Counter::LatticeJoins);
             let mut next = frame.approximation.clone();
-            if !next.join(&produced) {
+            let grew = next.join(&produced);
+            let unsettled = grew || frame.dirty;
+            if grew {
+                profile::count(Counter::LatticeGrowths);
+            }
+            if let Some(leader) = leader_index {
+                let key = frame.key.clone();
+                frame.dirty = false;
+                frame.approximation = next.clone();
+                let leader = &mut local.frames[leader];
+                leader.inner.insert(key, next.clone());
+                leader.dirty |= unsettled;
                 return Advance::Done(next);
             }
-            profile::count(Counter::LatticeGrowths);
+            if !unsettled {
+                return Advance::Done(next);
+            }
             frame.approximation = next;
             frame.recursive = false;
+            frame.dirty = false;
             frame.effects.clear();
+            frame.pending.clear();
             Advance::Again
         })
     }
@@ -289,7 +322,7 @@ impl SummaryTable {
         logged_reads: impl FnOnce(usize) -> Vec<ReadSite>,
         arguments_are_stable: bool,
     ) -> Finished {
-        let (frame, cacheable, assumed) = local(|local| {
+        let (mut frame, cacheable, assumed) = local(|local| {
             let frame = local
                 .frames
                 .pop()
@@ -330,32 +363,52 @@ impl SummaryTable {
             }
             (frame, cacheable, outer)
         });
-        if cacheable {
+        let sound_under_one_root = arguments_are_stable
+            && !frame.cut
+            && frame.before.writes == after.writes
+            && frame.before.derived_reads == after.derived_reads
+            && assumed.len() == 1;
+        if cacheable || sound_under_one_root {
             let mut seen = HashSet::new();
-            let reads = frame
-                .inherited_reads
+            let reads = std::mem::take(&mut frame.inherited_reads)
                 .into_iter()
                 .chain(logged_reads(frame.before.read_cursor))
                 .filter(|read| seen.insert(read.clone()))
                 .collect::<Vec<_>>();
-            let mut shared = self.shared();
-            for (environment, name) in &reads {
-                shared
-                    .readers
-                    .entry((frame.key.package, *environment))
-                    .or_default()
-                    .entry(name.clone())
-                    .or_default()
-                    .push(frame.key.clone());
+            let summary = Summary {
+                value: value.clone(),
+                effects: std::mem::take(&mut frame.effects).into(),
+                reads: reads.into(),
+            };
+            if cacheable {
+                let mut shared = self.shared();
+                for (key, summary) in std::mem::take(&mut frame.pending)
+                    .into_iter()
+                    .chain(std::iter::once((frame.key.clone(), summary)))
+                {
+                    for (environment, name) in summary.reads.iter() {
+                        shared
+                            .readers
+                            .entry((key.package, *environment))
+                            .or_default()
+                            .entry(name.clone())
+                            .or_default()
+                            .push(key.clone());
+                    }
+                    shared.summaries.insert(key, summary);
+                }
+            } else {
+                let root = assumed[0].0;
+                local(|local| {
+                    if let Some(frame_root) = local
+                        .frames
+                        .iter_mut()
+                        .find(|candidate| candidate.id == root)
+                    {
+                        frame_root.pending.push((frame.key.clone(), summary));
+                    }
+                });
             }
-            shared.summaries.insert(
-                frame.key,
-                Summary {
-                    value: value.clone(),
-                    effects: frame.effects.into(),
-                    reads: reads.into(),
-                },
-            );
         }
         Finished { cacheable, assumed }
     }

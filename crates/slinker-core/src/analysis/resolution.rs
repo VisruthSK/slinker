@@ -10,7 +10,7 @@ use crate::package::{
 };
 use crate::profile::{self, Probe};
 use crate::syntax::{
-    NamespaceImportResolution, NamespaceImports, OakParseContext, SourceKey, Span,
+    NamespaceImportResolution, NamespaceImports, OakParseContext, SharedNames, SourceKey, Span,
     closure_definitely_non_returning,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -110,8 +110,11 @@ fn prove_non_returning<'a>(
     proven: &mut BTreeSet<BindingName>,
 ) {
     loop {
-        let context =
-            OakParseContext::with_imports(shadowed.clone(), imports.clone(), proven.clone());
+        let context = OakParseContext::with_imports(
+            SharedNames::from(shadowed.clone()),
+            Arc::new(imports.clone()),
+            SharedNames::from(proven.clone()),
+        );
         let before = proven.len();
         for (name, closure) in candidates.clone() {
             if !proven.contains(name) && closure_definitely_non_returning(&closure.source, &context)
@@ -190,14 +193,40 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(shadowed)
     }
 
+    fn namespace_shadow_base(
+        &self,
+        package: PackageId,
+        image: &PackageImage,
+    ) -> Result<Arc<BTreeSet<BindingName>>> {
+        self.seal_namespace(package)?;
+        let loaded = self.loaded(package)?;
+        let version = loaded.namespace.lock().bindings.len();
+        let known = self.shadow_bases.lock().get(&package).cloned();
+        if let Some((known_version, base)) = known
+            && known_version == version
+        {
+            return Ok(base);
+        }
+        let base = Arc::new(self.namespace_shadowed_names(
+            package,
+            image,
+            image.index.binding_names.iter(),
+        )?);
+        self.shadow_bases
+            .lock()
+            .insert(package, (version, Arc::clone(&base)));
+        Ok(base)
+    }
+
     fn inferred_non_returning_bindings(
         &self,
         package: PackageId,
         image: &PackageImage,
         imports: &NamespaceImports,
-    ) -> Result<BTreeSet<BindingName>> {
-        if let Some(bindings) = self.non_returning_bindings.lock().get(&package) {
-            return Ok(bindings.clone());
+    ) -> Result<Arc<BTreeSet<BindingName>>> {
+        let known = self.non_returning_bindings.lock().get(&package).cloned();
+        if let Some(bindings) = known {
+            return Ok(bindings);
         }
         let shadowed = self.namespace_shadowed_names(package, image, image.bindings.keys())?;
         let namespace = EnvironmentLabel::namespace(&self.packages.name(package));
@@ -207,9 +236,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         });
         let mut proven = BTreeSet::new();
         prove_non_returning(&candidates, &shadowed, imports, &mut proven);
+        let proven = Arc::new(proven);
         self.non_returning_bindings
             .lock()
-            .insert(package, proven.clone());
+            .insert(package, Arc::clone(&proven));
         Ok(proven)
     }
 
@@ -220,8 +250,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &EnvironmentLabel,
     ) -> Result<OakParseContext> {
         let _span = profile::span(Probe::OakParseContext);
-        let mut shadowed =
-            self.namespace_shadowed_names(package, image, image.index.binding_names.iter())?;
+        let base = self.namespace_shadow_base(package, image)?;
+        let mut extra_shadowed = BTreeSet::new();
         let mut private_shadowed = BTreeSet::new();
         let mut visible_private = BTreeMap::new();
         let mut current = Some(lexical_environment.clone());
@@ -238,7 +268,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 for name in shape.bindings.keys() {
                     private_shadowed.insert(name.clone());
-                    shadowed.insert(name.clone());
+                    extra_shadowed.insert(name.clone());
                 }
                 match shape.parent {
                     Some(parent) => environment = parent,
@@ -259,23 +289,33 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
             for (name, binding) in &private.bindings {
                 private_shadowed.insert(name.clone());
-                shadowed.insert(name.clone());
+                extra_shadowed.insert(name.clone());
                 visible_private.entry(name).or_insert(binding);
             }
             current = Some(private.parent.clone());
         }
 
         let imports = self.namespace_imports(package, image)?;
-        let mut non_returning = self.inferred_non_returning_bindings(package, image, &imports)?;
+        let proven = self.inferred_non_returning_bindings(package, image, &imports)?;
+        if private_shadowed.is_empty() && visible_private.is_empty() {
+            return Ok(OakParseContext::with_imports(
+                SharedNames::from(base),
+                imports,
+                SharedNames::from(proven),
+            ));
+        }
+        let mut shadowed = (*base).clone();
+        shadowed.extend(extra_shadowed);
+        let mut non_returning = (*proven).clone();
         non_returning.retain(|name| !private_shadowed.contains(name));
         let candidates = visible_private
             .iter()
             .filter_map(|(&name, binding)| Some((name, binding.object.closure.as_ref()?)));
         prove_non_returning(&candidates, &shadowed, &imports, &mut non_returning);
         Ok(OakParseContext::with_imports(
-            shadowed,
-            (*imports).clone(),
-            non_returning,
+            SharedNames::from(shadowed),
+            imports,
+            SharedNames::from(non_returning),
         ))
     }
 

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const AIR_VERSION: &str = "0.11.0";
-const ANALYSIS_SCHEMA: &str = "slinker-analysis-v10";
+const ANALYSIS_SCHEMA: &str = "slinker-analysis-v11";
 const MAX_R_WORKERS: usize = 4;
 const SOURCES_PER_WORKER: usize = 48;
 

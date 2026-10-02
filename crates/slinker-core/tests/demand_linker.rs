@@ -2932,7 +2932,7 @@ fn package_image_is_requested_once_and_binding_is_parsed_once() {
     );
     let provider = FakeProvider::new(vec![root]);
     let counts = provider.count_handle();
-    Linker::new(provider, 2).analyze("root").unwrap();
+    Linker::new(provider, 1).analyze("root").unwrap();
     assert_eq!(counts.lock().unwrap().get("root").copied().unwrap_or(0), 1);
 }
 

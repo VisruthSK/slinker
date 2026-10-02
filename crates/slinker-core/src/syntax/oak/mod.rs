@@ -27,6 +27,7 @@ mod scan;
 mod tests;
 
 pub use context::OakParseContext;
+pub(crate) use context::SharedNames;
 pub(crate) use context::{NamespaceImportResolution, NamespaceImports};
 pub(crate) use proofs::closure_definitely_non_returning;
 

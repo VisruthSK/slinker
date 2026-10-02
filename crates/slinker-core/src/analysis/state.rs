@@ -79,6 +79,8 @@ pub(super) struct AnalysisOptions {
     pub(super) root_description: Option<Arc<str>>,
 }
 
+type ShadowBase = (usize, Arc<BTreeSet<BindingName>>);
+
 pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) packages: TargetUniverse<P>,
     pub(super) linked_packages: HashSet<PackageName>,
@@ -113,7 +115,8 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) root: PackageId,
     pub(super) declared_dependencies: Guarded<HashMap<PackageId, Arc<DeclaredDependencies>>>,
     pub(super) namespace_imports: Guarded<HashMap<PackageId, Arc<NamespaceImports>>>,
-    pub(super) non_returning_bindings: Guarded<HashMap<PackageId, BTreeSet<BindingName>>>,
+    pub(super) non_returning_bindings: Guarded<HashMap<PackageId, Arc<BTreeSet<BindingName>>>>,
+    pub(super) shadow_bases: Guarded<HashMap<PackageId, ShadowBase>>,
     pub(super) root_description: Option<Arc<str>>,
 }
 
@@ -174,6 +177,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             declared_dependencies: Guarded::default(),
             namespace_imports: Guarded::default(),
             non_returning_bindings: Guarded::default(),
+            shadow_bases: Guarded::default(),
             root_description: options.root_description,
         })
     }
