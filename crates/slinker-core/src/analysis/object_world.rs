@@ -621,25 +621,28 @@ impl ObjectWorld {
         self.write(package, |graph| graph.merge_image(image));
     }
 
+    #[track_caller]
     pub fn read<R>(&self, package: PackageId, read: impl FnOnce(&ObjectGraph) -> R) -> R {
         let cell = self.cell(package);
-        let graph = cell.lock().expect("object graph");
+        let graph = super::guarded::contended(&cell);
         read(&graph)
     }
 
+    #[track_caller]
     pub fn write<R>(&self, package: PackageId, write: impl FnOnce(&mut ObjectGraph) -> R) -> R {
         let cell = self.cell(package);
-        let mut graph = cell.lock().expect("object graph");
+        let mut graph = super::guarded::contended(&cell);
         write(&mut graph)
     }
 
+    #[track_caller]
     pub fn existing<R>(
         &self,
         package: PackageId,
         read: impl FnOnce(&ObjectGraph) -> R,
     ) -> Option<R> {
         let cell = Arc::clone(self.graphs.read().expect("object world").get(&package)?);
-        let graph = cell.lock().expect("object graph");
+        let graph = super::guarded::contended(&cell);
         Some(read(&graph))
     }
 }

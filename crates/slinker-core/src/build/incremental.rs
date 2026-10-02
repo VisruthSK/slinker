@@ -4,6 +4,7 @@ use crate::package::{
     analysis_schema, fingerprint_strings, tree_digest,
 };
 use crate::{Error, Result, TargetEnvironment};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -187,11 +188,18 @@ pub fn is_up_to_date(
     if record.inputs != inputs.as_str() || record.package != root_package {
         return Ok(false);
     }
-    for consulted in &record.consulted {
-        let current = locator
-            .locate(&consulted.name)?
-            .map(|package| IdentityToken::from(&package.identity));
-        if current != consulted.identity {
+    let unchanged = record
+        .consulted
+        .par_iter()
+        .map(|consulted| {
+            let current = locator
+                .locate(&consulted.name)?
+                .map(|package| IdentityToken::from(&package.identity));
+            Ok(current == consulted.identity)
+        })
+        .collect::<Vec<Result<bool>>>();
+    for package_unchanged in unchanged {
+        if !package_unchanged? {
             return Ok(false);
         }
     }

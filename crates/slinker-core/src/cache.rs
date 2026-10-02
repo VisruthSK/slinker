@@ -1,9 +1,10 @@
 use crate::{Error, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::collections::{BTreeMap, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -48,10 +49,17 @@ const PACK_MAGIC: &[u8; 6] = b"SLKP1\n";
 const PACK_EXTENSION: &str = "pack";
 const COMPACTION_THRESHOLD: usize = 8;
 
+#[derive(Debug)]
+struct Entry {
+    pack: usize,
+    start: u64,
+    length: usize,
+}
+
 #[derive(Debug, Default)]
 struct Loaded {
-    packs: Vec<Vec<u8>>,
-    entries: HashMap<String, (usize, usize, usize)>,
+    packs: Vec<Mutex<fs::File>>,
+    entries: HashMap<String, Entry>,
     files: Vec<PathBuf>,
 }
 
@@ -70,71 +78,101 @@ impl Loaded {
             .collect::<Vec<_>>();
         files.sort();
         for file in files {
-            if let Ok(bytes) = fs::read(&file) {
-                loaded.add_pack(bytes);
-                loaded.files.push(file);
-            }
+            loaded.add_pack(&file);
+            loaded.files.push(file);
         }
         loaded
     }
 
-    fn add_pack(&mut self, bytes: Vec<u8>) {
-        let pack = self.packs.len();
-        let mut at = PACK_MAGIC.len();
-        if bytes.get(..at) != Some(PACK_MAGIC.as_slice()) {
+    fn add_pack(&mut self, path: &Path) {
+        let Ok(file) = fs::File::open(path) else {
             return;
+        };
+        let Some(entries) = Self::scan(&file) else {
+            return;
+        };
+        let pack = self.packs.len();
+        for (name, start, length) in entries {
+            self.entries.entry(name).or_insert(Entry {
+                pack,
+                start,
+                length,
+            });
         }
-        while let Some((name, start, end)) = Self::next_entry(&bytes, &mut at) {
-            if let Ok(name) = std::str::from_utf8(&bytes[name.0..name.1]) {
-                self.entries
-                    .entry(name.to_owned())
-                    .or_insert((pack, start, end));
-            }
-        }
-        self.packs.push(bytes);
+        self.packs.push(Mutex::new(file));
     }
 
-    fn next_entry(bytes: &[u8], at: &mut usize) -> Option<((usize, usize), usize, usize)> {
-        let length = |from: usize| -> Option<usize> {
-            let raw = bytes.get(from..from + 4)?;
-            usize::try_from(u32::from_le_bytes(raw.try_into().ok()?)).ok()
-        };
-        let name_length = length(*at)?;
-        let name = (*at + 4, *at + 4 + name_length);
-        let data_length = length(name.1)?;
-        let data = (name.1 + 4, name.1 + 4 + data_length);
-        if data.1 > bytes.len() {
+    fn scan(file: &fs::File) -> Option<Vec<(String, u64, usize)>> {
+        let size = file.metadata().ok()?.len();
+        let mut reader = BufReader::new(file);
+        let mut magic = [0u8; PACK_MAGIC.len()];
+        reader.read_exact(&mut magic).ok()?;
+        if &magic != PACK_MAGIC {
             return None;
         }
-        *at = data.1;
-        Some((name, data.0, data.1))
+        let mut at = PACK_MAGIC.len() as u64;
+        let mut entries = Vec::new();
+        while let Some((name, start, length)) = Self::next_entry(&mut reader, &mut at, size) {
+            if let Some(name) = name {
+                entries.push((name, start, length));
+            }
+        }
+        Some(entries)
     }
 
-    fn get(&self, name: &str) -> Option<&[u8]> {
-        let &(pack, start, end) = self.entries.get(name)?;
-        self.packs.get(pack)?.get(start..end)
+    fn next_entry(
+        reader: &mut BufReader<&fs::File>,
+        at: &mut u64,
+        size: u64,
+    ) -> Option<(Option<String>, u64, usize)> {
+        let mut word = [0u8; 4];
+        reader.read_exact(&mut word).ok()?;
+        let name_length = u64::from(u32::from_le_bytes(word));
+        if *at + 4 + name_length + 4 > size {
+            return None;
+        }
+        let mut name = vec![0u8; usize::try_from(name_length).ok()?];
+        reader.read_exact(&mut name).ok()?;
+        reader.read_exact(&mut word).ok()?;
+        let data_length = u64::from(u32::from_le_bytes(word));
+        let start = *at + 4 + name_length + 4;
+        if start + data_length > size {
+            return None;
+        }
+        reader
+            .seek_relative(i64::try_from(data_length).ok()?)
+            .ok()?;
+        *at = start + data_length;
+        Some((
+            String::from_utf8(name).ok(),
+            start,
+            usize::try_from(data_length).ok()?,
+        ))
+    }
+
+    fn get(&self, name: &str) -> Option<Vec<u8>> {
+        let entry = self.entries.get(name)?;
+        let mut file = self.packs.get(entry.pack)?.lock().ok()?;
+        file.seek(SeekFrom::Start(entry.start)).ok()?;
+        let mut data = vec![0u8; entry.length];
+        file.read_exact(&mut data).ok()?;
+        Some(data)
     }
 }
 
-fn write_pack<'a>(
+fn write_pack<N: AsRef<str>, D: AsRef<[u8]>>(
     writer: &mut impl Write,
-    entries: impl Iterator<Item = (&'a str, &'a [u8])>,
+    entries: impl Iterator<Item = (N, D)>,
 ) -> io::Result<()> {
     writer.write_all(PACK_MAGIC)?;
     for (name, data) in entries {
-        for part in [name.as_bytes(), data] {
+        for part in [name.as_ref().as_bytes(), data.as_ref()] {
             let length = u32::try_from(part.len()).unwrap_or(u32::MAX);
             writer.write_all(&length.to_le_bytes())?;
             writer.write_all(part)?;
         }
     }
     Ok(())
-}
-
-fn encode_pack<'a>(entries: impl Iterator<Item = (&'a str, &'a [u8])>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    write_pack(&mut bytes, entries).expect("writing to a Vec never fails");
-    bytes
 }
 
 #[derive(Debug)]
@@ -195,7 +233,7 @@ impl Cache {
         if let Some(bytes) = self.shared.pending.lock().expect("cache pending").get(name) {
             return serde_json::from_slice(bytes).ok();
         }
-        serde_json::from_slice(self.shared.loaded.get(name)?).ok()
+        serde_json::from_slice(&self.shared.loaded.get(name)?).ok()
     }
 
     #[must_use]
@@ -205,7 +243,7 @@ impl Cache {
             .loaded
             .entries
             .iter()
-            .map(|(name, (_, start, end))| (name.clone(), end - start))
+            .map(|(name, entry)| (name.clone(), entry.length))
             .collect::<Vec<_>>();
         entries.sort();
         entries
@@ -220,8 +258,7 @@ impl Cache {
             .entries
             .keys()
             .filter(|name| !remove(name))
-            .filter_map(|name| Some((name.as_str(), loaded.get(name)?)))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<BTreeSet<_>>();
         let removed = loaded.entries.len() - kept.len();
         if removed == 0 {
             return Ok(0);
@@ -230,7 +267,17 @@ impl Cache {
             let stem = format!("{}-retained", std::process::id());
             let temporary = directory.join(format!("{stem}.tmp"));
             let published = directory.join(format!("{stem}.{PACK_EXTENSION}"));
-            fs::write(&temporary, encode_pack(kept.into_iter())).map_err(|source| Error::Io {
+            let rewrite = fs::File::create(&temporary)
+                .map(BufWriter::new)
+                .and_then(|mut file| {
+                    write_pack(
+                        &mut file,
+                        kept.iter()
+                            .filter_map(|name| Some((name.as_str(), loaded.get(name)?))),
+                    )?;
+                    file.flush()
+                });
+            rewrite.map_err(|source| Error::Io {
                 path: temporary.clone(),
                 source,
             })?;
@@ -288,17 +335,24 @@ impl Shared {
             return;
         }
         let compact = self.loaded.files.len() >= COMPACTION_THRESHOLD;
-        let mut entries = pending
-            .iter()
-            .map(|(name, data)| (name.as_str(), data.as_slice()))
-            .collect::<BTreeMap<_, _>>();
-        if compact {
-            for name in self.loaded.entries.keys() {
-                if let Some(data) = self.loaded.get(name) {
-                    entries.entry(name.as_str()).or_insert(data);
-                }
-            }
-        }
+        let names = pending
+            .keys()
+            .map(String::as_str)
+            .chain(
+                self.loaded
+                    .entries
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|_| compact),
+            )
+            .collect::<BTreeSet<_>>();
+        let entries = names.into_iter().filter_map(|name| {
+            let data = match pending.get(name) {
+                Some(data) => Cow::Borrowed(data.as_slice()),
+                None => Cow::Owned(self.loaded.get(name)?),
+            };
+            Some((name, data))
+        });
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let stem = format!(
             "{}-{}",
@@ -310,7 +364,7 @@ impl Shared {
         if fs::File::create(&temporary)
             .map(BufWriter::new)
             .and_then(|mut file| {
-                write_pack(&mut file, entries.into_iter())?;
+                write_pack(&mut file, entries)?;
                 file.flush()
             })
             .and_then(|()| fs::rename(&temporary, &published))
@@ -430,6 +484,14 @@ mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+
+    fn encode_pack<N: AsRef<str>, D: AsRef<[u8]>>(
+        entries: impl Iterator<Item = (N, D)>,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_pack(&mut bytes, entries).expect("writing to a Vec never fails");
+        bytes
+    }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     struct Entry {

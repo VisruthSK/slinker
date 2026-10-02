@@ -51,6 +51,16 @@ impl ParseCache {
         self.normalized_shapes.insert(key, shape);
     }
 
+    pub(super) fn assigned_value_start(&self, key: &ParseKey) -> Option<usize> {
+        match self.states.get(key)? {
+            ParseState::Parsed(parsed) => parsed
+                .expressions
+                .first()
+                .and_then(|expression| expression.assigned_value_start),
+            ParseState::Blocked => None,
+        }
+    }
+
     pub(super) fn shape(&self, key: &ParseKey) -> Option<&Digest> {
         self.normalized_shapes.get(key)
     }

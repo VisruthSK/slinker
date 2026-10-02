@@ -115,7 +115,7 @@ jobs:
 
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          packages: any::rlang
+          packages: any::rlang, any::testthat
 
       - uses: dtolnay/rust-toolchain@stable
 

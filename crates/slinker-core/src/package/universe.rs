@@ -5,8 +5,9 @@ use crate::package::{
     PackageRole, SyntaxValidation, fingerprint_image,
 };
 use crate::{Error, Result, TargetEnvironment};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageAvailability {
@@ -53,7 +54,6 @@ pub struct TargetUniverse<P: PackageResolver> {
     root: PackageName,
     explicit_external: HashSet<PackageName>,
     roster: RwLock<Roster>,
-    locating: Mutex<()>,
 }
 
 impl<P: PackageResolver> TargetUniverse<P> {
@@ -67,7 +67,6 @@ impl<P: PackageResolver> TargetUniverse<P> {
             root: root.into(),
             explicit_external,
             roster: RwLock::new(Roster::default()),
-            locating: Mutex::new(()),
         }
     }
 
@@ -80,10 +79,6 @@ impl<P: PackageResolver> TargetUniverse<P> {
     }
 
     pub fn resolve(&self, name: &str) -> Result<Option<PackageId>> {
-        if let Some(availability) = self.availability(name) {
-            return Ok(availability.package());
-        }
-        let _locating = self.locating.lock().expect("universe locating lock");
         if let Some(availability) = self.availability(name) {
             return Ok(availability.package());
         }
@@ -101,6 +96,9 @@ impl<P: PackageResolver> TargetUniverse<P> {
 
     fn ingest(&self, name: &str, package: Option<InstalledPackage>) -> Option<PackageId> {
         let mut roster = self.roster.write().expect("universe roster");
+        if let Some(known) = roster.availability.get(name) {
+            return known.package();
+        }
         let Some(package) = package else {
             roster
                 .availability
@@ -264,8 +262,15 @@ impl PackageSources {
     }
 
     pub fn changed(&self) -> Result<Option<&PackageIdentity>> {
-        for (identity, location) in self.0.values() {
-            if fingerprint_image(&location.root)? != identity.image_fingerprint {
+        let packages = self.0.values().collect::<Vec<_>>();
+        let unchanged = packages
+            .par_iter()
+            .map(|(identity, location)| {
+                Ok(fingerprint_image(&location.root)? == identity.image_fingerprint)
+            })
+            .collect::<Vec<Result<bool>>>();
+        for ((identity, _), package_unchanged) in packages.into_iter().zip(unchanged) {
+            if !package_unchanged? {
                 return Ok(Some(identity));
             }
         }
@@ -280,6 +285,7 @@ mod tests {
     use crate::{Target, TargetEnvironment};
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
 
     struct CountingStore {
         locator: PackageLocator,
@@ -369,6 +375,26 @@ mod tests {
             reverse.identity(reverse_first)
         );
         assert_eq!(forward.require("first").expect("memoized"), forward_first);
+    }
+
+    #[test]
+    fn concurrent_resolution_of_one_new_package_agrees_on_a_single_id() {
+        let library = tempfile::tempdir().expect("library");
+        install(library.path(), "shared");
+        let universe = universe(library.path());
+
+        let ids = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| scope.spawn(|| universe.require("shared").expect("shared")))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("resolver"))
+                .collect::<Vec<_>>()
+        });
+
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(universe.require("shared").expect("memoized"), ids[0]);
     }
 
     #[test]

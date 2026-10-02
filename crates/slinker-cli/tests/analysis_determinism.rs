@@ -44,3 +44,13 @@ fn compiler_analysis_is_independent_of_the_job_count_and_the_cache() {
 fn grid_analysis_is_independent_of_the_job_count_and_the_cache() {
     assert_independent_of_jobs_and_cache("grid");
 }
+
+#[test]
+fn rlang_analysis_is_independent_of_the_job_count_and_the_cache() {
+    assert_independent_of_jobs_and_cache("rlang");
+}
+
+#[test]
+fn testthat_analysis_is_independent_of_the_job_count_and_the_cache() {
+    assert_independent_of_jobs_and_cache("testthat");
+}

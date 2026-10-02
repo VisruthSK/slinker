@@ -20,6 +20,7 @@ pub(super) enum Claim {
 struct Table<K> {
     phases: HashMap<K, Phase>,
     injected: Vec<K>,
+    staged: HashMap<ThreadId, Vec<K>>,
     waiting: HashMap<ThreadId, K>,
     pending: usize,
 }
@@ -35,6 +36,7 @@ impl<K: Eq + Hash + Clone> Default for Machine<K> {
             table: Mutex::new(Table {
                 phases: HashMap::new(),
                 injected: Vec::new(),
+                staged: HashMap::new(),
                 waiting: HashMap::new(),
                 pending: 0,
             }),
@@ -44,8 +46,9 @@ impl<K: Eq + Hash + Clone> Default for Machine<K> {
 }
 
 impl<K: Eq + Hash + Clone> Machine<K> {
+    #[track_caller]
     fn table(&self) -> MutexGuard<'_, Table<K>> {
-        self.table.lock().expect("scheduler table")
+        super::guarded::contended(&self.table)
     }
 
     pub(super) fn request(&self, key: K) {
@@ -55,7 +58,17 @@ impl<K: Eq + Hash + Clone> Machine<K> {
         }
         table.phases.insert(key.clone(), Phase::Queued);
         table.pending += 1;
-        table.injected.push(key);
+        match table.staged.get_mut(&std::thread::current().id()) {
+            Some(staged) => staged.push(key),
+            None => table.injected.push(key),
+        }
+    }
+
+    pub(super) fn publish_staged(&self) {
+        let mut table = self.table();
+        if let Some(staged) = table.staged.remove(&std::thread::current().id()) {
+            table.injected.extend(staged);
+        }
     }
 
     pub(super) fn take_injected(&self) -> Vec<K> {
@@ -66,9 +79,9 @@ impl<K: Eq + Hash + Clone> Machine<K> {
         let mut table = self.table();
         match table.phases.get(key).copied() {
             Some(Phase::Queued) => {
-                table
-                    .phases
-                    .insert(key.clone(), Phase::Running(std::thread::current().id()));
+                let me = std::thread::current().id();
+                table.phases.insert(key.clone(), Phase::Running(me));
+                table.staged.entry(me).or_default();
                 true
             }
             _ => false,
@@ -200,6 +213,11 @@ mod tests {
             3,
             "children are counted before the parent finishes"
         );
+        assert!(
+            drain(&machine).is_empty(),
+            "children are not visible to other workers while the parent runs"
+        );
+        machine.publish_staged();
         machine.release_claim(&1);
         assert_eq!(machine.pending(), 2);
         assert!(!machine.is_quiescent());
@@ -269,5 +287,119 @@ mod tests {
         first.join().unwrap();
         second.join().unwrap();
         assert!(machine.is_quiescent());
+    }
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    struct Graph {
+        machine: Machine<u32>,
+        children: Vec<Vec<(u32, bool)>>,
+        processed: Vec<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Graph {
+        fn random(seed: u64) -> Self {
+            let mut rng = Xorshift(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let keys = 8 + rng.below(56);
+            let children = (0..keys)
+                .map(|_| {
+                    (0..rng.below(5))
+                        .map(|_| (rng.below(keys) as u32, rng.below(3) == 0))
+                        .collect()
+                })
+                .collect();
+            Self {
+                machine: Machine::default(),
+                children,
+                processed: (0..keys)
+                    .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                    .collect(),
+            }
+        }
+
+        fn process(&self, key: u32) {
+            self.processed[key as usize].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for &(child, inline) in &self.children[key as usize] {
+                if !inline {
+                    self.machine.request(child);
+                    continue;
+                }
+                match self.machine.claim(&child) {
+                    Claim::Mine => {
+                        self.process(child);
+                        self.machine.release_claim(&child);
+                    }
+                    Claim::Wait => self.machine.wait_done(&child),
+                    Claim::AlreadyDone => {}
+                }
+            }
+        }
+
+        fn spawn_injected<'scope>(&'scope self, scope: &rayon::Scope<'scope>) {
+            for key in self.machine.take_injected() {
+                scope.spawn(move |scope| {
+                    if self.machine.begin(&key) {
+                        self.process(key);
+                        self.machine.publish_staged();
+                        self.spawn_injected(scope);
+                        self.machine.release_claim(&key);
+                    }
+                    self.spawn_injected(scope);
+                });
+            }
+        }
+
+        fn reachable_from(&self, start: u32) -> Vec<bool> {
+            let mut seen = vec![false; self.children.len()];
+            let mut pending = vec![start];
+            while let Some(key) = pending.pop() {
+                if std::mem::replace(&mut seen[key as usize], true) {
+                    continue;
+                }
+                pending.extend(self.children[key as usize].iter().map(|(child, _)| *child));
+            }
+            seen
+        }
+    }
+
+    #[test]
+    fn random_dependency_graphs_run_every_reachable_key_exactly_once_and_quiesce() {
+        for seed in 0..96 {
+            let graph = Graph::random(seed);
+            graph.machine.request(0);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1 + (seed % 8) as usize)
+                .build()
+                .expect("pool");
+            for _round in 0..64 {
+                if graph.machine.is_quiescent() {
+                    break;
+                }
+                pool.install(|| rayon::scope(|scope| graph.spawn_injected(scope)));
+            }
+            let reachable = graph.reachable_from(0);
+            for (key, counter) in graph.processed.iter().enumerate() {
+                let runs = counter.load(std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(
+                    runs,
+                    usize::from(reachable[key]),
+                    "seed {seed}: key {key} ran {runs} times (reachable: {})",
+                    reachable[key]
+                );
+            }
+            assert!(graph.machine.is_quiescent(), "seed {seed} did not quiesce");
+        }
     }
 }

@@ -13,7 +13,7 @@ use super::reflection::ReflectionFacts;
 use super::relocation::RelocationPlan;
 use super::s3::{CallableId, S3Model};
 use super::scheduler::{Claim, Machine};
-use super::summary::{Assumption, SummaryTable};
+use super::summary::{FrameRecord, SummaryTable};
 use crate::analysis::{Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::ObjectImage;
@@ -104,7 +104,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) invocations: Guarded<InvocationModel>,
     pub(super) value_closures: Guarded<HashSet<NodeId>>,
     pub(super) construction_calls:
-        Guarded<HashMap<ConstructionCallKey, (AbstractValue, Vec<Assumption>)>>,
+        Guarded<HashMap<ConstructionCallKey, (AbstractValue, FrameRecord)>>,
     pub(super) summaries: SummaryTable,
     pub(super) construction_evaluations: AtomicUsize,
     pub(super) reflection: Guarded<ReflectionFacts>,
@@ -285,6 +285,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 self.failure.lock().get_or_insert(error);
             }
+            self.work.publish_staged();
             self.spawn_injected(scope);
             self.work.release_claim(&key);
         }

@@ -64,12 +64,82 @@ pub(super) struct Summary {
     pub(super) reads: Arc<[ReadSite]>,
 }
 
+#[derive(Clone, Debug)]
+struct ByAddress(Arc<Effect>);
+
+impl PartialEq for ByAddress {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ByAddress {}
+
+impl std::hash::Hash for ByAddress {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+struct OrderedSet<T> {
+    items: Vec<T>,
+    seen: HashSet<T>,
+}
+
+impl<T> Default for OrderedSet<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            seen: HashSet::new(),
+        }
+    }
+}
+
+impl<T: Clone + Eq + std::hash::Hash> OrderedSet<T> {
+    fn push(&mut self, item: T) {
+        if self.seen.insert(item.clone()) {
+            self.items.push(item);
+        }
+    }
+
+    fn extend(&mut self, items: impl IntoIterator<Item = T>) {
+        for item in items {
+            self.push(item);
+        }
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.items.iter()
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.seen.clear();
+    }
+
+    fn into_items(self) -> Vec<T> {
+        self.items
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct FrameRecord {
+    effects: Arc<[Arc<Effect>]>,
+    assumed: Vec<Assumption>,
+}
+
+impl FrameRecord {
+    pub(super) fn assumed(&self) -> &[Assumption] {
+        &self.assumed
+    }
+}
+
 struct Frame {
     id: u64,
     key: SummaryKey,
-    effects: Vec<Arc<Effect>>,
+    effects: OrderedSet<ByAddress>,
     before: GraphStamps,
-    inherited_reads: Vec<ReadSite>,
+    inherited_reads: OrderedSet<ReadSite>,
     pending: Vec<(SummaryKey, Summary)>,
     inner: HashMap<SummaryKey, AbstractValue>,
     dirty: bool,
@@ -88,7 +158,7 @@ pub(super) enum Advance {
 
 pub(super) struct Finished {
     pub(super) cacheable: bool,
-    pub(super) assumed: Vec<Assumption>,
+    pub(super) record: FrameRecord,
 }
 
 #[derive(Default)]
@@ -120,8 +190,9 @@ pub(super) struct SummaryTable {
 }
 
 impl SummaryTable {
+    #[track_caller]
     fn shared(&self) -> MutexGuard<'_, Shared> {
-        self.shared.lock().expect("summary table")
+        super::guarded::contended(&self.shared)
     }
 
     pub(super) fn reset_thread(&self) {
@@ -209,9 +280,9 @@ impl SummaryTable {
             local.frames.push(Frame {
                 id,
                 key,
-                effects: Vec::new(),
+                effects: OrderedSet::default(),
                 before,
-                inherited_reads: Vec::new(),
+                inherited_reads: OrderedSet::default(),
                 pending: Vec::new(),
                 inner: HashMap::new(),
                 dirty: false,
@@ -228,7 +299,7 @@ impl SummaryTable {
     pub(super) fn inherit_reads(&self, reads: &[ReadSite]) {
         local(|local| {
             if let Some(top) = local.frames.last_mut() {
-                top.inherited_reads.extend_from_slice(reads);
+                top.inherited_reads.extend(reads.iter().cloned());
             }
         });
     }
@@ -302,6 +373,16 @@ impl SummaryTable {
         })
     }
 
+    pub(super) fn adopt(&self, record: &FrameRecord) {
+        local(|local| {
+            let Some(top) = local.frames.last_mut() else {
+                return;
+            };
+            top.effects
+                .extend(record.effects.iter().cloned().map(ByAddress));
+        });
+    }
+
     pub(super) fn note_cut(&self) {
         local(|local| {
             if let Some(top) = local.frames.last_mut() {
@@ -313,7 +394,7 @@ impl SummaryTable {
     pub(super) fn record(&self, effect: Arc<Effect>) {
         local(|local| {
             if let Some(top) = local.frames.last_mut() {
-                top.effects.push(effect);
+                top.effects.push(ByAddress(effect));
             }
         });
     }
@@ -387,17 +468,28 @@ impl SummaryTable {
             && frame.before.writes == after.writes
             && frame.before.derived_reads == after.derived_reads
             && assumed.len() == 1;
+        let effects: Arc<[Arc<Effect>]> = std::mem::take(&mut frame.effects)
+            .into_items()
+            .into_iter()
+            .map(|effect| effect.0)
+            .collect();
+        let record = FrameRecord {
+            effects: Arc::clone(&effects),
+            assumed: assumed.clone(),
+        };
         if cacheable || sound_under_one_root {
             let mut seen = HashSet::new();
-            let reads = std::mem::take(&mut frame.inherited_reads)
+            let reads: Arc<[ReadSite]> = std::mem::take(&mut frame.inherited_reads)
+                .into_items()
                 .into_iter()
                 .chain(logged_reads(frame.before.read_cursor))
                 .filter(|read| seen.insert(read.clone()))
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+                .into();
             let summary = Summary {
                 value: value.clone(),
-                effects: std::mem::take(&mut frame.effects).into(),
-                reads: reads.into(),
+                effects,
+                reads,
             };
             if cacheable {
                 profile::count(Counter::SummariesStored);
@@ -432,6 +524,6 @@ impl SummaryTable {
                 });
             }
         }
-        Finished { cacheable, assumed }
+        Finished { cacheable, record }
     }
 }

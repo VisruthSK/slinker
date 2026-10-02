@@ -263,6 +263,7 @@ pub struct SemanticIssue {
 #[derive(Debug, Clone)]
 pub struct ParsedExpression {
     pub span: Span,
+    pub assigned_value_start: Option<usize>,
     pub parameters: Vec<Atom>,
     pub used_parameters: Vec<Atom>,
     pub pinned_defaults: Vec<PinnedDefault>,

@@ -68,6 +68,12 @@ probes! {
     GuardVerdict => "guard_verdict",
     ProcessEffects => "process_effects",
     LockWait => "lock_wait",
+    FinalizeNamespaces => "finalize.namespaces",
+    FinalizeExports => "finalize.exports",
+    FinalizeRelocations => "finalize.relocations",
+    FinalizeDiagnostics => "finalize.diagnostics",
+    ExplanationBuild => "explain.build",
+    ExplanationSerialize => "explain.serialize",
     ParseSyntax => "parse.syntax",
     ParseIndex => "parse.semantic_index",
     ParseDeclarations => "parse.declarations",
@@ -304,6 +310,43 @@ pub fn count(counter: Counter) {
     add(counter, 1);
 }
 
+type LockSites = std::collections::HashMap<(&'static str, u32), (u64, u64)>;
+
+static LOCK_SITES: Mutex<Option<LockSites>> = Mutex::new(None);
+
+pub fn lock_wait(site: &'static std::panic::Location<'static>, waited: std::time::Duration) {
+    if registry().is_none() {
+        return;
+    }
+    if let Ok(mut sites) = LOCK_SITES.lock() {
+        let entry = sites
+            .get_or_insert_with(Default::default)
+            .entry((site.file(), site.line()))
+            .or_default();
+        entry.0 += 1;
+        entry.1 += u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+    }
+}
+
+fn lock_wait_report() -> String {
+    let sites = LOCK_SITES
+        .lock()
+        .ok()
+        .and_then(|mut sites| sites.take())
+        .unwrap_or_default();
+    let mut sites = sites.into_iter().collect::<Vec<_>>();
+    sites.sort_by_key(|(_, (_, nanos))| std::cmp::Reverse(*nanos));
+    let mut out = String::from("contended lock waits by call site\n");
+    for ((file, line), (count, nanos)) in sites.into_iter().take(12) {
+        let _ = writeln!(
+            out,
+            "  {file}:{line:<5} {count:>8} waits {:>10.1} ms",
+            nanos as f64 / 1e6
+        );
+    }
+    out
+}
+
 pub fn add(counter: Counter, amount: u64) {
     if let Some(registry) = registry() {
         registry.counters[counter as usize].fetch_add(amount, Ordering::Relaxed);
@@ -376,6 +419,7 @@ pub fn report() -> Option<String> {
             cell.exclusive_bytes.load(Ordering::Relaxed) as f64 / 1_048_576.0,
         );
     }
+    out.push_str(&lock_wait_report());
     let _ = writeln!(out, "counters");
     for counter in Counter::ALL {
         let value = registry.counters[*counter as usize].load(Ordering::Relaxed);

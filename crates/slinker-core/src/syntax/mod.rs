@@ -11,7 +11,6 @@ pub use facts::{
     SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 pub(crate) use oak::SharedNames;
-pub use oak::assigned_value_start;
 pub(crate) use oak::{
     NamespaceImportResolution, NamespaceImports, closure_definitely_non_returning,
 };

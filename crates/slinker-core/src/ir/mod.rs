@@ -304,9 +304,9 @@ pub struct CodeIr {
 }
 
 impl CodeIr {
-    pub fn new(source: Arc<str>, normalized_shape: Digest) -> Self {
+    pub fn new(source: Arc<str>, normalized_shape: Digest, value_start: Option<usize>) -> Self {
         Self {
-            value_start: crate::syntax::assigned_value_start(&source),
+            value_start,
             source,
             occurrences: Vec::new(),
             normalized_shape,
@@ -775,6 +775,7 @@ pub enum MaterializedSlotSource {
     Closure {
         source: Arc<str>,
         normalized_shape: Digest,
+        assigned_value_start: Option<usize>,
     },
     Payload,
 }
@@ -884,8 +885,10 @@ impl ProgramBuilder {
                 MaterializedSlotSource::Closure {
                     source,
                     normalized_shape,
+                    assigned_value_start,
                 } => {
-                    let code = self.add_code(CodeIr::new(source, normalized_shape));
+                    let code =
+                        self.add_code(CodeIr::new(source, normalized_shape, assigned_value_start));
                     let closure = self.add_closure(Closure {
                         code,
                         enclosure: namespace_environment,

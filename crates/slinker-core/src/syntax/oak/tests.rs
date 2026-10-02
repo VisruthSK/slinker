@@ -80,9 +80,14 @@ fn replacement_call_references_the_replacement_function() {
 #[test]
 fn assigned_value_start_is_the_outer_assignment_value() {
     let source = "`.onLoad` <- function(libname, pkgname) { x <- 1 }";
-    let start = assigned_value_start(source).unwrap();
+    let start = parse_source(source).expressions[0]
+        .assigned_value_start
+        .unwrap();
     assert!(source[start..].starts_with("function(libname"));
-    assert_eq!(assigned_value_start("f(1)"), None);
+    assert_eq!(
+        parse_source("f(1)").expressions[0].assigned_value_start,
+        None
+    );
 }
 
 #[test]

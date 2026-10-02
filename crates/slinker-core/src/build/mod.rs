@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 use crate::ir::PackageRole;
 use std::fs;
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tempfile::TempDir;
 use thiserror::Error;
 
@@ -31,11 +33,47 @@ use thiserror::Error;
 pub struct TargetRuntimeHandle {
     r_home: PathBuf,
     target: TargetEnvironment,
+    spare: Mutex<Option<WorkerClient>>,
+}
+
+pub(crate) struct BorrowedWorker<'a> {
+    client: Option<WorkerClient>,
+    spare: &'a Mutex<Option<WorkerClient>>,
+}
+
+impl Deref for BorrowedWorker<'_> {
+    type Target = WorkerClient;
+
+    fn deref(&self) -> &WorkerClient {
+        self.client
+            .as_ref()
+            .expect("a borrowed worker holds its client until it is dropped")
+    }
+}
+
+impl DerefMut for BorrowedWorker<'_> {
+    fn deref_mut(&mut self) -> &mut WorkerClient {
+        self.client
+            .as_mut()
+            .expect("a borrowed worker holds its client until it is dropped")
+    }
+}
+
+impl Drop for BorrowedWorker<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut spare) = self.spare.lock() {
+            *spare = self.client.take();
+        }
+    }
 }
 
 impl TargetRuntimeHandle {
     pub fn new(r_home: PathBuf, target: TargetEnvironment) -> Self {
-        Self { r_home, target }
+        Self {
+            r_home,
+            target,
+            spare: Mutex::new(None),
+        }
     }
 
     pub fn r_home(&self) -> &Path {
@@ -46,8 +84,16 @@ impl TargetRuntimeHandle {
         &self.target
     }
 
-    pub(crate) fn worker(&self) -> crate::Result<WorkerClient> {
-        WorkerClient::spawn(self.r_home.clone(), &self.target, 0)
+    pub(crate) fn worker(&self) -> crate::Result<BorrowedWorker<'_>> {
+        let reused = self.spare.lock().ok().and_then(|mut spare| spare.take());
+        let client = match reused {
+            Some(client) => client,
+            None => WorkerClient::spawn(self.r_home.clone(), &self.target, 0)?,
+        };
+        Ok(BorrowedWorker {
+            client: Some(client),
+            spare: &self.spare,
+        })
     }
 }
 

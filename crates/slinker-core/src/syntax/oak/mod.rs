@@ -104,9 +104,13 @@ impl OakParser {
             return Err(error.to_string());
         }
         let root = parsed.tree();
+        let value_start = assignment_value_start(&root);
         let Some(evaluated) = evaluated_quotation_text(text, &root, context) else {
             let index = build_semantic_index(&root, context);
-            return Ok(translate_index(source, text, context, &root, &index));
+            return Ok(with_value_start(
+                translate_index(source, text, context, &root, &index),
+                value_start,
+            ));
         };
         let parsed = parse(&evaluated, RParserOptions::default());
         if let Some(error) = parsed.error() {
@@ -114,7 +118,10 @@ impl OakParser {
         }
         let root = parsed.tree();
         let index = build_semantic_index(&root, context);
-        Ok(translate_index(source, &evaluated, context, &root, &index))
+        Ok(with_value_start(
+            translate_index(source, &evaluated, context, &root, &index),
+            value_start,
+        ))
     }
 }
 
@@ -406,10 +413,15 @@ impl LexicalScopes {
     }
 }
 
-pub fn assigned_value_start(text: &str) -> Option<usize> {
-    let parsed = parse(text, RParserOptions::default());
-    let assignment = parsed
-        .tree()
+fn with_value_start(mut parsed: ParsedRFile, value_start: Option<usize>) -> ParsedRFile {
+    if let Some(expression) = parsed.expressions.first_mut() {
+        expression.assigned_value_start = value_start;
+    }
+    parsed
+}
+
+fn assignment_value_start(root: &RRoot) -> Option<usize> {
+    let assignment = root
         .syntax()
         .descendants()
         .find_map(RBinaryExpression::cast)?;
@@ -524,6 +536,7 @@ fn translate_index(
     ParsedRFile {
         expressions: vec![ParsedExpression {
             span: Span::new(source, 0, text.len()),
+            assigned_value_start: None,
             parameters: parameters.into_iter().map(Atom::from).collect(),
             used_parameters: used_parameters.into_iter().map(Atom::from).collect(),
             pinned_defaults,

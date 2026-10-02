@@ -445,10 +445,16 @@ fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
     let (session, plan) = link(&args.analysis)?;
     let target = session.target();
     if args.json.format() == OutputFormat::Json {
-        let graph = ExplanationDag::from_plan(&plan, target, session.root())?;
-        let mut stdout = io::stdout().lock();
+        let graph =
+            slinker_core::profile::scoped(slinker_core::profile::Probe::ExplanationBuild, || {
+                ExplanationDag::from_plan(&plan, target, session.root())
+            })?;
+        let _serialize =
+            slinker_core::profile::span(slinker_core::profile::Probe::ExplanationSerialize);
+        let mut stdout = io::BufWriter::with_capacity(1 << 20, io::stdout().lock());
         serde_json::to_writer_pretty(&mut stdout, &graph)?;
         writeln!(stdout)?;
+        stdout.flush()?;
     } else {
         print_analysis(target, &plan);
     }

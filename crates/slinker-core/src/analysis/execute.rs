@@ -760,10 +760,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             arguments: Arc::clone(&key.arguments),
         };
         let remembered = self.construction_calls.lock().get(&memo).cloned();
-        if let Some((value, assumed)) = remembered
-            && self.summaries.assumptions_hold(&assumed)
+        if let Some((value, record)) = remembered
+            && self.summaries.assumptions_hold(record.assumed())
         {
             profile::count(Counter::ConstructionMemoHits);
+            self.summaries.adopt(&record);
             return Ok(ExecutionOutcome::value(value));
         }
         self.construction_evaluations
@@ -808,7 +809,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         if !finished.cacheable {
             self.construction_calls
                 .lock()
-                .insert(memo, (value.clone(), finished.assumed));
+                .insert(memo, (value.clone(), finished.record));
         }
         Ok(ExecutionOutcome::value(value))
     }
