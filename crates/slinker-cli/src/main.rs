@@ -12,8 +12,12 @@ use slinker_core::TargetEnvironment;
 use slinker_core::analysis::{
     ANALYSIS_STACK_BYTES, Edge, ExplanationDag, LinkIr, Node, NodeId, NodeKind,
 };
+use slinker_core::build::incremental::{
+    BuildRecord, BuildState, consulted_packages, inputs_digest, is_up_to_date,
+};
 use slinker_core::build::{BuildReport, PreflightError, PureRStatic, materialize};
 use slinker_core::package::{BindingName, PackageName};
+use slinker_core::package::{PackageLocator, tree_digest};
 
 mod cache_command;
 mod session;
@@ -296,31 +300,78 @@ fn link(args: &AnalysisArgs) -> Result<(Session, LinkIr), Box<dyn Error>> {
 }
 
 fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
-    let session = SourceSession::open(&args.path, &args.universe, discover_r_home()?)?;
-    let ir = session.session().analyze(&args.universe, false)?;
-    let package = session.snapshot().package().to_owned();
+    let prepared = SourceSession::prepare(&args.path, &args.universe, discover_r_home()?)?;
+    let package = prepared.snapshot().package().to_owned();
     let output = args.output.clone().unwrap_or_else(|| {
-        session
+        prepared
             .snapshot()
             .original_root()
             .join("target")
             .join("slinker")
             .join(&package)
     });
+    let output = std::path::absolute(&output)?;
+    let state = BuildState::new(&session::cache_location());
+    let sorted = |names: &[PackageName]| {
+        let mut names = names
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let (linked, external) = (
+        sorted(&args.universe.linked),
+        sorted(&args.universe.external),
+    );
+    let inputs = inputs_digest(
+        &tree_digest(prepared.snapshot().files().root())?,
+        prepared.target(),
+        &linked.iter().map(String::as_str).collect::<Vec<_>>(),
+        &external.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    if let Some(record) = state.load(&output)
+        && is_up_to_date(
+            &record,
+            &inputs,
+            &PackageLocator::new(prepared.target().clone()),
+            &package,
+        )?
+    {
+        print_built(args.json.format(), &package, &output, true);
+        return Ok(());
+    }
+    let session = SourceSession::stage(prepared)?;
+    let ir = session.session().analyze(&args.universe, false)?;
+    let consulted = consulted_packages(ir.consulted(), &package);
     let context = session.into_build_context();
     let buildable = PureRStatic::check(&ir, &context)?;
     let generated = materialize(buildable, &output)?;
-    if args.json.format() == OutputFormat::Json {
+    state.save(&BuildRecord {
+        package: package.clone(),
+        output,
+        inputs: inputs.as_str().to_owned(),
+        consulted,
+        output_digest: tree_digest(generated.path())?.as_str().to_owned(),
+    })?;
+    print_built(args.json.format(), &package, generated.path(), false);
+    Ok(())
+}
+
+fn print_built(format: OutputFormat, package: &str, output: &std::path::Path, up_to_date: bool) {
+    if format == OutputFormat::Json {
         let rendered = json!({
-            "status": "built",
+            "status": if up_to_date { "up_to_date" } else { "built" },
             "package": package,
-            "output": generated.path(),
+            "output": output,
         });
         println!("{rendered:#}");
     } else {
-        println!("{}", generated.path().display());
+        println!("{}", output.display());
+        if up_to_date {
+            eprintln!("up to date");
+        }
     }
-    Ok(())
 }
 
 fn check(args: &CheckArgs) -> Result<(), Box<dyn Error>> {

@@ -132,24 +132,62 @@ impl Session {
     }
 }
 
+pub struct PreparedSource {
+    snapshot: SourcePackageSnapshot,
+    r_home: PathBuf,
+    target: TargetEnvironment,
+}
+
+impl PreparedSource {
+    pub fn snapshot(&self) -> &SourcePackageSnapshot {
+        &self.snapshot
+    }
+
+    pub fn target(&self) -> &TargetEnvironment {
+        &self.target
+    }
+}
+
 impl SourceSession {
+    pub fn prepare(
+        path: &Path,
+        universe: &UniverseArgs,
+        r_home: PathBuf,
+    ) -> Result<PreparedSource, Box<dyn Error>> {
+        let snapshot = SourcePackageSnapshot::capture(path)?;
+        let mut request = TargetEnvironmentRequest::new(r_home.clone());
+        request.libraries = absolute_libraries(universe)?;
+        Ok(PreparedSource {
+            snapshot,
+            r_home,
+            target: request.capture()?,
+        })
+    }
+
     pub fn open(
         path: &Path,
         universe: &UniverseArgs,
         r_home: PathBuf,
     ) -> Result<Self, Box<dyn Error>> {
-        let snapshot = SourcePackageSnapshot::capture(path)?;
-        let libraries = resolve_libraries(&r_home, universe)?;
-        let staged = stage_root(&snapshot, &r_home, &libraries)?;
-        let ordered = std::iter::once(staged.library().to_path_buf())
-            .chain(libraries)
-            .collect();
-        let session = Session::capture(
+        Self::stage(Self::prepare(path, universe, r_home)?)
+    }
+
+    pub fn stage(prepared: PreparedSource) -> Result<Self, Box<dyn Error>> {
+        let PreparedSource {
+            snapshot,
             r_home,
-            snapshot.package().to_owned(),
-            Some(snapshot.description_source().into()),
-            ordered,
-        )?;
+            mut target,
+        } = prepared;
+        let staged = stage_root(&snapshot, &r_home, &target.libraries)?;
+        let staged_library = dunce::canonicalize(staged.library())?;
+        target.libraries.insert(0, staged_library);
+        let session = Session {
+            r_home,
+            target,
+            root: snapshot.package().to_owned(),
+            root_description: Some(snapshot.description_source().into()),
+            retained: None,
+        };
         Ok(Self {
             session,
             inputs: SourceInputs { snapshot, staged },

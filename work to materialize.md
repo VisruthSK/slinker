@@ -133,7 +133,7 @@ Landed: a Rayon work-stealing worklist over shared thread-safe analyzer state (o
 Still to do:
 - Canonical allocation-site identities for derived environments and closures (`derived:N` labels, `ObjectId`, `ClosureId`) and mergeable `AnalysisDelta`s; output is identical today only because the remaining orderings are canonicalized at finalization.
 - Allocation effects in construction summaries: evaluations that allocate environments or closures are still memoized per requesting node; instantiate fresh allocation identities per call site so they can share a summary.
-- A query dependency graph with fingerprint backdating and durability, used by warm unchanged and one-source-edit reruns, and persistence of semantic summaries keyed by exact inputs, target R identity, and analyzer schema versions. Parsed-source results hold invocation-local `SourceId`s and need a relocatable form first.
+- Analysis-level incrementality. Today an unchanged `build` is skipped outright (recorded inputs plus the consulted-package read set) and caches make an edited rebuild cheap, but an edit still re-runs analysis over the changed root. Reusing unchanged needs requires a query dependency graph with fingerprint backdating and durability, canonical allocation-site identities, and replayable per-need deltas, plus persistence of semantic summaries keyed by exact inputs, target R identity, and analyzer schema versions. Parsed-source results hold invocation-local `SourceId`s and need a relocatable form first.
 - Reuse of the initialized target-capture worker across capture, analysis, and preflight (warm runs still start three R processes).
 - Audit demand-driven package inspection; reduce full-package fingerprinting if it becomes a material share.
 

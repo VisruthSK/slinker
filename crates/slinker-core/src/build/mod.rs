@@ -1,5 +1,6 @@
 mod copy;
 mod emit;
+pub mod incremental;
 mod payload;
 mod relocated;
 mod report;
@@ -308,7 +309,7 @@ pub fn materialize(
     buildable: BuildableProgram<'_, PureRStatic>,
     output: &Path,
 ) -> Result<GeneratedPackage, MaterializeError> {
-    if output.exists() {
+    if output.exists() && !is_generated_package(output) {
         return Err(MaterializeError::OutputExists(output.into()));
     }
     let parent = output
@@ -355,10 +356,61 @@ pub fn materialize(
     fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
     copy_linked_resources(buildable.program, materialization, &package_root)?;
     copy_dataset_libraries(buildable.program, materialization, &package_root)?;
-    fs::rename(&package_root, output)?;
+    publish(&package_root, output)?;
     Ok(GeneratedPackage {
         path: output.to_path_buf(),
     })
+}
+
+fn is_generated_package(directory: &Path) -> bool {
+    directory.join("R/zzz-slinker-generated.R").is_file() && directory.join("inst/slinker").is_dir()
+}
+
+fn publish(package_root: &Path, output: &Path) -> std::io::Result<()> {
+    if !output.exists() {
+        return fs::rename(package_root, output);
+    }
+    let unchanged = preserve_unchanged_files(output, package_root)?;
+    if unchanged {
+        return Ok(());
+    }
+    let parent = output.parent().unwrap_or(Path::new("."));
+    let retired = tempfile::Builder::new()
+        .prefix(".slinker-replaced-")
+        .tempdir_in(parent)?;
+    let backup = retired.path().join("previous");
+    fs::rename(output, &backup)?;
+    if let Err(error) = fs::rename(package_root, output) {
+        fs::rename(&backup, output)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn preserve_unchanged_files(old: &Path, new: &Path) -> std::io::Result<bool> {
+    let mut identical = true;
+    let mut present = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(new)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        present.insert(name.clone());
+        let (old_path, new_path) = (old.join(&name), entry.path());
+        if entry.file_type()?.is_dir() {
+            identical &= old_path.is_dir() && preserve_unchanged_files(&old_path, &new_path)?;
+        } else if old_path.is_file() && fs::read(&old_path)? == fs::read(&new_path)? {
+            let modified = fs::metadata(&old_path)?.modified()?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&new_path)?
+                .set_modified(modified)?;
+        } else {
+            identical = false;
+        }
+    }
+    for entry in fs::read_dir(old)? {
+        identical &= present.contains(&entry?.file_name());
+    }
+    Ok(identical)
 }
 
 #[derive(Debug, Error)]

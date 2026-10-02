@@ -42,6 +42,7 @@ pub struct LinkIr {
     provenance: ProvenanceIr,
     blockers: Vec<Diagnostic>,
     sources: Sources,
+    consulted: Vec<(PackageName, Option<PackageIdentity>)>,
     construction_evaluations: usize,
 }
 
@@ -129,6 +130,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         self.finalize_s3_dispatch(&retained);
         self.finalize_unresolved_names();
+        let consulted = self.packages.consulted();
         let blockers = std::mem::take(&mut *self.diagnostics.lock()).into_sorted();
         let sources = std::mem::take(&mut *self.parses.lock()).into_sources();
         Ok(LinkIr {
@@ -137,6 +139,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             blockers,
             sources,
             packages: self.packages.sources(retained),
+            consulted,
             construction_evaluations: self.construction_evaluations.load(Ordering::Relaxed),
         })
     }
@@ -1156,6 +1159,10 @@ impl LinkIr {
 
     pub fn sources(&self) -> &Sources {
         &self.sources
+    }
+
+    pub fn consulted(&self) -> &[(PackageName, Option<PackageIdentity>)] {
+        &self.consulted
     }
 
     pub fn construction_evaluations(&self) -> usize {

@@ -74,6 +74,10 @@ impl PackageLocator {
     }
 }
 
+pub fn tree_digest(root: &Path) -> Result<Digest> {
+    fingerprint_image(root)
+}
+
 pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
     let _span = profile::span(Probe::PackageFingerprint);
     profile::count(Counter::FingerprintOperations);

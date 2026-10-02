@@ -11,8 +11,8 @@ mod universe;
 
 pub use cache_names::EntryKind;
 pub use cache_report::{
-    CacheReport, ClearOutcome, ClearScope, KindTotals, PackageCacheReport, SchemaCacheReport,
-    clear_cache, inspect_cache,
+    BuildCacheReport, CacheReport, ClearOutcome, ClearScope, KindTotals, PackageCacheReport,
+    SchemaCacheReport, clear_cache, inspect_cache,
 };
 pub use identity::{
     Digest, InstalledPackage, PackageId, PackageIdentity, PackageLocation, PackageRole,
@@ -29,10 +29,11 @@ pub use index::{
     PackageData, PackageIndex, S3Registration,
 };
 pub use locator::PackageLocator;
-pub(crate) use locator::fingerprint_image;
+pub use locator::tree_digest;
+pub(crate) use locator::{fingerprint_image, fingerprint_strings};
 pub use store::{
     CanonicalSyntax, DispatchSubject, PackageProvider, PackageResolver, PackageStore,
-    SyntaxValidation,
+    SyntaxValidation, analysis_schema,
 };
 pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUniverse};
 

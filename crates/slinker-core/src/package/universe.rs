@@ -161,6 +161,22 @@ impl<P: PackageResolver> TargetUniverse<P> {
         self.target_environment().base_bindings.contains(name)
     }
 
+    pub fn consulted(&self) -> Vec<(PackageName, Option<PackageIdentity>)> {
+        let roster = self.roster.read().expect("universe roster");
+        let mut consulted = roster
+            .availability
+            .iter()
+            .map(|(name, availability)| {
+                let identity = availability
+                    .package()
+                    .map(|id| roster.packages[id.index()].package.identity.clone());
+                (name.clone(), identity)
+            })
+            .collect::<Vec<_>>();
+        consulted.sort_by(|left, right| left.0.cmp(&right.0));
+        consulted
+    }
+
     pub fn sources(&self, ids: impl IntoIterator<Item = PackageId>) -> PackageSources {
         PackageSources(
             ids.into_iter()

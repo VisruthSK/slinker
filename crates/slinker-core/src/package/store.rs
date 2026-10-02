@@ -20,6 +20,11 @@ use std::sync::{Arc, Mutex};
 
 const AIR_VERSION: &str = "0.11.0";
 pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v11";
+
+#[must_use]
+pub fn analysis_schema() -> &'static str {
+    ANALYSIS_SCHEMA
+}
 const MAX_R_WORKERS: usize = 4;
 const SOURCES_PER_WORKER: usize = 48;
 
