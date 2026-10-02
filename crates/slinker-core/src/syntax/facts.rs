@@ -62,15 +62,48 @@ pub struct CallSite {
     pub callee: Atom,
     pub callee_kind: CalleeKind,
     pub qualified_package: Option<Atom>,
-    pub args: Vec<Option<StaticArg>>,
-    pub arg_names: Vec<Option<Atom>>,
-    pub arg_spans: Vec<Option<Span>>,
-    pub local_closure_args: Vec<bool>,
+    pub arguments: Box<[CallArgument]>,
     pub scope: LexicalScopeId,
-    pub arg_bindings: Vec<Option<LexicalBindingId>>,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallArgument {
+    pub value: Option<StaticArg>,
+    pub name: Option<Atom>,
+    pub span: Option<Span>,
+    pub is_local_closure: bool,
+    pub binding: Option<LexicalBindingId>,
+}
+
+impl CallSite {
+    pub fn arg_count(&self) -> usize {
+        self.arguments.len()
+    }
+
+    pub fn static_arg(&self, index: usize) -> Option<&StaticArg> {
+        self.arguments.get(index)?.value.as_ref()
+    }
+
+    pub fn arg_name(&self, index: usize) -> Option<&str> {
+        self.arguments.get(index)?.name.as_deref()
+    }
+
+    pub fn arg_span(&self, index: usize) -> Option<&Span> {
+        self.arguments.get(index)?.span.as_ref()
+    }
+
+    pub fn arg_binding(&self, index: usize) -> Option<&LexicalBindingId> {
+        self.arguments.get(index)?.binding.as_ref()
+    }
+
+    pub fn arg_is_local_closure(&self, index: usize) -> bool {
+        self.arguments
+            .get(index)
+            .is_some_and(|argument| argument.is_local_closure)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

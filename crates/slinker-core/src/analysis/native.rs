@@ -29,7 +29,7 @@ struct CallbackSite<'a> {
 impl<P: PackageProvider> AnalyzerState<P> {
     fn native_selector(call: &CallSite) -> Option<&str> {
         let index = matched_arg_index(call, &[".NAME"], ".NAME")?;
-        match call.args.get(index)?.as_ref()? {
+        match call.static_arg(index)? {
             StaticArg::Symbol(name) | StaticArg::String(name) => Some(name.as_str()),
         }
     }
@@ -104,7 +104,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             let callback_index = native_call_argument_index(call, position);
-            let callback = callback_index.and_then(|index| call.args.get(index)?.as_ref());
+            let callback = callback_index.and_then(|index| call.static_arg(index));
             let Some(StaticArg::Symbol(callback_name)) = callback else {
                 self.diagnostic(
                     native_node,
@@ -118,11 +118,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
                 continue;
             };
-            if callback_index
-                .and_then(|index| call.local_closure_args.get(index))
-                .copied()
-                .unwrap_or(false)
-            {
+            if callback_index.is_some_and(|index| call.arg_is_local_closure(index)) {
                 self.depend(
                     native_node,
                     callback_owner,
@@ -281,7 +277,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         let Some(index) = matched_arg_index(call, &[".NAME"], ".NAME") else {
             return;
         };
-        let Some(StaticArg::String(symbol)) = call.args.get(index).and_then(Option::as_ref) else {
+        let Some(StaticArg::String(symbol)) = call.static_arg(index) else {
             return;
         };
         let Some(native) = image
@@ -292,14 +288,10 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         else {
             return;
         };
-        let names_other_library = call
-            .arg_names
-            .iter()
-            .zip(&call.args)
-            .any(|(name, argument)| {
-                name.as_deref() == Some("PACKAGE")
-                    && !matches!(argument, Some(StaticArg::String(library)) if library == component)
-            });
+        let names_other_library = call.arguments.iter().any(|argument| {
+            argument.name.as_deref() == Some("PACKAGE")
+                && !matches!(&argument.value, Some(StaticArg::String(library)) if library == component)
+        });
         let registered = NativeInterface::of_callee(&call.callee)
             .zip(native.library.routines())
             .is_some_and(|(interface, routines)| {
@@ -308,7 +300,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     .iter()
                     .any(|routine| routine == symbol)
             });
-        let source = call.arg_spans.get(index).cloned().flatten();
+        let source = call.arg_span(index).cloned();
         match (native.library.name_lookup(), source) {
             (Some(NameLookup::Forced), _) if !names_other_library => {}
             (Some(NameLookup::Allowed), Some(source)) if registered && !names_other_library => {
@@ -343,7 +335,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     ) {
         let formals = ["name", "PACKAGE", "unlist", "withRegistrationInfo"];
         let library = matched_arg_index(call, &formals, "PACKAGE");
-        match library.map(|index| (index, call.args.get(index).and_then(Option::as_ref))) {
+        match library.map(|index| (index, call.static_arg(index))) {
             None => {
                 let Some(StaticArg::String(symbol)) = matched_static_arg(call, &formals, "name")
                 else {
@@ -382,7 +374,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 };
                 match (
                     native.library.name_lookup(),
-                    call.arg_spans.get(index).cloned().flatten(),
+                    call.arg_span(index).cloned(),
                 ) {
                     (Some(NameLookup::Forced), _) => {}
                     (Some(NameLookup::Allowed), Some(source)) => {
@@ -426,7 +418,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         let Some(selector_index) = matched_arg_index(call, &[".NAME"], ".NAME") else {
             return Ok(None);
         };
-        let Some(selector) = call.args.get(selector_index).and_then(Option::as_ref) else {
+        let Some(selector) = call.static_arg(selector_index) else {
             return Ok(None);
         };
         if let StaticArg::String(symbol) = selector {

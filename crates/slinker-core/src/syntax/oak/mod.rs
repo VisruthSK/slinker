@@ -1,9 +1,11 @@
 use crate::package::{Atom, BindingName};
+use crate::profile::{self, Probe};
 use crate::syntax::facts::{
-    ActiveBindingDef, CallSite, CalleeKind, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef,
-    NameRefKind, NamespaceEnumeration, NamespaceInfoRead, NamespaceInfoReceiver, PackageRef,
-    ParsedExpression, ParsedRFile, PinnedDefault, ResourcePackage, ResourceRef, SemanticIssue,
-    SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    ActiveBindingDef, CallArgument, CallSite, CalleeKind, EvalPhase, LexicalBindingId,
+    LexicalScopeId, NameRef, NameRefKind, NamespaceEnumeration, NamespaceInfoRead,
+    NamespaceInfoReceiver, PackageRef, ParsedExpression, ParsedRFile, PinnedDefault,
+    ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment,
+    SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use air_r_parser::{RParserOptions, parse};
@@ -95,7 +97,9 @@ impl OakParser {
         if u32::try_from(text.len()).is_err() {
             return Err("source exceeds the 4 GiB text size Air can address".into());
         }
-        let parsed = parse(text, RParserOptions::default());
+        let parsed = profile::scoped(Probe::ParseSyntax, || {
+            parse(text, RParserOptions::default())
+        });
         if let Some(error) = parsed.error() {
             return Err(error.to_string());
         }
@@ -422,7 +426,9 @@ pub fn assigned_value_start(text: &str) -> Option<usize> {
 }
 
 fn build_semantic_index(root: &RRoot, context: &OakParseContext) -> SemanticIndex {
-    build_index(root, SlinkerImportsResolver { context })
+    profile::scoped(Probe::ParseIndex, || {
+        build_index(root, SlinkerImportsResolver { context })
+    })
 }
 
 fn translate_index(
@@ -433,23 +439,31 @@ fn translate_index(
     index: &SemanticIndex,
 ) -> ParsedRFile {
     let scopes = LexicalScopes::new(index);
-    let declarations = collect_declarations(&source, text, root, context, index, &scopes);
+    let declarations = profile::scoped(Probe::ParseDeclarations, || {
+        collect_declarations(&source, text, root, context, index, &scopes)
+    });
     let mut live_uses = collect_live_uses(index, &declarations);
 
-    let function_regions = find_function_regions(text);
-    let for_regions = find_for_regions(text);
-    let if_regions = find_if_regions(text);
-    refine_callee_kinds(
-        text,
-        context,
-        index,
-        &function_regions,
-        &for_regions,
-        &if_regions,
-        &mut live_uses,
-    );
+    let (function_regions, for_regions, if_regions) = profile::scoped(Probe::ParseRegions, || {
+        let function_regions = find_function_regions(text);
+        let for_regions = find_for_regions(text);
+        let if_regions = find_if_regions(text);
+        refine_callee_kinds(
+            text,
+            context,
+            index,
+            &function_regions,
+            &for_regions,
+            &if_regions,
+            &mut live_uses,
+        );
+        (function_regions, for_regions, if_regions)
+    });
 
-    let mut references = name_references(&source, text, context, root, index, &live_uses);
+    let mut references = profile::scoped(Probe::ParseReferences, || {
+        name_references(&source, text, context, root, index, &live_uses)
+    });
+    let calls_span = profile::span(Probe::ParseCalls);
     let mut live_calls = lexical_calls(&source, text, index, &scopes, &live_uses);
     let translation = Translation {
         source: &source,
@@ -464,7 +478,9 @@ fn translate_index(
     dispatching_syntax_facts(translation, &mut live_calls);
 
     deduplicate_calls(&mut live_calls);
+    drop(calls_span);
 
+    let guards_span = profile::span(Probe::ParseGuards);
     let mut guard_regions = if_guard_regions(text, context, &if_regions, &live_calls);
     apply_guard_regions_to_references(&guard_regions, &mut references);
     apply_guard_regions_to_package_refs(&guard_regions, &mut package_refs);
@@ -487,6 +503,9 @@ fn translate_index(
     );
     let namespace_enumerations =
         collect_namespace_enumerations(source, context, &live_calls, &environment_aliases);
+    drop(guards_span);
+
+    let effects_span = profile::span(Probe::ParseEffects);
     let (mut effects, suppressed_reference_spans) = collect_superassignments(
         source,
         text,
@@ -497,9 +516,12 @@ fn translate_index(
     );
     suppress_superassignment_references(&mut effects, &mut references, &suppressed_reference_spans);
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
+    drop(effects_span);
 
+    let construction_span = profile::span(Probe::ParseConstruction);
     let (parameters, construction) = collect_construction(source, text, root, &live_calls);
     let namespace_info_reads = collect_namespace_info_reads(source, text, root, &declarations);
+    drop(construction_span);
     let calls: Vec<CallSite> = live_calls.into_iter().map(|call| call.site).collect();
     let mut issues = translate_diagnostics(source, index);
     issues.extend(declarations.issues);
@@ -788,16 +810,8 @@ fn lexical_calls(
                 callee: Atom::from(live_use.name.as_str()),
                 callee_kind: live_use.callee_kind,
                 qualified_package: None,
-                args,
-                arg_names: raw
-                    .args
-                    .iter()
-                    .map(|argument| argument.name.as_deref().map(Atom::from))
-                    .collect(),
-                arg_spans: argument_spans(source, &raw.args),
-                local_closure_args: local_closure_arguments(text, index, live_uses, &raw.args),
+                arguments: call_arguments(source, text, index, live_uses, &raw, args, arg_bindings),
                 scope,
-                arg_bindings,
                 phase: live_use.phase,
                 guards: Vec::new(),
                 span: Span::new(*source, raw.start, raw.end),
@@ -864,16 +878,16 @@ fn namespace_access_facts(
                     callee: Atom::from(access.symbol()),
                     callee_kind: CalleeKind::DefinitelyExternal,
                     qualified_package: Some(Atom::from(access.package())),
-                    args,
-                    arg_names: raw
-                        .args
-                        .iter()
-                        .map(|argument| argument.name.as_deref().map(Atom::from))
-                        .collect(),
-                    arg_spans: argument_spans(source, &raw.args),
-                    local_closure_args: local_closure_arguments(text, index, live_uses, &raw.args),
+                    arguments: call_arguments(
+                        source,
+                        text,
+                        index,
+                        live_uses,
+                        &raw,
+                        args,
+                        arg_bindings,
+                    ),
                     scope: lexical_scope,
-                    arg_bindings,
                     phase: phase_for_scope(index, scope),
                     guards: Vec::new(),
                     span: Span::new(*source, raw.start, raw.end),
@@ -948,12 +962,19 @@ fn binary_operator_facts(
                 callee: Atom::from(operator.as_str()),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
-                args,
-                arg_names: vec![None, None],
-                arg_spans: vec![left_span, right_span],
-                local_closure_args: vec![false, false],
+                arguments: args
+                    .into_iter()
+                    .zip([left_span, right_span])
+                    .zip(arg_bindings)
+                    .map(|((value, span), binding)| CallArgument {
+                        value,
+                        name: None,
+                        span,
+                        is_local_closure: false,
+                        binding,
+                    })
+                    .collect(),
                 scope: lexical_scope,
-                arg_bindings,
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
                 span: span.clone(),
@@ -1097,10 +1118,10 @@ fn collect_resources(
             || {
                 ResourcePackage::Computed(
                     call.site
-                        .arg_names
+                        .arguments
                         .iter()
-                        .position(|name| name.as_deref() == Some("package"))
-                        .and_then(|index| call.site.arg_bindings.get(index)?.clone()),
+                        .find(|argument| argument.name.as_deref() == Some("package"))
+                        .and_then(|argument| argument.binding.clone()),
                 )
             },
             ResourcePackage::Literal,
@@ -1556,7 +1577,7 @@ fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<Semanti
 }
 
 fn static_first_string(call: &CallSite) -> Option<&str> {
-    match call.args.first()?.as_ref()? {
+    match call.static_arg(0)? {
         StaticArg::String(value) => Some(value),
         StaticArg::Symbol(_) => None,
     }
@@ -1620,6 +1641,35 @@ fn superassignment_parts(
         span: TextRange::new(value_start, target_end),
         value_symbol: static_symbol_range(text, value_start, value_end),
     })
+}
+
+fn call_arguments(
+    source: &SourceId,
+    text: &str,
+    index: &SemanticIndex,
+    live_uses: &[LiveUse],
+    raw: &RawCall,
+    values: Vec<Option<StaticArg>>,
+    bindings: Vec<Option<LexicalBindingId>>,
+) -> Box<[CallArgument]> {
+    let spans = argument_spans(source, &raw.args);
+    let closures = local_closure_arguments(text, index, live_uses, &raw.args);
+    raw.args
+        .iter()
+        .zip(values)
+        .zip(spans)
+        .zip(closures)
+        .zip(bindings)
+        .map(
+            |((((argument, value), span), is_local_closure), binding)| CallArgument {
+                value,
+                name: argument.name.as_deref().map(Atom::from),
+                span,
+                is_local_closure,
+                binding,
+            },
+        )
+        .collect()
 }
 
 fn local_closure_arguments(
@@ -1690,18 +1740,14 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
             return;
         }
         let (scope, _) = index.scope_at(node.syntax().text_trimmed_range().start());
-        let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &[]);
+        let (lexical_scope, _) = scopes.call_context(index, span.start, &[]);
         live_calls.push(LiveCall {
             site: CallSite {
                 callee: Atom::from(callee),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: qualified.then(|| "base".into()),
-                args: Vec::new(),
-                arg_names: Vec::new(),
-                arg_spans: Vec::new(),
-                local_closure_args: Vec::new(),
+                arguments: Box::default(),
                 scope: lexical_scope,
-                arg_bindings,
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
                 span: span.clone(),

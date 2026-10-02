@@ -8,11 +8,11 @@ pub(super) trait NamedArguments {
 
 impl NamedArguments for CallSite {
     fn len(&self) -> usize {
-        self.args.len()
+        self.arguments.len()
     }
 
     fn name(&self, index: usize) -> Option<&str> {
-        self.arg_names.get(index).and_then(Option::as_deref)
+        self.arg_name(index)
     }
 }
 
@@ -96,7 +96,7 @@ pub(super) fn matched_static_arg<'a>(
     target: &str,
 ) -> Option<&'a StaticArg> {
     let index = matched_arg_index(call, formals, target)?;
-    call.args.get(index)?.as_ref()
+    call.static_arg(index)
 }
 
 pub(super) fn declared_strings(
@@ -106,7 +106,7 @@ pub(super) fn declared_strings(
     target: &str,
 ) -> Option<BTreeSet<String>> {
     let index = matched_arg_index(call, formals, target)?;
-    let binding = call.arg_bindings.get(index)?.as_ref()?;
+    let binding = call.arg_binding(index)?;
     parsed.string_domain_for(binding, call.scope)
 }
 
@@ -115,13 +115,13 @@ pub(super) fn declared_callables(
     call: &CallSite,
     index: usize,
 ) -> Option<BTreeSet<DeclaredCallable>> {
-    let binding = call.arg_bindings.get(index)?.as_ref()?;
+    let binding = call.arg_binding(index)?;
     parsed.callable_domain_for(binding, call.scope)
 }
 
 pub(super) fn native_selector_span(call: &CallSite) -> Option<&Span> {
     let index = matched_arg_index(call, &[".NAME"], ".NAME")?;
-    call.arg_spans.get(index)?.as_ref()
+    call.arg_span(index)
 }
 
 pub(super) fn static_string_arg(call: &CallSite) -> Option<&str> {
@@ -133,7 +133,7 @@ pub(super) fn static_string_arg(call: &CallSite) -> Option<&str> {
         "packageVersion" => matched_static_arg(call, &["pkg"], "pkg"),
         "find.package" => matched_static_arg(call, &["package"], "package"),
         "UseMethod" => matched_static_arg(call, &["generic", "object"], "generic"),
-        _ => call.args.first().and_then(Option::as_ref),
+        _ => call.static_arg(0),
     }?;
     match argument {
         StaticArg::String(value) => Some(value),
@@ -163,10 +163,8 @@ pub(super) fn native_call_argument_index(call: &CallSite, position: usize) -> Op
     }
     let selector = matched_arg_index(call, &[".NAME"], ".NAME")?;
     let mut current = 0;
-    for index in 0..call.args.len() {
-        if index == selector
-            || call.arg_names.get(index).and_then(Option::as_deref) == Some("PACKAGE")
-        {
+    for index in 0..call.arg_count() {
+        if index == selector || call.arg_name(index) == Some("PACKAGE") {
             continue;
         }
         current += 1;
@@ -191,11 +189,11 @@ pub(super) fn reflective_name_formals(
 }
 
 pub(super) fn only_package_argument(call: &CallSite, rewritable: &[&str]) -> bool {
-    call.args.len()
+    call.arg_count()
         == 1 + call
-            .arg_names
+            .arguments
             .iter()
-            .flatten()
-            .filter(|name| rewritable.contains(&name.as_str()))
+            .filter_map(|argument| argument.name.as_deref())
+            .filter(|name| rewritable.contains(name))
             .count()
 }

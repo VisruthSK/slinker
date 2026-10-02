@@ -11,7 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const ANALYZED: [&str; 3] = ["rlang", "cli", "testthat"];
+#[cfg(feature = "profile")]
+#[global_allocator]
+static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
+    slinker_core::profile::heap::CountingAllocator;
+
+const ANALYZED: [&str; 6] = ["R6", "jsonlite", "rlang", "cli", "callr", "testthat"];
 const BUILT: [&str; 2] = ["here", "rebus.numbers"];
 
 fn jobs() -> usize {
@@ -23,17 +28,34 @@ fn analyze(
     target: &TargetEnvironment,
     root: &str,
     cache: CacheLocation,
-) -> (Duration, LinkIr) {
+) -> (Duration, LinkIr, String) {
+    #[cfg(feature = "profile")]
+    slinker_core::profile::heap::begin_measurement();
     let start = Instant::now();
     let plan = PackageStore::new(r_home.to_path_buf(), target.clone(), cache)
         .and_then(|store| Linker::new(store, jobs()).analyze(root))
         .unwrap_or_else(|error| panic!("analyze {root}: {error}"));
-    (start.elapsed(), plan)
+    let elapsed = start.elapsed();
+    (elapsed, plan, heap_usage())
 }
 
-fn report_analysis(name: &str, elapsed: Duration, plan: &LinkIr) {
+#[cfg(feature = "profile")]
+fn heap_usage() -> String {
+    let usage = slinker_core::profile::heap::usage();
+    format!(
+        "  heap peak {:>7.1} MiB  allocations {:>10}",
+        usage.peak_mib, usage.allocations
+    )
+}
+
+#[cfg(not(feature = "profile"))]
+fn heap_usage() -> String {
+    String::new()
+}
+
+fn report_analysis(name: &str, elapsed: Duration, plan: &LinkIr, heap: &str) {
     println!(
-        "{name:<32} {:>9.3} s  bindings {:>6}  construction evaluations {:>8}  blockers {:>4}",
+        "{name:<32} {:>9.3} s  bindings {:>6}  construction evaluations {:>8}  blockers {:>4}{heap}",
         elapsed.as_secs_f64(),
         plan.program().bindings().len(),
         plan.construction_evaluations(),
@@ -46,14 +68,14 @@ fn analyze_installed(r_home: &Path) {
         .capture()
         .expect("capture the target R library universe");
     for root in ANALYZED {
-        let (elapsed, plan) = analyze(r_home, &target, root, CacheLocation::Disabled);
-        report_analysis(&format!("analyze {root} cold"), elapsed, &plan);
+        let (elapsed, plan, heap) = analyze(r_home, &target, root, CacheLocation::Disabled);
+        report_analysis(&format!("analyze {root} cold"), elapsed, &plan, &heap);
 
         let warm = tempfile::tempdir().expect("warm cache directory");
         let directory = || CacheLocation::Directory(warm.path().to_path_buf());
         analyze(r_home, &target, root, directory());
-        let (elapsed, plan) = analyze(r_home, &target, root, directory());
-        report_analysis(&format!("analyze {root} warm"), elapsed, &plan);
+        let (elapsed, plan, heap) = analyze(r_home, &target, root, directory());
+        report_analysis(&format!("analyze {root} warm"), elapsed, &plan, &heap);
     }
 }
 
@@ -182,10 +204,15 @@ fn r_string(value: impl AsRef<OsStr>) -> String {
 
 fn run() {
     let r_home = common::discover_r_home();
-    analyze_installed(&r_home);
-    for package in BUILT {
-        build(&r_home, package);
-        analyze_edit(&r_home, package);
+    let selected = |section: &str| support::filter().is_none_or(|filter| section.contains(&filter));
+    if selected("analyze") {
+        analyze_installed(&r_home);
+    }
+    if selected("build") {
+        for package in BUILT {
+            build(&r_home, package);
+            analyze_edit(&r_home, package);
+        }
     }
 }
 

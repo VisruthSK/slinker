@@ -119,9 +119,7 @@ pub(super) fn hook_guard_regions(
         };
         let event = event_call
             .site
-            .args
-            .get(1)
-            .and_then(|argument| argument.as_ref())
+            .static_arg(1)
             .and_then(|argument| match argument {
                 StaticArg::String(value) => Some(value.as_str()),
                 StaticArg::Symbol(_) => None,

@@ -34,21 +34,20 @@ impl Invocation {
         keep: impl Fn(usize) -> bool,
     ) -> Self {
         let arguments = call
-            .arg_names
+            .arguments
             .iter()
             .enumerate()
             .filter(|(index, _)| keep(*index))
-            .map(|(index, name)| InvocationArgument {
-                name: name.clone(),
-                classes: call
-                    .arg_bindings
-                    .get(index)
-                    .and_then(Option::as_ref)
+            .map(|(_, argument)| InvocationArgument {
+                name: argument.name.clone(),
+                classes: argument
+                    .binding
+                    .as_ref()
                     .and_then(|binding| parsed.class_domain_for(binding, call.scope)),
-                forwards_dots: name.is_none()
+                forwards_dots: argument.name.is_none()
                     && matches!(
-                        call.args.get(index),
-                        Some(Some(StaticArg::Symbol(symbol))) if symbol == "..."
+                        &argument.value,
+                        Some(StaticArg::Symbol(symbol)) if symbol == "..."
                     ),
             })
             .collect();
@@ -215,7 +214,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             else {
                 continue;
             };
-            if call.arg_spans.get(function).and_then(Option::as_ref) != Some(function_span)
+            if call.arg_span(function) != Some(function_span)
                 || !self.call_resolves_definitely_to_base(
                     site.package,
                     site.image,
@@ -231,16 +230,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .filter_map(|formal| matched_arg_index(call, family.own_formals, formal))
                 .collect::<Vec<_>>();
             let named = |index: usize, names: &[&str]| {
-                call.arg_names
-                    .get(index)
-                    .and_then(Option::as_deref)
+                call.arg_name(index)
                     .is_some_and(|name| names.contains(&name))
             };
             if call
-                .arg_names
+                .arguments
                 .iter()
-                .flatten()
-                .any(|name| name == "MoreArgs")
+                .any(|argument| argument.name.as_deref() == Some("MoreArgs"))
             {
                 return Ok(None);
             }
@@ -266,7 +262,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let formals = ["what", "args", "quote", "envir"];
         let span_of = |formal: &str| {
             let index = matched_arg_index(call, &formals, formal)?;
-            call.arg_spans.get(index)?.as_ref()
+            call.arg_span(index)
         };
         if span_of("what") != Some(function_span) {
             return Ok(None);
@@ -354,7 +350,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 continue;
             }
-            let invocation = match call.arg_spans.get(function).and_then(Option::as_ref) {
+            let invocation = match call.arg_span(function) {
                 Some(span) => self.base_apply_invocation(site, parsed, expression, span)?,
                 None => None,
             };

@@ -68,6 +68,15 @@ probes! {
     GuardVerdict => "guard_verdict",
     ProcessEffects => "process_effects",
     LockWait => "lock_wait",
+    ParseSyntax => "parse.syntax",
+    ParseIndex => "parse.semantic_index",
+    ParseDeclarations => "parse.declarations",
+    ParseRegions => "parse.regions",
+    ParseReferences => "parse.references",
+    ParseCalls => "parse.calls",
+    ParseGuards => "parse.guards",
+    ParseEffects => "parse.effects",
+    ParseConstruction => "parse.construction",
 }
 
 counters! {
@@ -168,6 +177,7 @@ pub fn enabled() -> bool {
 }
 
 struct Frame {
+    #[cfg(feature = "profile")]
     probe: Probe,
     child_nanos: u64,
     child_allocations: u64,
@@ -179,6 +189,7 @@ thread_local! {
     static ACTIVE: RefCell<[u32; PROBE_COUNT]> = const { RefCell::new([0; PROBE_COUNT]) };
 }
 
+#[cfg(feature = "profile")]
 fn innermost_probe() -> Option<&'static str> {
     STACK
         .try_with(|stack| {
@@ -195,6 +206,11 @@ pub struct Span {
     live: Option<(Probe, Instant, u64, u64)>,
 }
 
+pub fn scoped<T>(probe: Probe, work: impl FnOnce() -> T) -> T {
+    let _span = span(probe);
+    work()
+}
+
 #[must_use]
 pub fn span(probe: Probe) -> Span {
     let Some(registry) = registry() else {
@@ -205,6 +221,7 @@ pub fn span(probe: Probe) -> Span {
         .fetch_add(1, Ordering::Relaxed);
     STACK.with(|stack| {
         stack.borrow_mut().push(Frame {
+            #[cfg(feature = "profile")]
             probe,
             child_nanos: 0,
             child_allocations: 0,
@@ -533,6 +550,30 @@ pub mod heap {
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             grew(new_size);
             unsafe { System.realloc(pointer, layout, new_size) }
+        }
+    }
+
+    static BASELINE: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Usage {
+        pub peak_mib: f64,
+        pub allocations: u64,
+    }
+
+    pub fn begin_measurement() {
+        let live = LIVE.load(Ordering::Relaxed);
+        BASELINE.store(live, Ordering::Relaxed);
+        PEAK.store(live, Ordering::Relaxed);
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn usage() -> Usage {
+        let peak = PEAK.load(Ordering::Relaxed);
+        let baseline = BASELINE.load(Ordering::Relaxed);
+        Usage {
+            peak_mib: peak.saturating_sub(baseline) as f64 / 1_048_576.0,
+            allocations: ALLOCATIONS.load(Ordering::Relaxed),
         }
     }
 

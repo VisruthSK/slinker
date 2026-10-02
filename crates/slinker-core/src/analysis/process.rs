@@ -713,9 +713,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     || (call.callee == "exists"
                         && self.argument_text(call, "inherits").as_deref() == Some("FALSE"))
             })
-            .flat_map(|call| call.arg_names.iter().zip(&call.arg_spans))
-            .filter(|(name, _)| name.as_deref() == Some("envir"))
-            .filter_map(|(_, span)| span.clone())
+            .flat_map(|call| call.arguments.iter())
+            .filter(|argument| argument.name.as_deref() == Some("envir"))
+            .filter_map(|argument| argument.span.clone())
             .collect();
         self.reflection
             .lock()

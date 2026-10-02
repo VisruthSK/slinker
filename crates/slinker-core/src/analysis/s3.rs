@@ -236,9 +236,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ));
             return Ok(());
         }
-        let generics = match call.args.first() {
-            Some(Some(StaticArg::String(generic))) => BTreeSet::from([generic.as_str().to_owned()]),
-            Some(Some(StaticArg::Symbol(_))) => {
+        let generics = match call.static_arg(0) {
+            Some(StaticArg::String(generic)) => BTreeSet::from([generic.as_str().to_owned()]),
+            Some(StaticArg::Symbol(_)) => {
                 declared_strings(parsed, call, &["generic", "object"], "generic")
                     .unwrap_or_default()
             }
@@ -272,7 +272,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let namespace_generic = site
             .lexical_environment
             .is_namespace_of(&self.packages.name(current));
-        let selector = match (parameters, call.args.get(1)) {
+        let selector = match (
+            parameters,
+            call.arguments.get(1).map(|argument| &argument.value),
+        ) {
             (Some(parameters), None) => parameters.first().cloned(),
             (Some(parameters), Some(Some(StaticArg::Symbol(object))))
                 if parameters.contains(object) =>

@@ -78,14 +78,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(index) = matched_arg_index(call, formals, target) else {
             return Ok(());
         };
-        let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
+        let Some(StaticArg::String(name)) = call.static_arg(index) else {
             self.dynamic_package_name(caller, call);
             return Ok(());
         };
         let name = name.clone();
         match self.discovered_package(from, current, call, &name)? {
             Discovered::Linked(package) => {
-                let Some(source) = call.arg_spans.get(index).cloned().flatten() else {
+                let Some(source) = call.arg_span(index).cloned() else {
                     self.unrewritable_package_call(from, current, call, &name);
                     return Ok(());
                 };
@@ -122,7 +122,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(index) = matched_arg_index(call, formals, target) else {
             return Ok(());
         };
-        let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
+        let Some(StaticArg::String(name)) = call.static_arg(index) else {
             self.dynamic_package_name(caller, call);
             return Ok(());
         };
@@ -148,13 +148,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(index) = matched_arg_index(call, &formals, "pkg") else {
             return Ok(());
         };
-        let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
+        let Some(StaticArg::String(name)) = call.static_arg(index) else {
             self.dynamic_package_name(caller, call);
             return Ok(());
         };
         let name = name.clone();
         match self.discovered_package(from, current, call, &name)? {
-            Discovered::Linked(package) => match call.arg_spans.get(index).cloned().flatten() {
+            Discovered::Linked(package) => match call.arg_span(index).cloned() {
                 Some(source) if only_package_argument(call, &["fields", "drop", "encoding"]) => {
                     self.relocations
                         .lock()
@@ -228,11 +228,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<Option<String>> {
-        let ([Some(StaticArg::String(name)), _], [None, None], [_, Some(set)]) = (
-            call.args.as_slice(),
-            call.arg_names.as_slice(),
-            call.arg_spans.as_slice(),
-        ) else {
+        let [first, second] = &*call.arguments else {
+            return Ok(None);
+        };
+        let (Some(StaticArg::String(name)), None, None, Some(set)) =
+            (&first.value, &first.name, &second.name, &second.span)
+        else {
             return Ok(None);
         };
         let set_text = self.parses.lock().text(set).unwrap_or_default().to_owned();
@@ -306,7 +307,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(index) = matched_arg_index(call, formals, target) else {
             return Ok(());
         };
-        let Some(StaticArg::String(name)) = call.args.get(index).and_then(Option::as_ref) else {
+        let Some(StaticArg::String(name)) = call.static_arg(index) else {
             self.dynamic_package_name(caller, call);
             return Ok(());
         };
@@ -397,11 +398,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let computed_environment = call
-            .arg_names
+            .arguments
             .iter()
-            .flatten()
-            .any(|name| matches!(name.as_str(), "envir" | "pos" | "where" | "frame"))
-            || call.arg_names.iter().filter(|name| name.is_none()).count() > 1
+            .filter_map(|argument| argument.name.as_deref())
+            .any(|name| matches!(name, "envir" | "pos" | "where" | "frame"))
+            || call
+                .arguments
+                .iter()
+                .filter(|argument| argument.name.is_none())
+                .count()
+                > 1
                 && call.callee != "do.call";
         match (
             matched_static_arg(call, formals, target),
@@ -455,10 +461,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn argument_span<'a>(&self, call: &'a CallSite, name: &str) -> Option<&'a Span> {
-        call.arg_names
+        call.arguments
             .iter()
-            .position(|argument| argument.as_deref() == Some(name))
-            .and_then(|index| call.arg_spans.get(index)?.as_ref())
+            .find(|argument| argument.name.as_deref() == Some(name))?
+            .span
+            .as_ref()
     }
 
     pub(super) fn argument_text(&self, call: &CallSite, name: &str) -> Option<String> {
@@ -468,7 +475,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn builds_function_name(&self, call: &CallSite, formals: &[&str], target: &str) -> bool {
         matched_arg_index(call, formals, target)
-            .and_then(|index| call.arg_spans.get(index)?.as_ref())
+            .and_then(|index| call.arg_span(index))
             .and_then(|span| {
                 let text = self.parses.lock().text(span)?.to_owned();
                 Some(

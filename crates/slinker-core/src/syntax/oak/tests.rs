@@ -117,7 +117,7 @@ fn slinker_declaration_is_an_inert_lexical_contract() {
         .find(|call| call.callee == "print")
         .unwrap();
     assert_eq!(
-        parsed.class_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+        parsed.class_domain_for(print.arg_binding(0).unwrap(), print.scope),
         Some(vec![
             vec!["foo".into()],
             vec!["bar".into(), "parent".into()]
@@ -136,7 +136,7 @@ fn string_declarations_narrow_and_never_mix_with_classes() {
         .iter()
         .find(|call| call.callee == "print")
         .unwrap();
-    let binding = print.arg_bindings[0].as_ref().unwrap();
+    let binding = print.arg_binding(0).unwrap();
     assert_eq!(
         parsed.string_domain_for(binding, print.scope),
         Some(["beta".to_owned()].into_iter().collect())
@@ -187,7 +187,7 @@ fn callable_declarations_name_exact_functions() {
         name: BindingName::from(name),
     };
     assert_eq!(
-        parsed.callable_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+        parsed.callable_domain_for(print.arg_binding(0).unwrap(), print.scope),
         Some(
             [
                 callable(Some("pkg"), "g"),
@@ -228,7 +228,7 @@ fn nested_declaration_narrows_the_captured_binding() {
         .find(|call| call.callee == "print")
         .unwrap();
     assert_eq!(
-        parsed.class_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+        parsed.class_domain_for(print.arg_binding(0).unwrap(), print.scope),
         Some(vec![vec!["foo".into()]])
     );
 }
@@ -901,16 +901,13 @@ fn call_argument_span_matches_selector_name_reference() {
         .find(|call| call.callee == ".Call")
         .expect("native call");
     let selector = call
-        .arg_names
+        .arguments
         .iter()
-        .position(|name| name.as_deref() == Some(".NAME"))
+        .find(|argument| argument.name.as_deref() == Some(".NAME"))
         .expect("named selector");
 
-    assert_eq!(
-        call.args[selector],
-        Some(StaticArg::Symbol("croot_f".into()))
-    );
-    assert_eq!(call.arg_spans[selector].as_ref(), Some(&reference.span));
+    assert_eq!(selector.value, Some(StaticArg::Symbol("croot_f".into())));
+    assert_eq!(selector.span.as_ref(), Some(&reference.span));
 }
 
 #[test]
@@ -924,7 +921,10 @@ fn call_argument_records_definite_local_closure_identity() {
         .find(|call| call.callee == ".Call")
         .expect("native call");
 
-    assert_eq!(call.local_closure_args, [false, false, true]);
+    let closures = (0..call.arg_count())
+        .map(|index| call.arg_is_local_closure(index))
+        .collect::<Vec<_>>();
+    assert_eq!(closures, [false, false, true]);
 }
 
 #[test]

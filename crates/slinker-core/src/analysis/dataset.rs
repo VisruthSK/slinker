@@ -53,9 +53,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         call: &CallSite,
     ) -> Result<()> {
         let Some(package_index) = call
-            .arg_names
+            .arguments
             .iter()
-            .position(|name| name.as_deref() == Some("package"))
+            .position(|argument| argument.name.as_deref() == Some("package"))
         else {
             self.diagnostic(
                 from,
@@ -67,8 +67,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             return Ok(());
         };
-        let Some(StaticArg::String(name)) = call.args.get(package_index).and_then(Option::as_ref)
-        else {
+        let Some(StaticArg::String(name)) = call.static_arg(package_index) else {
             self.dynamic_package_name(caller, call);
             return Ok(());
         };
@@ -109,9 +108,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
         };
         let mut sets = Vec::<DataSetId>::new();
-        for (index, argument) in call.args.iter().enumerate() {
-            let named = call.arg_names.get(index).and_then(Option::as_deref);
-            match (named, argument) {
+        for argument in call.arguments.iter() {
+            let named = argument.name.as_deref();
+            match (named, &argument.value) {
                 (None | Some("list"), Some(StaticArg::String(set))) => sets.push(set.into()),
                 (None, Some(StaticArg::Symbol(set))) => sets.push(set.into()),
                 (None | Some("list"), _) => {
@@ -141,7 +140,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             return Ok(());
         }
-        let Some(source) = call.arg_spans.get(package_index).cloned().flatten() else {
+        let Some(source) = call.arg_span(package_index).cloned() else {
             blocked(
                 self,
                 RejectCode::UnsupportedRootTransformation,
