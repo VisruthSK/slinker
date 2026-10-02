@@ -16,6 +16,9 @@ use std::sync::Arc;
 
 const AIR_VERSION: &str = "0.11.0";
 const ANALYSIS_SCHEMA: &str = "slinker-analysis-v10";
+const MAX_R_WORKERS: usize = 4;
+const SOURCES_PER_WORKER: usize = 48;
+const BINDING_BATCH: usize = 64;
 
 #[derive(Deserialize, Serialize)]
 struct CachedIndex {
@@ -218,6 +221,16 @@ pub trait PackageProvider: PackageResolver {
     fn dispatch_generics(&mut self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>>;
     fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation>;
     fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax>;
+    fn prefetch_canonical_syntax(&mut self, _sources: &[&str]) -> Result<()> {
+        Ok(())
+    }
+    fn prefetch_binding_images(
+        &mut self,
+        _package: &InstalledPackage,
+        _names: &[&str],
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct PackageStore {
@@ -229,6 +242,9 @@ pub struct PackageStore {
     r_home: PathBuf,
     target_fingerprint: Digest,
     worker: Option<WorkerClient>,
+    extra_workers: Vec<WorkerClient>,
+    worker_limit: usize,
+    syntax: HashMap<String, CanonicalSyntax>,
     native_summaries: NativeSummaryManifest,
 }
 
@@ -256,8 +272,17 @@ impl PackageStore {
             r_home,
             target_fingerprint,
             worker: None,
+            extra_workers: Vec::new(),
+            worker_limit: 1,
+            syntax: HashMap::new(),
             native_summaries: NativeSummaryManifest::load()?,
         })
+    }
+
+    #[must_use]
+    pub fn with_worker_limit(mut self, limit: usize) -> Self {
+        self.worker_limit = limit.clamp(1, MAX_R_WORKERS);
+        self
     }
 
     fn package_index(
@@ -354,7 +379,7 @@ impl PackageStore {
             Some(worker) => Ok(worker),
             empty => {
                 let target = self.locator.target();
-                Ok(empty.insert(WorkerClient::spawn(self.r_home.clone(), target)?))
+                Ok(empty.insert(WorkerClient::spawn(self.r_home.clone(), target, 1)?))
             }
         }
     }
@@ -369,6 +394,20 @@ impl PackageStore {
                     && entry.package_fingerprint == package.identity.image_fingerprint
             })?;
         self.package_index(cached.index, package).ok()
+    }
+
+    fn publish_binding(&self, package: &InstalledPackage, name: &str, binding: &WorkerBinding) {
+        if is_epoch_independent(binding) {
+            let cached = CachedBinding {
+                schema: ANALYSIS_SCHEMA.into(),
+                target: self.target_fingerprint.clone(),
+                package_fingerprint: package.identity.image_fingerprint.clone(),
+                binding_name: name.into(),
+                binding: binding.clone(),
+            };
+            self.cache
+                .publish(&self.binding_cache_name(&package.identity, name), &cached);
+        }
     }
 
     fn load_cached_binding(
@@ -470,22 +509,44 @@ impl PackageProvider for PackageStore {
             None => {
                 let index = self.index(package)?;
                 let binding = self.worker()?.binding(package, name)?;
-                if is_epoch_independent(&binding) {
-                    let cached = CachedBinding {
-                        schema: ANALYSIS_SCHEMA.into(),
-                        target: self.target_fingerprint.clone(),
-                        package_fingerprint: package.identity.image_fingerprint.clone(),
-                        binding_name: name.into(),
-                        binding: binding.clone(),
-                    };
-                    self.cache
-                        .publish(&self.binding_cache_name(&package.identity, name), &cached);
-                }
+                self.publish_binding(package, name, &binding);
                 Self::package_image(&package.identity, index, binding)?
             }
         };
         self.bindings.insert(key, Arc::clone(&image));
         Ok(image)
+    }
+
+    fn prefetch_binding_images(
+        &mut self,
+        package: &InstalledPackage,
+        names: &[&str],
+    ) -> Result<()> {
+        let mut pending = Vec::new();
+        let mut seen = HashSet::new();
+        for name in names {
+            let key = (package.identity.clone(), (*name).to_owned());
+            if self.bindings.contains_key(&key) || !seen.insert(*name) {
+                continue;
+            }
+            match self.load_cached_binding(package, name)? {
+                Some(image) => {
+                    self.bindings.insert(key, image);
+                }
+                None => pending.push(*name),
+            }
+        }
+        for chunk in pending.chunks(BINDING_BATCH) {
+            let index = self.index(package)?;
+            let inspected = self.worker()?.bindings(package, chunk)?;
+            for (name, binding) in chunk.iter().zip(inspected) {
+                self.publish_binding(package, name, &binding);
+                let image = Self::package_image(&package.identity, Arc::clone(&index), binding)?;
+                self.bindings
+                    .insert((package.identity.clone(), (*name).to_owned()), image);
+            }
+        }
+        Ok(())
     }
 
     fn resource_exists(&mut self, package: &InstalledPackage, path: &str) -> Result<bool> {
@@ -531,7 +592,98 @@ impl PackageProvider for PackageStore {
     }
 
     fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
-        self.worker()?.canonical_syntax(source)
+        if let Some(known) = self.syntax.get(source) {
+            return Ok(known.clone());
+        }
+        let canonical = self.worker()?.canonical_syntax(source)?;
+        self.syntax.insert(source.to_owned(), canonical.clone());
+        Ok(canonical)
+    }
+
+    fn prefetch_canonical_syntax(&mut self, sources: &[&str]) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut unknown = sources
+            .iter()
+            .copied()
+            .filter(|source| !self.syntax.contains_key(*source) && seen.insert(*source))
+            .collect::<Vec<_>>();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        unknown.sort_by_key(|source| std::cmp::Reverse(source.len()));
+        let lanes = self
+            .worker_limit
+            .min(unknown.len().div_ceil(SOURCES_PER_WORKER))
+            .max(1);
+        let mut chunks = vec![Vec::new(); lanes];
+        for (position, source) in unknown.into_iter().enumerate() {
+            chunks[position % lanes].push(source);
+        }
+        let mut clients = Vec::with_capacity(lanes);
+        clients.push(self.worker.take());
+        clients.extend(self.extra_workers.drain(..).map(Some));
+        clients.resize_with(clients.len().max(lanes), || None);
+        chunks.resize(clients.len(), Vec::new());
+        let r_home = &self.r_home;
+        let target = self.locator.target();
+        let outcomes = std::thread::scope(|scope| {
+            clients
+                .into_iter()
+                .zip(chunks)
+                .enumerate()
+                .map(|(position, (client, chunk))| {
+                    scope.spawn(move || {
+                        let client = match client {
+                            Some(client) => Ok(client),
+                            None if chunk.is_empty() => return (None, Ok(Vec::new())),
+                            None => {
+                                WorkerClient::spawn(r_home.clone(), target, position as u64 + 1)
+                            }
+                        };
+                        match client {
+                            Ok(mut client) => {
+                                let canonical = client.canonical_syntax_batch(&chunk);
+                                (
+                                    Some(client),
+                                    canonical
+                                        .map(|results| (chunk, results))
+                                        .map(|pair| vec![pair]),
+                                )
+                            }
+                            Err(error) => (None, Err(error)),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| Error::Analysis("R worker thread panicked".into()))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let mut first = None;
+        let mut failure = None;
+        for (position, (client, result)) in outcomes.into_iter().enumerate() {
+            match (position, client) {
+                (0, client) => first = client,
+                (_, Some(client)) => self.extra_workers.push(client),
+                (_, None) => {}
+            }
+            match result {
+                Ok(batches) => {
+                    for (chunk, results) in batches {
+                        for (source, canonical) in chunk.into_iter().zip(results) {
+                            self.syntax.insert(source.to_owned(), canonical);
+                        }
+                    }
+                }
+                Err(error) => failure = failure.or(Some(error)),
+            }
+        }
+        self.worker = first;
+        failure.map_or(Ok(()), Err)
     }
 }
 

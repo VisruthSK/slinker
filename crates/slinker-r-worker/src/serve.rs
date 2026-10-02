@@ -34,6 +34,11 @@ impl RequestContext {
                 package,
                 name,
             } => (Some(*request_id), Some(package), Some(name.clone())),
+            WorkerRequest::BindingBatch {
+                request_id,
+                package,
+                ..
+            } => (Some(*request_id), Some(package), None),
             WorkerRequest::DispatchGenerics {
                 request_id,
                 package,

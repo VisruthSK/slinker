@@ -117,7 +117,8 @@ impl Session {
         universe: &UniverseArgs,
         provenance: bool,
     ) -> Result<LinkIr, Box<dyn Error>> {
-        let store = PackageStore::new(self.r_home.clone(), self.target.clone(), cache_location())?;
+        let store = PackageStore::new(self.r_home.clone(), self.target.clone(), cache_location())?
+            .with_worker_limit(universe.jobs.get());
         let mut linker = Linker::new(store, universe.jobs.get())
             .with_external_packages(universe.external.iter().cloned())
             .with_linked_packages(universe.linked.iter().cloned());

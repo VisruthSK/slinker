@@ -100,14 +100,53 @@ pub(super) enum Popped {
     AlreadyStarted,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Schedule {
+    #[default]
+    Fifo,
+    Lifo,
+    Seeded(u64),
+}
+
 #[derive(Default)]
 pub(super) struct NeedQueue {
     pending: VecDeque<Need>,
     queued: HashSet<Need>,
     started: HashSet<Need>,
+    schedule: Schedule,
+    state: u64,
 }
 
 impl NeedQueue {
+    pub(super) fn with_schedule(schedule: Schedule) -> Self {
+        Self {
+            schedule,
+            state: match schedule {
+                Schedule::Seeded(seed) => seed | 1,
+                Schedule::Fifo | Schedule::Lifo => 0,
+            },
+            ..Self::default()
+        }
+    }
+
+    fn take(&mut self) -> Option<Need> {
+        match self.schedule {
+            Schedule::Fifo => self.pending.pop_front(),
+            Schedule::Lifo => self.pending.pop_back(),
+            Schedule::Seeded(_) => {
+                if self.pending.is_empty() {
+                    return None;
+                }
+                self.state ^= self.state << 13;
+                self.state ^= self.state >> 7;
+                self.state ^= self.state << 17;
+                let index = usize::try_from(self.state % self.pending.len() as u64)
+                    .expect("index fits usize");
+                self.pending.swap_remove_back(index)
+            }
+        }
+    }
+
     pub(super) fn schedule(&mut self, need: Need) {
         if !self.started.contains(&need) && self.queued.insert(need.clone()) {
             self.pending.push_back(need);
@@ -127,7 +166,7 @@ impl NeedQueue {
     }
 
     pub(super) fn pop(&mut self) -> Option<Popped> {
-        let need = self.pending.pop_front()?;
+        let need = self.take()?;
         self.queued.remove(&need);
         Some(if self.started.insert(need.clone()) {
             Popped::Started(need)

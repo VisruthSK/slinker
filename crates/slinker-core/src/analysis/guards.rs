@@ -2,6 +2,7 @@ use super::state::{AnalyzerState, Caller, ParsedSite};
 use crate::analysis::RejectCode;
 use crate::metadata::{RelationField, relations};
 use crate::package::{ImportSpec, PackageId, PackageImage, PackageName, PackageProvider};
+use crate::profile::{self, Probe};
 use crate::syntax::{PackageGuard, Span};
 use crate::{Error, Result};
 use std::collections::HashSet;
@@ -53,6 +54,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         image: &PackageImage,
         guards: &[PackageGuard],
     ) -> Result<GuardVerdict> {
+        let _span = profile::span(Probe::GuardVerdict);
         if guards.is_empty() {
             return Ok(GuardVerdict::Active);
         }

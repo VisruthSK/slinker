@@ -46,7 +46,7 @@ impl TargetRuntimeHandle {
     }
 
     pub(crate) fn worker(&self) -> crate::Result<WorkerClient> {
-        WorkerClient::spawn(self.r_home.clone(), &self.target)
+        WorkerClient::spawn(self.r_home.clone(), &self.target, 0)
     }
 }
 

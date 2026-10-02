@@ -14,7 +14,7 @@ use crate::package::{
     BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource, Digest, ObjectImage,
     ObjectKind, PackageId, PackageImage, PackageProvider, SyntaxValidation,
 };
-use crate::profile::{self, Probe};
+use crate::profile::{self, Counter, Probe};
 use crate::syntax::{
     ActiveBindingDef, NameRefKind, NamespaceInfoReceiver, OakParser, ParsedExpression, ParsedRFile,
     SemanticIssueKind, SourceId, SourceKey, Span, StaticEnvironment, SyntaxEffect,
@@ -89,7 +89,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             self.external.insert(id);
             return Ok(());
         }
-        let image = self.binding_image(id, binding)?;
+        let image = self.binding_image(id, binding, Counter::BindingLoadProcess)?;
         let Some(binding_image) = image.binding(binding) else {
             return self.process_absent_binding(node, id, &image, binding);
         };
@@ -490,6 +490,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         self.report_semantic_issues(site, parsed);
         for expression in &parsed.expressions {
+            let construction_span = profile::span(Probe::ExecuteConstruction);
             self.execute_construction(
                 ExecutionContext {
                     node,
@@ -501,6 +502,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 },
                 &expression.construction,
             )?;
+            drop(construction_span);
             self.register_active_bindings(site, expression)?;
             let consumed_native_selectors = self.consumed_native_selectors(site, expression)?;
             self.process_references(site, parsed, expression, &consumed_native_selectors)?;
@@ -564,6 +566,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .add_binding(active.name.clone().into())
             {
                 self.non_returning_bindings.remove(&site.package);
+                self.summaries.invalidate_package(site.package);
             }
         }
         Ok(())
@@ -615,6 +618,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         expression: &ParsedExpression,
         consumed_native_selectors: &[Span],
     ) -> Result<()> {
+        let _span = profile::span(Probe::ProcessReferences);
         let enclosure_known = !site.lexical_environment.is_unsupported();
         for reference in &expression.references {
             if !self.guards_active(site, &reference.guards, &reference.span)? {
@@ -724,6 +728,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         parsed: &ParsedRFile,
         expression: &ParsedExpression,
     ) -> Result<()> {
+        let _span = profile::span(Probe::ProcessCalls);
         for call in &expression.calls {
             if !self.guards_active(site, &call.guards, &call.span)? {
                 continue;
@@ -824,6 +829,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         site: ParsedSite<'_>,
         expression: &ParsedExpression,
     ) -> Result<()> {
+        let _span = profile::span(Probe::ProcessEffects);
         let enclosure_known = !site.lexical_environment.is_unsupported();
         for effect in &expression.effects {
             if !self.guards_active(site, &effect.guards, &effect.span)? {

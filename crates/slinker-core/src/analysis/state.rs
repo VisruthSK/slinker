@@ -5,12 +5,13 @@ use super::guards::DeclaredDependencies;
 use super::invocation::InvocationModel;
 use super::namespace::NamespaceBuilder;
 use super::native::NativeBindingIndex;
-use super::need::{NeedQueue, Popped};
+use super::need::{NeedQueue, Popped, Schedule};
 use super::object_world::ObjectWorld;
-use super::parse_cache::{ParseCache, ParseKey};
+use super::parse_cache::{ParseCache, ParseKey, ParseState};
 use super::reflection::ReflectionFacts;
 use super::relocation::RelocationPlan;
 use super::s3::{CallableId, S3Model};
+use super::summary::SummaryTable;
 use crate::analysis::{Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
@@ -74,6 +75,7 @@ pub(super) struct NativeCallbackContext<'a> {
 
 pub(super) struct AnalysisOptions {
     pub(super) jobs: usize,
+    pub(super) schedule: Schedule,
     pub(super) provenance: bool,
     pub(super) linked_packages: HashSet<PackageName>,
     pub(super) explicit_external_packages: HashSet<PackageName>,
@@ -99,7 +101,8 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) s3: S3Model,
     pub(super) invocations: InvocationModel,
     pub(super) value_closures: HashSet<NodeId>,
-    pub(super) construction_calls: HashMap<ConstructionCallKey, AbstractValue>,
+    pub(super) construction_calls: HashMap<ConstructionCallKey, (AbstractValue, Option<u64>)>,
+    pub(super) summaries: SummaryTable,
     pub(super) construction_evaluations: usize,
     pub(super) reflection: ReflectionFacts,
     pub(super) dynamic_names: DynamicNames,
@@ -145,7 +148,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             parse_pool: None,
             graph: Graph::default(),
             roots: Vec::new(),
-            needs: NeedQueue::default(),
+            needs: NeedQueue::with_schedule(options.schedule),
             encountered: HashSet::from([root]),
             external: HashSet::new(),
             parses: ParseCache::default(),
@@ -157,6 +160,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             invocations: InvocationModel::default(),
             value_closures: HashSet::new(),
             construction_calls: HashMap::new(),
+            summaries: SummaryTable::default(),
             construction_evaluations: 0,
             reflection: ReflectionFacts::default(),
             dynamic_names: DynamicNames::default(),
@@ -268,15 +272,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
         &mut self,
         package: PackageId,
         binding: &str,
+        reason: Counter,
     ) -> Result<Arc<PackageImage>> {
         let _span = profile::span(Probe::BindingImage);
         let image = self.image(package)?;
         if image.binding(binding).is_some() || !image.index.binding_names.contains(binding) {
             return Ok(image);
         }
-        let partial = self.packages.binding_image(package, binding)?;
-        self.objects.merge(package, &partial);
+        profile::count(reason);
+        let partial = {
+            let _store = profile::span(Probe::StoreBindingImage);
+            self.packages.binding_image(package, binding)?
+        };
+        {
+            let _merge = profile::span(Probe::ObjectsMerge);
+            self.objects.merge(package, &partial);
+        }
         drop(image);
+        let _extend = profile::span(Probe::ImageExtend);
         let loaded = self.loaded(package)?;
         let image = Arc::make_mut(&mut loaded.image);
         image.bindings.extend(
@@ -330,9 +343,46 @@ impl<P: PackageProvider> AnalyzerState<P> {
             source: SourceId,
             text: Arc<str>,
             context: OakParseContext,
+            image: Arc<PackageImage>,
+            environment: EnvironmentLabel,
         }
 
         let needs = self.needs.upcoming(frontier).cloned().collect::<Vec<_>>();
+        struct Candidate {
+            key: ParseKey,
+            id: PackageId,
+            owner: SourceKey,
+            source_key: SourceKey,
+            owner_node: NodeId,
+            closure: ClosureSource,
+            image: Arc<PackageImage>,
+        }
+
+        let mut unloaded = BTreeMap::<PackageId, Vec<BindingName>>::new();
+        for need in &needs {
+            let Need::Binding { package, binding } = need else {
+                continue;
+            };
+            if self.packages.is_external(*package) {
+                continue;
+            }
+            let image = self.image(*package)?;
+            if image.binding(binding).is_none() && image.index.binding_names.contains(binding) {
+                unloaded.entry(*package).or_default().push(binding.clone());
+            }
+        }
+        for (package, names) in &unloaded {
+            let names = names.iter().map(BindingName::as_str).collect::<Vec<_>>();
+            self.packages.prefetch_binding_images(*package, &names)?;
+        }
+
+        let mut candidates = Vec::<Candidate>::new();
+        let mut reparsed = Vec::<(
+            PackageId,
+            Arc<ParsedRFile>,
+            Arc<PackageImage>,
+            EnvironmentLabel,
+        )>::new();
         let mut work = Vec::<Work>::new();
         let mut scheduled = HashSet::<ParseKey>::new();
 
@@ -345,7 +395,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     if self.packages.is_external(id) {
                         continue;
                     }
-                    let image = self.binding_image(id, &binding)?;
+                    let image = self.binding_image(id, &binding, Counter::BindingLoadPreparse)?;
                     let Some(binding_image) = image.binding(&binding).cloned() else {
                         continue;
                     };
@@ -416,9 +466,43 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
 
             let key = (id, source_key.clone());
+            if let Some(ParseState::Parsed(parsed)) = self.parses.state(&key) {
+                reparsed.push((
+                    id,
+                    Arc::clone(parsed),
+                    Arc::clone(&image),
+                    closure.environment.clone(),
+                ));
+                continue;
+            }
             if self.parses.contains(&key) || !scheduled.insert(key.clone()) {
                 continue;
             }
+            candidates.push(Candidate {
+                key,
+                id,
+                owner,
+                source_key,
+                owner_node,
+                closure,
+                image,
+            });
+        }
+        let texts = candidates
+            .iter()
+            .map(|candidate| candidate.closure.source.as_ref())
+            .collect::<Vec<_>>();
+        self.packages.prefetch_canonical_syntax(&texts)?;
+        for candidate in candidates {
+            let Candidate {
+                key,
+                id,
+                owner,
+                source_key,
+                owner_node,
+                closure,
+                image,
+            } = candidate;
             let Some(source) =
                 self.admit_source(id, &owner, &source_key, owner_node, &closure.source)?
             else {
@@ -432,12 +516,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 source,
                 text: Arc::clone(&closure.source),
                 context: self.oak_parse_context(id, &image, &closure.environment)?,
+                environment: closure.environment.clone(),
+                image,
             });
         }
-        if work.is_empty() {
-            return Ok(());
-        }
-
         let parse_all = || {
             work.par_iter()
                 .map(|item| {
@@ -475,9 +557,26 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .collect()
         };
 
+        let mut hinted = BTreeMap::<PackageId, BTreeSet<BindingName>>::new();
+        for (package, parsed, image, environment) in reparsed {
+            hinted
+                .entry(package)
+                .or_default()
+                .extend(self.construction_bindings(package, &image, &environment, &parsed)?);
+        }
         for (item, result) in work.into_iter().zip(results) {
             match result {
                 Ok(parsed) => {
+                    let package = item.key.0;
+                    hinted
+                        .entry(package)
+                        .or_default()
+                        .extend(self.construction_bindings(
+                            package,
+                            &item.image,
+                            &item.environment,
+                            &parsed,
+                        )?);
                     self.parses.store(item.key, Arc::new(parsed));
                 }
                 Err(error) => {
@@ -490,6 +589,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     )?;
                 }
             }
+        }
+        for (package, names) in hinted {
+            let image = self.image(package)?;
+            let unloaded = names
+                .iter()
+                .filter(|name| {
+                    image.binding(name).is_none() && image.index.binding_names.contains(name)
+                })
+                .map(BindingName::as_str)
+                .collect::<Vec<_>>();
+            self.packages.prefetch_binding_images(package, &unloaded)?;
         }
         Ok(())
     }

@@ -12,6 +12,7 @@ mod finalize;
 pub mod graph;
 mod guards;
 mod invocation;
+mod lattice;
 mod namespace;
 mod native;
 pub mod need;
@@ -23,6 +24,7 @@ mod relocation;
 mod resolution;
 mod s3;
 mod state;
+mod summary;
 
 use crate::Result;
 use crate::package::{PackageName, PackageProvider};
@@ -43,7 +45,7 @@ pub use export::{
 };
 pub use finalize::LinkIr;
 pub use graph::{Edge, EdgeKind, Graph, Node, NodeId, NodeKind};
-pub use need::{GenericId, LifecycleHook, Need, S3Id};
+pub use need::{GenericId, LifecycleHook, Need, S3Id, Schedule};
 
 pub const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
 
@@ -58,12 +60,20 @@ impl<P: PackageProvider> Linker<P> {
             packages,
             options: AnalysisOptions {
                 jobs,
+                schedule: Schedule::default(),
                 provenance: true,
                 linked_packages: HashSet::new(),
                 explicit_external_packages: HashSet::new(),
                 root_description: None,
             },
         }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_schedule(mut self, schedule: Schedule) -> Self {
+        self.options.schedule = schedule;
+        self
     }
 
     #[must_use]

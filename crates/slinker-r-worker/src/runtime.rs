@@ -3,7 +3,9 @@ use super::scan::{InspectionEpoch, ObjectScanner, PrivateIds};
 use super::{Coded, InspectionError, WorkerOperationError, field, protocol};
 use super::{InspectionResult, OperationResult};
 use harp::{RFunctionExt, RObjectExt};
-use protocol::{WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse};
+use protocol::{
+    NormalizedSource, WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse,
+};
 use slinker_core::package::{BindingName, BindingOrigin, DataSetId, DatasetName};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
@@ -366,14 +368,21 @@ impl WorkerRuntime {
             WorkerRequest::ValidateSyntax { request_id, source } => {
                 syntax_verdict(request_id, self.validate_syntax(&source))
             }
-            WorkerRequest::NormalizeSyntax { request_id, source } => {
-                let (source, stable) = self
-                    .canonical_syntax(&source)
+            WorkerRequest::NormalizeSyntax {
+                request_id,
+                sources,
+            } => {
+                let results = sources
+                    .iter()
+                    .map(|source| {
+                        self.canonical_syntax(source)
+                            .map(|(source, stable)| NormalizedSource { source, stable })
+                    })
+                    .collect::<InspectionResult<Vec<_>>>()
                     .coded(WorkerErrorCode::TargetSyntaxRejection)?;
                 WorkerResponse::NormalizedSyntax {
                     request_id,
-                    source,
-                    stable,
+                    results,
                 }
             }
             WorkerRequest::VerifyRelocation {
@@ -401,6 +410,17 @@ impl WorkerRuntime {
             } => WorkerResponse::Binding {
                 request_id,
                 binding: self.binding(&package, name.as_str())?,
+            },
+            WorkerRequest::BindingBatch {
+                request_id,
+                package,
+                names,
+            } => WorkerResponse::Bindings {
+                request_id,
+                bindings: names
+                    .iter()
+                    .map(|name| self.binding(&package, name.as_str()))
+                    .collect::<OperationResult<Vec<_>>>()?,
             },
             WorkerRequest::DataLibrary {
                 request_id,

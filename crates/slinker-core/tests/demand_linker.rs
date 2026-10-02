@@ -1329,6 +1329,99 @@ fn bounded_switch_propagates_selected_package() {
     );
 }
 
+fn root_calling_helper_with(
+    helpers: &[(&str, &str)],
+    entry: &str,
+) -> slinker_core::analysis::LinkIr {
+    let mut bindings = vec![
+        ("f", format!("f <- function() helper({entry})")),
+        (
+            "helper",
+            "helper <- function(package) requireNamespace(package)".to_owned(),
+        ),
+    ];
+    bindings.extend(
+        helpers
+            .iter()
+            .map(|(name, source)| (*name, (*source).to_owned())),
+    );
+    let bindings = bindings
+        .iter()
+        .map(|(name, source)| (*name, Some(source.as_str())))
+        .collect::<Vec<_>>();
+    let root = PackageFixture::new("root", &bindings)
+        .exports(export("f"))
+        .build();
+    Linker::new(FakeProvider::new(vec![root, package("foo", &[])]), 1)
+        .with_external_packages(["foo"])
+        .analyze("root")
+        .unwrap()
+}
+
+fn has_dynamic_discovery(plan: &slinker_core::analysis::LinkIr) -> bool {
+    plan.blockers()
+        .iter()
+        .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
+}
+
+#[test]
+fn recursion_starts_from_bottom_so_its_base_case_survives() {
+    let plan = root_calling_helper_with(
+        &[(
+            "pick",
+            "pick <- function(n) if (print(n)) pick(n) else \"foo\"",
+        )],
+        "pick(\"x\")",
+    );
+    assert!(!has_dynamic_discovery(&plan), "{:?}", plan.blockers());
+}
+
+#[test]
+fn mutual_recursion_converges_to_its_base_case() {
+    let plan = root_calling_helper_with(
+        &[
+            (
+                "ping",
+                "ping <- function(n) if (print(n)) pong(n) else \"foo\"",
+            ),
+            ("pong", "pong <- function(n) ping(n)"),
+        ],
+        "ping(\"x\")",
+    );
+    assert!(!has_dynamic_discovery(&plan), "{:?}", plan.blockers());
+}
+
+#[test]
+fn recursion_without_a_base_case_is_unknown_not_a_silent_constant() {
+    let plan = root_calling_helper_with(&[("spin", "spin <- function(n) spin(n)")], "spin(\"x\")");
+    assert!(has_dynamic_discovery(&plan), "{:?}", plan.blockers());
+}
+
+#[test]
+fn unknown_branch_join_keeps_agreeing_values_and_widens_disagreeing_ones() {
+    let agreeing = root_calling_helper_with(
+        &[(
+            "pick",
+            "pick <- function(n) if (print(n)) \"foo\" else \"foo\"",
+        )],
+        "pick(\"x\")",
+    );
+    assert!(
+        !has_dynamic_discovery(&agreeing),
+        "{:?}",
+        agreeing.blockers()
+    );
+
+    let disagreeing = root_calling_helper_with(
+        &[(
+            "pick",
+            "pick <- function(n) if (print(n)) \"foo\" else \"bar\"",
+        )],
+        "pick(\"x\")",
+    );
+    assert!(has_dynamic_discovery(&disagreeing));
+}
+
 #[test]
 fn static_discovery_of_a_declared_dependency_links_it() {
     let root = package_importing(

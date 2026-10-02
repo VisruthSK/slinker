@@ -144,6 +144,11 @@ pub enum WorkerRequest {
         package: PackageSpec,
         name: BindingName,
     },
+    BindingBatch {
+        request_id: u64,
+        package: PackageSpec,
+        names: Vec<BindingName>,
+    },
     DispatchGenerics {
         request_id: u64,
         package: Option<PackageSpec>,
@@ -166,7 +171,7 @@ pub enum WorkerRequest {
     },
     NormalizeSyntax {
         request_id: u64,
-        source: String,
+        sources: Vec<String>,
     },
     VerifyRelocation {
         request_id: u64,
@@ -193,6 +198,10 @@ pub enum WorkerResponse {
         request_id: u64,
         binding: WorkerBinding,
     },
+    Bindings {
+        request_id: u64,
+        bindings: Vec<WorkerBinding>,
+    },
     DispatchGenerics {
         request_id: u64,
         generics: Vec<String>,
@@ -212,8 +221,7 @@ pub enum WorkerResponse {
     },
     NormalizedSyntax {
         request_id: u64,
-        source: String,
-        stable: bool,
+        results: Vec<NormalizedSource>,
     },
     Error {
         error: WorkerFailure,
@@ -226,6 +234,7 @@ impl WorkerResponse {
         match self {
             Self::PackageIndex { request_id, .. }
             | Self::Binding { request_id, .. }
+            | Self::Bindings { request_id, .. }
             | Self::DispatchGenerics { request_id, .. }
             | Self::DataLibrary { request_id, .. }
             | Self::Payloads { request_id, .. }
@@ -234,6 +243,12 @@ impl WorkerResponse {
             Self::Hello { .. } | Self::Error { .. } | Self::Shutdown => None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NormalizedSource {
+    pub source: String,
+    pub stable: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

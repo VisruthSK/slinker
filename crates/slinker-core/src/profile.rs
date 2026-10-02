@@ -59,16 +59,35 @@ probes! {
     WorkerRequest => "worker_request",
     PackageFingerprint => "package_fingerprint",
     Finalize => "finalize",
+    ExecuteConstruction => "execute_construction",
+    SummaryKey => "summary_key_without_node",
+    StoreBindingImage => "binding_image.store",
+    ObjectsMerge => "binding_image.objects_merge",
+    ImageExtend => "binding_image.image_extend",
+    ProcessReferences => "process_references",
+    ProcessCalls => "process_calls",
+    GuardVerdict => "guard_verdict",
+    ProcessEffects => "process_effects",
 }
 
 counters! {
     ConstructionEvaluations => "construction_evaluations",
     ConstructionMemoHits => "construction_memo_hits",
+    ConstructionSummaryHits => "construction_summary_hits",
+    SummaryRejectedArguments => "summary_rejected_unstable_arguments",
+    SummaryRejectedCut => "summary_rejected_depth_cut",
+    SummaryRejectedAssumption => "summary_rejected_recursion_assumption",
+    SummaryRejectedWrites => "summary_rejected_graph_access",
+    ConstructionPure => "construction_pure_evaluations",
+    ConstructionImpure => "construction_impure_evaluations",
     LexicalMemoHits => "lexical_memo_hits",
     LexicalMemoMisses => "lexical_memo_misses",
     ParseMemoHits => "parse_memo_hits",
     ParseMemoMisses => "parse_memo_misses",
     BindingImageHits => "binding_image_hits",
+    BindingLoadPrepare => "binding_load_prepare_construction",
+    BindingLoadProcess => "binding_load_process_binding",
+    BindingLoadPreparse => "binding_load_preparse",
     BindingImageMisses => "binding_image_misses",
     NeedsStarted => "needs_started",
     LatticeJoins => "lattice_joins",
@@ -106,7 +125,7 @@ struct Cell {
 struct Registry {
     probes: Vec<Cell>,
     counters: Vec<AtomicU64>,
-    opcodes: Mutex<std::collections::BTreeMap<String, u64>>,
+    opcodes: Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
     started: Instant,
 }
 
@@ -229,17 +248,15 @@ pub fn max(counter: Counter, value: u64) {
     }
 }
 
-pub fn r_request(opcode: &str, request_bytes: usize, response_bytes: usize) {
+pub fn r_request(opcode: &str, request_bytes: usize, response_bytes: usize, nanos: u64) {
     if let Some(registry) = registry() {
         add(Counter::RRequests, 1);
         add(Counter::RRequestBytes, request_bytes as u64);
         add(Counter::RResponseBytes, response_bytes as u64);
-        *registry
-            .opcodes
-            .lock()
-            .expect("profile opcodes")
-            .entry(opcode.to_owned())
-            .or_default() += 1;
+        let mut opcodes = registry.opcodes.lock().expect("profile opcodes");
+        let entry = opcodes.entry(opcode.to_owned()).or_default();
+        entry.0 += 1;
+        entry.1 += nanos;
     }
 }
 
@@ -294,8 +311,8 @@ pub fn report() -> Option<String> {
     let opcodes = registry.opcodes.lock().expect("profile opcodes");
     if !opcodes.is_empty() {
         let _ = writeln!(out, "r requests by opcode");
-        for (opcode, count) in opcodes.iter() {
-            let _ = writeln!(out, "  {opcode:<30} {count}");
+        for (opcode, (count, nanos)) in opcodes.iter() {
+            let _ = writeln!(out, "  {opcode:<30} {count:>8} {:>10.1} ms", millis(*nanos));
         }
     }
     Some(out)

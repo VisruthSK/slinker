@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempPath;
 
 const RESPONSE_SPIN: std::time::Duration = std::time::Duration::from_millis(2);
@@ -26,8 +25,12 @@ pub(crate) struct WorkerClient {
 }
 
 impl WorkerClient {
-    pub(crate) fn spawn(r_home: std::path::PathBuf, target: &TargetEnvironment) -> Result<Self> {
-        let (client, actual) = Self::connect(r_home, target.libraries.clone())?;
+    pub(crate) fn spawn(
+        r_home: std::path::PathBuf,
+        target: &TargetEnvironment,
+        lane: u64,
+    ) -> Result<Self> {
+        let (client, actual) = Self::connect(r_home, target.libraries.clone(), lane)?;
         if actual != *target {
             return Err(Error::Analysis(
                 "Harp worker target changed between discovery and analysis".into(),
@@ -40,13 +43,14 @@ impl WorkerClient {
         r_home: std::path::PathBuf,
         libraries: Vec<std::path::PathBuf>,
     ) -> Result<TargetEnvironment> {
-        let (_, target) = Self::connect(r_home, libraries)?;
+        let (_, target) = Self::connect(r_home, libraries, 0)?;
         Ok(target)
     }
 
     fn connect(
         r_home: std::path::PathBuf,
         libraries: Vec<std::path::PathBuf>,
+        lane: u64,
     ) -> Result<(Self, TargetEnvironment)> {
         let executable = std::env::current_exe().map_err(|source| Error::Io {
             path: "<current-executable>".into(),
@@ -94,7 +98,7 @@ impl WorkerClient {
             target: TargetSpec {
                 r_home,
                 arch: worker_arch().into(),
-                worker: next_worker(),
+                worker: lane,
                 libraries,
             },
         })?;
@@ -155,6 +159,34 @@ impl WorkerClient {
             },
             |response| match response {
                 WorkerResponse::PackageIndex { index, .. } => Some(index),
+                _ => None,
+            },
+        )
+    }
+
+    pub(crate) fn bindings(
+        &mut self,
+        package: &InstalledPackage,
+        names: &[&str],
+    ) -> Result<Vec<WorkerBinding>> {
+        profile::add(Counter::RBatchItems, names.len() as u64);
+        self.call(
+            "binding batch",
+            |request_id| WorkerRequest::BindingBatch {
+                request_id,
+                package: package_spec(package),
+                names: names.iter().map(|name| (*name).into()).collect(),
+            },
+            |response| match response {
+                WorkerResponse::Bindings { bindings, .. }
+                    if bindings.len() == names.len()
+                        && bindings
+                            .iter()
+                            .zip(names)
+                            .all(|(binding, name)| binding.binding.name == *name) =>
+                {
+                    Some(bindings)
+                }
                 _ => None,
             },
         )
@@ -306,20 +338,37 @@ impl WorkerClient {
     }
 
     pub(crate) fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+        self.canonical_syntax_batch(&[source])?
+            .pop()
+            .ok_or_else(|| Error::Analysis("Harp worker returned no syntax normalization".into()))
+    }
+
+    pub(crate) fn canonical_syntax_batch(
+        &mut self,
+        sources: &[&str],
+    ) -> Result<Vec<CanonicalSyntax>> {
+        profile::add(Counter::RBatchItems, sources.len() as u64);
+        let expected = sources.len();
         self.call(
             "syntax normalization",
             |request_id| WorkerRequest::NormalizeSyntax {
                 request_id,
-                source: source.to_owned(),
+                sources: sources.iter().map(|source| (*source).to_owned()).collect(),
             },
             |response| match response {
-                WorkerResponse::NormalizedSyntax {
-                    source,
-                    stable: true,
-                    ..
-                } => Some(CanonicalSyntax::Stable(source)),
-                WorkerResponse::NormalizedSyntax { stable: false, .. } => {
-                    Some(CanonicalSyntax::Unstable)
+                WorkerResponse::NormalizedSyntax { results, .. } if results.len() == expected => {
+                    Some(
+                        results
+                            .into_iter()
+                            .map(|result| {
+                                if result.stable {
+                                    CanonicalSyntax::Stable(result.source)
+                                } else {
+                                    CanonicalSyntax::Unstable
+                                }
+                            })
+                            .collect(),
+                    )
                 }
                 _ => None,
             },
@@ -328,6 +377,7 @@ impl WorkerClient {
 
     fn exchange(&mut self, request: &WorkerRequest) -> Result<WorkerResponse> {
         let _span = profile::span(Probe::WorkerRequest);
+        let started = std::time::Instant::now();
         let context = request_context(request);
         let payload = serde_json::to_vec(request).map_err(|error| {
             Error::Analysis(format!("failed to serialize Harp worker request: {error}"))
@@ -369,7 +419,12 @@ impl WorkerClient {
             }
         }
         if profile::enabled() {
-            profile::r_request(request_opcode(&payload), payload.len(), line.len());
+            profile::r_request(
+                request_opcode(&payload),
+                payload.len(),
+                line.len(),
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
         }
         serde_json::from_slice(&line).map_err(|error| {
             Error::Analysis(format!(
@@ -410,6 +465,17 @@ fn request_context(request: &WorkerRequest) -> String {
         } => format!(
             "request {request_id} binding {}::{name} {} {}",
             package.name, package.version, package.image_fingerprint
+        ),
+        WorkerRequest::BindingBatch {
+            request_id,
+            package,
+            names,
+        } => format!(
+            "request {request_id} {} bindings of {} {} {}",
+            names.len(),
+            package.name,
+            package.version,
+            package.image_fingerprint
         ),
         WorkerRequest::DispatchGenerics {
             request_id,
@@ -547,11 +613,6 @@ fn target_resource_directories(
         .zip(lines)
         .map(|(name, line)| (name, std::ffi::OsString::from_vec(line.to_vec())))
         .collect())
-}
-
-fn next_worker() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 fn protocol_file() -> Result<(File, TempPath)> {

@@ -354,15 +354,14 @@ impl WorkerProbe {
         match self
             .exchange(&WorkerRequest::NormalizeSyntax {
                 request_id,
-                source: source.into(),
+                sources: vec![source.into()],
             })
             .expect("syntax normalization response")
         {
             WorkerResponse::NormalizedSyntax {
                 request_id: response,
-                source,
-                ..
-            } if response == request_id => source,
+                mut results,
+            } if response == request_id && results.len() == 1 => results.remove(0).source,
             response => panic!("unexpected syntax normalization response: {response:?}"),
         }
     }

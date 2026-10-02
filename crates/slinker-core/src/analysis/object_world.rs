@@ -3,7 +3,8 @@ use crate::package::{
     PackageImage,
 };
 use crate::syntax::SourceKey;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -100,11 +101,68 @@ pub struct ObjectGraph {
     environments: Vec<EnvironmentObject>,
     environment_by_label: BTreeMap<EnvironmentLabel, EnvironmentId>,
     environment_objects: HashMap<EnvironmentId, ObjectId>,
+    derived_writes: u64,
+    derived_reads: Cell<u64>,
+    write_log: Vec<(EnvironmentId, Option<BindingName>)>,
+    read_log: RefCell<Vec<(EnvironmentId, BindingName)>>,
+    namespace_environment: Option<EnvironmentId>,
+    merging: bool,
+    derived_objects: HashSet<ObjectId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphStamps {
+    pub writes: u64,
+    pub derived_reads: u64,
+    pub read_cursor: usize,
 }
 
 impl ObjectGraph {
+    pub fn stamps(&self) -> GraphStamps {
+        GraphStamps {
+            writes: self.derived_writes,
+            derived_reads: self.derived_reads.get(),
+            read_cursor: self.read_log.borrow().len(),
+        }
+    }
+
+    pub fn is_derived_object(&self, object: ObjectId) -> bool {
+        self.derived_objects.contains(&object)
+            || match self.object(object) {
+                InstalledObject::Environment(environment) => {
+                    self.environment(*environment).is_derived()
+                }
+                InstalledObject::Closure(closure) => self.closure(*closure).derived_from.is_some(),
+                InstalledObject::Structured { .. } | InstalledObject::Atom => false,
+            }
+    }
+
     pub fn namespace_binding(&self, name: &str) -> Option<ObjectId> {
+        if let Some(namespace) = self.namespace_environment {
+            self.read_log.borrow_mut().push((namespace, name.into()));
+        }
         self.namespace_bindings.get(name).copied()
+    }
+
+    pub fn environment_binding(&self, environment: EnvironmentId, name: &str) -> Option<ObjectId> {
+        self.read_log.borrow_mut().push((environment, name.into()));
+        self.environment(environment).bindings.get(name).copied()
+    }
+
+    pub fn write_log(&self) -> &[(EnvironmentId, Option<BindingName>)] {
+        &self.write_log
+    }
+
+    pub fn reads_since(&self, cursor: usize) -> Vec<(EnvironmentId, BindingName)> {
+        self.read_log
+            .borrow()
+            .get(cursor..)
+            .unwrap_or_default()
+            .to_vec()
+    }
+
+    pub fn restart_read_log(&self) {
+        self.read_log.borrow_mut().clear();
     }
 
     pub fn object(&self, id: ObjectId) -> &InstalledObject {
@@ -145,6 +203,12 @@ impl ObjectGraph {
     }
 
     pub fn merge_image(&mut self, image: &PackageImage) {
+        self.merging = true;
+        self.merge_image_contents(image);
+        self.merging = false;
+    }
+
+    fn merge_image_contents(&mut self, image: &PackageImage) {
         let namespace_label = EnvironmentLabel::namespace(&image.index.identity.name);
         let private_labels = image
             .private_environments
@@ -173,10 +237,15 @@ impl ObjectGraph {
         }
         for private in image.private_environments.values() {
             let id = self.environment_by_label[&private.id];
-            self.environments[id.0].parent = self.environment_id(&private.parent);
+            let parent = self.environment_id(&private.parent);
+            if self.environments[id.0].parent != parent {
+                self.environments[id.0].parent = parent;
+                self.write_log.push((id, None));
+            }
         }
 
         let namespace = self.environment_by_label[&namespace_label];
+        self.namespace_environment = Some(namespace);
         let mut bindings = image.bindings.iter().collect::<Vec<_>>();
         bindings.sort_by_key(|(name, _)| *name);
         for (name, binding) in bindings {
@@ -194,6 +263,7 @@ impl ObjectGraph {
             self.environments[namespace.0]
                 .bindings
                 .insert(name.clone(), object);
+            self.write_log.push((namespace, Some(name.clone())));
         }
 
         let mut privates = image.private_environments.iter().collect::<Vec<_>>();
@@ -225,6 +295,12 @@ impl ObjectGraph {
 
     fn push_object(&mut self, object: InstalledObject) -> ObjectId {
         let id = ObjectId(self.objects.len());
+        if !self.merging {
+            self.derived_writes += 1;
+            if !matches!(object, InstalledObject::Environment(_)) {
+                self.derived_objects.insert(id);
+            }
+        }
         if let InstalledObject::Environment(environment) = object {
             self.environment_objects.entry(environment).or_insert(id);
         }
@@ -326,6 +402,7 @@ impl ObjectGraph {
     }
 
     pub fn derive_environment(&mut self, parent: Option<EnvironmentId>) -> EnvironmentId {
+        self.derived_writes += 1;
         let mut sequence = self.environments.len();
         let label = loop {
             let label = EnvironmentLabel::derived(sequence);
@@ -348,18 +425,27 @@ impl ObjectGraph {
         self.push_object(InstalledObject::Atom)
     }
 
+    fn note_environment_write(&mut self, environment: EnvironmentId, name: Option<&str>) {
+        self.derived_writes += 1;
+        if !self.environments[environment.0].is_derived() {
+            self.write_log.push((environment, name.map(Into::into)));
+        }
+    }
     pub fn set_environment_binding(
         &mut self,
         environment: EnvironmentId,
         name: impl Into<BindingName>,
         value: ObjectId,
     ) {
+        let name = name.into();
+        self.note_environment_write(environment, Some(&name));
         self.environments[environment.0]
             .bindings
-            .insert(name.into(), value);
+            .insert(name, value);
     }
 
     pub fn mark_environment_unknown_fields(&mut self, environment: EnvironmentId) {
+        self.note_environment_write(environment, None);
         self.environments[environment.0].unknown_fields = true;
     }
 
@@ -474,6 +560,11 @@ impl ObjectGraph {
                 return Lookup::Opaque;
             }
             let shape = self.environment(environment);
+            if shape.is_derived() {
+                self.derived_reads.set(self.derived_reads.get() + 1);
+            } else {
+                self.read_log.borrow_mut().push((environment, name.into()));
+            }
             if let Some(value) = shape.bindings.get(name) {
                 return Lookup::Found(*value);
             }

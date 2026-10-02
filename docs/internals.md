@@ -26,9 +26,11 @@ Installed package identities use SHA-256 fingerprints computed from current file
 
 Air parses reachable installed closure units with the exact parser revision used by the pinned Oak semantic crate. Oak is the authority for R lexical scopes, use-def relationships, lexical fallthrough, and evaluation/NSE effects. Slinker translates Oak semantic facts into its existing package/linker graph; it does not maintain a second lexical-flow engine. Atomic/materialized bindings do not invoke Air/Oak. Target R remains the syntax authority when Air rejects a binding.
 
-Air parsing uses one reusable Rayon pool. Independent reachable closures are parsed in parallel. Oak then supplies semantic scope/evaluation information for those parsed closures; linker-specific package/resource recognition consumes only semantically live sites.
+Air parsing uses one reusable Rayon pool. Independent reachable closures are parsed in parallel. Before parsing, one batch asks the R workers to normalize the frontier's sources, split across up to four worker processes, and one batch per package loads the frontier's binding images. Binding images of one package are always inspected by one worker so private-environment identity stays valid; normalization is pure and runs on any worker. Oak then supplies semantic scope/evaluation information for those parsed closures; linker-specific package/resource recognition consumes only semantically live sites.
 
-The construction interpreter evaluates an installed closure at most once per requesting node, callee, and named argument values; `LinkIr::construction_evaluations` reports how many bodies it evaluated.
+The construction interpreter evaluates an installed closure body once per package, callee, and abstract argument tuple whenever the evaluation is pure: it allocates no environments or closures, writes no environment binding, and reads no environment that evaluation can mutate. That summary is keyed by semantics and never by the requesting node. Each later call site replays the summary's call-site effects (retention requirements and reflective-name retention) from its own node, so provenance edges are recorded for every caller. A summary is dropped when a binding it read is written. Evaluations that allocate or mutate stay memoized per requesting node.
+
+Abstract values form a flat lattice: `Bottom` (no information yet) below every exact value, and `Unknown` above all of them; distinct exact values join to `Unknown`. A recursive call returns the enclosing call's current approximation, which starts at `Bottom`, and the enclosing call is re-evaluated until the approximation stops growing, so recursion yields the least fixed point instead of `Unknown`. A call to a function that is already being evaluated is widened to `Unknown` arguments, which keeps the set of summary keys finite; a hard depth limit remains as a backstop and makes the result `Unknown`. An `if` whose condition is not statically known evaluates both branches and joins their values. `LinkIr::construction_evaluations` reports how many bodies were evaluated.
 
 ## Cache
 
@@ -43,3 +45,7 @@ Disposable typed index and per-binding analysis artifacts are stored under cache
 Installed `DESCRIPTION` files are parsed by `r-description-parser`; package versions and dependency relations use `r-metadata` types. Slinker does not keep a second DCF/dependency parser.
 
 The semantic stack is deliberately narrow: `harp`, `libr`, `air_r_parser`, `air_r_syntax`, `oak_semantic`, `r-description-parser`, and `r-metadata`. Harp, libr, and Oak share Ark commit `37fe33a19c4fc678da32c5c23111306b52019f4a`; slinker's direct Air crates use Oak's matching Air revision, `d2659d5b158374bf486b594625ca50abbd0ac879`. No Ark LSP/Jupyter crates, package manager, or alternative R parser are included.
+
+## Profiling
+
+`SLINKER_PROFILE=1` prints a deterministic report on stderr when a command finishes: calls, unique semantic keys, inclusive and exclusive time per probe, memo and summary counters, recursion (SCC) statistics, R requests by opcode with their time, R batch sizes and bytes, R startups, and package fingerprint work. Probe order is fixed; timings are not. With the variable unset the probes cost one branch each.

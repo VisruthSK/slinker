@@ -181,6 +181,15 @@ impl<P: PackageProvider> TargetUniverse<P> {
     pub fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
         self.store.canonical_syntax(source)
     }
+
+    pub fn prefetch_canonical_syntax(&mut self, sources: &[&str]) -> Result<()> {
+        self.store.prefetch_canonical_syntax(sources)
+    }
+
+    pub fn prefetch_binding_images(&mut self, id: PackageId, names: &[&str]) -> Result<()> {
+        self.store
+            .prefetch_binding_images(&self.packages[id.index()].0, names)
+    }
 }
 
 fn is_platform(package: &InstalledPackage) -> bool {
