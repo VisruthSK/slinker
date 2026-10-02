@@ -29,8 +29,8 @@ pub(super) struct ComputedNamespaceInfoRead {
 }
 
 impl ReflectionFacts {
-    pub(super) fn set_non_reflective_namespace_uses(&mut self, uses: HashSet<Span>) {
-        self.non_reflective_namespace_uses = uses;
+    pub(super) fn add_non_reflective_namespace_uses(&mut self, uses: HashSet<Span>) {
+        self.non_reflective_namespace_uses.extend(uses);
     }
 
     pub(super) fn is_non_reflective_namespace_use(&self, span: &Span) -> bool {

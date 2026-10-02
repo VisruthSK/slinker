@@ -48,7 +48,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn process_native_routine_callbacks(
-        &mut self,
+        &self,
         context: NativeCallbackContext<'_>,
     ) -> Result<()> {
         let NativeCallbackContext {
@@ -163,7 +163,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn declared_callable_resolution(
-        &mut self,
+        &self,
         current: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
@@ -179,7 +179,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 binding: Some(callable.name.as_str().into()),
             }),
             Some(package) if self.packages.is_external(package) => {
-                self.external.insert(package);
+                self.external.lock().insert(package);
                 Resolution::Static(BindingTarget::External { package, binding })
             }
             Some(package) => Resolution::Static(BindingTarget::Imported { package, binding }),
@@ -187,7 +187,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn require_native_callback(
-        &mut self,
+        &self,
         site: &CallbackSite<'_>,
         callback_name: &str,
         resolution: Resolution,
@@ -271,7 +271,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     }
 
     pub(super) fn linked_native_selector(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         image: &PackageImage,
@@ -312,7 +312,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         match (native.library.name_lookup(), source) {
             (Some(NameLookup::Forced), _) if !names_other_library => {}
             (Some(NameLookup::Allowed), Some(source)) if registered && !names_other_library => {
-                self.relocations.push(PendingRelocation::NativeSymbol {
+                self.relocations.lock().push(PendingRelocation::NativeSymbol {
                     source,
                     package: current,
                     component: component.into(),
@@ -334,7 +334,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     }
 
     pub(super) fn linked_native_symbol_query(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         image: &PackageImage,
@@ -387,7 +387,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     (Some(NameLookup::Forced), _) => {}
                     (Some(NameLookup::Allowed), Some(source)) => {
 
-                        self.relocations.push(PendingRelocation::NativeLibrary {
+                        self.relocations.lock().push(PendingRelocation::NativeLibrary {
                             source,
                             package: current,
                             component: library.as_str().into(),
@@ -417,7 +417,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     }
 
     pub(super) fn native_component_for_call(
-        &mut self,
+        &self,
         current: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,

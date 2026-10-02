@@ -11,9 +11,9 @@ use crate::package::{
 use std::sync::Arc;
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    pub(super) fn process_activation(&mut self, id: PackageId) -> Result<()> {
+    pub(super) fn process_activation(&self, id: PackageId) -> Result<()> {
         if self.packages.is_external(id) {
-            self.external.insert(id);
+            self.external.lock().insert(id);
             return Ok(());
         }
         let image = self.image(id)?;
@@ -27,6 +27,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             {
                 self.loaded(id)?
                     .namespace
+                    .lock()
                     .optional_registrations
                     .push(OptionalRegistration {
                         package: package_name.into(),
@@ -78,6 +79,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
             self.loaded(id)?
                 .namespace
+                .lock()
                 .registrations
                 .push(registration_id.clone());
             self.require(
@@ -121,13 +123,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_resource(
-        &mut self,
-        id: PackageId,
-        resource: &ResourcePath,
-    ) -> Result<()> {
+    pub(super) fn process_resource(&self, id: PackageId, resource: &ResourcePath) -> Result<()> {
         if self.packages.is_external(id) {
-            self.external.insert(id);
+            self.external.lock().insert(id);
             return Ok(());
         }
         self.image(id)?;
@@ -135,9 +133,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_dataset(&mut self, id: PackageId, dataset: &DatasetName) -> Result<()> {
+    pub(super) fn process_dataset(&self, id: PackageId, dataset: &DatasetName) -> Result<()> {
         if self.packages.is_external(id) {
-            self.external.insert(id);
+            self.external.lock().insert(id);
             return Ok(());
         }
         let image = self.image(id)?;
@@ -158,7 +156,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_s3(&mut self, id: PackageId, registration: &S3Id) -> Result<()> {
+    pub(super) fn process_s3(&self, id: PackageId, registration: &S3Id) -> Result<()> {
         let node = self.need_node(&Need::S3Registration {
             package: id,
             registration: registration.clone(),
@@ -229,13 +227,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_native(
-        &mut self,
-        id: PackageId,
-        component: &ComponentName,
-    ) -> Result<()> {
+    pub(super) fn process_native(&self, id: PackageId, component: &ComponentName) -> Result<()> {
         if self.packages.is_external(id) {
-            self.external.insert(id);
+            self.external.lock().insert(id);
             return Ok(());
         }
         let index = self.packages.index(id)?;
@@ -335,7 +329,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    pub(super) fn process_lifecycle(&mut self, id: PackageId, hook: LifecycleHook) {
+    pub(super) fn process_lifecycle(&self, id: PackageId, hook: LifecycleHook) {
         let node = self.need_node(&Need::Lifecycle { package: id, hook });
         self.require(
             node,

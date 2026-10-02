@@ -115,7 +115,9 @@ impl<P: PackageResolver> TargetUniverse<P> {
         } else {
             (PackageRole::Linked, PackageAvailability::Linked(id))
         };
-        roster.packages.push(Arc::new(PackageEntry { package, role }));
+        roster
+            .packages
+            .push(Arc::new(PackageEntry { package, role }));
         roster
             .availability
             .insert(PackageName::from(name), availability);
@@ -359,8 +361,7 @@ mod tests {
         for name in ["root", "dependency", "kept"] {
             install(library.path(), name);
         }
-        let universe =
-            universe_with_policy(library.path(), "root", HashSet::from(["kept".into()]));
+        let universe = universe_with_policy(library.path(), "root", HashSet::from(["kept".into()]));
 
         let roles = ["root", "dependency", "kept"].map(|name| {
             let package = universe.require(name).expect("installed");

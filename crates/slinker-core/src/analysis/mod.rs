@@ -10,6 +10,7 @@ pub mod explain;
 pub mod export;
 mod finalize;
 pub mod graph;
+mod guarded;
 mod guards;
 mod invocation;
 mod lattice;
@@ -23,6 +24,7 @@ mod reflection;
 mod relocation;
 mod resolution;
 mod s3;
+mod scheduler;
 mod state;
 mod summary;
 

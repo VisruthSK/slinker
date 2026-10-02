@@ -189,13 +189,13 @@ pub struct PrivateEnvironmentImage {
 #[derive(Clone, Debug)]
 pub struct PackageImage {
     pub index: Arc<PackageIndex>,
-    pub bindings: HashMap<BindingName, BindingImage>,
+    pub bindings: HashMap<BindingName, Arc<BindingImage>>,
     pub private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
 }
 
 impl PackageImage {
     pub fn binding(&self, name: &str) -> Option<&BindingImage> {
-        self.bindings.get(name)
+        self.bindings.get(name).map(AsRef::as_ref)
     }
 
     pub fn private_environment(&self, id: &EnvironmentLabel) -> Option<&PrivateEnvironmentImage> {

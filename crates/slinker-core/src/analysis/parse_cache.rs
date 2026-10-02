@@ -24,11 +24,10 @@ impl ParseCache {
         self.states.get(key)
     }
 
-    pub(super) fn contains(&self, key: &ParseKey) -> bool {
-        self.states.contains_key(key)
-    }
-
     pub(super) fn register(&mut self, key: ParseKey, package: &str, text: &Arc<str>) -> SourceId {
+        if let Some(known) = self.source_ids.get(&key) {
+            return *known;
+        }
         let source = self.sources.add(package, key.1.clone(), Arc::clone(text));
         self.source_ids.insert(key, source);
         source

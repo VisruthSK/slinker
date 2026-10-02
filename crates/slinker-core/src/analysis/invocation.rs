@@ -193,7 +193,7 @@ fn apply_family(callee: &str) -> Option<ApplyFamily> {
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn base_apply_invocation(
-        &mut self,
+        &self,
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
         expression: &ParsedExpression,
@@ -256,7 +256,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn do_call_invocation(
-        &mut self,
+        &self,
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
         expression: &ParsedExpression,
@@ -281,7 +281,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         else {
             return Ok(None);
         };
-        let resolves_to_base = |state: &mut Self, call: &CallSite| {
+        let resolves_to_base = |state: &Self, call: &CallSite| {
             state.call_resolves_definitely_to_base(
                 site.package,
                 site.image,
@@ -325,7 +325,7 @@ impl InvocationModel {
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn process_declared_callable_calls(
-        &mut self,
+        &self,
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
         expression: &ParsedExpression,

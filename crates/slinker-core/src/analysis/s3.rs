@@ -220,7 +220,7 @@ impl S3Dispatch {
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn s3_dispatch(
-        &mut self,
+        &self,
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
         parameters: Option<&[String]>,
@@ -228,9 +228,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<()> {
         let (from, current, binding) = (site.node, site.package, site.binding);
         if call.callee == "NextMethod" {
-            self.s3
-                .next_method_calls
-                .push((from, current, binding.to_owned(), call.span.clone()));
+            self.s3.lock().next_method_calls.push((
+                from,
+                current,
+                binding.to_owned(),
+                call.span.clone(),
+            ));
             return Ok(());
         }
         let generics = match call.args.first() {
@@ -259,7 +262,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn observe_generic(
-        &mut self,
+        &self,
         site: ParsedSite<'_>,
         parameters: Option<&[String]>,
         call: &CallSite,
@@ -294,13 +297,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 formals: parameters.map(<[String]>::to_vec).unwrap_or_default(),
             });
         self.s3
+            .lock()
             .observe_use_method(&key, (from, current, call.span.clone()), definition);
         self.connect_generic_site(from, generic);
         self.refresh_s3_generic(&key)
     }
 
     pub(super) fn record_invocation(
-        &mut self,
+        &self,
         parsed: &ParsedRFile,
         callable: CallableId,
         call: &CallSite,
@@ -308,34 +312,37 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.record_use(callable, Some(Invocation::from_call(parsed, call)))
     }
 
-    pub(super) fn record_escape(&mut self, callable: CallableId) -> Result<()> {
+    pub(super) fn record_escape(&self, callable: CallableId) -> Result<()> {
         self.record_use(callable, None)
     }
 
     pub(super) fn record_use(
-        &mut self,
+        &self,
         callable: CallableId,
         invocation: Option<Invocation>,
     ) -> Result<()> {
-        let generics = self.s3.generics_of(&callable);
-        self.invocations.record(callable, invocation);
+        let generics = self.s3.lock().generics_of(&callable);
+        self.invocations.lock().record(callable, invocation);
         self.refresh_generics(generics)
     }
 
-    fn refresh_generics(&mut self, keys: BTreeSet<S3GenericKey>) -> Result<()> {
+    fn refresh_generics(&self, keys: BTreeSet<S3GenericKey>) -> Result<()> {
         keys.into_iter()
             .try_for_each(|key| self.refresh_s3_generic(&key))
     }
 
-    fn refresh_s3_generic(&mut self, key: &S3GenericKey) -> Result<()> {
-        let callable_is_external = match self.s3.callable_to_check(key).cloned() {
+    fn refresh_s3_generic(&self, key: &S3GenericKey) -> Result<()> {
+        let callable = self.s3.lock().callable_to_check(key).cloned();
+        let callable_is_external = match callable {
             Some(callable) => self.is_externally_callable(&callable)?,
             None => false,
         };
-        let classes = match self
-            .s3
-            .refresh(key, callable_is_external, &self.invocations)
-        {
+        let change = {
+            let mut model = self.s3.lock();
+            let invocations = self.invocations.lock();
+            model.refresh(key, callable_is_external, &invocations)
+        };
+        let classes = match change {
             DispatchChange::Unchanged => return Ok(()),
             DispatchChange::Opened => None,
             DispatchChange::Added { classes } => Some(classes),
@@ -346,7 +353,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    fn is_externally_callable(&mut self, callable: &CallableId) -> Result<bool> {
+    fn is_externally_callable(&self, callable: &CallableId) -> Result<bool> {
         Ok(self.is_root(callable.package)
             && self
                 .image(callable.package)?
@@ -358,17 +365,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn retained_namespaces(&self) -> Vec<PackageId> {
         let mut namespaces = self
-            .loaded
-            .keys()
-            .copied()
+            .loaded_packages()
+            .into_iter()
             .filter(|package| !self.packages.is_external(*package))
             .collect::<Vec<_>>();
         namespaces.sort_unstable();
         namespaces
     }
 
-    pub(super) fn retain_s3_methods_on_activation(&mut self, package: PackageId) -> Result<()> {
-        for (name, dispatch) in self.s3.dispatches() {
+    pub(super) fn retain_s3_methods_on_activation(&self, package: PackageId) -> Result<()> {
+        let dispatches = self.s3.lock().dispatches();
+        for (name, dispatch) in dispatches {
             match dispatch {
                 S3Dispatch::Pending => {}
                 S3Dispatch::Classes(classes) => {
@@ -381,7 +388,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn s3_method_candidates(
-        &mut self,
+        &self,
         package: PackageId,
         generic: &str,
         classes: Option<&BTreeSet<ClassName>>,
@@ -392,12 +399,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let registered = self
             .loaded(package)?
             .namespace
+            .lock()
             .registrations
             .iter()
             .filter(|registration| {
                 registration.generic.name == generic && wanted(&registration.class)
             })
-            .map(|registration| registration.method.clone());
+            .map(|registration| registration.method.clone())
+            .collect::<Vec<_>>();
         let indexed_registrations = image
             .index
             .s3
@@ -427,14 +436,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn demand_s3_method(
-        &mut self,
+        &self,
         from: NodeId,
         package: PackageId,
         generic: &str,
         method: &BindingName,
         kind: EdgeKind,
     ) {
-        self.s3.closed_methods.insert((package, method.clone()));
+        self.s3
+            .lock()
+            .closed_methods
+            .insert((package, method.clone()));
         self.require(
             from,
             Need::Binding {
@@ -447,15 +459,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn retain_s3_methods(
-        &mut self,
+        &self,
         package: PackageId,
         generic: &str,
         classes: Option<&BTreeSet<ClassName>>,
     ) -> Result<()> {
         let methods = self.s3_method_candidates(package, generic, classes)?;
-        let sites = self.s3.sites_named(generic);
+        let sites = self.s3.lock().sites_named(generic);
         for (method, kind) in methods {
             self.s3
+                .lock()
                 .retained
                 .entry(generic.into())
                 .or_default()
@@ -467,8 +480,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    fn connect_generic_site(&mut self, from: NodeId, generic: &str) {
-        for ((package, method), kind) in self.s3.retained_methods(generic) {
+    fn connect_generic_site(&self, from: NodeId, generic: &str) {
+        let retained = self.s3.lock().retained_methods(generic);
+        for ((package, method), kind) in retained {
             self.demand_s3_method(from, package, generic, &method, kind);
         }
     }
@@ -515,7 +529,7 @@ pub(super) fn callable_target(resolved: &Resolution) -> Option<CallableId> {
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn call_target(
-        &mut self,
+        &self,
         current: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
@@ -540,7 +554,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn retain_lexical_s3_methods(
-        &mut self,
+        &self,
         site: ParsedSite<'_>,
         call: &CallSite,
     ) -> Result<()> {
@@ -550,11 +564,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let generics = self.packages.dispatch_generics(owner.as_callee())?;
         for generic in generics {
             let key = (site.package, generic.clone());
-            if !self.s3.lexical_methods.contains_key(&key) {
+            if !self.s3.lock().lexical_methods.contains_key(&key) {
                 let methods = self.s3_method_candidates(site.package, &generic, None)?;
-                self.s3.lexical_methods.insert(key.clone(), methods);
+                self.s3.lock().lexical_methods.insert(key.clone(), methods);
             }
-            let methods = self.s3.lexical_methods[&key].clone();
+            let methods = self.s3.lock().lexical_methods[&key].clone();
             for (method, kind) in methods {
                 self.demand_s3_method(site.node, site.package, &generic, &method, kind);
             }
@@ -563,7 +577,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn dispatching_callee(
-        &mut self,
+        &self,
         site: ParsedSite<'_>,
         call: &CallSite,
     ) -> Result<Option<DispatchOwner>> {
@@ -600,7 +614,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn defining_namespace(
-        &mut self,
+        &self,
         mut package: PackageId,
         mut binding: BindingName,
     ) -> Result<Option<DispatchOwner>> {

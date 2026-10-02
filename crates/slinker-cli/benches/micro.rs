@@ -95,18 +95,11 @@ impl PackageProvider for MemoryProvider {
         Ok(Arc::clone(&self.image.index))
     }
 
-    fn binding_image(
-        &self,
-        _package: &InstalledPackage,
-        _name: &str,
-    ) -> Result<Arc<PackageImage>> {
+    fn binding_image(&self, _package: &InstalledPackage, _name: &str) -> Result<Arc<PackageImage>> {
         Ok(Arc::clone(&self.image))
     }
 
-    fn dispatch_generics(
-        &self,
-        _subject: DispatchSubject<'_>,
-    ) -> Result<BTreeSet<GenericName>> {
+    fn dispatch_generics(&self, _subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
         Ok(BTreeSet::new())
     }
 
@@ -152,7 +145,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
         .map(|(name, source)| {
             (
                 BindingName::from(name.as_str()),
-                BindingImage {
+                Arc::new(BindingImage {
                     name: BindingName::from(name.as_str()),
                     origin: BindingOrigin::Code,
                     object: ObjectImage {
@@ -162,7 +155,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
                         }),
                         ..ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Closure)
                     },
-                },
+                }),
             )
         })
         .collect::<HashMap<_, _>>();

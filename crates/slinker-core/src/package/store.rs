@@ -1,18 +1,18 @@
 use crate::cache::{Cache, CacheLocation};
+use crate::package::inspection::{Batcher, Lanes, Placement, Slot};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
     BindingName, ComponentName, Digest, GenericName, InstalledPackage, LifecycleMetadata,
     NativeFacts, NativeRoutineSummary, NativeSafety, PackageData, PackageIdentity, PackageImage,
     PackageIndex, PackageLocator, PackageName,
 };
-use crate::package::inspection::{Batcher, Lanes, Placement, Slot};
 use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{WorkerBinding, WorkerPackageIndex};
 use crate::{Error, Result, TargetEnvironment};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -364,7 +364,7 @@ impl PackageStore {
         }
         Ok(Arc::new(PackageImage {
             index,
-            bindings: HashMap::from([(worker.binding.name.clone(), worker.binding)]),
+            bindings: HashMap::from([(worker.binding.name.clone(), Arc::new(worker.binding))]),
             private_environments: worker.private_environments,
         }))
     }
@@ -488,7 +488,7 @@ impl PackageStore {
             return None;
         }
         if let Some(image) = self.load_cached_binding(package, index, name) {
-            batcher.seed(query, image);
+            batcher.seed(&query, image);
             return None;
         }
         Some(batcher.submit(&query))
@@ -521,7 +521,6 @@ fn is_epoch_independent(binding: &WorkerBinding) -> bool {
             .all(|label| !label.starts_with("private:"))
 }
 
-
 impl PackageResolver for PackageStore {
     fn target_environment(&self) -> &TargetEnvironment {
         self.locator.target()
@@ -534,16 +533,12 @@ impl PackageResolver for PackageStore {
 
 impl PackageProvider for PackageStore {
     fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
-        self.indexes
-            .get_or_compute(&package.identity, || match self.load_cached_index(package) {
+        self.indexes.get_or_compute(&package.identity, || {
+            match self.load_cached_index(package) {
                 Some(index) => Ok(index),
                 None => {
                     let lane = self.affine_lane(&package.identity);
-                    let worker = self
-                        .lanes
-                        .lane(lane)
-                        .client()?
-                        .package_index(package)?;
+                    let worker = self.lanes.lane(lane).client()?.package_index(package)?;
                     let index = self.package_index(worker.clone(), package)?;
                     let cached = CachedIndex {
                         schema: ANALYSIS_SCHEMA.into(),
@@ -555,7 +550,8 @@ impl PackageProvider for PackageStore {
                         .publish(&self.index_cache_name(&package.identity), &cached);
                     Ok(index)
                 }
-            })
+            }
+        })
     }
 
     fn binding_image(&self, package: &InstalledPackage, name: &str) -> Result<Arc<PackageImage>> {
@@ -565,9 +561,8 @@ impl PackageProvider for PackageStore {
             return known;
         }
         let index = self.index(package)?;
-        let slot = match self.submit_binding(&batcher, package, &index, name) {
-            Some(slot) => slot,
-            None => return batcher.known(&query).expect("a seeded binding is known"),
+        let Some(slot) = self.submit_binding(&batcher, package, &index, name) else {
+            return batcher.known(&query).expect("a seeded binding is known");
         };
         let lane = self.affine_lane(&package.identity);
         batcher.drive(
@@ -583,7 +578,9 @@ impl PackageProvider for PackageStore {
         let index = self.index(package)?;
         let mut submitted = false;
         for name in names {
-            submitted |= self.submit_binding(&batcher, package, &index, name).is_some();
+            submitted |= self
+                .submit_binding(&batcher, package, &index, name)
+                .is_some();
         }
         if submitted {
             let lane = self.affine_lane(&package.identity);
@@ -642,10 +639,11 @@ impl PackageProvider for PackageStore {
             return known;
         }
         let slot = self.normalizer.submit(&query);
-        self.normalizer.drive(&self.lanes, &Placement::Any, &slot, &|client, sources| {
-            let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
-            client.canonical_syntax_batch(&refs)
-        })
+        self.normalizer
+            .drive(&self.lanes, &Placement::Any, &slot, &|client, sources| {
+                let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+                client.canonical_syntax_batch(&refs)
+            })
     }
 
     fn prefetch_canonical_syntax(&self, sources: &[&str]) -> Result<()> {

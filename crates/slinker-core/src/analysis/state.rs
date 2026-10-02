@@ -1,32 +1,31 @@
 use super::diagnostic::{Cause, DiagnosticSink, Evidence};
 use super::dynamic_names::DynamicNames;
 use super::execute::{AbstractValue, ConstructionCallKey};
+use super::guarded::Guarded;
 use super::guards::DeclaredDependencies;
 use super::invocation::InvocationModel;
 use super::namespace::NamespaceBuilder;
 use super::native::NativeBindingIndex;
-use super::need::{NeedQueue, Popped, Schedule};
+use super::need::{Schedule, WorkKey};
 use super::object_world::ObjectWorld;
-use super::parse_cache::{ParseCache, ParseKey, ParseState};
+use super::parse_cache::ParseCache;
 use super::reflection::ReflectionFacts;
 use super::relocation::RelocationPlan;
 use super::s3::{CallableId, S3Model};
-use super::summary::SummaryTable;
+use super::scheduler::{Claim, Machine};
+use super::summary::{Assumption, SummaryTable};
 use crate::analysis::{Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    BindingName, ClosureSource, ComponentName, EnvironmentLabel, GenericLabel, PackageId,
-    PackageImage, PackageName, PackageProvider, TargetUniverse,
+    BindingName, ComponentName, EnvironmentLabel, GenericLabel, PackageId, PackageImage,
+    PackageName, PackageProvider, TargetUniverse,
 };
 use crate::profile::{self, Counter, Probe};
-use crate::syntax::{
-    CallSite, NamespaceImports, OakParseContext, OakParser, ParsedRFile, SourceId, SourceKey, Span,
-};
+use crate::syntax::{CallSite, NamespaceImports, ParsedRFile, SourceKey, Span};
 use crate::{Error, Result};
-use rayon::prelude::*;
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Copy)]
 pub(super) struct Caller<'a> {
@@ -87,47 +86,43 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) linked_packages: HashSet<PackageName>,
     pub(super) explicit_external_packages: HashSet<PackageName>,
     pub(super) jobs: usize,
-    pub(super) parse_pool: Option<Arc<rayon::ThreadPool>>,
-    pub(super) graph: Graph,
-    pub(super) roots: Vec<NodeId>,
-    pub(super) needs: NeedQueue,
-    pub(super) encountered: HashSet<PackageId>,
-    pub(super) external: HashSet<PackageId>,
-    pub(super) parses: ParseCache,
-    pub(super) loaded: HashMap<PackageId, LoadedPackage>,
+    pub(super) schedule: Schedule,
+    pub(super) graph: Guarded<Graph>,
+    pub(super) roots: Guarded<Vec<NodeId>>,
+    pub(super) work: Machine<WorkKey>,
+    pub(super) failure: Guarded<Option<Error>>,
+    pub(super) encountered: Guarded<HashSet<PackageId>>,
+    pub(super) external: Guarded<HashSet<PackageId>>,
+    pub(super) parses: Guarded<ParseCache>,
+    pub(super) loaded: RwLock<HashMap<PackageId, Arc<LoadedPackage>>>,
+    load_gate: Guarded<()>,
     pub(super) objects: ObjectWorld,
-    pub(super) diagnostics: DiagnosticSink,
-    pub(super) relocations: RelocationPlan,
-    pub(super) s3: S3Model,
-    pub(super) invocations: InvocationModel,
-    pub(super) value_closures: HashSet<NodeId>,
-    pub(super) construction_calls: HashMap<ConstructionCallKey, (AbstractValue, Option<u64>)>,
+    pub(super) diagnostics: Guarded<DiagnosticSink>,
+    pub(super) relocations: Guarded<RelocationPlan>,
+    pub(super) s3: Guarded<S3Model>,
+    pub(super) invocations: Guarded<InvocationModel>,
+    pub(super) value_closures: Guarded<HashSet<NodeId>>,
+    pub(super) construction_calls:
+        Guarded<HashMap<ConstructionCallKey, (AbstractValue, Vec<Assumption>)>>,
     pub(super) summaries: SummaryTable,
-    pub(super) construction_evaluations: usize,
-    pub(super) reflection: ReflectionFacts,
-    pub(super) dynamic_names: DynamicNames,
-    pub(super) external_bindings: BTreeMap<(PackageId, BindingName), ExternalBindingAccess>,
-    pub(super) dependencies: HashMap<NodeId, HashSet<NodeId>>,
+    pub(super) construction_evaluations: AtomicUsize,
+    pub(super) reflection: Guarded<ReflectionFacts>,
+    pub(super) dynamic_names: Guarded<DynamicNames>,
+    pub(super) dependencies: Guarded<HashMap<NodeId, HashSet<NodeId>>>,
+    pub(super) external_bindings:
+        Guarded<BTreeMap<(PackageId, BindingName), ExternalBindingAccess>>,
     pub(super) provenance: bool,
     pub(super) root: PackageId,
-    pub(super) declared_dependencies: HashMap<PackageId, DeclaredDependencies>,
-    pub(super) namespace_imports: HashMap<PackageId, NamespaceImports>,
-    pub(super) non_returning_bindings: HashMap<PackageId, BTreeSet<BindingName>>,
+    pub(super) declared_dependencies: Guarded<HashMap<PackageId, Arc<DeclaredDependencies>>>,
+    pub(super) namespace_imports: Guarded<HashMap<PackageId, Arc<NamespaceImports>>>,
+    pub(super) non_returning_bindings: Guarded<HashMap<PackageId, BTreeSet<BindingName>>>,
     pub(super) root_description: Option<Arc<str>>,
 }
 
 pub(super) struct LoadedPackage {
-    pub(super) image: Arc<PackageImage>,
-    pub(super) namespace: NamespaceBuilder,
+    pub(super) image: RwLock<Arc<PackageImage>>,
+    pub(super) namespace: Guarded<NamespaceBuilder>,
     pub(super) native_bindings: NativeBindingIndex,
-    pub(super) surface: NamespaceSurface,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NamespaceSurface {
-    Open,
-    Sealing,
-    Sealed,
 }
 
 pub(super) struct NativeCallTarget {
@@ -153,43 +148,43 @@ impl<P: PackageProvider> AnalyzerState<P> {
             linked_packages: options.linked_packages,
             explicit_external_packages: options.explicit_external_packages,
             jobs: options.jobs.max(1),
-            parse_pool: None,
-            graph: Graph::default(),
-            roots: Vec::new(),
-            needs: NeedQueue::with_schedule(options.schedule),
-            encountered: HashSet::from([root]),
-            external: HashSet::new(),
-            parses: ParseCache::default(),
-            loaded: HashMap::new(),
+            schedule: options.schedule,
+            graph: Guarded::default(),
+            roots: Guarded::default(),
+            work: Machine::default(),
+            failure: Guarded::default(),
+            encountered: Guarded::new(HashSet::from([root])),
+            external: Guarded::default(),
+            parses: Guarded::default(),
+            loaded: RwLock::new(HashMap::new()),
+            load_gate: Guarded::default(),
             objects: ObjectWorld::default(),
-            diagnostics: DiagnosticSink::default(),
-            relocations: RelocationPlan::default(),
-            s3: S3Model::default(),
-            invocations: InvocationModel::default(),
-            value_closures: HashSet::new(),
-            construction_calls: HashMap::new(),
+            diagnostics: Guarded::default(),
+            relocations: Guarded::default(),
+            s3: Guarded::default(),
+            invocations: Guarded::default(),
+            value_closures: Guarded::default(),
+            construction_calls: Guarded::default(),
             summaries: SummaryTable::default(),
-            construction_evaluations: 0,
-            reflection: ReflectionFacts::default(),
-            dynamic_names: DynamicNames::default(),
-            external_bindings: BTreeMap::new(),
-            dependencies: HashMap::new(),
+            construction_evaluations: AtomicUsize::new(0),
+            reflection: Guarded::default(),
+            dynamic_names: Guarded::default(),
+            dependencies: Guarded::default(),
+            external_bindings: Guarded::default(),
             provenance: options.provenance,
             root,
-            declared_dependencies: HashMap::new(),
-            namespace_imports: HashMap::new(),
-            non_returning_bindings: HashMap::new(),
+            declared_dependencies: Guarded::default(),
+            namespace_imports: Guarded::default(),
+            non_returning_bindings: Guarded::default(),
             root_description: options.root_description,
         })
     }
 
-    pub(super) fn run(mut self) -> Result<Self> {
+    pub(super) fn run(self) -> Result<Self> {
         let root = self.root;
         let root_image = self.image(root)?;
 
         self.require_root(Need::Activation { package: root });
-        self.settle()?;
-
         let mut entry_bindings = root_image
             .index
             .exports
@@ -220,6 +215,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.report_dynamic_namespace_operations();
         let materialized = self
             .encountered
+            .lock()
             .iter()
             .copied()
             .filter(|package| !self.packages.is_external(*package))
@@ -231,72 +227,124 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(self)
     }
 
-    fn settle(&mut self) -> Result<()> {
+    fn settle(&self) -> Result<()> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.jobs)
+            .thread_name(|index| format!("slinker-analysis-{index}"))
+            .stack_size(super::ANALYSIS_STACK_BYTES)
+            .build()
+            .map_err(|error| Error::Analysis(format!("failed to create Rayon pool: {error}")))?;
         loop {
-            while !self.needs.is_empty() {
-                self.process_frontier()?;
+            pool.install(|| rayon::scope(|scope| self.spawn_injected(scope)));
+            if let Some(error) = self.failure.lock().take() {
+                return Err(error);
             }
-            if !self.settle_namespace_operations()? {
+            debug_assert!(self.work.is_quiescent());
+            if !self.settle_namespace_operations()? && self.work.is_quiescent() {
                 return Ok(());
             }
         }
     }
 
-    fn process_frontier(&mut self) -> Result<()> {
-        let frontier = self.needs.len();
-        if frontier == 0 {
-            return Ok(());
+    fn spawn_injected<'scope>(&'scope self, scope: &rayon::Scope<'scope>) {
+        let mut keys = self
+            .work
+            .take_injected()
+            .into_iter()
+            .filter_map(|key| match key {
+                WorkKey::Need(need) => Some(need),
+                WorkKey::Seal(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return;
         }
+        self.schedule.arrange(&mut keys);
+        profile::max(Counter::QueueDepthMax, self.work.pending() as u64);
+        let origin = rayon::current_thread_index();
+        for key in keys {
+            scope.spawn(move |scope| {
+                if origin != rayon::current_thread_index() {
+                    profile::count(Counter::TaskSteals);
+                }
+                self.run_work(key, scope);
+            });
+        }
+    }
 
-        self.preparse_frontier_bindings(frontier)?;
+    fn run_work<'scope>(&'scope self, need: Need, scope: &rayon::Scope<'scope>) {
+        let started = std::time::Instant::now();
+        let key = WorkKey::Need(need.clone());
+        if self.work.begin(&key) {
+            self.summaries.reset_thread();
+            if self.failure.lock().is_none()
+                && let Err(error) = self.process_need(need)
+            {
+                self.failure.lock().get_or_insert(error);
+            }
+            self.spawn_injected(scope);
+            self.work.release_claim(&key);
+        }
+        self.spawn_injected(scope);
+        profile::add(
+            Counter::WorkerBusyMicros,
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+    }
 
-        for _ in 0..frontier {
-            match self.needs.pop() {
-                Some(Popped::Started(need)) => self.process_need(need)?,
-                Some(Popped::AlreadyStarted) => {}
-                None => break,
+    pub(super) fn loaded(&self, package: PackageId) -> Result<Arc<LoadedPackage>> {
+        if let Some(loaded) = self.loaded.read().expect("loaded packages").get(&package) {
+            return Ok(Arc::clone(loaded));
+        }
+        let _loading = self.load_gate.lock();
+        if let Some(loaded) = self.loaded.read().expect("loaded packages").get(&package) {
+            return Ok(Arc::clone(loaded));
+        }
+        let index = self.packages.index(package)?;
+        let image = Arc::new(PackageImage {
+            index: Arc::clone(&index),
+            bindings: HashMap::new(),
+            private_environments: HashMap::new(),
+        });
+        self.objects.merge(package, &image);
+        let loaded = Arc::new(LoadedPackage {
+            image: RwLock::new(image),
+            namespace: Guarded::new(NamespaceBuilder::new(&index)),
+            native_bindings: NativeBindingIndex::new(&index),
+        });
+        Ok(Arc::clone(
+            self.loaded
+                .write()
+                .expect("loaded packages")
+                .entry(package)
+                .or_insert(loaded),
+        ))
+    }
+
+    pub(super) fn seal_namespace(&self, package: PackageId) -> Result<()> {
+        let key = WorkKey::Seal(package);
+        match self.work.claim(&key) {
+            Claim::Mine => {
+                let analyzed = self.ensure_on_load_analyzed(package);
+                self.work.release_claim(&key);
+                analyzed
+            }
+            Claim::AlreadyDone => Ok(()),
+            Claim::Wait => {
+                self.work.wait_done(&key);
+                Ok(())
             }
         }
-        Ok(())
     }
 
-    pub(super) fn loaded(&mut self, package: PackageId) -> Result<&mut LoadedPackage> {
-        match self.loaded.entry(package) {
-            Entry::Occupied(entry) => Ok(entry.into_mut()),
-            Entry::Vacant(entry) => {
-                let index = self.packages.index(package)?;
-                let image = Arc::new(PackageImage {
-                    index: Arc::clone(&index),
-                    bindings: HashMap::new(),
-                    private_environments: HashMap::new(),
-                });
-                self.objects.merge(package, &image);
-                Ok(entry.insert(LoadedPackage {
-                    image,
-                    namespace: NamespaceBuilder::new(&index),
-                    native_bindings: NativeBindingIndex::new(&index),
-                    surface: NamespaceSurface::Open,
-                }))
-            }
-        }
-    }
-
-    pub(super) fn seal_namespace(&mut self, package: PackageId) -> Result<()> {
-        if self.loaded(package)?.surface != NamespaceSurface::Open {
-            return Ok(());
-        }
-        self.loaded(package)?.surface = NamespaceSurface::Sealing;
-        self.ensure_on_load_analyzed(package)?;
-        self.loaded(package)?.surface = NamespaceSurface::Sealed;
-        Ok(())
-    }
-
-    pub(super) fn image(&mut self, package: PackageId) -> Result<Arc<PackageImage>> {
-        Ok(Arc::clone(&self.loaded(package)?.image))
+    pub(super) fn image(&self, package: PackageId) -> Result<Arc<PackageImage>> {
+        Ok(Arc::clone(
+            &self.loaded(package)?.image.read().expect("package image"),
+        ))
     }
 
     pub(super) fn binding_image(
-        &mut self,
+        &self,
         package: PackageId,
         binding: &str,
         reason: Counter,
@@ -318,7 +366,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         drop(image);
         let _extend = profile::span(Probe::ImageExtend);
         let loaded = self.loaded(package)?;
-        let image = Arc::make_mut(&mut loaded.image);
+        let mut guard = loaded.image.write().expect("package image");
+        let image = Arc::make_mut(&mut guard);
         image.bindings.extend(
             partial
                 .bindings
@@ -339,299 +388,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 })
                 .or_insert_with(|| environment.clone());
         }
-        Ok(Arc::clone(&loaded.image))
+        Ok(Arc::clone(&guard))
     }
 
-    fn parse_pool(&mut self) -> Result<Option<Arc<rayon::ThreadPool>>> {
-        if self.jobs <= 1 {
-            return Ok(None);
-        }
-        if self.parse_pool.is_none() {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(self.jobs)
-                .thread_name(|index| format!("slinker-air-{index}"))
-                .stack_size(super::ANALYSIS_STACK_BYTES)
-                .build()
-                .map_err(|error| {
-                    Error::Analysis(format!("failed to create Rayon pool: {error}"))
-                })?;
-            self.parse_pool = Some(Arc::new(pool));
-        }
-        Ok(self.parse_pool.as_ref().map(Arc::clone))
-    }
-
-    fn preparse_frontier_bindings(&mut self, frontier: usize) -> Result<()> {
-        let _span = profile::span(Probe::Preparse);
-        struct Work {
-            key: ParseKey,
-            owner: SourceKey,
-            source_key: SourceKey,
-            owner_node: NodeId,
-            source: SourceId,
-            text: Arc<str>,
-            context: OakParseContext,
-            image: Arc<PackageImage>,
-            environment: EnvironmentLabel,
-        }
-
-        let needs = self.needs.upcoming(frontier).cloned().collect::<Vec<_>>();
-        struct Candidate {
-            key: ParseKey,
-            id: PackageId,
-            owner: SourceKey,
-            source_key: SourceKey,
-            owner_node: NodeId,
-            closure: ClosureSource,
-            image: Arc<PackageImage>,
-        }
-
-        let mut unloaded = BTreeMap::<PackageId, Vec<BindingName>>::new();
-        for need in &needs {
-            let Need::Binding { package, binding } = need else {
-                continue;
-            };
-            if self.packages.is_external(*package) {
-                continue;
-            }
-            let image = self.image(*package)?;
-            if image.binding(binding).is_none() && image.index.binding_names.contains(binding) {
-                unloaded.entry(*package).or_default().push(binding.clone());
-            }
-        }
-        for (package, names) in &unloaded {
-            let names = names.iter().map(BindingName::as_str).collect::<Vec<_>>();
-            self.packages.prefetch_binding_images(*package, &names)?;
-        }
-
-        let mut candidates = Vec::<Candidate>::new();
-        let mut reparsed = Vec::<(
-            PackageId,
-            Arc<ParsedRFile>,
-            Arc<PackageImage>,
-            EnvironmentLabel,
-        )>::new();
-        let mut work = Vec::<Work>::new();
-        let mut scheduled = HashSet::<ParseKey>::new();
-
-        for need in needs {
-            let (id, owner, source_key, closure, owner_node, image) = match need {
-                Need::Binding {
-                    package: id,
-                    binding,
-                } => {
-                    if self.packages.is_external(id) {
-                        continue;
-                    }
-                    let image = self.binding_image(id, &binding, Counter::BindingLoadPreparse)?;
-                    let Some(binding_image) = image.binding(&binding).cloned() else {
-                        continue;
-                    };
-                    let Some(closure) = binding_image.object.closure else {
-                        continue;
-                    };
-                    let owner_node = self.need_node(&Need::Binding {
-                        package: id,
-                        binding: binding.clone(),
-                    });
-                    let key = SourceKey::Binding(binding);
-                    (id, key.clone(), key, closure, owner_node, image)
-                }
-                Need::PrivateBinding {
-                    package: id,
-                    environment,
-                    binding,
-                } => {
-                    if self.packages.is_external(id) {
-                        continue;
-                    }
-                    let image = self.image(id)?;
-                    let Some(binding_image) =
-                        image.private_binding(&environment, &binding).cloned()
-                    else {
-                        continue;
-                    };
-                    let Some(closure) = binding_image.object.closure else {
-                        continue;
-                    };
-                    let owner_node = self.need_node(&Need::PrivateBinding {
-                        package: id,
-                        environment: environment.clone(),
-                        binding: binding.clone(),
-                    });
-                    let key = SourceKey::private(environment, binding);
-                    (id, key.clone(), key, closure, owner_node, image)
-                }
-                Need::ClosureExecution {
-                    package: id,
-                    closure,
-                } => {
-                    if self.packages.is_external(id) {
-                        continue;
-                    }
-                    let image = self.image(id)?;
-                    let Some(execution) = self.closure_execution_source(id, closure) else {
-                        continue;
-                    };
-                    let owner_node = self.need_node(&Need::ClosureExecution {
-                        package: id,
-                        closure,
-                    });
-                    let source = ClosureSource {
-                        source: execution.closure.source,
-                        environment: execution.environment,
-                    };
-                    (
-                        id,
-                        execution.owner,
-                        execution.key,
-                        source,
-                        owner_node,
-                        image,
-                    )
-                }
-                _ => continue,
-            };
-
-            let key = (id, source_key.clone());
-            if let Some(ParseState::Parsed(parsed)) = self.parses.state(&key) {
-                reparsed.push((
-                    id,
-                    Arc::clone(parsed),
-                    Arc::clone(&image),
-                    closure.environment.clone(),
-                ));
-                continue;
-            }
-            if self.parses.contains(&key) || !scheduled.insert(key.clone()) {
-                continue;
-            }
-            candidates.push(Candidate {
-                key,
-                id,
-                owner,
-                source_key,
-                owner_node,
-                closure,
-                image,
-            });
-        }
-        let texts = candidates
-            .iter()
-            .map(|candidate| candidate.closure.source.as_ref())
-            .collect::<Vec<_>>();
-        self.packages.prefetch_canonical_syntax(&texts)?;
-        for candidate in candidates {
-            let Candidate {
-                key,
-                id,
-                owner,
-                source_key,
-                owner_node,
-                closure,
-                image,
-            } = candidate;
-            let Some(source) =
-                self.admit_source(id, &owner, &source_key, owner_node, &closure.source)?
-            else {
-                continue;
-            };
-            work.push(Work {
-                key,
-                owner,
-                source_key,
-                owner_node,
-                source,
-                text: Arc::clone(&closure.source),
-                context: self.oak_parse_context(id, &image, &closure.environment)?,
-                environment: closure.environment.clone(),
-                image,
-            });
-        }
-        let parse_all = || {
-            work.par_iter()
-                .map(|item| {
-                    OakParser.parse_binding_with_context(
-                        item.source,
-                        item.text.as_ref(),
-                        &item.context,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let results = if work.len() > 1 {
-            if let Some(pool) = self.parse_pool()? {
-                pool.install(parse_all)
-            } else {
-                work.iter()
-                    .map(|item| {
-                        OakParser.parse_binding_with_context(
-                            item.source,
-                            item.text.as_ref(),
-                            &item.context,
-                        )
-                    })
-                    .collect()
-            }
-        } else {
-            work.iter()
-                .map(|item| {
-                    OakParser.parse_binding_with_context(
-                        item.source,
-                        item.text.as_ref(),
-                        &item.context,
-                    )
-                })
-                .collect()
-        };
-
-        let mut hinted = BTreeMap::<PackageId, BTreeSet<BindingName>>::new();
-        for (package, parsed, image, environment) in reparsed {
-            hinted
-                .entry(package)
-                .or_default()
-                .extend(self.construction_bindings(package, &image, &environment, &parsed)?);
-        }
-        for (item, result) in work.into_iter().zip(results) {
-            match result {
-                Ok(parsed) => {
-                    let package = item.key.0;
-                    hinted
-                        .entry(package)
-                        .or_default()
-                        .extend(self.construction_bindings(
-                            package,
-                            &item.image,
-                            &item.environment,
-                            &parsed,
-                        )?);
-                    self.parses.store(item.key, Arc::new(parsed));
-                }
-                Err(error) => {
-                    self.handle_air_rejection(
-                        item.key.0,
-                        &item.owner,
-                        &item.source_key,
-                        item.owner_node,
-                        &error,
-                    )?;
-                }
-            }
-        }
-        for (package, names) in hinted {
-            let image = self.image(package)?;
-            let unloaded = names
-                .iter()
-                .filter(|name| {
-                    image.binding(name).is_none() && image.index.binding_names.contains(name)
-                })
-                .map(BindingName::as_str)
-                .collect::<Vec<_>>();
-            self.packages.prefetch_binding_images(package, &unloaded)?;
-        }
-        Ok(())
-    }
-
-    fn process_need(&mut self, need: Need) -> Result<()> {
+    fn process_need(&self, need: Need) -> Result<()> {
         let _span = profile::span(Probe::ProcessNeed);
         profile::count(Counter::NeedsStarted);
         match need {
@@ -659,22 +419,25 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    fn require_root(&mut self, need: Need) {
+    fn require_root(&self, need: Need) {
         self.record_unclassified(&need);
         self.require_internal_root(need);
     }
 
-    fn require_internal_root(&mut self, need: Need) {
-        self.encountered.insert(need.package());
+    fn require_internal_root(&self, need: Need) {
+        self.encountered.lock().insert(need.package());
         let node = self.need_node(&need);
-        if !self.roots.contains(&node) {
-            self.roots.push(node);
+        {
+            let mut roots = self.roots.lock();
+            if !roots.contains(&node) {
+                roots.push(node);
+            }
         }
-        self.needs.schedule(need);
+        self.work.request(WorkKey::Need(need));
     }
 
     pub(super) fn require(
-        &mut self,
+        &self,
         from: NodeId,
         need: Need,
         kind: EdgeKind,
@@ -684,7 +447,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn require_at(
-        &mut self,
+        &self,
         from: NodeId,
         need: Need,
         kind: EdgeKind,
@@ -695,9 +458,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.require_classified_at(from, need, kind, reason, span);
     }
 
-    pub(super) fn record_unclassified(&mut self, need: &Need) {
+    pub(super) fn record_unclassified(&self, need: &Need) {
         if let Need::Binding { package, binding } = need {
-            self.invocations.record_unclassified(CallableId {
+            self.invocations.lock().record_unclassified(CallableId {
                 package: *package,
                 binding: binding.clone(),
             });
@@ -705,49 +468,51 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn require_classified_at(
-        &mut self,
+        &self,
         from: NodeId,
         need: Need,
         kind: EdgeKind,
         reason: impl Into<String>,
         span: Option<Span>,
     ) {
-        self.encountered.insert(need.package());
+        self.encountered.lock().insert(need.package());
         let to = self.need_node(&need);
         self.depend(from, to, kind, reason, span);
-        self.needs.schedule(need);
+        self.work.request(WorkKey::Need(need));
     }
 
     pub(super) fn depend(
-        &mut self,
+        &self,
         from: NodeId,
         to: NodeId,
         kind: EdgeKind,
         reason: impl Into<String>,
         span: Option<Span>,
     ) {
-        self.dependencies.entry(from).or_default().insert(to);
+        self.dependencies.lock().entry(from).or_default().insert(to);
         if self.provenance {
-            self.graph.add_edge(from, to, kind, reason, span);
+            self.graph.lock().add_edge(from, to, kind, reason, span);
         }
     }
 
     pub(super) fn external_binding(
-        &mut self,
+        &self,
         package: PackageId,
         name: &str,
         access: ExternalBindingAccess,
         span: Option<Span>,
     ) -> NodeId {
-        let recorded = self
-            .external_bindings
-            .entry((package, BindingName::from(name)))
-            .or_insert(access);
-        if access == ExternalBindingAccess::Internal {
-            *recorded = access;
+        {
+            let mut bindings = self.external_bindings.lock();
+            let recorded = bindings
+                .entry((package, BindingName::from(name)))
+                .or_insert(access);
+            if access == ExternalBindingAccess::Internal {
+                *recorded = access;
+            }
         }
-        self.graph.add_node(
-            self.packages.name(package).clone(),
+        self.graph.lock().add_node(
+            self.packages.name(package),
             NodeKind::ExternalBinding {
                 name: BindingName::from(name),
             },
@@ -755,8 +520,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         )
     }
 
-    pub(super) fn need_node(&mut self, need: &Need) -> NodeId {
-        let package = self.packages.name(need.package()).clone();
+    pub(super) fn need_node(&self, need: &Need) -> NodeId {
+        let package = self.packages.name(need.package());
         let kind = match need {
             Need::Binding { binding, .. } => NodeKind::Binding {
                 name: binding.clone(),
@@ -798,11 +563,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 hook: hook.binding(),
             },
         };
-        self.graph.add_node(package, kind, None)
+        self.graph.lock().add_node(package, kind, None)
     }
 
     pub(super) fn diagnostic(
-        &mut self,
+        &self,
         node: NodeId,
         package: PackageId,
         binding: Option<&str>,
@@ -811,7 +576,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         span: Option<Span>,
     ) {
         let diagnostic = self.new_diagnostic(node, package, binding, code, message.into(), span);
-        self.diagnostics.record(node, diagnostic);
+        self.diagnostics.lock().record(node, diagnostic);
     }
 
     fn new_diagnostic(
@@ -824,7 +589,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         span: Option<Span>,
     ) -> Diagnostic {
         Diagnostic {
-            package: self.packages.name(package).clone(),
+            package: self.packages.name(package),
             binding: binding.map(BindingName::from),
             code,
             message,
@@ -846,7 +611,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn record_missing_package(
-        &mut self,
+        &self,
         from: NodeId,
         requester: PackageId,
         missing: &str,
@@ -855,13 +620,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         span: Option<Span>,
     ) {
         let reason = reason.into();
-        let node = self.graph.add_node(
-            PackageName::from(missing),
-            NodeKind::MissingPackage,
-            span.clone(),
-        );
-        self.graph
-            .add_edge(from, node, kind, reason.clone(), span.clone());
+        let node = {
+            let mut graph = self.graph.lock();
+            let node = graph.add_node(
+                PackageName::from(missing),
+                NodeKind::MissingPackage,
+                span.clone(),
+            );
+            graph.add_edge(from, node, kind, reason.clone(), span.clone());
+            node
+        };
         let primary = self.new_diagnostic(
             node,
             requester,
@@ -873,12 +641,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
             None,
         );
         let evidence = Evidence {
-            package: self.packages.name(requester).clone(),
+            package: self.packages.name(requester),
             binding: self.node_binding(from),
             span,
             detail: reason,
         };
-        self.diagnostics.record_derived(
+        self.diagnostics.lock().record_derived(
             Cause::MissingPackage(PackageName::from(missing)),
             Diagnostic {
                 package: PackageName::from(missing),
@@ -889,11 +657,30 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn node_binding(&self, node: NodeId) -> Option<BindingName> {
-        match &self.graph.nodes[node.0].kind {
+        match &self.graph.lock().nodes[node.0].kind {
             NodeKind::Binding { name } | NodeKind::PrivateBinding { name, .. } => {
                 Some(name.clone())
             }
             _ => None,
         }
+    }
+}
+
+impl<P: PackageProvider> AnalyzerState<P> {
+    pub(super) fn namespace_declares(&self, package: PackageId, name: &str) -> bool {
+        self.loaded
+            .read()
+            .expect("loaded packages")
+            .get(&package)
+            .is_some_and(|loaded| loaded.namespace.lock().contains(name))
+    }
+
+    pub(super) fn loaded_packages(&self) -> Vec<PackageId> {
+        self.loaded
+            .read()
+            .expect("loaded packages")
+            .keys()
+            .copied()
+            .collect()
     }
 }

@@ -122,6 +122,8 @@ pub(super) enum Placement {
     Lane(usize),
 }
 
+pub(super) type Execute<'a, Q, V> = &'a dyn Fn(&mut WorkerClient, &[Q]) -> Result<Vec<V>>;
+
 pub(super) struct Batcher<Q, V> {
     slots: Mutex<HashMap<Q, Arc<Slot<V>>>>,
     pending: Mutex<Vec<(Q, Arc<Slot<V>>)>>,
@@ -145,8 +147,8 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
             .and_then(|slot| slot.peek())
     }
 
-    pub(super) fn seed(&self, query: Q, value: V) {
-        let slot = self.slot_for(&query).0;
+    pub(super) fn seed(&self, query: &Q, value: V) {
+        let slot = self.slot_for(query).0;
         slot.fill(Ok(value));
     }
 
@@ -178,7 +180,7 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
         lanes: &Lanes,
         placement: &Placement,
         slot: &Slot<V>,
-        execute: &dyn Fn(&mut WorkerClient, &[Q]) -> Result<Vec<V>>,
+        execute: Execute<'_, Q, V>,
     ) -> Result<V> {
         let start = slot as *const Slot<V> as usize;
         loop {
@@ -196,12 +198,7 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
         }
     }
 
-    pub(super) fn lead(
-        &self,
-        lanes: &Lanes,
-        placement: &Placement,
-        execute: &dyn Fn(&mut WorkerClient, &[Q]) -> Result<Vec<V>>,
-    ) {
+    pub(super) fn lead(&self, lanes: &Lanes, placement: &Placement, execute: Execute<'_, Q, V>) {
         let guard = match placement {
             Placement::Any => lanes.try_any(0),
             Placement::Lane(index) => Some(lanes.lane(*index)),
@@ -211,11 +208,7 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
         }
     }
 
-    fn serve(
-        &self,
-        mut guard: LaneGuard<'_>,
-        execute: &dyn Fn(&mut WorkerClient, &[Q]) -> Result<Vec<V>>,
-    ) {
+    fn serve(&self, mut guard: LaneGuard<'_>, execute: Execute<'_, Q, V>) {
         loop {
             let batch = {
                 let mut pending = self.pending.lock().expect("batcher pending");
@@ -225,7 +218,10 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
             if batch.is_empty() {
                 return;
             }
-            let queries = batch.iter().map(|(query, _)| query.clone()).collect::<Vec<_>>();
+            let queries = batch
+                .iter()
+                .map(|(query, _)| query.clone())
+                .collect::<Vec<_>>();
             let outcome = guard
                 .client()
                 .and_then(|client| execute(client, &queries))
@@ -233,7 +229,9 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
                     if values.len() == queries.len() {
                         Ok(values)
                     } else {
-                        Err(Error::Analysis("worker answered a different batch size".into()))
+                        Err(Error::Analysis(
+                            "worker answered a different batch size".into(),
+                        ))
                     }
                 });
             match outcome {

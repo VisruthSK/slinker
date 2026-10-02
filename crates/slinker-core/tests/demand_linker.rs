@@ -173,11 +173,7 @@ impl PackageProvider for FakeProvider {
             .ok_or_else(|| Error::Analysis(format!("missing fake index {}", package.identity.name)))
     }
 
-    fn binding_image(
-        &self,
-        package: &InstalledPackage,
-        _name: &str,
-    ) -> Result<Arc<PackageImage>> {
+    fn binding_image(&self, package: &InstalledPackage, _name: &str) -> Result<Arc<PackageImage>> {
         *self
             .image_counts
             .lock()
@@ -320,11 +316,11 @@ impl<'a> PackageFixture<'a> {
                 };
                 (
                     BindingName::from(*binding),
-                    BindingImage {
+                    Arc::new(BindingImage {
                         name: (*binding).into(),
                         origin: BindingOrigin::Code,
                         object,
-                    },
+                    }),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -488,7 +484,7 @@ fn retaining_structured_object_executes_nested_closures() {
     )
     .exports(export("generator_funs"))
     .build();
-    let binding = root.bindings.get_mut("generator_funs").unwrap();
+    let binding = Arc::make_mut(root.bindings.get_mut("generator_funs").unwrap());
     binding.object.object_kind = ObjectKind::List;
     binding
         .object
@@ -515,19 +511,17 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
             ("capsule", None),
             ("templates", None),
         ]).exports(export("f")).build();
-    root.bindings
-        .get_mut("f")
-        .unwrap()
+    Arc::make_mut(root.bindings.get_mut("f").unwrap())
         .object
         .closure
         .as_mut()
         .unwrap()
         .environment = "private:1".into();
-    let capsule = root.bindings.get_mut("capsule").unwrap();
+    let capsule = Arc::make_mut(root.bindings.get_mut("capsule").unwrap());
     capsule.object.object_kind = ObjectKind::Environment;
     capsule.object.environment = Some("private:1".into());
     {
-        let templates = root.bindings.get_mut("templates").unwrap();
+        let templates = Arc::make_mut(root.bindings.get_mut("templates").unwrap());
         templates.object.object_kind = ObjectKind::List;
         for name in ["first", "second"] {
             templates
@@ -545,7 +539,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
     for name in ["first", "second"] {
         root.bindings.insert(
             format!("{name}_dependency").into(),
-            BindingImage {
+            Arc::new(BindingImage {
                 name: format!("{name}_dependency").into(),
                 origin: BindingOrigin::Code,
                 object: ObjectImage {
@@ -561,7 +555,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
                     embedded_environments: Vec::new(),
                     issues: Vec::new(),
                 },
-            },
+            }),
         );
     }
     root.private_environments.insert(
@@ -607,9 +601,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
 #[test]
 fn unknown_closure_enclosure_reports_root_cause_without_lexical_cascade() {
     let mut root = package("root", &[("f", Some("f <- function() self + classname"))]);
-    root.bindings
-        .get_mut("f")
-        .unwrap()
+    Arc::make_mut(root.bindings.get_mut("f").unwrap())
         .object
         .closure
         .as_mut()
@@ -686,9 +678,7 @@ fn closure_private_environment_is_inventory_not_a_root_set() {
         .exports(export("public"))
         .description("Suggests: foo\n")
         .build();
-    root.bindings
-        .get_mut("public")
-        .unwrap()
+    Arc::make_mut(root.bindings.get_mut("public").unwrap())
         .object
         .closure
         .as_mut()
@@ -729,9 +719,7 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
             .exports(export("public"))
             .description("Suggests: foo\n")
             .build();
-    root.bindings
-        .get_mut("public")
-        .unwrap()
+    Arc::make_mut(root.bindings.get_mut("public").unwrap())
         .object
         .closure
         .as_mut()
@@ -782,9 +770,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
     let mut root = PackageFixture::new("root", &[("public", Some("public <- function() 1"))])
         .exports(export("public"))
         .build();
-    root.bindings
-        .get_mut("public")
-        .unwrap()
+    Arc::make_mut(root.bindings.get_mut("public").unwrap())
         .object
         .closure
         .as_mut()
@@ -3859,11 +3845,13 @@ fn registered_operator_method_is_retained_with_its_dependencies() {
         method: "|.root_criterion".into(),
     }])
     .build();
-    root.bindings
-        .get_mut("criterion")
-        .expect("criterion binding")
-        .object
-        .classes = vec!["root_criterion".into()];
+    Arc::make_mut(
+        root.bindings
+            .get_mut("criterion")
+            .expect("criterion binding"),
+    )
+    .object
+    .classes = vec!["root_criterion".into()];
 
     let plan = analyze_images(vec![root]);
 
@@ -4569,9 +4557,7 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
                 "public <- function(direction) { if (direction == 'ok') value <- 1 else .die(); value }",
             ),
         )]).exports(export("public")).build();
-    root.bindings
-        .get_mut("public")
-        .unwrap()
+    Arc::make_mut(root.bindings.get_mut("public").unwrap())
         .object
         .closure
         .as_mut()
@@ -5519,7 +5505,24 @@ fn derivative_grouping_leaves_the_graph_observational_and_the_report_determinist
                 (
                     blocker.code,
                     blocker.message.clone(),
-                    blocker.evidence.clone(),
+                    blocker
+                        .evidence
+                        .iter()
+                        .map(|evidence| {
+                            (
+                                evidence.package.clone(),
+                                evidence.binding.clone(),
+                                evidence.span.as_ref().map(|span| {
+                                    (
+                                        plan.sources().origin(&span.source).to_string(),
+                                        span.start,
+                                        span.end,
+                                    )
+                                }),
+                                evidence.detail.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>()
@@ -5790,18 +5793,16 @@ mod schedule_equivalence {
         )
         .exports(export("f"))
         .build();
-        root.bindings
-            .get_mut("f")
-            .unwrap()
+        Arc::make_mut(root.bindings.get_mut("f").unwrap())
             .object
             .closure
             .as_mut()
             .unwrap()
             .environment = "private:1".into();
-        let capsule = root.bindings.get_mut("capsule").unwrap();
+        let capsule = Arc::make_mut(root.bindings.get_mut("capsule").unwrap());
         capsule.object.object_kind = ObjectKind::Environment;
         capsule.object.environment = Some("private:1".into());
-        let templates = root.bindings.get_mut("templates").unwrap();
+        let templates = Arc::make_mut(root.bindings.get_mut("templates").unwrap());
         templates.object.object_kind = ObjectKind::List;
         for name in ["first", "second"] {
             templates
@@ -5883,9 +5884,7 @@ mod schedule_equivalence {
         .exports(export("public"))
         .build();
         for name in ["public", "other"] {
-            root.bindings
-                .get_mut(name)
-                .unwrap()
+            Arc::make_mut(root.bindings.get_mut(name).unwrap())
                 .object
                 .closure
                 .as_mut()

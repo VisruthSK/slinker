@@ -1,7 +1,7 @@
 mod identity;
-mod inspection;
 mod image;
 mod index;
+mod inspection;
 mod locator;
 mod names;
 mod store;

@@ -5,7 +5,7 @@ use crate::package::{
 use crate::syntax::SourceKey;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObjectId(usize);
@@ -101,10 +101,7 @@ pub struct ObjectGraph {
     environments: Vec<EnvironmentObject>,
     environment_by_label: BTreeMap<EnvironmentLabel, EnvironmentId>,
     environment_objects: HashMap<EnvironmentId, ObjectId>,
-    derived_writes: u64,
-    derived_reads: Cell<u64>,
     write_log: Vec<(EnvironmentId, Option<BindingName>)>,
-    read_log: RefCell<Vec<(EnvironmentId, BindingName)>>,
     namespace_environment: Option<EnvironmentId>,
     opaque: Option<ObjectId>,
     merging: bool,
@@ -118,15 +115,41 @@ pub struct GraphStamps {
     pub read_cursor: usize,
 }
 
-impl ObjectGraph {
-    pub fn stamps(&self) -> GraphStamps {
-        GraphStamps {
-            writes: self.derived_writes,
-            derived_reads: self.derived_reads.get(),
-            read_cursor: self.read_log.borrow().len(),
-        }
-    }
+thread_local! {
+    static DERIVED_WRITES: Cell<u64> = const { Cell::new(0) };
+    static DERIVED_READS: Cell<u64> = const { Cell::new(0) };
+    static READ_LOG: RefCell<Vec<(EnvironmentId, BindingName)>> = const { RefCell::new(Vec::new()) };
+}
 
+fn note_read(environment: EnvironmentId, name: &str) {
+    READ_LOG.with(|log| log.borrow_mut().push((environment, name.into())));
+}
+
+fn note_derived_write() {
+    DERIVED_WRITES.with(|writes| writes.set(writes.get() + 1));
+}
+
+fn note_derived_read() {
+    DERIVED_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+pub fn current_stamps() -> GraphStamps {
+    GraphStamps {
+        writes: DERIVED_WRITES.with(Cell::get),
+        derived_reads: DERIVED_READS.with(Cell::get),
+        read_cursor: READ_LOG.with(|log| log.borrow().len()),
+    }
+}
+
+pub fn reads_since(cursor: usize) -> Vec<(EnvironmentId, BindingName)> {
+    READ_LOG.with(|log| log.borrow().get(cursor..).unwrap_or_default().to_vec())
+}
+
+pub fn restart_read_log() {
+    READ_LOG.with(|log| log.borrow_mut().clear());
+}
+
+impl ObjectGraph {
     pub fn is_derived_object(&self, object: ObjectId) -> bool {
         self.derived_objects.contains(&object)
             || match self.object(object) {
@@ -140,30 +163,18 @@ impl ObjectGraph {
 
     pub fn namespace_binding(&self, name: &str) -> Option<ObjectId> {
         if let Some(namespace) = self.namespace_environment {
-            self.read_log.borrow_mut().push((namespace, name.into()));
+            note_read(namespace, name);
         }
         self.namespace_bindings.get(name).copied()
     }
 
     pub fn environment_binding(&self, environment: EnvironmentId, name: &str) -> Option<ObjectId> {
-        self.read_log.borrow_mut().push((environment, name.into()));
+        note_read(environment, name);
         self.environment(environment).bindings.get(name).copied()
     }
 
     pub fn write_log(&self) -> &[(EnvironmentId, Option<BindingName>)] {
         &self.write_log
-    }
-
-    pub fn reads_since(&self, cursor: usize) -> Vec<(EnvironmentId, BindingName)> {
-        self.read_log
-            .borrow()
-            .get(cursor..)
-            .unwrap_or_default()
-            .to_vec()
-    }
-
-    pub fn restart_read_log(&self) {
-        self.read_log.borrow_mut().clear();
     }
 
     pub fn object(&self, id: ObjectId) -> &InstalledObject {
@@ -297,7 +308,7 @@ impl ObjectGraph {
     fn push_object(&mut self, object: InstalledObject) -> ObjectId {
         let id = ObjectId(self.objects.len());
         if !self.merging {
-            self.derived_writes += 1;
+            note_derived_write();
             if !matches!(object, InstalledObject::Environment(_)) {
                 self.derived_objects.insert(id);
             }
@@ -403,7 +414,7 @@ impl ObjectGraph {
     }
 
     pub fn derive_environment(&mut self, parent: Option<EnvironmentId>) -> EnvironmentId {
-        self.derived_writes += 1;
+        note_derived_write();
         let mut sequence = self.environments.len();
         let label = loop {
             let label = EnvironmentLabel::derived(sequence);
@@ -434,7 +445,7 @@ impl ObjectGraph {
     }
 
     fn note_environment_write(&mut self, environment: EnvironmentId, name: Option<&str>) {
-        self.derived_writes += 1;
+        note_derived_write();
         if !self.environments[environment.0].is_derived() {
             self.write_log.push((environment, name.map(Into::into)));
         }
@@ -569,9 +580,9 @@ impl ObjectGraph {
             }
             let shape = self.environment(environment);
             if shape.is_derived() {
-                self.derived_reads.set(self.derived_reads.get() + 1);
+                note_derived_read();
             } else {
-                self.read_log.borrow_mut().push((environment, name.into()));
+                note_read(environment, name);
             }
             if let Some(value) = shape.bindings.get(name) {
                 return Lookup::Found(*value);
@@ -587,27 +598,49 @@ impl ObjectGraph {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ObjectWorld {
-    graphs: HashMap<PackageId, ObjectGraph>,
-    unmerged: ObjectGraph,
+    graphs: RwLock<HashMap<PackageId, Arc<Mutex<ObjectGraph>>>>,
 }
 
 impl ObjectWorld {
-    pub fn merge(&mut self, package: PackageId, image: &PackageImage) {
-        self.graphs.entry(package).or_default().merge_image(image);
+    fn cell(&self, package: PackageId) -> Arc<Mutex<ObjectGraph>> {
+        if let Some(graph) = self.graphs.read().expect("object world").get(&package) {
+            return Arc::clone(graph);
+        }
+        Arc::clone(
+            self.graphs
+                .write()
+                .expect("object world")
+                .entry(package)
+                .or_default(),
+        )
     }
 
-    pub fn get(&self, package: PackageId) -> Option<&ObjectGraph> {
-        self.graphs.get(&package)
+    pub fn merge(&self, package: PackageId, image: &PackageImage) {
+        self.write(package, |graph| graph.merge_image(image));
     }
 
-    pub fn graph(&self, package: PackageId) -> &ObjectGraph {
-        self.get(package).unwrap_or(&self.unmerged)
+    pub fn read<R>(&self, package: PackageId, read: impl FnOnce(&ObjectGraph) -> R) -> R {
+        let cell = self.cell(package);
+        let graph = cell.lock().expect("object graph");
+        read(&graph)
     }
 
-    pub fn graph_mut(&mut self, package: PackageId) -> &mut ObjectGraph {
-        self.graphs.entry(package).or_default()
+    pub fn write<R>(&self, package: PackageId, write: impl FnOnce(&mut ObjectGraph) -> R) -> R {
+        let cell = self.cell(package);
+        let mut graph = cell.lock().expect("object graph");
+        write(&mut graph)
+    }
+
+    pub fn existing<R>(
+        &self,
+        package: PackageId,
+        read: impl FnOnce(&ObjectGraph) -> R,
+    ) -> Option<R> {
+        let cell = Arc::clone(self.graphs.read().expect("object world").get(&package)?);
+        let graph = cell.lock().expect("object graph");
+        Some(read(&graph))
     }
 }
 
@@ -722,7 +755,7 @@ mod tests {
             }),
             bindings: bindings
                 .into_iter()
-                .map(|binding| (binding.name.clone(), binding))
+                .map(|binding| (binding.name.clone(), Arc::new(binding)))
                 .collect(),
             private_environments: privates
                 .into_iter()

@@ -3,7 +3,6 @@ use crate::package::{
     BindingName, ClassName, ComponentName, DatasetName, EnvironmentLabel, GenericName, PackageId,
     ResourcePath,
 };
-use std::collections::{HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LifecycleHook {
@@ -95,11 +94,6 @@ impl Need {
     }
 }
 
-pub(super) enum Popped {
-    Started(Need),
-    AlreadyStarted,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Schedule {
     #[default]
@@ -108,79 +102,28 @@ pub enum Schedule {
     Seeded(u64),
 }
 
-#[derive(Default)]
-pub(super) struct NeedQueue {
-    pending: VecDeque<Need>,
-    queued: HashSet<Need>,
-    started: HashSet<Need>,
-    schedule: Schedule,
-    state: u64,
-}
-
-impl NeedQueue {
-    pub(super) fn with_schedule(schedule: Schedule) -> Self {
-        Self {
-            schedule,
-            state: match schedule {
-                Schedule::Seeded(seed) => seed.wrapping_mul(2).wrapping_add(1),
-                Schedule::Fifo | Schedule::Lifo => 0,
-            },
-            ..Self::default()
-        }
-    }
-
-    fn take(&mut self) -> Option<Need> {
-        match self.schedule {
-            Schedule::Fifo => self.pending.pop_front(),
-            Schedule::Lifo => self.pending.pop_back(),
-            Schedule::Seeded(_) => {
-                if self.pending.is_empty() {
-                    return None;
+impl Schedule {
+    pub(super) fn arrange(self, needs: &mut [Need]) {
+        match self {
+            Self::Fifo => {}
+            Self::Lifo => needs.reverse(),
+            Self::Seeded(seed) => {
+                let mut state = seed.wrapping_mul(2).wrapping_add(1);
+                for position in (1..needs.len()).rev() {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let other =
+                        usize::try_from(state % (position as u64 + 1)).expect("index fits usize");
+                    needs.swap(position, other);
                 }
-                self.state ^= self.state << 13;
-                self.state ^= self.state >> 7;
-                self.state ^= self.state << 17;
-                let index = usize::try_from(self.state % self.pending.len() as u64)
-                    .expect("index fits usize");
-                self.pending.swap_remove_back(index)
             }
         }
     }
+}
 
-    pub(super) fn schedule(&mut self, need: Need) {
-        if !self.started.contains(&need) && self.queued.insert(need.clone()) {
-            self.pending.push_back(need);
-        }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-
-    pub(super) fn upcoming(&self, count: usize) -> impl Iterator<Item = &Need> {
-        self.pending.iter().take(count)
-    }
-
-    pub(super) fn pop(&mut self) -> Option<Popped> {
-        let need = self.take()?;
-        self.queued.remove(&need);
-        Some(if self.started.insert(need.clone()) {
-            Popped::Started(need)
-        } else {
-            Popped::AlreadyStarted
-        })
-    }
-
-    pub(super) fn start(&mut self, need: &Need) -> bool {
-        self.queued.remove(need);
-        self.started.insert(need.clone())
-    }
-
-    pub(super) fn started(&self) -> impl Iterator<Item = &Need> {
-        self.started.iter()
-    }
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum WorkKey {
+    Need(Need),
+    Seal(PackageId),
 }
