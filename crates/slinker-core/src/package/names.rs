@@ -138,8 +138,8 @@ impl EnvironmentLabel {
         Self("base:empty".into())
     }
 
-    pub fn private(epoch: impl fmt::Display, ordinal: usize) -> Self {
-        Self(format!("private:{epoch}:{ordinal}"))
+    pub fn private(key: impl fmt::Display) -> Self {
+        Self(format!("private:{key}"))
     }
 
     pub fn derived(sequence: usize) -> Self {

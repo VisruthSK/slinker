@@ -312,9 +312,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             site.image,
             &site.closure.environment,
             ParseRequest {
-                owner: site.owner,
                 source_key: site.key,
-                owner_node: site.node,
             },
         )
     }
@@ -871,11 +869,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         request: ParseRequest<'_>,
     ) -> Result<Option<Arc<ParsedRFile>>> {
         let _span = profile::span(Probe::ParsedSource);
-        let ParseRequest {
-            owner,
-            source_key,
-            owner_node,
-        } = request;
+        let ParseRequest { source_key } = request;
         let key = (id, source_key.clone());
         if let Some(state) = self.parses.lock().state(&key) {
             return Ok(match state {
@@ -883,8 +877,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 ParseState::Blocked => None,
             });
         }
-        let Some(source) = self.admit_source(id, owner, source_key, owner_node, source_text)?
-        else {
+        let Some(source) = self.admit_source(id, source_key, source_text)? else {
             return Ok(None);
         };
         let context = self.oak_parse_context(id, image, lexical_environment)?;
@@ -895,7 +888,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Ok(Some(parsed))
             }
             Err(error) => {
-                self.handle_air_rejection(id, owner, source_key, owner_node, &error)?;
+                self.handle_air_rejection(id, source_key, &error)?;
                 Ok(None)
             }
         }
@@ -904,12 +897,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn admit_source(
         &self,
         id: PackageId,
-        owner: &SourceKey,
         source_key: &SourceKey,
-        owner_node: NodeId,
         text: &Arc<str>,
     ) -> Result<Option<SourceId>> {
         let key = (id, source_key.clone());
+        let owner_node = self.source_node(id, source_key);
+        let owner = source_key;
         let source = self
             .parses
             .lock()
@@ -934,15 +927,33 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(Some(source))
     }
 
+    fn source_node(&self, id: PackageId, key: &SourceKey) -> NodeId {
+        match key {
+            SourceKey::Binding(binding) => self.need_node(&Need::Binding {
+                package: id,
+                binding: binding.clone(),
+            }),
+            SourceKey::Private {
+                environment,
+                binding,
+            } => self.need_node(&Need::PrivateBinding {
+                package: id,
+                environment: environment.clone(),
+                binding: binding.clone(),
+            }),
+            SourceKey::Closure { owner, .. } => self.source_node(id, owner),
+        }
+    }
+
     pub(super) fn handle_air_rejection(
         &self,
         id: PackageId,
-        owner: &SourceKey,
         source_key: &SourceKey,
-        owner_node: NodeId,
         air_error: &str,
     ) -> Result<()> {
         let key = (id, source_key.clone());
+        let owner_node = self.source_node(id, source_key);
+        let owner = source_key;
         let (source_id, source_text) = self.parses.lock().registered(&key).ok_or_else(|| {
             Error::Analysis(format!(
                 "missing virtual source for {}::{source_key}",

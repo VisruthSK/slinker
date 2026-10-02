@@ -117,11 +117,6 @@ impl Lanes {
     }
 }
 
-pub(super) enum Placement {
-    Any,
-    Lane(usize),
-}
-
 pub(super) type Execute<'a, Q, V> = &'a dyn Fn(&mut WorkerClient, &[Q]) -> Result<Vec<V>>;
 
 pub(super) struct Batcher<Q, V> {
@@ -178,7 +173,6 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
     pub(super) fn drive(
         &self,
         lanes: &Lanes,
-        placement: &Placement,
         slot: &Slot<V>,
         execute: Execute<'_, Q, V>,
     ) -> Result<V> {
@@ -187,10 +181,7 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
             if let Some(outcome) = slot.peek() {
                 return outcome;
             }
-            let guard = match placement {
-                Placement::Any => lanes.try_any(start),
-                Placement::Lane(index) => lanes.try_lane(*index),
-            };
+            let guard = lanes.try_any(start);
             match guard {
                 Some(guard) => self.serve(guard, execute),
                 None => slot.wait_briefly(),
@@ -198,11 +189,8 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
         }
     }
 
-    pub(super) fn lead(&self, lanes: &Lanes, placement: &Placement, execute: Execute<'_, Q, V>) {
-        let guard = match placement {
-            Placement::Any => lanes.try_any(0),
-            Placement::Lane(index) => Some(lanes.lane(*index)),
-        };
+    pub(super) fn lead(&self, lanes: &Lanes, execute: Execute<'_, Q, V>) {
+        let guard = lanes.try_any(0);
         if let Some(guard) = guard {
             self.serve(guard, execute);
         }

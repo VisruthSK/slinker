@@ -1,5 +1,5 @@
 use crate::cache::{Cache, CacheLocation};
-use crate::package::inspection::{Batcher, Lanes, Placement, Slot};
+use crate::package::inspection::{Batcher, Lanes, Slot};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
     BindingName, ComponentName, Digest, EnvironmentKind, EnvironmentLabel, GenericName,
@@ -28,6 +28,29 @@ struct CachedIndex {
     target: Digest,
     package_fingerprint: Digest,
     index: WorkerPackageIndex,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CachedDispatch {
+    schema: String,
+    target: Digest,
+    generics: BTreeSet<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CachedNormalization {
+    schema: String,
+    target: Digest,
+    source: String,
+    canonical: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CachedEnvironment {
+    schema: String,
+    target: Digest,
+    package_fingerprint: Digest,
+    environment: PrivateEnvironmentImage,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -259,21 +282,14 @@ impl<K: Eq + Hash + Clone, V: Clone> Memo<K, V> {
 }
 
 type BindingBatcher = Batcher<String, Arc<PackageImage>>;
-type ProbeBatcher = Batcher<String, Probed>;
-
-#[derive(Clone)]
-struct Probed {
-    image: Arc<PackageImage>,
-    epoch_independent: bool,
-}
 
 pub struct PackageStore {
     locator: PackageLocator,
     indexes: Memo<PackageIdentity, Arc<PackageIndex>>,
     bindings: Mutex<HashMap<PackageIdentity, Arc<BindingBatcher>>>,
-    probes: Mutex<HashMap<PackageIdentity, Arc<ProbeBatcher>>>,
     delivered:
         Mutex<HashMap<PackageIdentity, HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>>>>,
+    published_environments: Mutex<HashSet<(PackageIdentity, EnvironmentLabel)>>,
     dispatch: Memo<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
     normalizer: Batcher<String, CanonicalSyntax>,
     cache: Cache,
@@ -302,8 +318,8 @@ impl PackageStore {
             locator: PackageLocator::new(target),
             indexes: Memo::default(),
             bindings: Mutex::new(HashMap::new()),
-            probes: Mutex::new(HashMap::new()),
             delivered: Mutex::new(HashMap::new()),
+            published_environments: Mutex::new(HashSet::new()),
             dispatch: Memo::default(),
             normalizer: Batcher::default(),
             cache: Cache::new(cache, ANALYSIS_SCHEMA)?,
@@ -428,18 +444,89 @@ impl PackageStore {
         self.package_index(cached.index, package).ok()
     }
 
-    fn publish_binding(&self, package: &InstalledPackage, name: &str, binding: &WorkerBinding) {
-        if is_epoch_independent(binding) {
-            let cached = CachedBinding {
+    fn environment_cache_name(
+        &self,
+        identity: &PackageIdentity,
+        label: &EnvironmentLabel,
+    ) -> String {
+        let label = fingerprint_strings([label.as_str()]).to_string();
+        format!(
+            "{}-{}-{label}.environment.slinker",
+            identity.name,
+            self.cache_key(identity)
+        )
+    }
+
+    fn publish_binding(
+        &self,
+        package: &InstalledPackage,
+        name: &str,
+        binding: &WorkerBinding,
+        environments: &HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>>,
+    ) {
+        for (label, environment) in environments {
+            let fresh = self
+                .published_environments
+                .lock()
+                .expect("published environments")
+                .insert((package.identity.clone(), label.clone()));
+            if fresh {
+                self.cache.publish_deferred(
+                    self.environment_cache_name(&package.identity, label),
+                    CachedEnvironment {
+                        schema: ANALYSIS_SCHEMA.into(),
+                        target: self.target_fingerprint.clone(),
+                        package_fingerprint: package.identity.image_fingerprint.clone(),
+                        environment: (**environment).clone(),
+                    },
+                );
+            }
+        }
+        let mut fragment = binding.clone();
+        fragment.private_environments.clear();
+        self.cache.publish_deferred(
+            self.binding_cache_name(&package.identity, name),
+            CachedBinding {
                 schema: ANALYSIS_SCHEMA.into(),
                 target: self.target_fingerprint.clone(),
                 package_fingerprint: package.identity.image_fingerprint.clone(),
                 binding_name: name.into(),
-                binding: binding.clone(),
-            };
-            self.cache
-                .publish(&self.binding_cache_name(&package.identity, name), &cached);
+                binding: fragment,
+            },
+        );
+    }
+
+    fn load_cached_environments(
+        &self,
+        package: &InstalledPackage,
+        roots: Vec<EnvironmentLabel>,
+    ) -> Option<HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>>> {
+        let mut environments = HashMap::new();
+        let mut pending = roots;
+        while let Some(label) = pending.pop() {
+            if label.kind() != EnvironmentKind::Private || environments.contains_key(&label) {
+                continue;
+            }
+            let cached = self
+                .cache
+                .read::<CachedEnvironment>(&self.environment_cache_name(&package.identity, &label))
+                .filter(|entry| {
+                    entry.schema == ANALYSIS_SCHEMA
+                        && entry.target == self.target_fingerprint
+                        && entry.package_fingerprint == package.identity.image_fingerprint
+                        && entry.environment.id == label
+                })?;
+            pending.push(cached.environment.parent.clone());
+            pending.extend(
+                cached
+                    .environment
+                    .bindings
+                    .values()
+                    .flat_map(|private| private.object.environment_labels().cloned()),
+            );
+            environments.insert(label, Arc::new(cached.environment));
         }
+        Some(environments)
     }
 
     fn load_cached_binding(
@@ -456,15 +543,86 @@ impl PackageStore {
                     && entry.target == self.target_fingerprint
                     && entry.package_fingerprint == package.identity.image_fingerprint
                     && entry.binding_name == binding
-                    && is_epoch_independent(&entry.binding)
             })?;
+        let environments = self.load_cached_environments(
+            package,
+            cached
+                .binding
+                .binding
+                .object
+                .environment_labels()
+                .cloned()
+                .collect(),
+        )?;
         Self::package_image(
             &package.identity,
             Arc::clone(index),
             cached.binding,
-            HashMap::new(),
+            environments,
         )
         .ok()
+    }
+
+    fn dispatch_cache_name(&self, identity: Option<&PackageIdentity>, binding: &str) -> String {
+        let owner = identity.map_or_else(
+            || self.target_fingerprint.to_string(),
+            |identity| self.cache_key(identity),
+        );
+        let key = fingerprint_strings([owner.as_str(), binding]);
+        format!("dispatch-{key}.dispatch.slinker")
+    }
+
+    fn normalization_cache_name(&self, source: &str) -> String {
+        let key = fingerprint_strings([self.target_fingerprint.as_str(), ANALYSIS_SCHEMA, source]);
+        format!("normalized-{key}.syntax.slinker")
+    }
+
+    fn load_cached_normalization(&self, source: &str) -> Option<CanonicalSyntax> {
+        let cached = self
+            .cache
+            .read::<CachedNormalization>(&self.normalization_cache_name(source))
+            .filter(|entry| {
+                entry.schema == ANALYSIS_SCHEMA
+                    && entry.target == self.target_fingerprint
+                    && entry.source == source
+            })?;
+        Some(
+            cached
+                .canonical
+                .map_or(CanonicalSyntax::Unstable, CanonicalSyntax::Stable),
+        )
+    }
+
+    fn execute_normalizations(
+        &self,
+        client: &mut WorkerClient,
+        sources: &[String],
+    ) -> Result<Vec<CanonicalSyntax>> {
+        let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
+        let results = client.canonical_syntax_batch(&refs)?;
+        for (source, result) in sources.iter().zip(&results) {
+            self.cache.publish_deferred(
+                self.normalization_cache_name(source),
+                CachedNormalization {
+                    schema: ANALYSIS_SCHEMA.into(),
+                    target: self.target_fingerprint.clone(),
+                    source: source.clone(),
+                    canonical: match result {
+                        CanonicalSyntax::Stable(canonical) => Some(canonical.clone()),
+                        CanonicalSyntax::Unstable => None,
+                    },
+                },
+            );
+        }
+        Ok(results)
+    }
+
+    fn seed_cached_normalization(&self, source: &str) -> bool {
+        let Some(cached) = self.load_cached_normalization(source) else {
+            return false;
+        };
+        self.normalizer.seed(&source.to_owned(), cached);
+        true
     }
 
     fn binding_batcher(&self, identity: &PackageIdentity) -> Arc<BindingBatcher> {
@@ -522,42 +680,6 @@ impl PackageStore {
         reachable
     }
 
-    fn probe_batcher(&self, identity: &PackageIdentity) -> Arc<ProbeBatcher> {
-        Arc::clone(
-            self.probes
-                .lock()
-                .expect("probe batchers")
-                .entry(identity.clone())
-                .or_default(),
-        )
-    }
-
-    fn execute_probes(
-        &self,
-        package: &InstalledPackage,
-        index: &Arc<PackageIndex>,
-        client: &mut WorkerClient,
-        names: &[String],
-    ) -> Result<Vec<Probed>> {
-        let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-        client
-            .bindings(package, &refs)?
-            .into_iter()
-            .zip(names)
-            .map(|(mut binding, name)| {
-                self.publish_binding(package, name, &binding);
-                let epoch_independent = is_epoch_independent(&binding);
-                let privates = self.deliver(&package.identity, &mut binding);
-                Self::package_image(&package.identity, Arc::clone(index), binding, privates).map(
-                    |image| Probed {
-                        image,
-                        epoch_independent,
-                    },
-                )
-            })
-            .collect()
-    }
-
     fn execute_bindings(
         &self,
         package: &InstalledPackage,
@@ -571,57 +693,30 @@ impl PackageStore {
             .into_iter()
             .zip(names)
             .map(|(mut binding, name)| {
-                self.publish_binding(package, name, &binding);
                 let privates = self.deliver(&package.identity, &mut binding);
+                self.publish_binding(package, name, &binding, &privates);
                 Self::package_image(&package.identity, Arc::clone(index), binding, privates)
             })
             .collect()
     }
 
-    fn submit_probe(
+    fn submit_binding(
         &self,
         batcher: &BindingBatcher,
-        probes: &ProbeBatcher,
         package: &InstalledPackage,
         index: &Arc<PackageIndex>,
         name: &str,
-    ) -> Option<Arc<Slot<Probed>>> {
+    ) -> Option<Arc<Slot<Arc<PackageImage>>>> {
         let query = name.to_owned();
-        if batcher.known(&query).is_some() || probes.known(&query).is_some() {
+        if batcher.known(&query).is_some() {
             return None;
         }
         if let Some(image) = self.load_cached_binding(package, index, name) {
             batcher.seed(&query, image);
             return None;
         }
-        Some(probes.submit(&query))
+        Some(batcher.submit(&query))
     }
-}
-
-fn is_epoch_independent(binding: &WorkerBinding) -> bool {
-    let image = &binding.binding;
-    binding.private_environments.is_empty()
-        && image
-            .object
-            .closure
-            .iter()
-            .map(|closure| closure.environment.as_str())
-            .chain(image.object.environment.as_deref())
-            .chain(
-                image
-                    .object
-                    .embedded_closures
-                    .iter()
-                    .map(|closure| closure.environment.as_str()),
-            )
-            .chain(
-                image
-                    .object
-                    .embedded_environments
-                    .iter()
-                    .map(|environment| environment.environment.as_str()),
-            )
-            .all(|label| !label.starts_with("private:"))
 }
 
 impl PackageResolver for PackageStore {
@@ -664,45 +759,26 @@ impl PackageProvider for PackageStore {
             return known;
         }
         let index = self.index(package)?;
-        let probes = self.probe_batcher(&package.identity);
-        if let Some(slot) = self.submit_probe(&batcher, &probes, package, &index, name) {
-            let probed = probes.drive(&self.lanes, &Placement::Any, &slot, &|client, names| {
-                self.execute_probes(package, &index, client, names)
-            })?;
-            if probed.epoch_independent {
-                batcher.seed(&query, Arc::clone(&probed.image));
-                return Ok(probed.image);
-            }
-        } else if let Some(known) = batcher.known(&query) {
-            return known;
-        } else if let Some(Ok(probed)) = probes.known(&query)
-            && probed.epoch_independent
-        {
-            return Ok(probed.image);
-        }
-        let slot = batcher.submit(&query);
-        let lane = self.affine_lane(&package.identity);
-        batcher.drive(
-            &self.lanes,
-            &Placement::Lane(lane),
-            &slot,
-            &|client, names| self.execute_bindings(package, &index, client, names),
-        )
+        let Some(slot) = self.submit_binding(&batcher, package, &index, name) else {
+            return batcher.known(&query).expect("a seeded binding is known");
+        };
+        batcher.drive(&self.lanes, &slot, &|client, names| {
+            self.execute_bindings(package, &index, client, names)
+        })
     }
 
     fn prefetch_binding_images(&self, package: &InstalledPackage, names: &[&str]) -> Result<()> {
         let batcher = self.binding_batcher(&package.identity);
-        let probes = self.probe_batcher(&package.identity);
         let index = self.index(package)?;
         let mut submitted = false;
         for name in names {
             submitted |= self
-                .submit_probe(&batcher, &probes, package, &index, name)
+                .submit_binding(&batcher, package, &index, name)
                 .is_some();
         }
         if submitted {
-            probes.lead(&self.lanes, &Placement::Any, &|client, names| {
-                self.execute_probes(package, &index, client, names)
+            batcher.lead(&self.lanes, &|client, names| {
+                self.execute_bindings(package, &index, client, names)
             });
         }
         Ok(())
@@ -734,15 +810,29 @@ impl PackageProvider for PackageStore {
             binding.to_owned(),
         );
         self.dispatch.get_or_compute(&key, || {
+            let name = self.dispatch_cache_name(package.map(|package| &package.identity), binding);
+            if let Some(cached) = self.cache.read::<CachedDispatch>(&name).filter(|entry| {
+                entry.schema == ANALYSIS_SCHEMA && entry.target == self.target_fingerprint
+            }) {
+                return Ok(cached.generics.into_iter().map(GenericName::from).collect());
+            }
             let lane = package.map_or(0, |package| self.affine_lane(&package.identity));
-            Ok(self
+            let generics = self
                 .lanes
                 .lane(lane)
                 .client()?
                 .dispatch_generics(package, binding)?
                 .into_iter()
-                .map(GenericName::from)
-                .collect::<BTreeSet<_>>())
+                .collect::<BTreeSet<String>>();
+            self.cache.publish_deferred(
+                name,
+                CachedDispatch {
+                    schema: ANALYSIS_SCHEMA.into(),
+                    target: self.target_fingerprint.clone(),
+                    generics: generics.clone(),
+                },
+            );
+            Ok(generics.into_iter().map(GenericName::from).collect())
         })
     }
 
@@ -755,11 +845,15 @@ impl PackageProvider for PackageStore {
         if let Some(known) = self.normalizer.known(&query) {
             return known;
         }
+        if self.seed_cached_normalization(source)
+            && let Some(known) = self.normalizer.known(&query)
+        {
+            return known;
+        }
         let slot = self.normalizer.submit(&query);
         self.normalizer
-            .drive(&self.lanes, &Placement::Any, &slot, &|client, sources| {
-                let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
-                client.canonical_syntax_batch(&refs)
+            .drive(&self.lanes, &slot, &|client, sources| {
+                self.execute_normalizations(client, sources)
             })
     }
 
@@ -767,7 +861,7 @@ impl PackageProvider for PackageStore {
         let mut submitted = 0usize;
         for source in sources {
             let query = (*source).to_owned();
-            if self.normalizer.known(&query).is_none() {
+            if self.normalizer.known(&query).is_none() && !self.seed_cached_normalization(source) {
                 self.normalizer.submit(&query);
                 submitted += 1;
             }
@@ -781,11 +875,9 @@ impl PackageProvider for PackageStore {
             std::thread::scope(|scope| {
                 for _ in 0..leaders {
                     scope.spawn(|| {
-                        self.normalizer
-                            .lead(&self.lanes, &Placement::Any, &|client, sources| {
-                                let refs = sources.iter().map(String::as_str).collect::<Vec<_>>();
-                                client.canonical_syntax_batch(&refs)
-                            });
+                        self.normalizer.lead(&self.lanes, &|client, sources| {
+                            self.execute_normalizations(client, sources)
+                        });
                     });
                 }
             });
@@ -798,10 +890,7 @@ impl PackageProvider for PackageStore {
 mod tests {
     use super::*;
     use crate::Description;
-    use crate::package::{
-        BindingImage, BindingNames, BindingOrigin, BindingRepresentation, ClosureSource, Digest,
-        LifecycleMetadata, NativeComponent, NativeLibrary, ObjectImage, ObjectKind,
-    };
+    use crate::package::{BindingNames, Digest, LifecycleMetadata, NativeComponent, NativeLibrary};
 
     fn package_index() -> PackageIndex {
         PackageIndex {
@@ -860,38 +949,6 @@ mod tests {
                     callback_arguments: vec![2],
                 }]
         ));
-    }
-
-    #[test]
-    fn only_epoch_independent_binding_fragments_are_cacheable() {
-        let fragment = |environment: &str| WorkerBinding {
-            package_name: "fixture".into(),
-            package_version: "1.0.0".into(),
-            image_fingerprint: "exact-image".into(),
-            binding: BindingImage {
-                name: "f".into(),
-                origin: BindingOrigin::Code,
-                object: ObjectImage {
-                    representation: BindingRepresentation::Value,
-                    classes: Vec::new(),
-                    object_kind: ObjectKind::Closure,
-                    closure: Some(ClosureSource {
-                        source: "function() 1".into(),
-                        environment: environment.into(),
-                    }),
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: Vec::new(),
-                },
-            },
-            private_environments: HashMap::new(),
-        };
-
-        assert!(is_epoch_independent(&fragment("namespace:fixture")));
-        assert!(!is_epoch_independent(&fragment(
-            "private:00000000000000ab:1"
-        )));
     }
 
     #[test]

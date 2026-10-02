@@ -33,7 +33,22 @@
       call. = FALSE
     )
   }
-  base::lazyLoad(code_db, envir = image_env)
+  load_database <- function(database) {
+    registry <- NULL
+    install <- function(db) {
+      registry <<- db$envenv
+      .Internal(makeLazy(
+        db$vars,
+        db$vals,
+        quote(lazyLoadDBfetch(key, datafile, compressed, envhook)),
+        db,
+        image_env
+      ))
+    }
+    base:::lazyLoadDBexec(database, install)
+    registry
+  }
+  lazy_environments <- list(code = load_database(code_db))
   assign(
     ".__NAMESPACE__.",
     get(".__NAMESPACE__.", envir = image_env),
@@ -46,7 +61,7 @@
     file.exists(paste0(sysdata_db, ".rdx")) &&
       file.exists(paste0(sysdata_db, ".rdb"))
   ) {
-    base::lazyLoad(sysdata_db, envir = image_env)
+    lazy_environments$sysdata <- load_database(sysdata_db)
     sysdata_names <- setdiff(ls(image_env, all.names = TRUE), before)
   } else {
     sysdata_names <- character()
@@ -70,6 +85,7 @@
     version = version,
     ns_info = readRDS(file.path(root, "Meta", "nsInfo.rds")),
     image_env = image_env,
+    lazy_environments = lazy_environments,
     binding_names = sort(setdiff(
       ls(image_env, all.names = TRUE),
       c(".__NAMESPACE__.", ".__S3MethodsTable__.", ".packageName")
@@ -480,4 +496,16 @@
     readBin(path, "raw", file.size(path))
   }
   list(rdb = read("rdb"), rdx = read("rdx"), rds = read("rds"))
+}
+
+.slinker_environment_key <- function(registries, environment) {
+  for (database in names(registries)) {
+    registry <- registries[[database]]
+    for (key in ls(registry, all.names = TRUE, sorted = FALSE)) {
+      if (identical(registry[[key]], environment)) {
+        return(paste0(database, ":", sub("^env::", "", key)))
+      }
+    }
+  }
+  ""
 }

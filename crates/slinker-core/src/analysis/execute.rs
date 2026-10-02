@@ -826,11 +826,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             &closure.source,
             context.image,
             &closure.environment,
-            ParseRequest {
-                owner,
-                source_key: owner,
-                owner_node: context.node,
-            },
+            ParseRequest { source_key: owner },
         )?
         else {
             return Ok(AbstractValue::Unknown);

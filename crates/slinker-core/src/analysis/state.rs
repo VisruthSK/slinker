@@ -55,9 +55,7 @@ impl<'a> ParsedSite<'a> {
 
 #[derive(Clone, Copy)]
 pub(super) struct ParseRequest<'a> {
-    pub(super) owner: &'a SourceKey,
     pub(super) source_key: &'a SourceKey,
-    pub(super) owner_node: NodeId,
 }
 
 #[derive(Clone, Copy)]
@@ -363,6 +361,32 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let _merge = profile::span(Probe::ObjectsMerge);
             self.objects.merge(package, &partial);
         }
+        let sources = partial
+            .bindings
+            .values()
+            .map(|binding| &binding.object)
+            .chain(
+                partial
+                    .private_environments
+                    .values()
+                    .flat_map(|environment| {
+                        environment.bindings.values().map(|binding| &binding.object)
+                    }),
+            )
+            .flat_map(|object| {
+                object
+                    .closure
+                    .iter()
+                    .map(|closure| closure.source.as_ref())
+                    .chain(
+                        object
+                            .embedded_closures
+                            .iter()
+                            .map(|closure| closure.source.as_ref()),
+                    )
+            })
+            .collect::<Vec<_>>();
+        self.packages.prefetch_canonical_syntax(&sources)?;
         drop(image);
         let _extend = profile::span(Probe::ImageExtend);
         let loaded = self.loaded(package)?;
