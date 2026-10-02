@@ -29,7 +29,7 @@ pub use index::{
     PackageData, PackageIndex, S3Registration,
 };
 pub use locator::PackageLocator;
-pub use locator::tree_digest;
+pub use locator::{Fingerprint, tree_digest};
 pub(crate) use locator::{fingerprint_image, fingerprint_strings};
 pub use store::{
     CanonicalSyntax, DispatchSubject, Normalization, PackageProvider, PackageResolver,

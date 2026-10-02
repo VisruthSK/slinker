@@ -1,7 +1,7 @@
 use crate::cache::{CacheLocation, cache_root};
 use crate::package::{
-    Digest, PackageIdentity, PackageLocator, PackageName, analysis_schema, fingerprint_strings,
-    tree_digest,
+    BindingName, Digest, Fingerprint, PackageIdentity, PackageLocator, PackageName,
+    analysis_schema, fingerprint_strings, tree_digest,
 };
 use crate::{Error, Result, TargetEnvironment};
 use serde::{Deserialize, Serialize};
@@ -62,36 +62,25 @@ pub fn inputs_digest(
     let manifest = std::env::var_os("SLINKER_NATIVE_SUMMARIES")
         .and_then(|path| fs::read(path).ok())
         .map_or_else(String::new, |bytes| Digest::of(bytes).as_str().to_owned());
-    let mut parts = vec![
-        "slinker-build-inputs-v1".to_owned(),
-        env!("CARGO_PKG_VERSION").to_owned(),
-        analysis_schema().to_owned(),
-        source.as_str().to_owned(),
-        target.r_home.to_string_lossy().into_owned(),
-        target.target.r_version.clone(),
-        target.target.os.clone(),
-        target.target.arch.clone(),
-        manifest,
-    ];
-    parts.push(format!("libraries:{}", target.libraries.len()));
-    parts.extend(
-        target
-            .libraries
-            .iter()
-            .map(|library| library.to_string_lossy().into_owned()),
-    );
-    parts.push(format!("base:{}", target.base_bindings.len()));
-    parts.extend(
-        target
-            .base_bindings
-            .iter()
-            .map(|name| name.as_str().to_owned()),
-    );
-    parts.push(format!("linked:{}", linked.len()));
-    parts.extend(linked.iter().map(|name| (*name).to_owned()));
-    parts.push(format!("external:{}", external.len()));
-    parts.extend(external.iter().map(|name| (*name).to_owned()));
-    fingerprint_strings(parts)
+    Fingerprint::new("slinker-build-inputs-v2")
+        .field(env!("CARGO_PKG_VERSION"))
+        .field(analysis_schema())
+        .field(source.as_str())
+        .field(target.r_home.to_string_lossy().as_bytes())
+        .field(&target.target.r_version)
+        .field(&target.target.os)
+        .field(&target.target.arch)
+        .field(manifest)
+        .list(
+            target
+                .libraries
+                .iter()
+                .map(|library| library.to_string_lossy().into_owned()),
+        )
+        .list(target.base_bindings.iter().map(BindingName::as_str))
+        .list(linked)
+        .list(external)
+        .finish()
 }
 
 #[derive(Debug)]

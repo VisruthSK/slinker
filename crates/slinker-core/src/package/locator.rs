@@ -127,6 +127,38 @@ pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
     Ok(Digest::finish(hash))
 }
 
+pub struct Fingerprint(Sha256);
+
+impl Fingerprint {
+    #[must_use]
+    pub fn new(domain: &str) -> Self {
+        Self(Sha256::new()).field(domain)
+    }
+
+    #[must_use]
+    pub fn field(mut self, value: impl AsRef<[u8]>) -> Self {
+        let value = value.as_ref();
+        self.0.update((value.len() as u64).to_le_bytes());
+        self.0.update(value);
+        self
+    }
+
+    #[must_use]
+    pub fn list<T: AsRef<[u8]>>(mut self, items: impl IntoIterator<Item = T>) -> Self {
+        let items = items.into_iter().collect::<Vec<_>>();
+        self.0.update((items.len() as u64).to_le_bytes());
+        for item in &items {
+            self = self.field(item);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn finish(self) -> Digest {
+        Digest::finish(self.0)
+    }
+}
+
 pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<str>>) -> Digest {
     let mut hash = Sha256::new();
     hash.update(b"slinker-key-v1\0");
@@ -151,6 +183,17 @@ mod tests {
         let after = fingerprint_image(root.path()).expect("fingerprint changed image");
 
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn fingerprint_fields_are_unambiguous() {
+        let split =
+            |left: &str, right: &str| Fingerprint::new("t").field(left).field(right).finish();
+        assert_ne!(split("ab", "c"), split("a", "bc"));
+        let listed = |items: &[&str]| Fingerprint::new("t").list(items.iter().copied()).finish();
+        assert_ne!(listed(&["a", "b"]), listed(&["b", "a"]));
+        assert_ne!(listed(&["a"]), listed(&["a", ""]));
+        assert_eq!(listed(&["a", "b"]), listed(&["a", "b"]));
     }
 
     #[test]
