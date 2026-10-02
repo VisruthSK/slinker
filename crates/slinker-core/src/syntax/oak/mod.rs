@@ -18,6 +18,8 @@ use oak_semantic::semantic_index::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+mod census;
+use census::Census;
 mod construction;
 mod context;
 mod declarations;
@@ -47,10 +49,9 @@ use proofs::{
     post_for_use_may_fall_through, recursive_closure_binding_is_initialized,
 };
 use scan::{
-    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, argument_spans, call_after_name,
-    expression_end, find_for_regions, find_function_regions, find_if_regions, namespace_extent,
-    skip_trivia, statement_start, static_arg, static_args, static_symbol_range, trim_end_offset,
-    word_boundary_after,
+    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, argument_spans, expression_end,
+    namespace_extent, skip_trivia, statement_start, static_arg, static_args, static_symbol_range,
+    trim_end_offset, word_boundary_after,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -444,27 +445,26 @@ fn translate_index(
     });
     let mut live_uses = collect_live_uses(index, &declarations);
 
-    let (function_regions, for_regions, if_regions) = profile::scoped(Probe::ParseRegions, || {
-        let function_regions = find_function_regions(text);
-        let for_regions = find_for_regions(text);
-        let if_regions = find_if_regions(text);
+    let census = profile::scoped(Probe::ParseRegions, || Census::of(root));
+    let (function_regions, for_regions, if_regions) =
+        (&census.functions, &census.fors, &census.ifs);
+    profile::scoped(Probe::ParseRegions, || {
         refine_callee_kinds(
             text,
             context,
             index,
-            &function_regions,
-            &for_regions,
-            &if_regions,
+            function_regions,
+            for_regions,
+            if_regions,
             &mut live_uses,
         );
-        (function_regions, for_regions, if_regions)
     });
 
     let mut references = profile::scoped(Probe::ParseReferences, || {
-        name_references(&source, text, context, root, index, &live_uses)
+        name_references(&source, text, context, root, index, &census, &live_uses)
     });
     let calls_span = profile::span(Probe::ParseCalls);
-    let mut live_calls = lexical_calls(&source, text, index, &scopes, &live_uses);
+    let mut live_calls = lexical_calls(&source, text, index, &scopes, &census, &live_uses);
     let translation = Translation {
         source: &source,
         text,
@@ -472,6 +472,7 @@ fn translate_index(
         index,
         scopes: &scopes,
         declarations: &declarations,
+        census: &census,
     };
     let mut package_refs = namespace_access_facts(translation, &live_uses, &mut live_calls);
     binary_operator_facts(translation, &mut references, &mut live_calls);
@@ -481,7 +482,7 @@ fn translate_index(
     drop(calls_span);
 
     let guards_span = profile::span(Probe::ParseGuards);
-    let mut guard_regions = if_guard_regions(text, context, &if_regions, &live_calls);
+    let mut guard_regions = if_guard_regions(text, context, if_regions, &live_calls);
     apply_guard_regions_to_references(&guard_regions, &mut references);
     apply_guard_regions_to_package_refs(&guard_regions, &mut package_refs);
     apply_guard_regions_to_calls(&guard_regions, &mut live_calls);
@@ -499,7 +500,7 @@ fn translate_index(
         context,
         &live_calls,
         &environment_aliases,
-        &if_regions,
+        if_regions,
     );
     let namespace_enumerations =
         collect_namespace_enumerations(source, context, &live_calls, &environment_aliases);
@@ -510,9 +511,9 @@ fn translate_index(
         source,
         text,
         index,
-        &function_regions,
-        &for_regions,
-        &if_regions,
+        function_regions,
+        for_regions,
+        if_regions,
     );
     suppress_superassignment_references(&mut effects, &mut references, &suppressed_reference_spans);
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
@@ -746,6 +747,7 @@ fn name_references(
     context: &OakParseContext,
     root: &RRoot,
     index: &SemanticIndex,
+    census: &Census,
     live_uses: &[LiveUse],
 ) -> Vec<NameRef> {
     let data_masks = data_mask_ranges(text, root, context);
@@ -770,11 +772,7 @@ fn name_references(
                 CalleeKind::DefinitelyExternal => NameRefKind::External,
                 CalleeKind::ConditionalFallthrough => NameRefKind::ConditionalFallthrough,
             };
-            let replaced =
-                call_after_name(text, live_use.start, live_use.end).is_some_and(|call| {
-                    let rest = &text[skip_trivia(text, call.end)..];
-                    rest.starts_with("<-") || rest.starts_with("<<-")
-                });
+            let replaced = census.is_replacement_target(live_use.start, live_use.end);
             Some(NameRef {
                 name: if replaced {
                     BindingName::from(format!("{}<-", live_use.name))
@@ -795,12 +793,13 @@ fn lexical_calls(
     text: &str,
     index: &SemanticIndex,
     scopes: &LexicalScopes,
+    census: &Census,
     live_uses: &[LiveUse],
 ) -> Vec<LiveCall> {
     let mut live_calls = Vec::new();
 
     for live_use in live_uses {
-        let Some(raw) = call_after_name(text, live_use.start, live_use.end) else {
+        let Some(raw) = census.call_of(live_use.start, live_use.end) else {
             continue;
         };
         let args = static_args(&raw);
@@ -830,6 +829,7 @@ struct Translation<'a> {
     index: &'a SemanticIndex,
     scopes: &'a LexicalScopes,
     declarations: &'a Declarations,
+    census: &'a Census,
 }
 
 fn namespace_access_facts(
@@ -843,6 +843,7 @@ fn namespace_access_facts(
         index,
         scopes,
         declarations,
+        census,
         ..
     } = translation;
     let mut package_refs = Vec::new();
@@ -869,7 +870,7 @@ fn namespace_access_facts(
             span: Span::new(*source, start, access_end),
         });
 
-        if let Some(raw) = call_after_name(text, start, access_end) {
+        if let Some(raw) = census.call_of(start, access_end) {
             let (scope, _) = index.scope_at(access.offset());
             let args = static_args(&raw);
             let (lexical_scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
@@ -911,6 +912,7 @@ fn binary_operator_facts(
         index,
         scopes,
         declarations,
+        ..
     } = translation;
     for binary in root
         .syntax()
@@ -1594,14 +1596,9 @@ fn named_static_string(arguments: &[RawArgument], name: &str) -> Option<String> 
 
 fn named_static_bool(arguments: &[RawArgument], name: &str) -> Option<bool> {
     arguments.iter().find_map(|argument| {
-        if argument.name.as_deref() != Some(name) {
-            return None;
-        }
-        match argument.static_arg.as_ref() {
-            Some(StaticArg::Symbol(value)) if value == "TRUE" || value == "T" => Some(true),
-            Some(StaticArg::Symbol(value)) if value == "FALSE" || value == "F" => Some(false),
-            _ => None,
-        }
+        (argument.name.as_deref() == Some(name))
+            .then_some(argument.logical)
+            .flatten()
     })
 }
 
