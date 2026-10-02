@@ -19,7 +19,7 @@ use oak_semantic::semantic_index::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 mod census;
-use census::Census;
+use census::{Census, assignment_of, node_range, static_arg_of};
 mod construction;
 mod context;
 mod declarations;
@@ -49,9 +49,8 @@ use proofs::{
     post_for_use_may_fall_through, recursive_closure_binding_is_initialized,
 };
 use scan::{
-    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, argument_spans, expression_end,
-    namespace_extent, skip_trivia, statement_start, static_arg, static_args, static_symbol_range,
-    trim_end_offset, word_boundary_after,
+    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, argument_spans, namespace_extent,
+    skip_trivia, static_arg, static_args,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -451,6 +450,7 @@ fn translate_index(
     profile::scoped(Probe::ParseRegions, || {
         refine_callee_kinds(
             text,
+            root,
             context,
             index,
             function_regions,
@@ -464,7 +464,7 @@ fn translate_index(
         name_references(&source, text, context, root, index, &census, &live_uses)
     });
     let calls_span = profile::span(Probe::ParseCalls);
-    let mut live_calls = lexical_calls(&source, text, index, &scopes, &census, &live_uses);
+    let mut live_calls = lexical_calls(&source, root, index, &scopes, &census, &live_uses);
     let translation = Translation {
         source: &source,
         text,
@@ -494,7 +494,7 @@ fn translate_index(
     guard_regions.extend(hook_regions);
 
     let resource_refs = collect_resources(source, context, &live_calls);
-    let environment_aliases = collect_environment_aliases(text, context, index, &live_calls);
+    let environment_aliases = collect_environment_aliases(root, context, index, &live_calls);
     let active_bindings = collect_active_bindings(
         source,
         context,
@@ -510,6 +510,7 @@ fn translate_index(
     let (mut effects, suppressed_reference_spans) = collect_superassignments(
         source,
         text,
+        root,
         index,
         function_regions,
         for_regions,
@@ -699,6 +700,7 @@ fn collect_live_uses(index: &SemanticIndex, declarations: &Declarations) -> Vec<
 
 fn refine_callee_kinds(
     text: &str,
+    root: &RRoot,
     context: &OakParseContext,
     index: &SemanticIndex,
     function_regions: &[FunctionRegion],
@@ -717,7 +719,7 @@ fn refine_callee_kinds(
             && (formal_default_use_is_bound(function_regions, live_use)
                 || for_body_use_is_bound(index, for_regions, live_use)
                 || recursive_closure_binding_is_initialized(
-                    text,
+                    root,
                     index,
                     function_regions,
                     live_use,
@@ -729,6 +731,7 @@ fn refine_callee_kinds(
         if live_use.callee_kind == CalleeKind::ConditionalFallthrough
             && conditional_fallthrough_proven_bound(
                 text,
+                root,
                 context,
                 index,
                 for_regions,
@@ -761,7 +764,7 @@ fn name_references(
             let kind = match live_use.callee_kind {
                 CalleeKind::DefinitelyLexical
                     if text.as_bytes().get(skip_trivia(text, live_use.end)) == Some(&b'(')
-                        && !reaches_only_closures(text, index, live_use) =>
+                        && !reaches_only_closures(root, index, live_use) =>
                 {
                     NameRefKind::MaybeLocal
                 }
@@ -790,7 +793,7 @@ fn name_references(
 
 fn lexical_calls(
     source: &SourceId,
-    text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     scopes: &LexicalScopes,
     census: &Census,
@@ -809,7 +812,7 @@ fn lexical_calls(
                 callee: Atom::from(live_use.name.as_str()),
                 callee_kind: live_use.callee_kind,
                 qualified_package: None,
-                arguments: call_arguments(source, text, index, live_uses, &raw, args, arg_bindings),
+                arguments: call_arguments(source, root, index, live_uses, &raw, args, arg_bindings),
                 scope,
                 phase: live_use.phase,
                 guards: Vec::new(),
@@ -881,7 +884,7 @@ fn namespace_access_facts(
                     qualified_package: Some(Atom::from(access.package())),
                     arguments: call_arguments(
                         source,
-                        text,
+                        translation.root,
                         index,
                         live_uses,
                         &raw,
@@ -1204,7 +1207,7 @@ fn collect_active_bindings(
 }
 
 fn collect_environment_aliases(
-    text: &str,
+    root: &RRoot,
     context: &OakParseContext,
     index: &SemanticIndex,
     calls: &[LiveCall],
@@ -1216,13 +1219,10 @@ fn collect_environment_aliases(
                 continue;
             }
             let name = index.symbols(scope).symbol(definition.symbol()).name();
-            let range = definition.range();
-            let target_end = text_offset(range.end());
-            let Some((value_start, value_end)) = assignment_rhs_after(text, target_end, "<-")
-            else {
+            let Some(assignment) = assignment_of(root, definition.kind()) else {
                 continue;
             };
-            let value = TextRange::new(value_start, value_end);
+            let value = node_range(&assignment.value);
             let Some(target) = calls
                 .iter()
                 .find(|call| {
@@ -1351,6 +1351,7 @@ fn collect_namespace_enumerations(
 fn collect_superassignments(
     source: SourceId,
     text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     function_regions: &[FunctionRegion],
     for_regions: &[ForRegion],
@@ -1372,7 +1373,7 @@ fn collect_superassignments(
             let range = definition.range();
             let target_start = text_offset(range.start());
             let target_end = text_offset(range.end());
-            let parts = superassignment_parts(text, target_start, target_end);
+            let parts = superassignment_parts(root, definition.kind(), target_start, target_end);
             let (span_start, span_end, value_symbol) = match parts {
                 Some(parts) => {
                     if let Some((name, start, end)) = &parts.value_symbol {
@@ -1602,47 +1603,9 @@ fn named_static_bool(arguments: &[RawArgument], name: &str) -> Option<bool> {
     })
 }
 
-fn assignment_rhs_after(text: &str, target_end: usize, operator: &str) -> Option<(usize, usize)> {
-    let mut cursor = skip_trivia(text, target_end);
-    if !text.get(cursor..)?.starts_with(operator) {
-        return None;
-    }
-    cursor += operator.len();
-    let value_start = skip_trivia(text, cursor);
-    let value_end = expression_end(text, value_start);
-    (value_start < value_end).then_some((value_start, value_end))
-}
-
-fn superassignment_parts(
-    text: &str,
-    target_start: usize,
-    target_end: usize,
-) -> Option<SuperAssignmentParts> {
-    let mut cursor = skip_trivia(text, target_end);
-    if text.get(cursor..)?.starts_with("<<-") {
-        cursor += 3;
-        let value_start = skip_trivia(text, cursor);
-        let value_end = expression_end(text, value_start);
-        return Some(SuperAssignmentParts {
-            span: TextRange::new(target_start, value_end),
-            value_symbol: static_symbol_range(text, value_start, value_end),
-        });
-    }
-
-    let statement_start = statement_start(text, target_start);
-    let before_target = text.get(statement_start..target_start)?;
-    let operator = before_target.rfind("->>")?;
-    let value_start = skip_trivia(text, statement_start);
-    let value_end = trim_end_offset(text, statement_start + operator);
-    Some(SuperAssignmentParts {
-        span: TextRange::new(value_start, target_end),
-        value_symbol: static_symbol_range(text, value_start, value_end),
-    })
-}
-
 fn call_arguments(
     source: &SourceId,
-    text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     live_uses: &[LiveUse],
     raw: &RawCall,
@@ -1650,7 +1613,7 @@ fn call_arguments(
     bindings: Vec<Option<LexicalBindingId>>,
 ) -> Box<[CallArgument]> {
     let spans = argument_spans(source, &raw.args);
-    let closures = local_closure_arguments(text, index, live_uses, &raw.args);
+    let closures = local_closure_arguments(root, index, live_uses, &raw.args);
     raw.args
         .iter()
         .zip(values)
@@ -1670,7 +1633,7 @@ fn call_arguments(
 }
 
 fn local_closure_arguments(
-    text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     live_uses: &[LiveUse],
     arguments: &[RawArgument],
@@ -1692,34 +1655,32 @@ fn local_closure_arguments(
             index
                 .reaching_definitions(use_site.scope, use_site.use_id)
                 .any(|(scope, definition_id)| {
-                    definition_is_closure(text, index, scope, definition_id)
+                    definition_is_closure(root, index, scope, definition_id)
                 })
         })
         .collect()
 }
 
-fn reaches_only_closures(text: &str, index: &SemanticIndex, live_use: &LiveUse) -> bool {
+fn reaches_only_closures(root: &RRoot, index: &SemanticIndex, live_use: &LiveUse) -> bool {
     let mut definitions = index
         .reaching_definitions(live_use.scope, live_use.use_id)
         .peekable();
     definitions.peek().is_some()
         && definitions
-            .all(|(scope, definition_id)| definition_is_closure(text, index, scope, definition_id))
+            .all(|(scope, definition_id)| definition_is_closure(root, index, scope, definition_id))
 }
 
 fn definition_is_closure(
-    text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     scope: ScopeId,
     definition_id: oak_semantic::semantic_index::DefinitionId,
 ) -> bool {
     let definition = &index.definitions(scope)[definition_id];
     matches!(definition.kind(), DefinitionKind::Assignment(_))
-        && assignment_rhs_after(text, text_offset(definition.range().end()), "<-")
-            .and_then(|(start, _)| text.get(start..))
-            .is_some_and(|rhs| {
-                rhs.starts_with("function") && word_boundary_after(rhs, "function".len())
-            })
+        && assignment_of(root, definition.kind()).is_some_and(|assignment| {
+            matches!(assignment.value, AnyRExpression::RFunctionDefinition(_))
+        })
 }
 
 fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<LiveCall>) {
@@ -1819,4 +1780,24 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
             _ => {}
         }
     }
+}
+
+fn superassignment_parts(
+    root: &RRoot,
+    kind: &DefinitionKind,
+    target_start: usize,
+    target_end: usize,
+) -> Option<SuperAssignmentParts> {
+    let assignment = assignment_of(root, kind)?;
+    let value = node_range(&assignment.value);
+    let span = if assignment.value_first {
+        TextRange::new(value.start, target_end)
+    } else {
+        TextRange::new(target_start, value.end)
+    };
+    let value_symbol = match static_arg_of(&assignment.value) {
+        Some(StaticArg::Symbol(name)) => Some((name, value.start, value.end)),
+        _ => None,
+    };
+    Some(SuperAssignmentParts { span, value_symbol })
 }

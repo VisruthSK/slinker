@@ -203,20 +203,6 @@ pub(super) fn function_body_range(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-pub(super) fn static_symbol_range(
-    text: &str,
-    start: usize,
-    end: usize,
-) -> Option<(Atom, usize, usize)> {
-    let start = skip_trivia(text, start);
-    let end = trim_end_offset(text, end);
-    let value = text.get(start..end)?;
-    match static_arg(value) {
-        Some(StaticArg::Symbol(name)) => Some((name, start, end)),
-        _ => None,
-    }
-}
-
 pub(super) fn static_args(raw: &RawCall) -> Vec<Option<StaticArg>> {
     raw.args
         .iter()

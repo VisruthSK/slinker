@@ -1,3 +1,4 @@
+use super::census::{assignment_of, node_range};
 use super::context::OakParseContext;
 use super::predicates::{
     BranchAssumption, PredicateValue, SimplePredicate, assumption_symbols,
@@ -10,9 +11,10 @@ use super::scan::{
     identifier_occurs_before, last_top_level_expression, matching_delimiter, name_token_end,
     skip_comment, skip_trivia_bounded, split_arguments, statement_start, static_symbol,
 };
-use super::{LiveUse, assignment_rhs_after, innermost_function_region, text_offset};
+use super::{LiveUse, innermost_function_region, text_offset};
 use crate::syntax::facts::{CallSite, CalleeKind, StaticArg};
 use crate::syntax::source::TextRange;
+use air_r_syntax::{AnyRExpression, RRoot};
 use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex};
 use std::collections::BTreeSet;
 
@@ -70,7 +72,7 @@ pub(super) fn for_body_use_is_bound(
 }
 
 pub(super) fn recursive_closure_binding_is_initialized(
-    text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     functions: &[FunctionRegion],
     live_use: &LiveUse,
@@ -90,9 +92,10 @@ pub(super) fn recursive_closure_binding_is_initialized(
             if symbol.name() != live_use.name {
                 return false;
             }
-            let target_end = text_offset(definition.range().end());
-            assignment_rhs_after(text, target_end, "<-")
-                .is_some_and(|(start, _)| start == function.function_start)
+            assignment_of(root, definition.kind()).is_some_and(|assignment| {
+                matches!(&assignment.value, AnyRExpression::RFunctionDefinition(value)
+                    if node_range(value).start == function.function_start)
+            })
         })
 }
 
@@ -227,6 +230,7 @@ pub(super) fn definition_must_execute_before_position(
 
 pub(super) fn conditional_fallthrough_proven_bound(
     text: &str,
+    root: &RRoot,
     context: &OakParseContext,
     index: &SemanticIndex,
     for_regions: &[ForRegion],
@@ -282,6 +286,7 @@ pub(super) fn conditional_fallthrough_proven_bound(
     let mut use_assumptions = branch_assumptions_at(text, regions, live_use.start);
     expand_boolean_alias_assumptions(
         text,
+        root,
         index,
         live_use.scope,
         live_use.start,

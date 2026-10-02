@@ -10,6 +10,7 @@ use air_r_syntax::{
     RCall, RForStatement, RFunctionDefinition, RIfStatement, RLanguage, RRoot, RSyntaxKind,
 };
 use biome_rowan::{AstNode, AstSeparatedList};
+use oak_semantic::semantic_index::DefinitionKind;
 use std::collections::{BTreeSet, HashMap};
 
 pub(super) struct Census {
@@ -94,6 +95,30 @@ impl Census {
                         .is_ok_and(|operator| matches!(operator.text_trimmed(), "<-" | "<<-"))
             })
     }
+}
+
+pub(super) struct Assignment {
+    pub(super) value: AnyRExpression,
+    pub(super) value_first: bool,
+}
+
+pub(super) fn assignment_of(root: &RRoot, kind: &DefinitionKind) -> Option<Assignment> {
+    let (DefinitionKind::Assignment(pointer) | DefinitionKind::SuperAssignment(pointer)) = kind
+    else {
+        return None;
+    };
+    let binary = pointer.to_node(root.syntax());
+    let value_first = matches!(
+        binary.operator().ok()?.kind(),
+        RSyntaxKind::ASSIGN_RIGHT | RSyntaxKind::SUPER_ASSIGN_RIGHT
+    );
+    let value = if value_first {
+        binary.left()
+    } else {
+        binary.right()
+    }
+    .ok()?;
+    Some(Assignment { value, value_first })
 }
 
 pub(super) fn node_range(node: &impl AstNode<Language = RLanguage>) -> TextRange {

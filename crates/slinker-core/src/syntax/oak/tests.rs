@@ -1109,3 +1109,24 @@ fn missing_import_all_blocks_only_names_no_later_import_provides() {
     );
     assert_eq!(imports.names(), Err(&PackageName::from("missing")));
 }
+
+#[test]
+fn superassignment_span_covers_a_value_that_starts_with_a_parenthesis() {
+    let text = "f <- function() { x <<- (a == 1) + 0L }";
+    let parsed = parse_source(text);
+    let effect = &parsed.expressions[0].effects[0];
+
+    assert_eq!(
+        &text[effect.span.start..effect.span.end],
+        "x <<- (a == 1) + 0L"
+    );
+}
+
+#[test]
+fn right_superassignment_span_starts_at_the_value() {
+    let text = "f <- function() {\n  other <- 1\n  (a + b) ->> x\n}";
+    let parsed = parse_source(text);
+    let effect = &parsed.expressions[0].effects[0];
+
+    assert_eq!(&text[effect.span.start..effect.span.end], "(a + b) ->> x");
+}
