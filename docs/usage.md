@@ -86,7 +86,6 @@ Provenance explains a result and never decides one: finalization reads typed req
 ```text
 R_HOME                    fallback R installation when `R RHOME` is unavailable
 SLINKER_CACHE_DIR         persistent installed-image analysis cache
-SLINKER_PROFILE           set to 1 to print a profile report on stderr
 SLINKER_NATIVE_SUMMARIES  audited native-effect manifest for exact installed images
 ```
 

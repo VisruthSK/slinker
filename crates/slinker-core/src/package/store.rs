@@ -2,9 +2,10 @@ use crate::cache::{Cache, CacheLocation};
 use crate::package::inspection::{Batcher, Lanes, Placement, Slot};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, ComponentName, Digest, GenericName, InstalledPackage, LifecycleMetadata,
-    NativeFacts, NativeRoutineSummary, NativeSafety, PackageData, PackageIdentity, PackageImage,
-    PackageIndex, PackageLocator, PackageName,
+    BindingName, ComponentName, Digest, EnvironmentKind, EnvironmentLabel, GenericName,
+    InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
+    PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocator, PackageName,
+    PrivateEnvironmentImage,
 };
 use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{WorkerBinding, WorkerPackageIndex};
@@ -258,11 +259,21 @@ impl<K: Eq + Hash + Clone, V: Clone> Memo<K, V> {
 }
 
 type BindingBatcher = Batcher<String, Arc<PackageImage>>;
+type ProbeBatcher = Batcher<String, Probed>;
+
+#[derive(Clone)]
+struct Probed {
+    image: Arc<PackageImage>,
+    epoch_independent: bool,
+}
 
 pub struct PackageStore {
     locator: PackageLocator,
     indexes: Memo<PackageIdentity, Arc<PackageIndex>>,
     bindings: Mutex<HashMap<PackageIdentity, Arc<BindingBatcher>>>,
+    probes: Mutex<HashMap<PackageIdentity, Arc<ProbeBatcher>>>,
+    delivered:
+        Mutex<HashMap<PackageIdentity, HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>>>>,
     dispatch: Memo<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
     normalizer: Batcher<String, CanonicalSyntax>,
     cache: Cache,
@@ -291,6 +302,8 @@ impl PackageStore {
             locator: PackageLocator::new(target),
             indexes: Memo::default(),
             bindings: Mutex::new(HashMap::new()),
+            probes: Mutex::new(HashMap::new()),
+            delivered: Mutex::new(HashMap::new()),
             dispatch: Memo::default(),
             normalizer: Batcher::default(),
             cache: Cache::new(cache, ANALYSIS_SCHEMA)?,
@@ -351,6 +364,7 @@ impl PackageStore {
         identity: &PackageIdentity,
         index: Arc<PackageIndex>,
         worker: WorkerBinding,
+        private_environments: HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>>,
     ) -> Result<Arc<PackageImage>> {
         if identity.name != worker.package_name
             || worker.package_version != identity.version.to_string()
@@ -365,7 +379,7 @@ impl PackageStore {
         Ok(Arc::new(PackageImage {
             index,
             bindings: HashMap::from([(worker.binding.name.clone(), Arc::new(worker.binding))]),
-            private_environments: worker.private_environments,
+            private_environments,
         }))
     }
 
@@ -444,7 +458,13 @@ impl PackageStore {
                     && entry.binding_name == binding
                     && is_epoch_independent(&entry.binding)
             })?;
-        Self::package_image(&package.identity, Arc::clone(index), cached.binding).ok()
+        Self::package_image(
+            &package.identity,
+            Arc::clone(index),
+            cached.binding,
+            HashMap::new(),
+        )
+        .ok()
     }
 
     fn binding_batcher(&self, identity: &PackageIdentity) -> Arc<BindingBatcher> {
@@ -455,6 +475,87 @@ impl PackageStore {
                 .entry(identity.clone())
                 .or_default(),
         )
+    }
+
+    fn arced(
+        environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
+    ) -> HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>> {
+        environments
+            .into_iter()
+            .map(|(label, environment)| (label, Arc::new(environment)))
+            .collect()
+    }
+
+    fn deliver(
+        &self,
+        identity: &PackageIdentity,
+        binding: &mut WorkerBinding,
+    ) -> HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>> {
+        let mut delivered = self.delivered.lock().expect("delivered environments");
+        let known = delivered.entry(identity.clone()).or_default();
+        for (label, environment) in Self::arced(std::mem::take(&mut binding.private_environments)) {
+            known.entry(label).or_insert(environment);
+        }
+        let mut reachable = HashMap::new();
+        let mut pending = binding
+            .binding
+            .object
+            .environment_labels()
+            .cloned()
+            .collect::<Vec<_>>();
+        while let Some(label) = pending.pop() {
+            if label.kind() != EnvironmentKind::Private || reachable.contains_key(&label) {
+                continue;
+            }
+            let Some(environment) = known.get(&label) else {
+                continue;
+            };
+            pending.push(environment.parent.clone());
+            pending.extend(
+                environment
+                    .bindings
+                    .values()
+                    .flat_map(|private| private.object.environment_labels().cloned()),
+            );
+            reachable.insert(label, Arc::clone(environment));
+        }
+        reachable
+    }
+
+    fn probe_batcher(&self, identity: &PackageIdentity) -> Arc<ProbeBatcher> {
+        Arc::clone(
+            self.probes
+                .lock()
+                .expect("probe batchers")
+                .entry(identity.clone())
+                .or_default(),
+        )
+    }
+
+    fn execute_probes(
+        &self,
+        package: &InstalledPackage,
+        index: &Arc<PackageIndex>,
+        client: &mut WorkerClient,
+        names: &[String],
+    ) -> Result<Vec<Probed>> {
+        let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        client
+            .bindings(package, &refs)?
+            .into_iter()
+            .zip(names)
+            .map(|(mut binding, name)| {
+                self.publish_binding(package, name, &binding);
+                let epoch_independent = is_epoch_independent(&binding);
+                let privates = self.deliver(&package.identity, &mut binding);
+                Self::package_image(&package.identity, Arc::clone(index), binding, privates).map(
+                    |image| Probed {
+                        image,
+                        epoch_independent,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn execute_bindings(
@@ -469,29 +570,31 @@ impl PackageStore {
             .bindings(package, &refs)?
             .into_iter()
             .zip(names)
-            .map(|(binding, name)| {
+            .map(|(mut binding, name)| {
                 self.publish_binding(package, name, &binding);
-                Self::package_image(&package.identity, Arc::clone(index), binding)
+                let privates = self.deliver(&package.identity, &mut binding);
+                Self::package_image(&package.identity, Arc::clone(index), binding, privates)
             })
             .collect()
     }
 
-    fn submit_binding(
+    fn submit_probe(
         &self,
         batcher: &BindingBatcher,
+        probes: &ProbeBatcher,
         package: &InstalledPackage,
         index: &Arc<PackageIndex>,
         name: &str,
-    ) -> Option<Arc<Slot<Arc<PackageImage>>>> {
+    ) -> Option<Arc<Slot<Probed>>> {
         let query = name.to_owned();
-        if batcher.known(&query).is_some() {
+        if batcher.known(&query).is_some() || probes.known(&query).is_some() {
             return None;
         }
         if let Some(image) = self.load_cached_binding(package, index, name) {
             batcher.seed(&query, image);
             return None;
         }
-        Some(batcher.submit(&query))
+        Some(probes.submit(&query))
     }
 }
 
@@ -561,9 +664,23 @@ impl PackageProvider for PackageStore {
             return known;
         }
         let index = self.index(package)?;
-        let Some(slot) = self.submit_binding(&batcher, package, &index, name) else {
-            return batcher.known(&query).expect("a seeded binding is known");
-        };
+        let probes = self.probe_batcher(&package.identity);
+        if let Some(slot) = self.submit_probe(&batcher, &probes, package, &index, name) {
+            let probed = probes.drive(&self.lanes, &Placement::Any, &slot, &|client, names| {
+                self.execute_probes(package, &index, client, names)
+            })?;
+            if probed.epoch_independent {
+                batcher.seed(&query, Arc::clone(&probed.image));
+                return Ok(probed.image);
+            }
+        } else if let Some(known) = batcher.known(&query) {
+            return known;
+        } else if let Some(Ok(probed)) = probes.known(&query)
+            && probed.epoch_independent
+        {
+            return Ok(probed.image);
+        }
+        let slot = batcher.submit(&query);
         let lane = self.affine_lane(&package.identity);
         batcher.drive(
             &self.lanes,
@@ -575,17 +692,17 @@ impl PackageProvider for PackageStore {
 
     fn prefetch_binding_images(&self, package: &InstalledPackage, names: &[&str]) -> Result<()> {
         let batcher = self.binding_batcher(&package.identity);
+        let probes = self.probe_batcher(&package.identity);
         let index = self.index(package)?;
         let mut submitted = false;
         for name in names {
             submitted |= self
-                .submit_binding(&batcher, package, &index, name)
+                .submit_probe(&batcher, &probes, package, &index, name)
                 .is_some();
         }
         if submitted {
-            let lane = self.affine_lane(&package.identity);
-            batcher.lead(&self.lanes, &Placement::Lane(lane), &|client, names| {
-                self.execute_bindings(package, &index, client, names)
+            probes.lead(&self.lanes, &Placement::Any, &|client, names| {
+                self.execute_probes(package, &index, client, names)
             });
         }
         Ok(())

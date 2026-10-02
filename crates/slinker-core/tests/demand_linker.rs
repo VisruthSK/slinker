@@ -560,7 +560,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
     }
     root.private_environments.insert(
         "private:1".into(),
-        PrivateEnvironmentImage {
+        Arc::new(PrivateEnvironmentImage {
             id: "private:1".into(),
             parent: "namespace:root".into(),
             bindings: HashMap::from([
@@ -581,7 +581,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
                     ),
                 ),
             ]),
-        },
+        }),
     );
     Arc::make_mut(&mut root.index).binding_names = root
         .bindings
@@ -686,14 +686,14 @@ fn closure_private_environment_is_inventory_not_a_root_set() {
         .environment = "private:1".into();
     root.private_environments.insert(
         "private:1".into(),
-        PrivateEnvironmentImage {
+        Arc::new(PrivateEnvironmentImage {
             id: "private:1".into(),
             parent: "namespace:root".into(),
             bindings: HashMap::from([(
                 "unused".into(),
                 private_closure("unused", "private:1", "unused <- function() foo::bar()"),
             )]),
-        },
+        }),
     );
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
     let plan = analyze_images(vec![root, foo]);
@@ -727,7 +727,7 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
         .environment = "private:1".into();
     root.private_environments.insert(
         "private:1".into(),
-        PrivateEnvironmentImage {
+        Arc::new(PrivateEnvironmentImage {
             id: "private:1".into(),
             parent: "namespace:root".into(),
             bindings: HashMap::from([
@@ -740,7 +740,7 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
                     private_closure("unused", "private:1", "unused <- function() foo::bar()"),
                 ),
             ]),
-        },
+        }),
     );
     let foo = package("foo", &[("bar", Some("bar <- function() 1"))]);
     let plan = analyze_images(vec![root, foo]);
@@ -778,7 +778,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
         .environment = "private:1".into();
     root.private_environments.insert(
         "private:1".into(),
-        PrivateEnvironmentImage {
+        Arc::new(PrivateEnvironmentImage {
             id: "private:1".into(),
             parent: "namespace:root".into(),
             bindings: HashMap::from([(
@@ -801,7 +801,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
                     },
                 },
             )]),
-        },
+        }),
     );
     let plan = analyze_images(vec![root]);
     assert!(
@@ -4565,7 +4565,7 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
         .environment = "private:1".into();
     root.private_environments.insert(
         "private:1".into(),
-        PrivateEnvironmentImage {
+        Arc::new(PrivateEnvironmentImage {
             id: "private:1".into(),
             parent: "namespace:root".into(),
             bindings: HashMap::from([(
@@ -4576,7 +4576,7 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
                     ".die <- function() { stop('invalid') }",
                 ),
             )]),
-        },
+        }),
     );
 
     let plan = analyze_images(vec![root]);
@@ -5818,7 +5818,7 @@ mod schedule_equivalence {
         }
         root.private_environments.insert(
             "private:1".into(),
-            PrivateEnvironmentImage {
+            Arc::new(PrivateEnvironmentImage {
                 id: "private:1".into(),
                 parent: "namespace:root".into(),
                 bindings: HashMap::from([
@@ -5839,7 +5839,7 @@ mod schedule_equivalence {
                         ),
                     ),
                 ]),
-            },
+            }),
         );
         Scenario {
             name: "reenclosed_derived_environment",
@@ -5893,7 +5893,7 @@ mod schedule_equivalence {
         }
         root.private_environments.insert(
             "private:1".into(),
-            PrivateEnvironmentImage {
+            Arc::new(PrivateEnvironmentImage {
                 id: "private:1".into(),
                 parent: "namespace:root".into(),
                 bindings: HashMap::from([
@@ -5910,7 +5910,7 @@ mod schedule_equivalence {
                         private_closure("unused", "private:1", "unused <- function() 2"),
                     ),
                 ]),
-            },
+            }),
         );
         Scenario {
             name: "private_environment",

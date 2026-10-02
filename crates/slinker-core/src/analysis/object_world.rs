@@ -759,7 +759,7 @@ mod tests {
                 .collect(),
             private_environments: privates
                 .into_iter()
-                .map(|environment| (environment.id.clone(), environment))
+                .map(|environment| (environment.id.clone(), Arc::new(environment)))
                 .collect(),
         }
     }

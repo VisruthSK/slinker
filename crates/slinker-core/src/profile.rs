@@ -129,6 +129,9 @@ struct Registry {
 }
 
 fn registry() -> Option<&'static Registry> {
+    if !cfg!(feature = "profile") {
+        return None;
+    }
     static REGISTRY: OnceLock<Option<Registry>> = OnceLock::new();
     REGISTRY
         .get_or_init(|| {

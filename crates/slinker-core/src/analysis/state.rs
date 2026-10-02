@@ -378,15 +378,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             image
                 .private_environments
                 .entry(id.clone())
-                .and_modify(|existing| {
-                    existing.bindings.extend(
-                        environment
-                            .bindings
-                            .iter()
-                            .map(|(name, binding)| (name.clone(), binding.clone())),
-                    );
-                })
-                .or_insert_with(|| environment.clone());
+                .or_insert_with(|| Arc::clone(environment));
         }
         Ok(Arc::clone(&guard))
     }

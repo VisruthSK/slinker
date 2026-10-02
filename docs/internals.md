@@ -48,4 +48,4 @@ The semantic stack is deliberately narrow: `harp`, `libr`, `air_r_parser`, `air_
 
 ## Profiling
 
-`SLINKER_PROFILE=1` prints a deterministic report on stderr when a command finishes: calls, unique semantic keys, inclusive and exclusive time per probe, memo and summary counters, recursion (SCC) statistics, R requests by opcode with their time, R batch sizes and bytes, R startups, and package fingerprint work. Probe order is fixed; timings are not. With the variable unset the probes cost one branch each.
+The `profile` cargo feature (off in the distributed binary; enabled by `--all-features` for tests and benchmarks) compiles the profiler in. With it, `SLINKER_PROFILE=1` prints a deterministic report on stderr when a command finishes: calls, unique semantic keys, inclusive and exclusive time per probe, memo and summary counters, recursion (SCC) statistics, scheduler queue depth and steals, R requests by opcode with their time, R batch sizes and bytes, R startups, and package fingerprint work. Probe order is fixed; timings are not. Without the feature or the variable the probes cost one branch each.
