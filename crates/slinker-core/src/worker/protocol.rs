@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+pub const RESPONSE_READY: u8 = 0;
+
 pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

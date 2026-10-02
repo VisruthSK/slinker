@@ -1,26 +1,25 @@
 use crate::package::SyntaxValidation;
 use crate::package::{CanonicalSyntax, DataSetId, DatasetName, InstalledPackage, Normalization};
 use crate::profile::{self, Counter, Probe};
-use crate::worker::protocol::WorkerBinding;
 use crate::worker::protocol::WorkerPackageIndex;
 use crate::worker::protocol::{
     DataLibraryFiles, NamespaceImageSpec, PROTOCOL_VERSION, PackageSpec, PayloadSerialization,
     PayloadSite, PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
 };
+use crate::worker::protocol::{RESPONSE_READY, WorkerBinding};
 use crate::{Error, Result, Target, TargetEnvironment};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::TempPath;
-
-const RESPONSE_SPIN: std::time::Duration = std::time::Duration::from_millis(2);
 
 #[derive(Debug)]
 pub(crate) struct WorkerClient {
     child: Child,
     input: BufWriter<ChildStdin>,
     output: BufReader<File>,
+    ready: BufReader<ChildStdout>,
     protocol_path: TempPath,
     next_request: u64,
 }
@@ -63,7 +62,7 @@ impl WorkerClient {
             .arg("__r-worker")
             .arg(&protocol_path)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         for variable in [
             "R_ENVIRON_USER",
@@ -87,9 +86,14 @@ impl WorkerClient {
             .stdin
             .take()
             .ok_or_else(|| Error::Analysis("failed to open Harp worker request stream".into()))?;
+        let ready = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Analysis("failed to open Harp worker readiness stream".into()))?;
         let mut client = Self {
             child,
             input: BufWriter::new(input),
+            ready: BufReader::new(ready),
             output: BufReader::new(protocol_file),
             protocol_path,
             next_request: 1,
@@ -349,6 +353,27 @@ impl WorkerClient {
         )
     }
 
+    fn await_response_ready(&mut self, context: &str) -> Result<()> {
+        let mut console_noise = Vec::new();
+        let bytes = self
+            .ready
+            .read_until(RESPONSE_READY, &mut console_noise)
+            .map_err(|source| Error::Io {
+                path: "<r-worker-stdout>".into(),
+                source,
+            })?;
+        if bytes == 0 || console_noise.last() != Some(&RESPONSE_READY) {
+            let status = self
+                .child
+                .wait()
+                .map_or_else(|error| error.to_string(), |status| status.to_string());
+            return Err(Error::Analysis(format!(
+                "Harp worker terminated while processing {context}; status {status}"
+            )));
+        }
+        Ok(())
+    }
+
     fn exchange(&mut self, request: &WorkerRequest) -> Result<WorkerResponse> {
         let _span = profile::span(Probe::WorkerRequest);
         let started = std::time::Instant::now();
@@ -368,29 +393,18 @@ impl WorkerClient {
             path: "<r-worker-stdin>".into(),
             source,
         })?;
+        self.await_response_ready(&context)?;
         let mut line = Vec::new();
-        let waiting = std::time::Instant::now();
-        loop {
-            let bytes = self
-                .output
-                .read_until(b'\n', &mut line)
-                .map_err(|source| Error::Io {
-                    path: self.protocol_path.to_path_buf(),
-                    source,
-                })?;
-            if bytes != 0 && line.ends_with(b"\n") {
-                break;
-            }
-            if let Some(status) = self.child.try_wait().ok().flatten() {
-                return Err(Error::Analysis(format!(
-                    "Harp worker terminated while processing {context}; status {status}"
-                )));
-            }
-            if waiting.elapsed() < RESPONSE_SPIN {
-                std::thread::yield_now();
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+        self.output
+            .read_until(b'\n', &mut line)
+            .map_err(|source| Error::Io {
+                path: self.protocol_path.to_path_buf(),
+                source,
+            })?;
+        if !line.ends_with(b"\n") {
+            return Err(Error::Analysis(format!(
+                "Harp worker response to {context} was incomplete"
+            )));
         }
         if profile::enabled() {
             profile::r_request(

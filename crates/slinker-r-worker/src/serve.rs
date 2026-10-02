@@ -1,7 +1,7 @@
 use super::protocol;
 use super::protocol::{
-    PROTOCOL_VERSION, WorkerErrorCode, WorkerFailure, WorkerPackageIdentity, WorkerRequest,
-    WorkerResponse,
+    PROTOCOL_VERSION, RESPONSE_READY, WorkerErrorCode, WorkerFailure, WorkerPackageIdentity,
+    WorkerRequest, WorkerResponse,
 };
 use super::runtime::WorkerRuntime;
 use slinker_core::package::BindingName;
@@ -139,7 +139,8 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
         }
         let response = match serde_json::from_str::<WorkerRequest>(&line) {
             Ok(WorkerRequest::Shutdown) => {
-                return write_response(&mut output, &WorkerResponse::Shutdown);
+                write_response(&mut output, &WorkerResponse::Shutdown)?;
+                return signal_response_ready();
             }
             Ok(request) => respond(&mut runtime, request),
             Err(error) => RequestContext::default().failure(
@@ -148,15 +149,28 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
             ),
         };
         write_response(&mut output, &response)?;
+        signal_response_ready()?;
     }
     Ok(())
 }
 
+fn signal_response_ready() -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(&[RESPONSE_READY])
+        .and_then(|()| stdout.flush())
+        .map_err(|source| Error::Io {
+            path: "<r-worker-stdout>".into(),
+            source,
+        })
+}
+
 pub(super) fn write_response(writer: &mut impl Write, response: &WorkerResponse) -> Result<()> {
-    serde_json::to_writer(&mut *writer, response).map_err(|error| {
+    let mut encoded = serde_json::to_vec(response).map_err(|error| {
         Error::Analysis(format!("failed to serialize R worker response: {error}"))
     })?;
-    writer.write_all(b"\n").map_err(|source| Error::Io {
+    encoded.push(b'\n');
+    writer.write_all(&encoded).map_err(|source| Error::Io {
         path: "<r-worker-stdout>".into(),
         source,
     })?;
