@@ -4,7 +4,7 @@ use super::scan::{contains_call_named, static_symbol};
 use super::text_offset;
 use crate::syntax::StaticArg;
 use crate::syntax::source::TextRange;
-use air_r_syntax::{AnyRExpression, AnyRValue, RRoot, RSyntaxKind};
+use air_r_syntax::{AnyRExpression, AnyRValue, RRoot};
 use biome_rowan::{AstNode, AstSeparatedList};
 use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex};
 use std::collections::BTreeSet;
@@ -33,14 +33,11 @@ pub(super) enum SimplePredicate {
         value: PredicateValue,
     },
     IsNull {
-        value: ExpressionKey,
+        symbol: String,
         is_null: bool,
     },
     Static(bool),
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ExpressionKey(Vec<(RSyntaxKind, String)>);
 
 pub(super) fn branch_assumptions_at(
     index: &SemanticIndex,
@@ -154,8 +151,8 @@ pub(super) fn negate_predicate(predicate: SimplePredicate) -> SimplePredicate {
     match predicate {
         SimplePredicate::Eq { symbol, value } => SimplePredicate::Ne { symbol, value },
         SimplePredicate::Ne { symbol, value } => SimplePredicate::Eq { symbol, value },
-        SimplePredicate::IsNull { value, is_null } => SimplePredicate::IsNull {
-            value,
+        SimplePredicate::IsNull { symbol, is_null } => SimplePredicate::IsNull {
+            symbol,
             is_null: !is_null,
         },
         SimplePredicate::Static(value) => SimplePredicate::Static(!value),
@@ -200,15 +197,8 @@ pub(super) fn parse_simple_predicate(condition: &AnyRExpression) -> Option<Simpl
             if items.next().is_some() {
                 return None;
             }
-            let key = ExpressionKey(
-                value
-                    .syntax()
-                    .descendants_tokens(biome_rowan::Direction::Next)
-                    .map(|token| (token.kind(), token.text_trimmed().to_owned()))
-                    .collect(),
-            );
             Some(SimplePredicate::IsNull {
-                value: key,
+                symbol: symbol_of(&value)?,
                 is_null: true,
             })
         }

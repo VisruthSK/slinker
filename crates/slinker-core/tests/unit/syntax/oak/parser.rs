@@ -832,11 +832,11 @@ fn repeated_boolean_guard_preserves_exhaustive_inner_assignment() {
 }
 
 #[test]
-fn boolean_alias_correlates_equivalent_null_guard() {
+fn boolean_alias_does_not_correlate_compound_null_guard() {
     let parsed = parse_source(
         "f <- function(obj) { present <- !is.null(obj$field); if (!is.null(obj$field)) value <- 1; if (present) print(value) }",
     );
-    assert!(!reference_names(&parsed).contains(&"value"));
+    assert!(reference_names(&parsed).contains(&"value"));
 }
 
 #[test]
@@ -1096,6 +1096,17 @@ fn explicit_return_prevents_never_returns_summary() {
         "function(flag) { if (flag) return(1); stop('otherwise') }",
         &context,
     ));
+}
+
+#[test]
+fn repeated_null_queries_on_calls_do_not_prove_a_local_binding() {
+    let parsed = parse_source(
+        "f <- function() { if (!is.null(next_value())) fallback <- 1; if (!is.null(next_value())) fallback }",
+    );
+    assert!(
+        reference_names(&parsed).contains(&"fallback"),
+        "repeating a call can produce a different value and reach the namespace fallback"
+    );
 }
 
 #[test]
