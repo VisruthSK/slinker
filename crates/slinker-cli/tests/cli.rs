@@ -1,3 +1,5 @@
+mod common;
+
 use std::process::Command;
 
 fn slinker(args: &[&str]) -> std::process::Output {
@@ -106,7 +108,12 @@ fn cache_commands_report_and_clear_the_persistent_cache() {
 #[test]
 fn package_roles_form_a_retention_tree_without_escapes_when_piped() {
     let cache = tempfile::tempdir().expect("cache directory");
-    let output = slinker_with_cache(&["analyze", "rlang"], cache.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["analyze", "rlang"])
+        .args(common::user_library_arguments())
+        .env("SLINKER_CACHE_DIR", cache.path())
+        .output()
+        .expect("run slinker binary");
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).expect("utf-8 output");
     assert!(!text.contains('\u{1b}'));
