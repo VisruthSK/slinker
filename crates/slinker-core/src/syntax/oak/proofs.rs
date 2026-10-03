@@ -853,20 +853,16 @@ pub(super) fn if_chain_all_paths_exit(
 }
 
 pub(super) fn bare_call_is_external(index: &SemanticIndex, callee: &str, start: usize) -> bool {
-    for scope in index.scope_ids() {
-        for (use_id, use_site) in index.uses(scope).iter() {
-            if text_offset(use_site.range().start()) != start {
-                continue;
-            }
-            let symbol = index.symbols(scope).symbol(use_site.symbol());
-            if symbol.name() != callee {
-                continue;
-            }
-            return !index.use_is_bound(scope, use_id)
-                && index.reaching_definitions(scope, use_id).next().is_none();
-        }
-    }
-    false
+    let Ok(offset) = u32::try_from(start) else {
+        return false;
+    };
+    let Some((scope, use_id, use_site)) = index.use_at(offset.into()) else {
+        return false;
+    };
+    text_offset(use_site.range().start()) == start
+        && index.symbols(scope).symbol(use_site.symbol()).name() == callee
+        && !index.use_is_bound(scope, use_id)
+        && index.reaching_definitions(scope, use_id).next().is_none()
 }
 
 pub(super) fn call_is_non_returning(

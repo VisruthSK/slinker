@@ -1,6 +1,6 @@
 use crate::package::Atom;
 use crate::syntax::facts::StaticArg;
-use crate::syntax::source::{SourceId, Span, TextRange};
+use crate::syntax::source::TextRange;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
@@ -138,23 +138,6 @@ pub(super) fn function_body_range(text: &str) -> Option<(usize, usize)> {
         return Some((body_start, expression_end(text, body_start)));
     }
     None
-}
-
-pub(super) fn static_args(raw: &RawCall) -> Vec<Option<StaticArg>> {
-    raw.args
-        .iter()
-        .map(|argument| argument.static_arg.clone())
-        .collect()
-}
-
-pub(super) fn argument_spans(source: &SourceId, arguments: &[RawArgument]) -> Vec<Option<Span>> {
-    arguments
-        .iter()
-        .map(|argument| {
-            (argument.value.start < argument.value.end)
-                .then(|| Span::new(*source, argument.value.start, argument.value.end))
-        })
-        .collect()
 }
 
 pub(super) fn static_arg(value: &str) -> Option<StaticArg> {
