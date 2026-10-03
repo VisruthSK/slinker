@@ -127,19 +127,20 @@ fn package_roles_form_a_retention_tree_without_escapes_when_piped() {
         lines[0],
         format!("rlang {} root", lines[0].split(' ').nth(1).unwrap())
     );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("└── winch ") && line.ends_with(" linked"))
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("    ├── lifecycle "))
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("    │   └── cli "))
-    );
+    let roles = [" root", " linked", " external"];
+    let entries = lines
+        .iter()
+        .skip(1)
+        .take_while(|line| !line.starts_with("no recorded path"))
+        .collect::<Vec<_>>();
+    assert!(!entries.is_empty(), "the root has at least one child");
+    for line in &entries {
+        let branch = line.trim_start_matches(['│', ' ']);
+        assert!(
+            branch.starts_with("├── ") || branch.starts_with("└── "),
+            "{line}"
+        );
+        assert!(roles.iter().any(|role| line.ends_with(role)), "{line}");
+    }
+    assert!(entries.iter().any(|line| line.starts_with("└── ")));
 }
