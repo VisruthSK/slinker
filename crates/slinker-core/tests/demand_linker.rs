@@ -5455,7 +5455,7 @@ fn independent_primary_blockers_stay_independent() {
 
 #[test]
 fn derivative_grouping_leaves_the_graph_observational_and_the_report_deterministic() {
-    let analyze = |jobs| {
+    let analyze = |threads| {
         let root = package(
             "root",
             &[
@@ -5466,7 +5466,7 @@ fn derivative_grouping_leaves_the_graph_observational_and_the_report_determinist
         );
         Linker::new(
             FakeProvider::new(vec![root, dependency_importing_from_missing_package()]),
-            jobs,
+            threads,
         )
         .analyze("root")
         .unwrap()
@@ -6135,9 +6135,9 @@ mod schedule_equivalence {
         blockers: Vec<String>,
     }
 
-    fn observe(scenario: &Scenario, schedule: Schedule, jobs: usize) -> Observation {
+    fn observe(scenario: &Scenario, schedule: Schedule, threads: usize) -> Observation {
         let provider = FakeProvider::new(scenario.images.clone());
-        let plan: LinkIr = Linker::new(provider, jobs)
+        let plan: LinkIr = Linker::new(provider, threads)
             .with_external_packages(scenario.external.iter().copied())
             .with_schedule(schedule)
             .analyze("root")
@@ -6186,23 +6186,23 @@ mod schedule_equivalence {
         for scenario in scenarios() {
             let reference = observe(&scenario, Schedule::Fifo, 1);
             for schedule in &schedules {
-                for jobs in [1, 2, 8] {
-                    let observed = observe(&scenario, *schedule, jobs);
+                for threads in [1, 2, 8] {
+                    let observed = observe(&scenario, *schedule, threads);
                     assert!(
                         reference.program == observed.program,
-                        "{} program under {schedule:?} jobs={jobs}: {}",
+                        "{} program under {schedule:?} threads={threads}: {}",
                         scenario.name,
                         first_difference(&reference.program, &observed.program)
                     );
                     assert!(
                         reference.explanation == observed.explanation,
-                        "{} provenance under {schedule:?} jobs={jobs}: {}",
+                        "{} provenance under {schedule:?} threads={threads}: {}",
                         scenario.name,
                         first_difference(&reference.explanation, &observed.explanation)
                     );
                     assert!(
                         reference.blockers == observed.blockers,
-                        "{} blockers under {schedule:?} jobs={jobs}: {:?} vs {:?}",
+                        "{} blockers under {schedule:?} threads={threads}: {:?} vs {:?}",
                         scenario.name,
                         reference.blockers,
                         observed.blockers

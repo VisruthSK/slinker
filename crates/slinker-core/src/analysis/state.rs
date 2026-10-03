@@ -72,7 +72,7 @@ pub(super) struct NativeCallbackContext<'a> {
 }
 
 pub(super) struct AnalysisOptions {
-    pub(super) jobs: usize,
+    pub(super) threads: usize,
     pub(super) schedule: Schedule,
     pub(super) provenance: bool,
     pub(super) linked_packages: HashSet<PackageName>,
@@ -86,7 +86,7 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) packages: TargetUniverse<P>,
     pub(super) linked_packages: HashSet<PackageName>,
     pub(super) explicit_external_packages: HashSet<PackageName>,
-    pub(super) jobs: usize,
+    pub(super) threads: usize,
     pub(super) schedule: Schedule,
     pub(super) graph: Guarded<Graph>,
     pub(super) roots: Guarded<Vec<NodeId>>,
@@ -150,7 +150,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             packages,
             linked_packages: options.linked_packages,
             explicit_external_packages: options.explicit_external_packages,
-            jobs: options.jobs.max(1),
+            threads: options.threads.max(1),
             schedule: options.schedule,
             graph: Guarded::default(),
             roots: Guarded::default(),
@@ -233,7 +233,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
 
     fn settle(&self) -> Result<()> {
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(self.jobs)
+            .num_threads(self.threads)
             .thread_name(|index| format!("slinker-analysis-{index}"))
             .stack_size(super::ANALYSIS_STACK_BYTES)
             .build()

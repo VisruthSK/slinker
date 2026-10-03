@@ -7,7 +7,7 @@ use slinker_core::package::PackageStore;
 use std::path::Path;
 
 const PACKAGES: [&str; 2] = ["compiler", "grid"];
-const JOB_COUNTS: [usize; 3] = [1, 3, 16];
+const THREAD_COUNTS: [usize; 3] = [1, 3, 16];
 const SCHEDULES: [Schedule; 6] = [
     Schedule::Fifo,
     Schedule::Lifo,
@@ -17,7 +17,7 @@ const SCHEDULES: [Schedule; 6] = [
     Schedule::Seeded(0xdead_beef),
 ];
 
-fn rendered(r_home: &Path, package: &str, jobs: usize, schedule: Schedule) -> String {
+fn rendered(r_home: &Path, package: &str, threads: usize, schedule: Schedule) -> String {
     let mut request = TargetEnvironmentRequest::new(r_home.to_path_buf());
     if let Some(libraries) = std::env::var_os("R_LIBS_USER") {
         request.libraries = std::env::split_paths(&libraries).collect();
@@ -29,7 +29,7 @@ fn rendered(r_home: &Path, package: &str, jobs: usize, schedule: Schedule) -> St
         CacheLocation::Disabled,
     )
     .expect("package store");
-    let plan = Linker::new(store, jobs)
+    let plan = Linker::new(store, threads)
         .with_schedule(schedule)
         .analyze(package)
         .unwrap_or_else(|error| panic!("analyze {package}: {error}"));
@@ -40,18 +40,18 @@ fn rendered(r_home: &Path, package: &str, jobs: usize, schedule: Schedule) -> St
 fn run() {
     let r_home = common::discover_r_home();
     for package in PACKAGES {
-        let reference = rendered(&r_home, package, JOB_COUNTS[0], SCHEDULES[0]);
-        for jobs in JOB_COUNTS {
+        let reference = rendered(&r_home, package, THREAD_COUNTS[0], SCHEDULES[0]);
+        for threads in THREAD_COUNTS {
             for schedule in SCHEDULES {
                 assert!(
-                    reference == rendered(&r_home, package, jobs, schedule),
-                    "{package} analysis at quiescence differs with --jobs {jobs} under {schedule:?}"
+                    reference == rendered(&r_home, package, threads, schedule),
+                    "{package} analysis at quiescence differs with --threads {threads} under {schedule:?}"
                 );
             }
         }
         println!(
-            "{package}: identical for {} job counts x {} schedules",
-            JOB_COUNTS.len(),
+            "{package}: identical for {} thread counts x {} schedules",
+            THREAD_COUNTS.len(),
             SCHEDULES.len()
         );
     }

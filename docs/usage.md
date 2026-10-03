@@ -20,7 +20,7 @@ The report groups blockers by rejection code. Each blocker names its package and
 
 Snapshotting the source tree skips `.git`, `target`, and `renv` at the package root and every entry matched by a `.Rbuildignore` regular expression (case-insensitive, matched against the path relative to the root, as `R CMD build` does). A pattern the regex engine cannot parse, such as lookaround, fails the build. Symlinks and other non-regular entries fail the build.
 
-`--lib`, `--external`, `--link`, and `--jobs` are accepted by every command and mean the same thing in each. `--jobs` defaults to the number of available CPUs.
+`--lib`, `--external`, `--link`, and `--threads` are accepted by every command and mean the same thing in each. `--threads` sets the number of analysis threads and defaults to 4.
 
 ## Check
 

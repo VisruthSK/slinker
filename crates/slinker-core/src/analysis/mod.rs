@@ -57,11 +57,11 @@ pub struct Linker<P: PackageProvider> {
 }
 
 impl<P: PackageProvider> Linker<P> {
-    pub fn new(packages: P, jobs: usize) -> Self {
+    pub fn new(packages: P, threads: usize) -> Self {
         Self {
             packages,
             options: AnalysisOptions {
-                jobs,
+                threads,
                 schedule: Schedule::default(),
                 provenance: true,
                 linked_packages: HashSet::new(),

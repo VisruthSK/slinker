@@ -40,6 +40,8 @@ const STYLES: Styles = Styles::styled()
     .valid(AnsiColor::Green.on_default())
     .invalid(AnsiColor::Yellow.on_default());
 
+const DEFAULT_THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
 #[derive(Debug, Parser)]
 #[command(
     name = "slinker",
@@ -101,8 +103,8 @@ struct UniverseArgs {
         help = "Select declared optional packages and link them in when reachable code uses them"
     )]
     linked: Vec<PackageName>,
-    #[arg(long, value_name = "N", default_value_t = default_jobs(), help = "Analysis workers")]
-    jobs: NonZeroUsize,
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_THREADS, help = "Analysis threads")]
+    threads: NonZeroUsize,
 }
 
 #[derive(Debug, Args)]
@@ -308,10 +310,6 @@ fn package_name(value: &str) -> Result<PackageName, &'static str> {
         return Err("expected an R package name");
     }
     Ok(PackageName::from(value))
-}
-
-fn default_jobs() -> NonZeroUsize {
-    std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
 fn link(args: &AnalysisArgs) -> Result<(Session, LinkIr), Box<dyn Error>> {
@@ -743,7 +741,7 @@ mod tests {
             "--external",
             "cli,glue",
             "--link=foo,bar",
-            "--jobs",
+            "--threads",
             "3",
             "--json",
         ])
@@ -758,7 +756,7 @@ mod tests {
         );
         assert_eq!(args.analysis.universe.external, ["cli", "glue"]);
         assert_eq!(args.analysis.universe.linked, ["foo", "bar"]);
-        assert_eq!(args.analysis.universe.jobs.get(), 3);
+        assert_eq!(args.analysis.universe.threads.get(), 3);
         assert!(args.json.json);
     }
 
@@ -804,7 +802,7 @@ mod tests {
     fn rejects_invalid_arguments() {
         for args in [
             &["slinker", "analyze"][..],
-            &["slinker", "analyze", "voucher", "--jobs=0"],
+            &["slinker", "analyze", "voucher", "--threads=0"],
             &["slinker", "analyze", "voucher", "--external", "cli,,glue"],
             &["slinker", "analyze", "voucher", "--bogus", "json"],
             &["slinker", "why", "voucher"],

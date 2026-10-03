@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -45,7 +45,9 @@ impl Writer {
     }
 }
 
-const PACK_MAGIC: &[u8; 6] = b"SLKP1\n";
+const PACK_MAGIC: &[u8; 6] = b"SLKP2\n";
+const TRAILER_MAGIC: &[u8; 4] = b"SLKE";
+const TRAILER_LENGTH: u64 = 16;
 const PACK_EXTENSION: &str = "pack";
 const COMPACTION_THRESHOLD: usize = 8;
 
@@ -103,51 +105,46 @@ impl Loaded {
     }
 
     fn scan(file: &fs::File) -> Option<Vec<(String, u64, usize)>> {
+        let mut file = file;
         let size = file.metadata().ok()?.len();
-        let mut reader = BufReader::new(file);
-        let mut magic = [0u8; PACK_MAGIC.len()];
-        reader.read_exact(&mut magic).ok()?;
-        if &magic != PACK_MAGIC {
+        if size < PACK_MAGIC.len() as u64 + TRAILER_LENGTH {
             return None;
         }
-        let mut at = PACK_MAGIC.len() as u64;
-        let mut entries = Vec::new();
-        while let Some((name, start, length)) = Self::next_entry(&mut reader, &mut at, size) {
+        let mut magic = [0u8; PACK_MAGIC.len()];
+        file.seek(SeekFrom::Start(0)).ok()?;
+        file.read_exact(&mut magic).ok()?;
+        let mut trailer = [0u8; TRAILER_LENGTH as usize];
+        file.seek(SeekFrom::Start(size - TRAILER_LENGTH)).ok()?;
+        file.read_exact(&mut trailer).ok()?;
+        let footer_start = u64::from_le_bytes(trailer[..8].try_into().ok()?);
+        let count = u32::from_le_bytes(trailer[8..12].try_into().ok()?);
+        let footer_end = size - TRAILER_LENGTH;
+        if &magic != PACK_MAGIC
+            || &trailer[12..] != TRAILER_MAGIC
+            || footer_start < PACK_MAGIC.len() as u64
+            || footer_start > footer_end
+        {
+            return None;
+        }
+        let mut footer = vec![0u8; usize::try_from(footer_end - footer_start).ok()?];
+        file.seek(SeekFrom::Start(footer_start)).ok()?;
+        file.read_exact(&mut footer).ok()?;
+        let mut entries = Vec::with_capacity(usize::try_from(count).ok()?);
+        let mut rest = footer.as_slice();
+        for _ in 0..count {
+            let name_length =
+                usize::try_from(u32::from_le_bytes(take(&mut rest, 4)?.try_into().ok()?)).ok()?;
+            let name = String::from_utf8(take(&mut rest, name_length)?.to_vec()).ok();
+            let start = u64::from_le_bytes(take(&mut rest, 8)?.try_into().ok()?);
+            let length = u32::from_le_bytes(take(&mut rest, 4)?.try_into().ok()?);
+            if start < PACK_MAGIC.len() as u64 || start + u64::from(length) > footer_start {
+                return None;
+            }
             if let Some(name) = name {
-                entries.push((name, start, length));
+                entries.push((name, start, usize::try_from(length).ok()?));
             }
         }
         Some(entries)
-    }
-
-    fn next_entry(
-        reader: &mut BufReader<&fs::File>,
-        at: &mut u64,
-        size: u64,
-    ) -> Option<(Option<String>, u64, usize)> {
-        let mut word = [0u8; 4];
-        reader.read_exact(&mut word).ok()?;
-        let name_length = u64::from(u32::from_le_bytes(word));
-        if *at + 4 + name_length + 4 > size {
-            return None;
-        }
-        let mut name = vec![0u8; usize::try_from(name_length).ok()?];
-        reader.read_exact(&mut name).ok()?;
-        reader.read_exact(&mut word).ok()?;
-        let data_length = u64::from(u32::from_le_bytes(word));
-        let start = *at + 4 + name_length + 4;
-        if start + data_length > size {
-            return None;
-        }
-        reader
-            .seek_relative(i64::try_from(data_length).ok()?)
-            .ok()?;
-        *at = start + data_length;
-        Some((
-            String::from_utf8(name).ok(),
-            start,
-            usize::try_from(data_length).ok()?,
-        ))
     }
 
     fn get(&self, name: &str) -> Option<Vec<u8>> {
@@ -160,19 +157,42 @@ impl Loaded {
     }
 }
 
+fn take<'a>(bytes: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
+    let (head, tail) = bytes.split_at_checked(length)?;
+    *bytes = tail;
+    Some(head)
+}
+
 fn write_pack<N: AsRef<str>, D: AsRef<[u8]>>(
     writer: &mut impl Write,
     entries: impl Iterator<Item = (N, D)>,
 ) -> io::Result<()> {
+    let too_large = |what| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cache {what} too large"),
+        )
+    };
     writer.write_all(PACK_MAGIC)?;
+    let mut at = PACK_MAGIC.len() as u64;
+    let mut footer = Vec::new();
+    let mut count = 0u32;
     for (name, data) in entries {
-        for part in [name.as_ref().as_bytes(), data.as_ref()] {
-            let length = u32::try_from(part.len()).unwrap_or(u32::MAX);
-            writer.write_all(&length.to_le_bytes())?;
-            writer.write_all(part)?;
-        }
+        let (name, data) = (name.as_ref().as_bytes(), data.as_ref());
+        let name_length = u32::try_from(name.len()).map_err(|_| too_large("entry name"))?;
+        let data_length = u32::try_from(data.len()).map_err(|_| too_large("entry"))?;
+        writer.write_all(data)?;
+        footer.extend_from_slice(&name_length.to_le_bytes());
+        footer.extend_from_slice(name);
+        footer.extend_from_slice(&at.to_le_bytes());
+        footer.extend_from_slice(&data_length.to_le_bytes());
+        at += u64::from(data_length);
+        count += 1;
     }
-    Ok(())
+    writer.write_all(&footer)?;
+    writer.write_all(&at.to_le_bytes())?;
+    writer.write_all(&count.to_le_bytes())?;
+    writer.write_all(TRAILER_MAGIC)
 }
 
 #[derive(Debug)]
@@ -574,5 +594,57 @@ mod tests {
         assert!(winner.value < 8);
         cache.publish("entry", &Entry { value: 99 });
         assert_eq!(cache.read::<Entry>("entry"), Some(winner));
+    }
+    #[test]
+    fn truncated_and_old_format_packs_are_ignored_without_hiding_complete_ones() {
+        let root = root();
+        let directory = root.join("analysis/schema");
+        fs::create_dir_all(&directory).expect("create cache directory");
+        let complete = encode_pack([("kept", br#"{"value":1}"#.as_slice())].into_iter());
+        let mut truncated = encode_pack([("lost", br#"{"value":2}"#.as_slice())].into_iter());
+        truncated.truncate(truncated.len() - 3);
+        fs::write(directory.join("a.pack"), complete).expect("write complete pack");
+        fs::write(directory.join("b.pack"), truncated).expect("write truncated pack");
+        fs::write(directory.join("c.pack"), b"SLKP1\nentries without a footer")
+            .expect("write old-format pack");
+
+        let cache = cache(root);
+
+        assert_eq!(cache.read::<Entry>("kept"), Some(Entry { value: 1 }));
+        assert_eq!(cache.read::<Entry>("lost"), None);
+        assert_eq!(cache.entries().len(), 1);
+    }
+
+    #[test]
+    fn a_pack_with_many_entries_is_indexed_from_its_footer() {
+        let root = root();
+        let directory = root.join("analysis/schema");
+        fs::create_dir_all(&directory).expect("create cache directory");
+        let values = (0..2000)
+            .map(|value| {
+                (
+                    format!("entry-{value}"),
+                    serde_json::to_vec(&Entry { value }).expect("serialize"),
+                )
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            directory.join("many.pack"),
+            encode_pack(
+                values
+                    .iter()
+                    .map(|(name, data)| (name.as_str(), data.as_slice())),
+            ),
+        )
+        .expect("write pack");
+
+        let cache = cache(root);
+
+        assert_eq!(cache.entries().len(), 2000);
+        assert_eq!(
+            cache.read::<Entry>("entry-1999"),
+            Some(Entry { value: 1999 })
+        );
+        assert_eq!(cache.read::<Entry>("entry-0"), Some(Entry { value: 0 }));
     }
 }

@@ -18,9 +18,12 @@ static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
 
 const ANALYZED: [&str; 6] = ["R6", "jsonlite", "rlang", "cli", "callr", "testthat"];
 const BUILT: [&str; 2] = ["here", "rebus.numbers"];
+const DEFAULT_THREADS: usize = 4;
 
-fn jobs() -> usize {
-    std::thread::available_parallelism().map_or(1, usize::from)
+fn threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(DEFAULT_THREADS)
 }
 
 fn analyze(
@@ -33,7 +36,7 @@ fn analyze(
     slinker_core::profile::heap::begin_measurement();
     let start = Instant::now();
     let plan = PackageStore::new(r_home.to_path_buf(), target.clone(), cache)
-        .and_then(|store| Linker::new(store, jobs()).analyze(root))
+        .and_then(|store| Linker::new(store, threads()).analyze(root))
         .unwrap_or_else(|error| panic!("analyze {root}: {error}"));
     let elapsed = start.elapsed();
     (elapsed, plan, heap_usage())
