@@ -86,6 +86,8 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
 
 ## Unproven behavior
 
+Linked resource selectors must stay relative to their owning package. Absolute paths, parent-directory components, and NUL bytes fail analysis with `UnsupportedResourcePath`. The checked `ResourcePath` type also validates serialized selectors before the provider or IR can use them.
+
 Anything slinker cannot prove blocks the build; there is no mode that accepts a heuristic instead. In particular these block:
 
 - unanalyzed native code, whose C-to-R callbacks are not checked, unless an audited native summary covers it (the blocker names the exact package, version, and image fingerprint to audit);

@@ -6,6 +6,7 @@ mod scan;
 mod serve;
 mod sexp;
 #[cfg(test)]
+#[path = "../tests/unit/inspection.rs"]
 mod tests;
 
 pub use serve::run;

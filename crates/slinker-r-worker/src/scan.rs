@@ -1,4 +1,4 @@
-use super::sexp::{classes, names, symbol_name};
+use super::sexp::names;
 use super::{InspectionError, InspectionResult};
 use harp::RFunctionExt;
 use harp::environment_iter::BindingValue;
@@ -125,7 +125,9 @@ impl<'a> ObjectScanner<'a> {
         let mut image =
             self.scan_value(object.sexp, &MemberPath::root(), Site::Binding(name), 0)?;
         image.representation = representation;
-        image.classes = classes(object.sexp)
+        image.classes = object
+            .class()?
+            .unwrap_or_default()
             .into_iter()
             .map(ClassName::from)
             .collect();
@@ -190,7 +192,7 @@ impl<'a> ObjectScanner<'a> {
             let mut attributes = Vec::new();
             harp::r::attrib_for_each(value, |tag, attribute| attributes.push((tag, attribute)));
             for (tag, attribute) in attributes {
-                let name = symbol_name(tag).unwrap_or_else(|| "?".into());
+                let name = String::from(harp::symbol::RSymbol::new(tag)?);
                 let member = self.scan_value(
                     attribute,
                     &MemberPath::new(format!("{path}.attr[{name}]")),

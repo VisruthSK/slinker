@@ -6,7 +6,7 @@ use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::PackageRole;
-use crate::package::{PackageId, PackageProvider};
+use crate::package::{PackageId, PackageProvider, ResourcePath};
 use crate::syntax::PackageRef;
 use crate::syntax::ResourceRef;
 use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, ResourcePackage};
@@ -241,7 +241,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             return Ok(());
         };
-        if !self.packages.resource_exists(foreign, path)? {
+        let path = match path.parse::<ResourcePath>() {
+            Ok(path) => path,
+            Err(error) => {
+                self.diagnostic(
+                    from,
+                    current,
+                    None,
+                    RejectCode::UnsupportedResourcePath,
+                    format!("{error}: {package_name}"),
+                    Some(resource.span.clone()),
+                );
+                return Ok(());
+            }
+        };
+        if !self.packages.resource_exists(foreign, &path)? {
             match resource.must_work {
                 Some(false) => return Ok(()),
                 Some(true) => {
@@ -272,7 +286,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             from,
             Need::Resource {
                 package: foreign,
-                resource: path.clone().into(),
+                resource: path.clone(),
             },
             EdgeKind::Resource,
             format!("system.file requires {package_name}/{path}"),
@@ -283,7 +297,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .push(PendingRelocation::ResourceAccess {
                 source: resource.span.clone(),
                 package: foreign,
-                resource: path.into(),
+                resource: path,
             });
         Ok(())
     }

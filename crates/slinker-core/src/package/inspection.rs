@@ -1,5 +1,5 @@
 use crate::worker::client::WorkerClient;
-use crate::{Error, Result, TargetEnvironment};
+use crate::{Error, Result, TargetEnvironment, WorkerExecutable};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::path::PathBuf;
@@ -55,6 +55,7 @@ pub(super) struct Lanes {
     lanes: Vec<Lane>,
     r_home: PathBuf,
     target: TargetEnvironment,
+    pub(super) executable: WorkerExecutable,
 }
 
 pub(super) struct LaneGuard<'a> {
@@ -70,6 +71,7 @@ impl LaneGuard<'_> {
                 self.lanes.r_home.clone(),
                 &self.lanes.target,
                 self.id,
+                &self.lanes.executable,
             )?);
         }
         Ok(self.guard.as_mut().expect("lane client was just spawned"))
@@ -87,6 +89,7 @@ impl Lanes {
                 .collect(),
             r_home,
             target,
+            executable: WorkerExecutable::default(),
         }
     }
 

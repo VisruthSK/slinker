@@ -7,7 +7,7 @@ use crate::worker::protocol::{
     PayloadSite, PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
 };
 use crate::worker::protocol::{RESPONSE_READY, WorkerBinding};
-use crate::{Error, Result, Target, TargetEnvironment};
+use crate::{Error, Result, Target, TargetEnvironment, WorkerExecutable};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -29,8 +29,9 @@ impl WorkerClient {
         r_home: std::path::PathBuf,
         target: &TargetEnvironment,
         lane: u64,
+        executable: &WorkerExecutable,
     ) -> Result<Self> {
-        let (client, actual) = Self::connect(r_home, target.libraries.clone(), lane)?;
+        let (client, actual) = Self::connect(r_home, target.libraries.clone(), lane, executable)?;
         if actual != *target {
             return Err(Error::Analysis(
                 "Harp worker target changed between discovery and analysis".into(),
@@ -42,8 +43,9 @@ impl WorkerClient {
     pub(crate) fn capture_target(
         r_home: std::path::PathBuf,
         libraries: Vec<std::path::PathBuf>,
+        executable: &WorkerExecutable,
     ) -> Result<(TargetEnvironment, Self)> {
-        let (client, target) = Self::connect(r_home, libraries, 0)?;
+        let (client, target) = Self::connect(r_home, libraries, 0, executable)?;
         Ok((target, client))
     }
 
@@ -51,11 +53,9 @@ impl WorkerClient {
         r_home: std::path::PathBuf,
         libraries: Vec<std::path::PathBuf>,
         lane: u64,
+        executable: &WorkerExecutable,
     ) -> Result<(Self, TargetEnvironment)> {
-        let executable = std::env::current_exe().map_err(|source| Error::Io {
-            path: "<current-executable>".into(),
-            source,
-        })?;
+        let executable = executable.path()?;
         let (protocol_file, protocol_path) = protocol_file()?;
         let mut command = Command::new(&executable);
         command
@@ -637,45 +637,5 @@ fn worker_error(operation: &str, response: WorkerResponse) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stale_protocol_files_do_not_block_worker_startup() {
-        let stale = (0..64)
-            .map(|index| {
-                std::env::temp_dir().join(format!(
-                    "slinker-r-worker-{}-{index}.jsonl",
-                    std::process::id()
-                ))
-            })
-            .filter(|path| std::fs::File::create_new(path).is_ok())
-            .collect::<Vec<_>>();
-        let created = (0..3).map(|_| protocol_file()).collect::<Vec<_>>();
-        for path in stale {
-            let _ = std::fs::remove_file(path);
-        }
-        for result in created {
-            result.expect("a fresh protocol file");
-        }
-    }
-
-    #[test]
-    fn worker_crash_context_identifies_exact_binding_request() {
-        let request = WorkerRequest::Binding {
-            request_id: 41,
-            package: PackageSpec {
-                name: "fixture".into(),
-                version: "1.0.0".into(),
-                image_fingerprint: "abc123".into(),
-                root: "fixture".into(),
-            },
-            name: "bad".into(),
-        };
-
-        assert_eq!(
-            request_context(&request),
-            "request 41 binding fixture::bad 1.0.0 abc123"
-        );
-    }
-}
+#[path = "../../tests/unit/worker/client.rs"]
+mod tests;

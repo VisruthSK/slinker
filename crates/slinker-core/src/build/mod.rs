@@ -30,10 +30,11 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 #[derive(Debug)]
-pub struct TargetRuntimeHandle {
+pub(crate) struct TargetRuntimeHandle {
     r_home: PathBuf,
     target: TargetEnvironment,
     spare: Mutex<Option<WorkerClient>>,
+    executable: crate::WorkerExecutable,
 }
 
 pub(crate) struct BorrowedWorker<'a> {
@@ -68,27 +69,20 @@ impl Drop for BorrowedWorker<'_> {
 }
 
 impl TargetRuntimeHandle {
-    pub fn new(r_home: PathBuf, target: TargetEnvironment) -> Self {
+    fn new(r_home: PathBuf, target: TargetEnvironment) -> Self {
         Self {
             r_home,
             target,
             spare: Mutex::new(None),
+            executable: crate::WorkerExecutable::default(),
         }
-    }
-
-    pub fn r_home(&self) -> &Path {
-        &self.r_home
-    }
-
-    pub fn target(&self) -> &TargetEnvironment {
-        &self.target
     }
 
     pub(crate) fn worker(&self) -> crate::Result<BorrowedWorker<'_>> {
         let reused = self.spare.lock().ok().and_then(|mut spare| spare.take());
         let client = match reused {
             Some(client) => client,
-            None => WorkerClient::spawn(self.r_home.clone(), &self.target, 0)?,
+            None => WorkerClient::spawn(self.r_home.clone(), &self.target, 0, &self.executable)?,
         };
         Ok(BorrowedWorker {
             client: Some(client),
@@ -98,7 +92,7 @@ impl TargetRuntimeHandle {
 }
 
 #[derive(Debug)]
-pub struct BuildContext {
+pub(crate) struct BuildContext {
     source: SourcePackageSnapshot,
     _staged_root: StagedRoot,
     target_runtime: TargetRuntimeHandle,
@@ -114,7 +108,13 @@ struct FrozenInputs {
 }
 
 impl BuildContext {
-    pub fn new(
+    #[must_use]
+    pub(crate) fn with_worker_executable(mut self, executable: crate::WorkerExecutable) -> Self {
+        self.target_runtime.executable = executable;
+        self
+    }
+
+    pub(crate) fn new(
         source: SourcePackageSnapshot,
         staged_root: StagedRoot,
         r_home: PathBuf,
@@ -212,10 +212,6 @@ impl BuildContext {
         })
     }
 
-    pub fn source(&self) -> &SourcePackageSnapshot {
-        &self.source
-    }
-
     fn materialization<'a>(&'a self, frozen: &'a FrozenInputs) -> MaterializationContext<'a> {
         MaterializationContext {
             source_files: self.source.files(),
@@ -238,7 +234,7 @@ pub enum BuildContextError {
 }
 
 #[derive(Clone, Copy)]
-pub struct MaterializationContext<'a> {
+pub(crate) struct MaterializationContext<'a> {
     source_files: &'a FrozenSourceFiles,
     target_runtime: &'a TargetRuntimeHandle,
     frozen: &'a FrozenInputs,
@@ -270,9 +266,9 @@ impl MaterializationContext<'_> {
     }
 }
 
-pub enum PureRStatic {}
+pub(crate) enum PureRStatic {}
 
-pub struct BuildableProgram<'a, Profile> {
+pub(crate) struct BuildableProgram<'a, Profile> {
     program: &'a ProgramIr,
     description: &'a str,
     context: &'a BuildContext,
@@ -281,7 +277,7 @@ pub struct BuildableProgram<'a, Profile> {
 }
 
 impl PureRStatic {
-    pub fn check<'a>(
+    pub(crate) fn check<'a>(
         ir: &'a LinkIr,
         context: &'a BuildContext,
     ) -> Result<BuildableProgram<'a, PureRStatic>, PreflightError> {
@@ -337,13 +333,20 @@ impl From<std::io::Error> for PreflightError {
 }
 
 #[derive(Debug)]
-pub struct GeneratedPackage {
-    path: PathBuf,
+pub(crate) struct PendingPackage {
+    root: PathBuf,
+    output: PathBuf,
+    _directory: TempDir,
 }
 
-impl GeneratedPackage {
-    pub fn path(&self) -> &Path {
-        &self.path
+impl PendingPackage {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn publish(self) -> Result<(), MaterializeError> {
+        publish(&self.root, &self.output)?;
+        Ok(())
     }
 }
 
@@ -351,10 +354,10 @@ impl GeneratedPackage {
     clippy::needless_pass_by_value,
     reason = "consuming the preflight capability makes each approved program materialize once"
 )]
-pub fn materialize(
+pub(crate) fn materialize(
     buildable: BuildableProgram<'_, PureRStatic>,
     output: &Path,
-) -> Result<GeneratedPackage, MaterializeError> {
+) -> Result<PendingPackage, MaterializeError> {
     if output.exists() && !is_generated_package(output) {
         return Err(MaterializeError::OutputExists(output.into()));
     }
@@ -402,9 +405,10 @@ pub fn materialize(
     fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
     copy_linked_resources(buildable.program, materialization, &package_root)?;
     copy_dataset_libraries(buildable.program, materialization, &package_root)?;
-    publish(&package_root, output)?;
-    Ok(GeneratedPackage {
-        path: output.to_path_buf(),
+    Ok(PendingPackage {
+        root: package_root,
+        output: output.to_path_buf(),
+        _directory: temporary,
     })
 }
 

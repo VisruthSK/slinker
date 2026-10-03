@@ -6,7 +6,7 @@ use crate::package::{
     BindingName, ComponentName, Digest, EnvironmentKind, EnvironmentLabel, GenericName,
     InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
     ObjectImage, PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocator,
-    PackageName, PrivateEnvironmentImage,
+    PackageName, PrivateEnvironmentImage, ResourcePath,
 };
 use crate::target_env::PrimedWorker;
 use crate::worker::client::WorkerClient;
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const AIR_VERSION: &str = "0.11.0";
@@ -28,7 +28,7 @@ fn identifiers(source: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v12";
+pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v13";
 
 #[must_use]
 pub fn analysis_schema() -> &'static str {
@@ -286,12 +286,12 @@ pub trait PackageResolver: Send + Sync {
 pub trait PackageProvider: PackageResolver {
     fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>>;
     fn binding_image(&self, package: &InstalledPackage, name: &str) -> Result<Arc<PackageImage>>;
-    fn resource_exists(&self, package: &InstalledPackage, path: &str) -> Result<bool> {
+    fn resource_exists(&self, package: &InstalledPackage, path: &ResourcePath) -> Result<bool> {
         Ok(self
             .index(package)?
             .files
             .iter()
-            .any(|candidate| candidate == path))
+            .any(|candidate| candidate == path.as_str()))
     }
     fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>>;
     fn validate_syntax(&self, source: &str) -> Result<SyntaxValidation>;
@@ -396,7 +396,15 @@ impl PackageStore {
     pub fn with_worker_limit(mut self, limit: usize) -> Self {
         let target = self.locator.target().clone();
         let r_home = self.lanes.r_home().to_path_buf();
+        let executable = self.lanes.executable.clone();
         self.lanes = Lanes::new(r_home, target, limit.clamp(1, MAX_R_WORKERS));
+        self.lanes.executable = executable;
+        self
+    }
+
+    #[must_use]
+    pub fn with_worker_executable(mut self, executable: crate::WorkerExecutable) -> Self {
+        self.lanes.executable = executable;
         self
     }
 
@@ -896,20 +904,11 @@ impl PackageProvider for PackageStore {
         Ok(())
     }
 
-    fn resource_exists(&self, package: &InstalledPackage, path: &str) -> Result<bool> {
-        use std::path::Component;
+    fn resource_exists(&self, package: &InstalledPackage, path: &ResourcePath) -> Result<bool> {
         if path.is_empty() {
             return Ok(package.location.root.is_dir());
         }
-        let relative = Path::new(path);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-        {
-            return Ok(false);
-        }
-        Ok(package.location.root.join(relative).exists())
+        Ok(package.location.root.join(path.as_str()).exists())
     }
 
     fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
@@ -1005,88 +1004,5 @@ impl PackageProvider for PackageStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Description;
-    use crate::package::{BindingNames, Digest, LifecycleMetadata, NativeComponent, NativeLibrary};
-
-    fn package_index() -> PackageIndex {
-        PackageIndex {
-            identity: PackageIdentity {
-                name: "fixture".into(),
-                version: "1.0.0".parse().expect("version"),
-                image_fingerprint: Digest::from("exact-image"),
-            },
-            description: Description::parse("Package: fixture\nVersion: 1.0.0\n"),
-            exports: Default::default(),
-            imports: Vec::new(),
-            s3: Vec::new(),
-            dynlibs: vec![NativeComponent {
-                name: "fixture".into(),
-                alias: String::new(),
-                registration: None,
-                symbols: Vec::new(),
-                library: NativeLibrary::Missing,
-                safety: NativeSafety::Unanalyzed,
-            }],
-            lifecycle: LifecycleMetadata::default(),
-            binding_names: BindingNames::default(),
-            data: PackageData::default(),
-            files: Vec::new(),
-            has_sysdata: false,
-        }
-    }
-
-    #[test]
-    fn exact_image_native_manifest_attaches_routine_callbacks() {
-        let manifest: NativeSummaryManifest = serde_json::from_str(
-            r#"{
-                "schema": 1,
-                "packages": [{
-                    "package": "fixture",
-                    "version": "1.0.0",
-                    "image_fingerprint": "exact-image",
-                    "components": [{
-                        "component": "fixture",
-                        "safety": "summarized",
-                        "routines": [{"selector": "fixture_call", "callback_arguments": [2]}]
-                    }]
-                }]
-            }"#,
-        )
-        .expect("manifest");
-        manifest.validate().expect("valid manifest");
-        let mut index = package_index();
-        manifest.apply(&mut index);
-
-        assert!(matches!(
-            &index.dynlibs[0].safety,
-            NativeSafety::Summarized(routines)
-                if routines == &[NativeRoutineSummary {
-                    selector: "fixture_call".into(),
-                    callback_arguments: vec![2],
-                }]
-        ));
-    }
-
-    #[test]
-    fn native_manifest_rejects_zero_callback_position() {
-        let manifest: NativeSummaryManifest = serde_json::from_str(
-            r#"{
-                "schema": 1,
-                "packages": [{
-                    "package": "fixture",
-                    "version": "1.0.0",
-                    "image_fingerprint": "exact-image",
-                    "components": [{
-                        "component": "fixture",
-                        "safety": "summarized",
-                        "routines": [{"selector": "fixture_call", "callback_arguments": [0]}]
-                    }]
-                }]
-            }"#,
-        )
-        .expect("manifest");
-        assert!(manifest.validate().is_err());
-    }
-}
+#[path = "../../tests/unit/package/store.rs"]
+mod tests;

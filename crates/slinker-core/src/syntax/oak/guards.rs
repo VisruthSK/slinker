@@ -1,9 +1,12 @@
+use super::census::{Census, node_range};
 use super::context::OakParseContext;
 use super::proofs::is_base_call;
-use super::scan::{CodeScanner, IfRegion};
 use super::{LiveCall, static_first_string};
 use crate::syntax::facts::{NameRef, PackageGuard, PackageRef, StaticArg, SyntaxEffect};
 use crate::syntax::source::TextRange;
+use air_r_syntax::AnyRExpression;
+use biome_rowan::AstNode;
+use oak_semantic::semantic_index::SemanticIndex;
 
 pub(super) fn apply_guard_regions_to_references(
     regions: &[(TextRange, PackageGuard)],
@@ -58,23 +61,22 @@ pub(super) fn apply_guard_regions_to_effects(
 }
 
 pub(super) fn if_guard_regions(
-    text: &str,
     context: &OakParseContext,
-    regions: &[IfRegion],
+    index: &SemanticIndex,
+    census: &Census,
     calls: &[LiveCall],
 ) -> Vec<(TextRange, PackageGuard)> {
     let mut guards = Vec::new();
-    for region in regions {
-        if condition_contains_or(text, region.condition.start, region.condition.end) {
-            continue;
-        }
-        for call in calls {
-            if !region.condition.contains_range(call.site.span.range())
-                || !is_base_call(context, &call.site)
-                || directly_negated(text, region.condition.start, call.site.span.start)
-            {
+    for region in &census.ifs {
+        let mut required = Vec::new();
+        required_calls(&region.condition, context, index, &mut required);
+        for range in required {
+            let Some(call) = calls
+                .iter()
+                .find(|call| call.site.span.range() == range && is_base_call(context, &call.site))
+            else {
                 continue;
-            }
+            };
             let guard = match call.site.callee.as_str() {
                 "requireNamespace" => static_first_string(&call.site)
                     .map(|package| PackageGuard::Available(package.into())),
@@ -134,20 +136,36 @@ pub(super) fn hook_guard_regions(
     guards
 }
 
-pub(super) fn condition_contains_or(text: &str, start: usize, end: usize) -> bool {
-    CodeScanner::new(text, start, end).any(|(_, byte)| byte == b'|')
-}
-
-pub(super) fn directly_negated(text: &str, condition_start: usize, call_start: usize) -> bool {
-    let bytes = text.as_bytes();
-    let mut cursor = call_start;
-    while cursor > condition_start && bytes[cursor - 1].is_ascii_whitespace() {
-        cursor -= 1;
+fn required_calls(
+    condition: &AnyRExpression,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    required: &mut Vec<TextRange>,
+) {
+    match condition {
+        AnyRExpression::RCall(call) => required.push(node_range(call)),
+        AnyRExpression::RParenthesizedExpression(parentheses) => {
+            if let Ok(body) = parentheses.body() {
+                required_calls(&body, context, index, required);
+            }
+        }
+        AnyRExpression::RBinaryExpression(binary) => {
+            let Ok(operator) = binary.operator() else {
+                return;
+            };
+            let name = operator.text_trimmed();
+            let (scope, _) = index.scope_at(binary.range().start());
+            if matches!(name, "&&" | "&")
+                && context.resolves_to_base(name)
+                && index.resolve(name, scope).is_none()
+                && let (Ok(left), Ok(right)) = (binary.left(), binary.right())
+            {
+                required_calls(&left, context, index, required);
+                required_calls(&right, context, index, required);
+            }
+        }
+        _ => {}
     }
-    if cursor > condition_start && bytes[cursor - 1] == b'!' {
-        return true;
-    }
-    false
 }
 
 pub(super) fn push_guard(guards: &mut Vec<PackageGuard>, guard: PackageGuard) {

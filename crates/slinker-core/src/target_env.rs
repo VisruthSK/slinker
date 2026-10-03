@@ -5,6 +5,28 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+/// Executable implementing slinker's `__r-worker` protocol.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum WorkerExecutable {
+    /// The host dispatches `__r-worker` to `slinker_r_worker::run`.
+    #[default]
+    CurrentProcess,
+    /// A separate slinker executable, for consumers that do not host the worker.
+    Standalone(PathBuf),
+}
+
+impl WorkerExecutable {
+    pub(crate) fn path(&self) -> crate::Result<PathBuf> {
+        match self {
+            Self::CurrentProcess => std::env::current_exe().map_err(|source| Error::Io {
+                path: "<current-executable>".into(),
+                source,
+            }),
+            Self::Standalone(path) => Ok(path.clone()),
+        }
+    }
+}
+
 pub fn r_executable(r_home: &Path) -> Option<PathBuf> {
     [
         r_home.join("bin/x64/R.exe"),
@@ -40,6 +62,7 @@ pub struct PrimedWorker {
 pub struct TargetEnvironmentRequest {
     pub r_home: PathBuf,
     pub libraries: Vec<PathBuf>,
+    pub worker_executable: WorkerExecutable,
 }
 
 impl TargetEnvironmentRequest {
@@ -47,6 +70,7 @@ impl TargetEnvironmentRequest {
         Self {
             r_home: r_home.into(),
             libraries: Vec::new(),
+            worker_executable: WorkerExecutable::default(),
         }
     }
 
@@ -57,8 +81,9 @@ impl TargetEnvironmentRequest {
     pub fn capture_primed(
         self,
     ) -> Result<(TargetEnvironment, PrimedWorker), TargetEnvironmentError> {
-        let (target, client) = WorkerClient::capture_target(self.r_home, self.libraries)
-            .map_err(TargetEnvironmentError)?;
+        let (target, client) =
+            WorkerClient::capture_target(self.r_home, self.libraries, &self.worker_executable)
+                .map_err(TargetEnvironmentError)?;
         let worker = PrimedWorker {
             client,
             target: target.clone(),

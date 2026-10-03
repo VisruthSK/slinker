@@ -19,7 +19,7 @@ use oak_semantic::semantic_index::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 mod census;
-use census::{Census, assignment_of, node_range, static_arg_of};
+use census::{Census, IfRegion, assignment_of, node_range, static_arg_of};
 mod construction;
 mod context;
 mod declarations;
@@ -28,6 +28,7 @@ mod predicates;
 mod proofs;
 mod scan;
 #[cfg(test)]
+#[path = "../../../tests/unit/syntax/oak/parser.rs"]
 mod tests;
 
 pub use context::OakParseContext;
@@ -49,8 +50,8 @@ use proofs::{
     post_for_use_may_fall_through, recursive_closure_binding_is_initialized,
 };
 use scan::{
-    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, argument_spans, namespace_extent,
-    skip_trivia, static_arg, static_args,
+    ForRegion, FunctionRegion, RawArgument, RawCall, argument_spans, namespace_extent, skip_trivia,
+    static_args,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -284,7 +285,7 @@ fn pinned_defaults(
         .filter_map(|parameter| {
             let name = ast_text(text, &parameter.name().ok()?);
             let default = parameter.default()?.value().ok()?;
-            let Some(StaticArg::String(value)) = static_arg(ast_str(text, &default)) else {
+            let Some(StaticArg::String(value)) = static_arg_of(&default) else {
                 return None;
             };
             let rebound = effects.iter().any(|effect| {
@@ -485,7 +486,7 @@ fn translate_index(
     drop(calls_span);
 
     let guards_span = profile::span(Probe::ParseGuards);
-    let mut guard_regions = if_guard_regions(text, context, if_regions, &live_calls);
+    let mut guard_regions = if_guard_regions(context, index, &census, &live_calls);
     apply_guard_regions_to_references(&guard_regions, &mut references);
     apply_guard_regions_to_package_refs(&guard_regions, &mut package_refs);
     apply_guard_regions_to_calls(&guard_regions, &mut live_calls);
@@ -615,7 +616,7 @@ fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpress
             if arguments.next().is_some() {
                 return None;
             }
-            match static_arg(ast_str(text, &index).trim())? {
+            match static_arg_of(&index)? {
                 StaticArg::String(member) => {
                     Some((subset.function().ok()?, member.as_str().to_owned()))
                 }
@@ -643,9 +644,7 @@ fn namespace_info_receiver(text: &str, receiver: &AnyRExpression) -> NamespaceIn
             "asNamespace" | "getNamespace"
         )
     });
-    match sole_positional_argument(call)
-        .and_then(|argument| static_arg(ast_str(text, &argument).trim()))
-    {
+    match sole_positional_argument(call).and_then(|argument| static_arg_of(&argument)) {
         Some(StaticArg::String(package)) if named => {
             NamespaceInfoReceiver::Namespace(package.into())
         }
@@ -733,15 +732,7 @@ fn refine_callee_kinds(
             continue;
         }
         if live_use.callee_kind == CalleeKind::ConditionalFallthrough
-            && conditional_fallthrough_proven_bound(
-                text,
-                root,
-                context,
-                index,
-                for_regions,
-                if_regions,
-                live_use,
-            )
+            && conditional_fallthrough_proven_bound(text, root, context, index, census, live_use)
         {
             live_use.callee_kind = CalleeKind::DefinitelyLexical;
         }
@@ -914,7 +905,6 @@ fn binary_operator_facts(
 ) {
     let Translation {
         source,
-        text,
         root,
         index,
         scopes,
@@ -957,10 +947,7 @@ fn binary_operator_facts(
         }
         let argument = |expression: &AnyRExpression| {
             let span = ast_span(source, expression);
-            (
-                static_arg(text.get(span.start..span.end).unwrap_or_default().trim()),
-                Some(span),
-            )
+            (static_arg_of(expression), Some(span))
         };
         let (left_arg, left_span) = argument(&left);
         let (right_arg, right_span) = argument(&right);

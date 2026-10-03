@@ -2270,14 +2270,14 @@ fn resource_reference_retains_only_required_path() {
     let plan = analyze_images(vec![root, foo]);
     assert!(plan.program().resources().iter().any(|resource| {
         plan.program().package(resource.package).identity().name == "foo"
-            && resource.path == "data/x.json"
+            && resource.path.as_str() == "data/x.json"
     }));
     assert!(
         !plan
             .program()
             .resources()
             .iter()
-            .any(|resource| resource.path == "data/y.json")
+            .any(|resource| resource.path.as_str() == "data/y.json")
     );
 }
 
@@ -2366,6 +2366,26 @@ fn do_call_with_a_literal_list_is_a_typed_invocation() {
     assert!(!defaults_hold("do.call(helper, list(1, package = 'foo'))"));
     assert!(!defaults_hold("do.call(helper, list(...))"));
     assert!(!defaults_hold("do.call(helper, args)"));
+}
+
+#[test]
+fn linked_resource_paths_cannot_escape_the_package() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some("f <- function() system.file('..', package = 'foo')"),
+        )],
+    );
+    let foo = package("foo", &[]);
+    let plan = analyze_images(vec![root, foo]);
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("resource path")
+                && diagnostic.message.contains("package")),
+        "out-of-package resource path was accepted"
+    );
 }
 
 #[test]
