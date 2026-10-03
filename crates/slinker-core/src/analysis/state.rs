@@ -25,7 +25,7 @@ use crate::profile::{self, Counter, Probe};
 use crate::syntax::{CallSite, NamespaceImports, ParsedRFile, SourceKey, Span};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Copy)]
@@ -125,6 +125,7 @@ pub(super) struct LoadedPackage {
     pub(super) image: RwLock<Arc<PackageImage>>,
     pub(super) namespace: Guarded<NamespaceBuilder>,
     pub(super) native_bindings: NativeBindingIndex,
+    sealed: AtomicBool,
 }
 
 pub(super) struct NativeCallTarget {
@@ -315,6 +316,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             image: RwLock::new(image),
             namespace: Guarded::new(NamespaceBuilder::new(&index)),
             native_bindings: NativeBindingIndex::new(&index),
+            sealed: AtomicBool::new(false),
         });
         Ok(Arc::clone(
             self.loaded
@@ -326,11 +328,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn seal_namespace(&self, package: PackageId) -> Result<()> {
+        let loaded = self.loaded(package)?;
+        if loaded.sealed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let key = WorkKey::Seal(package);
         match self.work.claim(&key) {
             Claim::Mine => {
                 let analyzed = self.ensure_on_load_analyzed(package);
                 self.work.release_claim(&key);
+                loaded.sealed.store(true, Ordering::Release);
                 analyzed
             }
             Claim::AlreadyDone => Ok(()),

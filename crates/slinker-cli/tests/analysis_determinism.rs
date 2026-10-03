@@ -1,14 +1,26 @@
 mod common;
 
 use common::assert_success;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 
 const JOB_COUNTS: [&str; 4] = ["1", "2", "5", "16"];
 
+fn user_library_arguments() -> Vec<OsString> {
+    std::env::var_os("R_LIBS_USER")
+        .map(|libraries| {
+            std::env::split_paths(&libraries)
+                .flat_map(|library| [OsString::from("--lib"), library.into_os_string()])
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn analyze(package: &str, jobs: &str, cache: &Path) -> Vec<u8> {
     let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
         .args(["analyze", package, "--json", "--jobs", jobs])
+        .args(user_library_arguments())
         .env("SLINKER_CACHE_DIR", cache)
         .output()
         .expect("run slinker");

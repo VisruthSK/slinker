@@ -26,7 +26,7 @@ Installed package identities use SHA-256 fingerprints computed from current file
 
 Air parses reachable installed closure units with the exact parser revision used by the pinned Oak semantic crate. Oak is the authority for R lexical scopes, use-def relationships, lexical fallthrough, and evaluation/NSE effects. Slinker translates Oak semantic facts into its existing package/linker graph; it does not maintain a second lexical-flow engine. Atomic/materialized bindings do not invoke Air/Oak. Target R remains the syntax authority when Air rejects a binding.
 
-Analysis runs on one Rayon work-stealing pool (`--jobs` threads). Each reachable need is a task keyed by a `WorkKey`; a `Machine` tracks Queued/Running/Done per key with exact pending-count quiescence, lets a task claim a key inline (`.onLoad` sealing), and breaks wait cycles between claiming threads. Tasks parse and demand-load binding images themselves. Any R worker can inspect any binding: a private environment is named by its lazy-load key (`private:code:N`), which is the same in every worker, and every binding image carries the full closure of private environments it reaches. Requests from concurrent tasks are batched per lane, the worker normalizes each closure source while it inspects the binding, and loading a binding looks ahead at the bindings its sources mention so inspection overlaps analysis. A worker answers on a file and signals completion with one byte on its stdout, so the client blocks instead of polling; the target-capture worker becomes the first inspection lane. Summary frames are thread-local; summaries, the object graph (one lock per package) and the namespace builders are shared. The result is independent of thread count and task order.
+Analysis runs on one Rayon work-stealing pool (`--jobs` threads). Each reachable need is a task keyed by a `WorkKey`; a `Machine` tracks Queued/Running/Done per key with exact pending-count quiescence, lets a task claim a key inline (`.onLoad` sealing), and breaks wait cycles between claiming threads. Tasks parse and demand-load binding images themselves. Any R worker can inspect any binding: a private environment is named by its lazy-load key (`private:code:N`), which is the same in every worker, and every binding image carries the full closure of private environments it reaches. Requests from concurrent tasks are batched per lane, the worker normalizes each closure source while it inspects the binding, and loading a binding looks ahead at the bindings its sources mention so inspection overlaps analysis. A worker answers on a file and signals completion with one byte on its stdout, so the client blocks instead of polling; the target-capture worker becomes the first inspection lane. Summary frames are thread-local; summaries, the object graph (one lock per package) and the namespace builders are shared. The scheduling model is deliberately small. A task is leaf work: it never joins Rayon (a thread that joined would run other tasks inline and clobber its own thread-local frames), so parallelism comes only from spawning more tasks, and parallel I/O such as checking consulted-package fingerprints runs on the calling thread outside the pool. Requests a task makes are staged and published when the task finishes, so work it schedules (an executable closure in a derived environment, say) never starts before the task has finished writing that environment. A memo hit adopts the recorded effects of the evaluation it stands for, held as identity-deduplicated sets, so a summary's effects do not depend on which caller evaluated first. Where several nodes could own the same finding, the owner is chosen canonically (an installed closure before a derived instance, then the semantic node id). The result is independent of thread count and task order, and `analysis_determinism` checks it byte for byte on rlang and testthat across job counts and cache states.
 
 The construction interpreter evaluates an installed closure body once per package, callee, and abstract argument tuple whenever the evaluation is pure: it allocates no environments or closures, writes no environment binding, and reads no environment that evaluation can mutate. That summary is keyed by semantics and never by the requesting node. Each later call site replays the summary's call-site effects (retention requirements and reflective-name retention) from its own node, so provenance edges are recorded for every caller. A summary is dropped when a binding it read is written. Evaluations that allocate or mutate stay memoized per requesting node.
 
@@ -39,6 +39,39 @@ Disposable typed artifacts (package indexes, binding images, private environment
 ## Benchmarks
 
 `cargo bench --bench micro` runs criterion microbenchmarks: Air and Oak on large closures, the construction interpreter on rlang-style closures, installed-image location and fingerprinting, the uncached installed index read, and the index cache hit. `cargo bench --bench end_to_end` analyzes R6, jsonlite, rlang, cli, callr, and testthat with the cache disabled and warm, and builds here and rebus.numbers with a fresh cache, printing wall time next to the retained binding count and construction evaluations so a timing change can be checked against its workload. A name argument selects a section (`cargo bench --bench end_to_end -- analyze`), and `--features profile` adds the analyzer's peak heap and allocation count per run. Both need R and the analyzed packages installed in a library the target R sees by default; the build benchmark provisions its sources and dependencies from CRAN. CI runs them sequentially in their own job without thresholds.
+
+### Measured against the pre-Track-H baseline
+
+`slinker analyze PACKAGE --jobs N`, whole process wall time (process start and target capture included) and the peak sum of the working sets of every `slinker.exe` process alive at once (the analyzer plus its R worker lanes). Cold uses a fresh cache; warm is the next run on the same cache. Baseline is commit `2156825` (the branch before Track H began), head is the Track H branch; both are default-feature release builds. Windows 11, 20 logical CPUs, R 4.6.1, every run under a memory and time guard, one run per cell, runs strictly sequential.
+
+| package | jobs | phase | base time | head time | speedup | base peak MB | head peak MB | memory ratio |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| R6 | 1 | cold | 0.86 s | 0.32 s | 2.7x | 80 | 68 | 0.85 |
+| R6 | 1 | warm | 0.94 s | 0.23 s | 4.1x | 80 | 48 | 0.60 |
+| R6 | 20 | cold | 0.81 s | 0.32 s | 2.5x | 83 | 114 | 1.37 |
+| R6 | 20 | warm | 0.82 s | 0.23 s | 3.5x | 80 | 51 | 0.64 |
+| jsonlite | 1 | cold | 1.45 s | 0.45 s | 3.3x | 87 | 88 | 1.01 |
+| jsonlite | 1 | warm | 2.10 s | 0.27 s | 7.7x | 86 | 65 | 0.76 |
+| jsonlite | 20 | cold | 1.40 s | 0.41 s | 3.4x | 90 | 131 | 1.46 |
+| jsonlite | 20 | warm | 1.18 s | 0.22 s | 5.4x | 88 | 66 | 0.75 |
+| callr | 1 | cold | 2.98 s | 0.94 s | 3.2x | 102 | 87 | 0.85 |
+| callr | 1 | warm | 5.28 s | 0.53 s | 10.0x | 102 | 59 | 0.58 |
+| callr | 20 | cold | 2.88 s | 0.66 s | 4.3x | 107 | 151 | 1.41 |
+| callr | 20 | warm | 2.57 s | 0.26 s | 9.7x | 107 | 64 | 0.60 |
+| cli | 1 | cold | 10.13 s | 1.08 s | 9.4x | 135 | 93 | 0.69 |
+| cli | 1 | warm | 9.34 s | 0.66 s | 14.1x | 131 | 62 | 0.47 |
+| cli | 20 | cold | 4.81 s | 0.68 s | 7.0x | 142 | 157 | 1.11 |
+| cli | 20 | warm | 4.40 s | 0.35 s | 12.4x | 137 | 73 | 0.53 |
+| rlang | 1 | cold | 24.99 s | 2.06 s | 12.1x | 277 | 115 | 0.42 |
+| rlang | 1 | warm | 37.88 s | 1.33 s | 28.6x | 242 | 80 | 0.33 |
+| rlang | 20 | cold | 24.91 s | 1.10 s | 22.7x | 287 | 191 | 0.67 |
+| rlang | 20 | warm | 29.40 s | 0.62 s | 47.5x | 251 | 99 | 0.39 |
+| testthat | 1 | cold | 27.88 s | 4.18 s | 6.7x | 369 | 282 | 0.76 |
+| testthat | 1 | warm | 42.67 s | 1.94 s | 22.0x | 319 | 124 | 0.39 |
+| testthat | 20 | cold | 29.97 s | 1.87 s | 16.0x | 382 | 315 | 0.82 |
+| testthat | 20 | warm | 40.60 s | 0.71 s | 57.3x | 333 | 142 | 0.43 |
+
+Two readings of the table. Parallelism: the baseline barely scales (rlang 25.0 s at 1 job and 24.9 s at 20; testthat warm 42.7 s and 40.6 s), while head's warm analysis scales (testthat 1.94 s at 1 job, 0.84 s at 4, 0.71 s at 20) and its cold analysis is bounded by R inspection overlapped on two worker lanes rather than by analysis. Memory: head uses 0.33 to 0.86 of the baseline's peak on the larger packages and about half on warm runs, but the small packages (R6, jsonlite, callr) peak 30 to 50 percent higher cold at 4 or more jobs because both R worker lanes are alive together; a lane could start only when the first one is saturated.
 
 ## Dependencies
 
