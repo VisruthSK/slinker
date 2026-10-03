@@ -361,6 +361,7 @@ pub enum RelocationTarget {
     Resource {
         target: ResourceId,
     },
+    AbsentResource,
     LoadedQuery,
     NamespaceArgument {
         package: PackageId,
@@ -1257,7 +1258,9 @@ impl ProgramBuilder {
             RelocationTarget::RequireNamespace { .. } => callee.starts_with("requireNamespace("),
             RelocationTarget::Namespace { operation, .. } => callee.starts_with(operation.callee()),
             RelocationTarget::PackageVersion { .. } => callee.starts_with("packageVersion("),
-            RelocationTarget::Resource { .. } => callee.starts_with("system.file("),
+            RelocationTarget::Resource { .. } | RelocationTarget::AbsentResource => {
+                callee.starts_with("system.file(")
+            }
             RelocationTarget::InstalledQuery { check: true } => {
                 callee.starts_with("check_installed(")
             }

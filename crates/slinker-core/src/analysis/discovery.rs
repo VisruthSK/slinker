@@ -9,7 +9,7 @@ use crate::package::PackageRole;
 use crate::package::{PackageId, PackageProvider, ResourcePath};
 use crate::syntax::PackageRef;
 use crate::syntax::ResourceRef;
-use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, ResourcePackage};
+use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, ResourceArguments, ResourcePackage};
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn namespace_access(
@@ -230,13 +230,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(foreign) = self.resource_package(from, current, resource, package_name)? else {
             return Ok(());
         };
-        let Some(path) = &resource.path else {
+        let ResourceArguments::Static { path, must_work } = &resource.arguments else {
             self.diagnostic(
                 from,
                 current,
                 None,
                 RejectCode::DynamicLookup,
-                format!("dynamic system.file() path for package {package_name}"),
+                format!("system.file() arguments for Linked {package_name} cannot be relocated without changing their evaluation or library lookup"),
                 Some(resource.span.clone()),
             );
             return Ok(());
@@ -256,10 +256,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         };
         if !self.packages.resource_exists(foreign, &path)? {
-            match resource.must_work {
-                Some(false) => return Ok(()),
-                Some(true) => {
-                    self.diagnostic(
+            if *must_work {
+                self.diagnostic(
                         from,
                         current,
                         None,
@@ -267,20 +265,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         format!("system.file(..., mustWork = TRUE) requires absent path {package_name}/{path}"),
                         Some(resource.span.clone()),
                     );
-                    return Ok(());
-                }
-                None => {
-                    self.diagnostic(
-                        from,
-                        current,
-                        None,
-                        RejectCode::DynamicLookup,
-                        format!("dynamic mustWork controls absent system.file path {package_name}/{path}"),
-                        Some(resource.span.clone()),
-                    );
-                    return Ok(());
-                }
+            } else {
+                self.relocations
+                    .lock()
+                    .push(PendingRelocation::AbsentResource {
+                        source: resource.span.clone(),
+                    });
             }
+            return Ok(());
         }
         self.require_at(
             from,

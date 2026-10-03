@@ -598,6 +598,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         target: resource_id,
                     }
                 }
+                PendingRelocation::AbsentResource { .. } => RelocationTarget::AbsentResource,
                 PendingRelocation::RequireNamespace { loaded, .. } => {
                     RelocationTarget::RequireNamespace {
                         result: loaded.is_some(),

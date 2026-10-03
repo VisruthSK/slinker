@@ -2400,6 +2400,48 @@ fn base_resource_lookup_is_not_a_package_resource() {
 }
 
 #[test]
+fn linked_resource_relocation_cannot_discard_argument_evaluation() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some(
+                "f <- function() system.file('DESCRIPTION', package = 'foo', mustWork = { cat('evaluated'); FALSE })",
+            ),
+        )],
+    );
+    let foo = PackageFixture::new("foo", &[])
+        .files(vec!["DESCRIPTION".into()])
+        .build();
+    let plan = analyze_images(vec![root, foo]);
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicLookup),
+        "resource replacement discards observable argument evaluation"
+    );
+}
+
+#[test]
+fn proven_absent_linked_resource_does_not_query_the_real_installation() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some("f <- function() system.file('missing', package = 'foo', mustWork = FALSE)"),
+        )],
+    );
+    let foo = package("foo", &[]);
+    let plan = analyze_images(vec![root, foo]);
+    assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
+    assert_eq!(
+        plan.program().relocations().len(),
+        1,
+        "proven absence must replace the original installation query"
+    );
+}
+
+#[test]
 fn synthetic_namespace_metadata_reads_block_for_linked_packages() {
     let analyze = |source: &str| {
         let root = package("root", &[("f", Some(source))]);

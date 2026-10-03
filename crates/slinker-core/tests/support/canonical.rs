@@ -96,6 +96,7 @@ impl<'a> Canonical<'a> {
                 format!("namespace {} {operation:?}", self.package(*package))
             }
             RelocationTarget::Resource { target } => format!("resource {}", self.resource(*target)),
+            RelocationTarget::AbsentResource => "absent-resource".to_owned(),
             RelocationTarget::NamespaceArgument { package } => {
                 format!("namespace-argument {}", self.package(*package))
             }

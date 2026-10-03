@@ -158,6 +158,7 @@ impl Replacement {
                 "base::package_version({})",
                 r_string(version.as_ref())
             ))),
+            RelocationTarget::AbsentResource => Self::expression(r_string("")),
             RelocationTarget::Resource { target } => {
                 let resource = program.resource(*target);
                 let package = program.package(resource.package).identity();

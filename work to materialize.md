@@ -86,7 +86,7 @@ acceptance cases here.
 
 ## Track E: Retire heuristics
 
-- Audit resource-call lowering: preserve argument evaluation and `mustWork`, handle explicit `lib.loc` against the frozen universe, and represent proven absence without leaving a query on the real Linked package name. Compare side effects and absent-resource behavior against the original, then run the same artifact with the Linked package absent, installed with different resources, and loaded.
+- Extend resource-call lowering to explicit `lib.loc` and computed arguments while preserving their evaluation against the frozen universe. These forms currently block analysis.
 
 - Invocation model: `InvocationModel` records direct calls and base
   `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` `FUN` uses with their forwarded `...`; any

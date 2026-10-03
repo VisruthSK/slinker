@@ -4,8 +4,8 @@ use crate::syntax::facts::{
     ActiveBindingDef, CallArgument, CallSite, CalleeKind, EvalPhase, LexicalBindingId,
     LexicalScopeId, NameRef, NameRefKind, NamespaceEnumeration, NamespaceInfoRead,
     NamespaceInfoReceiver, PackageRef, ParsedExpression, ParsedRFile, PinnedDefault,
-    ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment,
-    SyntaxEffect, SyntaxEffectKind,
+    ResourceArguments, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg,
+    StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use air_r_parser::{RParserOptions, parse};
@@ -1098,28 +1098,9 @@ fn collect_resources(
             },
             ResourcePackage::Literal,
         );
-        let must_work = named_static_bool(&call.raw.args, "mustWork");
-        let path_parts = call
-            .raw
-            .args
-            .iter()
-            .filter(|argument| argument.name.is_none())
-            .map(|argument| match &argument.static_arg {
-                Some(StaticArg::String(value)) => Some(value.as_str()),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>();
-        let path = path_parts.map(|parts| {
-            parts
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join("/")
-        });
         resources.push(ResourceRef {
             package,
-            path,
-            must_work,
+            arguments: resource_arguments(&call.raw.args).unwrap_or(ResourceArguments::Unsupported),
             guards: call.site.guards.clone(),
             scope: call.site.scope,
             span: Span::new(source, call.site.span.start, call.site.span.end),
@@ -1562,11 +1543,28 @@ fn named_static_string(arguments: &[RawArgument], name: &str) -> Option<String> 
     })
 }
 
-fn named_static_bool(arguments: &[RawArgument], name: &str) -> Option<bool> {
-    arguments.iter().find_map(|argument| {
-        (argument.name.as_deref() == Some(name))
-            .then_some(argument.logical)
-            .flatten()
+fn resource_arguments(arguments: &[RawArgument]) -> Option<ResourceArguments> {
+    let mut parts = Vec::new();
+    let mut package_seen = false;
+    let mut must_work = None;
+    for argument in arguments {
+        match argument.name.as_deref() {
+            None => match &argument.static_arg {
+                Some(StaticArg::String(value)) => {
+                    if !value.is_empty() {
+                        parts.push(value.as_str());
+                    }
+                }
+                _ => return None,
+            },
+            Some("package") if !package_seen => package_seen = true,
+            Some("mustWork") if must_work.is_none() => must_work = Some(argument.logical?),
+            _ => return None,
+        }
+    }
+    Some(ResourceArguments::Static {
+        path: parts.join("/"),
+        must_work: must_work.unwrap_or(false),
     })
 }
 

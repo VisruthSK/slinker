@@ -1872,6 +1872,62 @@ fn rlang_package_queries_answer_for_the_linked_copy() {
     );
 }
 
+#[test]
+fn absent_linked_resource_stays_absent_when_the_real_installation_changes() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("resource fixture");
+    let dependency = fixture.path().join("resourceleaf");
+    write_package(&dependency, "resourceleaf", "", "", "unused <- 1\n");
+    let root = fixture.path().join("resourceprobe");
+    write_package(
+        &root,
+        "resourceprobe",
+        "Imports: resourceleaf\n",
+        "export(probe)\n",
+        "probe <- function() system.file('appears-later.txt', package = 'resourceleaf', mustWork = FALSE)\n",
+    );
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency, &original);
+    install_package(&r_home, &root, &original);
+    let behavior = "library(resourceprobe); stopifnot(identical(probe(), ''))";
+    run_r(&r_home, &original, behavior);
+
+    let output = fixture.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&original)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root)
+        .output()
+        .expect("build absent-resource package");
+    assert_success(&result, "build absent-resource package");
+
+    let absent = fixture.path().join("absent");
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&absent).expect("absent library");
+    fs::create_dir(&installed).expect("installed library");
+    install_package(&r_home, &output, &absent);
+    fs::create_dir(dependency.join("inst")).expect("installed resource directory");
+    fs::write(
+        dependency.join("inst/appears-later.txt"),
+        "different installation\n",
+    )
+    .expect("resource in a later installation");
+    install_package(&r_home, &dependency, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    let real_resource =
+        "stopifnot(nzchar(system.file('appears-later.txt', package = 'resourceleaf')))";
+    run_r(&r_home, &installed, &format!("{real_resource}; {behavior}"));
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('resourceleaf'); {real_resource}; {behavior}"),
+    );
+}
+
 fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &str) {
     fs::create_dir_all(root.join("R")).expect("R directory");
     fs::write(
