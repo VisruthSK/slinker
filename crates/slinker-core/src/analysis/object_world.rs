@@ -3,8 +3,9 @@ use crate::package::{
     PackageImage,
 };
 use crate::syntax::SourceKey;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObjectId(usize);
@@ -100,11 +101,80 @@ pub struct ObjectGraph {
     environments: Vec<EnvironmentObject>,
     environment_by_label: BTreeMap<EnvironmentLabel, EnvironmentId>,
     environment_objects: HashMap<EnvironmentId, ObjectId>,
+    write_log: Vec<(EnvironmentId, Option<BindingName>)>,
+    namespace_environment: Option<EnvironmentId>,
+    opaque: Option<ObjectId>,
+    merging: bool,
+    derived_objects: HashSet<ObjectId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraphStamps {
+    pub writes: u64,
+    pub derived_reads: u64,
+    pub read_cursor: usize,
+}
+
+thread_local! {
+    static DERIVED_WRITES: Cell<u64> = const { Cell::new(0) };
+    static DERIVED_READS: Cell<u64> = const { Cell::new(0) };
+    static READ_LOG: RefCell<Vec<(EnvironmentId, BindingName)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn note_read(environment: EnvironmentId, name: &str) {
+    READ_LOG.with(|log| log.borrow_mut().push((environment, name.into())));
+}
+
+fn note_derived_write() {
+    DERIVED_WRITES.with(|writes| writes.set(writes.get() + 1));
+}
+
+fn note_derived_read() {
+    DERIVED_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+pub fn current_stamps() -> GraphStamps {
+    GraphStamps {
+        writes: DERIVED_WRITES.with(Cell::get),
+        derived_reads: DERIVED_READS.with(Cell::get),
+        read_cursor: READ_LOG.with(|log| log.borrow().len()),
+    }
+}
+
+pub fn reads_since(cursor: usize) -> Vec<(EnvironmentId, BindingName)> {
+    READ_LOG.with(|log| log.borrow().get(cursor..).unwrap_or_default().to_vec())
+}
+
+pub fn restart_read_log() {
+    READ_LOG.with(|log| log.borrow_mut().clear());
 }
 
 impl ObjectGraph {
+    pub fn is_derived_object(&self, object: ObjectId) -> bool {
+        self.derived_objects.contains(&object)
+            || match self.object(object) {
+                InstalledObject::Environment(environment) => {
+                    self.environment(*environment).is_derived()
+                }
+                InstalledObject::Closure(closure) => self.closure(*closure).derived_from.is_some(),
+                InstalledObject::Structured { .. } | InstalledObject::Atom => false,
+            }
+    }
+
     pub fn namespace_binding(&self, name: &str) -> Option<ObjectId> {
+        if let Some(namespace) = self.namespace_environment {
+            note_read(namespace, name);
+        }
         self.namespace_bindings.get(name).copied()
+    }
+
+    pub fn environment_binding(&self, environment: EnvironmentId, name: &str) -> Option<ObjectId> {
+        note_read(environment, name);
+        self.environment(environment).bindings.get(name).copied()
+    }
+
+    pub fn write_log(&self) -> &[(EnvironmentId, Option<BindingName>)] {
+        &self.write_log
     }
 
     pub fn object(&self, id: ObjectId) -> &InstalledObject {
@@ -145,6 +215,12 @@ impl ObjectGraph {
     }
 
     pub fn merge_image(&mut self, image: &PackageImage) {
+        self.merging = true;
+        self.merge_image_contents(image);
+        self.merging = false;
+    }
+
+    fn merge_image_contents(&mut self, image: &PackageImage) {
         let namespace_label = EnvironmentLabel::namespace(&image.index.identity.name);
         let private_labels = image
             .private_environments
@@ -173,10 +249,15 @@ impl ObjectGraph {
         }
         for private in image.private_environments.values() {
             let id = self.environment_by_label[&private.id];
-            self.environments[id.0].parent = self.environment_id(&private.parent);
+            let parent = self.environment_id(&private.parent);
+            if self.environments[id.0].parent != parent {
+                self.environments[id.0].parent = parent;
+                self.write_log.push((id, None));
+            }
         }
 
         let namespace = self.environment_by_label[&namespace_label];
+        self.namespace_environment = Some(namespace);
         let mut bindings = image.bindings.iter().collect::<Vec<_>>();
         bindings.sort_by_key(|(name, _)| *name);
         for (name, binding) in bindings {
@@ -194,6 +275,7 @@ impl ObjectGraph {
             self.environments[namespace.0]
                 .bindings
                 .insert(name.clone(), object);
+            self.write_log.push((namespace, Some(name.clone())));
         }
 
         let mut privates = image.private_environments.iter().collect::<Vec<_>>();
@@ -225,6 +307,12 @@ impl ObjectGraph {
 
     fn push_object(&mut self, object: InstalledObject) -> ObjectId {
         let id = ObjectId(self.objects.len());
+        if !self.merging {
+            note_derived_write();
+            if !matches!(object, InstalledObject::Environment(_)) {
+                self.derived_objects.insert(id);
+            }
+        }
         if let InstalledObject::Environment(environment) = object {
             self.environment_objects.entry(environment).or_insert(id);
         }
@@ -326,6 +414,7 @@ impl ObjectGraph {
     }
 
     pub fn derive_environment(&mut self, parent: Option<EnvironmentId>) -> EnvironmentId {
+        note_derived_write();
         let mut sequence = self.environments.len();
         let label = loop {
             let label = EnvironmentLabel::derived(sequence);
@@ -344,22 +433,38 @@ impl ObjectGraph {
         }
     }
 
-    pub fn abstract_value(&mut self) -> ObjectId {
-        self.push_object(InstalledObject::Atom)
+    pub fn opaque_value(&mut self) -> ObjectId {
+        if let Some(opaque) = self.opaque {
+            return opaque;
+        }
+        let merging = std::mem::replace(&mut self.merging, true);
+        let opaque = self.push_object(InstalledObject::Atom);
+        self.merging = merging;
+        self.opaque = Some(opaque);
+        opaque
     }
 
+    fn note_environment_write(&mut self, environment: EnvironmentId, name: Option<&str>) {
+        note_derived_write();
+        if !self.environments[environment.0].is_derived() {
+            self.write_log.push((environment, name.map(Into::into)));
+        }
+    }
     pub fn set_environment_binding(
         &mut self,
         environment: EnvironmentId,
         name: impl Into<BindingName>,
         value: ObjectId,
     ) {
+        let name = name.into();
+        self.note_environment_write(environment, Some(&name));
         self.environments[environment.0]
             .bindings
-            .insert(name.into(), value);
+            .insert(name, value);
     }
 
     pub fn mark_environment_unknown_fields(&mut self, environment: EnvironmentId) {
+        self.note_environment_write(environment, None);
         self.environments[environment.0].unknown_fields = true;
     }
 
@@ -449,7 +554,7 @@ impl ObjectGraph {
         for (offset, name) in names.iter().enumerate() {
             let value = match indexed.get(&(offset + 1)) {
                 Some(value) => *value,
-                None => self.abstract_value(),
+                None => self.opaque_value(),
             };
             self.set_environment_binding(environment, name.as_str(), value);
         }
@@ -474,6 +579,11 @@ impl ObjectGraph {
                 return Lookup::Opaque;
             }
             let shape = self.environment(environment);
+            if shape.is_derived() {
+                note_derived_read();
+            } else {
+                note_read(environment, name);
+            }
             if let Some(value) = shape.bindings.get(name) {
                 return Lookup::Found(*value);
             }
@@ -488,27 +598,52 @@ impl ObjectGraph {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ObjectWorld {
-    graphs: HashMap<PackageId, ObjectGraph>,
-    unmerged: ObjectGraph,
+    graphs: RwLock<HashMap<PackageId, Arc<Mutex<ObjectGraph>>>>,
 }
 
 impl ObjectWorld {
-    pub fn merge(&mut self, package: PackageId, image: &PackageImage) {
-        self.graphs.entry(package).or_default().merge_image(image);
+    fn cell(&self, package: PackageId) -> Arc<Mutex<ObjectGraph>> {
+        if let Some(graph) = self.graphs.read().expect("object world").get(&package) {
+            return Arc::clone(graph);
+        }
+        Arc::clone(
+            self.graphs
+                .write()
+                .expect("object world")
+                .entry(package)
+                .or_default(),
+        )
     }
 
-    pub fn get(&self, package: PackageId) -> Option<&ObjectGraph> {
-        self.graphs.get(&package)
+    pub fn merge(&self, package: PackageId, image: &PackageImage) {
+        self.write(package, |graph| graph.merge_image(image));
     }
 
-    pub fn graph(&self, package: PackageId) -> &ObjectGraph {
-        self.get(package).unwrap_or(&self.unmerged)
+    #[track_caller]
+    pub fn read<R>(&self, package: PackageId, read: impl FnOnce(&ObjectGraph) -> R) -> R {
+        let cell = self.cell(package);
+        let graph = super::guarded::contended(&cell);
+        read(&graph)
     }
 
-    pub fn graph_mut(&mut self, package: PackageId) -> &mut ObjectGraph {
-        self.graphs.entry(package).or_default()
+    #[track_caller]
+    pub fn write<R>(&self, package: PackageId, write: impl FnOnce(&mut ObjectGraph) -> R) -> R {
+        let cell = self.cell(package);
+        let mut graph = super::guarded::contended(&cell);
+        write(&mut graph)
+    }
+
+    #[track_caller]
+    pub fn existing<R>(
+        &self,
+        package: PackageId,
+        read: impl FnOnce(&ObjectGraph) -> R,
+    ) -> Option<R> {
+        let cell = Arc::clone(self.graphs.read().expect("object world").get(&package)?);
+        let graph = super::guarded::contended(&cell);
+        Some(read(&graph))
     }
 }
 
@@ -623,11 +758,11 @@ mod tests {
             }),
             bindings: bindings
                 .into_iter()
-                .map(|binding| (binding.name.clone(), binding))
+                .map(|binding| (binding.name.clone(), Arc::new(binding)))
                 .collect(),
             private_environments: privates
                 .into_iter()
-                .map(|environment| (environment.id.clone(), environment))
+                .map(|environment| (environment.id.clone(), Arc::new(environment)))
                 .collect(),
         }
     }

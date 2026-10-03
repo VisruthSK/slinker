@@ -1,5 +1,6 @@
-use crate::package::{BindingName, PackageName};
+use crate::package::{Atom, BindingName, PackageName};
 use crate::syntax::source::Span;
+use std::sync::Arc;
 
 use std::collections::BTreeSet;
 
@@ -58,18 +59,51 @@ pub enum CalleeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
-    pub callee: String,
+    pub callee: Atom,
     pub callee_kind: CalleeKind,
-    pub qualified_package: Option<String>,
-    pub args: Vec<Option<StaticArg>>,
-    pub arg_names: Vec<Option<String>>,
-    pub arg_spans: Vec<Option<Span>>,
-    pub local_closure_args: Vec<bool>,
+    pub qualified_package: Option<Atom>,
+    pub arguments: Box<[CallArgument]>,
     pub scope: LexicalScopeId,
-    pub arg_bindings: Vec<Option<LexicalBindingId>>,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallArgument {
+    pub value: Option<StaticArg>,
+    pub name: Option<Atom>,
+    pub span: Option<Span>,
+    pub is_local_closure: bool,
+    pub binding: Option<LexicalBindingId>,
+}
+
+impl CallSite {
+    pub fn arg_count(&self) -> usize {
+        self.arguments.len()
+    }
+
+    pub fn static_arg(&self, index: usize) -> Option<&StaticArg> {
+        self.arguments.get(index)?.value.as_ref()
+    }
+
+    pub fn arg_name(&self, index: usize) -> Option<&str> {
+        self.arguments.get(index)?.name.as_deref()
+    }
+
+    pub fn arg_span(&self, index: usize) -> Option<&Span> {
+        self.arguments.get(index)?.span.as_ref()
+    }
+
+    pub fn arg_binding(&self, index: usize) -> Option<&LexicalBindingId> {
+        self.arguments.get(index)?.binding.as_ref()
+    }
+
+    pub fn arg_is_local_closure(&self, index: usize) -> bool {
+        self.arguments
+            .get(index)
+            .is_some_and(|argument| argument.is_local_closure)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,8 +124,8 @@ pub enum ResourcePackage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaticArg {
-    String(String),
-    Symbol(String),
+    String(Atom),
+    Symbol(Atom),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,75 +151,75 @@ pub enum ConstructionExprKind {
         value: i64,
     },
     Double {
-        value: String,
+        value: Atom,
     },
     String {
-        value: String,
+        value: Atom,
     },
     Symbol {
-        name: String,
+        name: Atom,
     },
     Sequence {
-        expressions: Vec<ConstructionExpr>,
+        expressions: Arc<[ConstructionExpr]>,
     },
     Call {
-        call: ConstructionCall,
+        call: Arc<ConstructionCall>,
     },
     Member {
-        object: Box<ConstructionExpr>,
-        name: Option<String>,
+        object: Arc<ConstructionExpr>,
+        name: Option<Atom>,
     },
     Index {
-        object: Box<ConstructionExpr>,
-        index: Box<ConstructionExpr>,
+        object: Arc<ConstructionExpr>,
+        index: Arc<ConstructionExpr>,
     },
     Assign {
         target: ConstructionTarget,
-        value: Box<ConstructionExpr>,
+        value: Arc<ConstructionExpr>,
     },
     If {
-        condition: Box<ConstructionExpr>,
-        consequence: Box<ConstructionExpr>,
-        alternative: Option<Box<ConstructionExpr>>,
+        condition: Arc<ConstructionExpr>,
+        consequence: Arc<ConstructionExpr>,
+        alternative: Option<Arc<ConstructionExpr>>,
     },
     Function {
-        parameters: Vec<String>,
-        body: Box<ConstructionExpr>,
+        parameters: Arc<[Atom]>,
+        body: Arc<ConstructionExpr>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstructionCall {
-    pub callee: String,
+    pub callee: Atom,
     pub callee_kind: CalleeKind,
-    pub qualified_package: Option<String>,
-    pub arguments: Vec<ConstructionArgument>,
+    pub qualified_package: Option<Atom>,
+    pub arguments: Arc<[ConstructionArgument]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstructionArgument {
-    pub name: Option<String>,
+    pub name: Option<Atom>,
     pub value: Option<ConstructionExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstructionTarget {
     Local {
-        name: String,
+        name: Atom,
     },
     Member {
-        object: Box<ConstructionExpr>,
-        name: Option<String>,
+        object: Arc<ConstructionExpr>,
+        name: Option<Atom>,
     },
     ClosureEnvironment {
-        closure: Box<ConstructionExpr>,
+        closure: Arc<ConstructionExpr>,
     },
     Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveBindingDef {
-    pub name: String,
+    pub name: Atom,
     pub target: StaticEnvironment,
     pub certain: bool,
     pub guards: Vec<PackageGuard>,
@@ -202,9 +236,9 @@ pub enum SyntaxEffectKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxEffect {
     pub kind: SyntaxEffectKind,
-    pub target: Option<String>,
+    pub target: Option<Atom>,
     pub target_enclosing_local: bool,
-    pub value_symbol: Option<String>,
+    pub value_symbol: Option<Atom>,
     pub phase: EvalPhase,
     pub guards: Vec<PackageGuard>,
     pub span: Span,
@@ -229,8 +263,9 @@ pub struct SemanticIssue {
 #[derive(Debug, Clone)]
 pub struct ParsedExpression {
     pub span: Span,
-    pub parameters: Vec<String>,
-    pub used_parameters: Vec<String>,
+    pub assigned_value_start: Option<usize>,
+    pub parameters: Vec<Atom>,
+    pub used_parameters: Vec<Atom>,
     pub pinned_defaults: Vec<PinnedDefault>,
     pub references: Vec<NameRef>,
     pub package_refs: Vec<PackageRef>,
@@ -245,8 +280,8 @@ pub struct ParsedExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedDefault {
-    pub name: String,
-    pub value: String,
+    pub name: Atom,
+    pub value: Atom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,7 +294,7 @@ pub struct NamespaceInfoRead {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceEnumeration {
     pub package: PackageName,
-    pub callee: String,
+    pub callee: Atom,
     pub span: Span,
 }
 
@@ -284,7 +319,7 @@ pub struct LexicalScopeId(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LexicalBindingId {
     pub defining_scope: LexicalScopeId,
-    pub name: String,
+    pub name: Atom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

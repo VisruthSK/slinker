@@ -12,13 +12,15 @@ slinker build path/to/rootpkg --lib C:/project/renv/library --external dplyr --o
 
 `build` turns an R source package into another source package whose Linked dependencies are absorbed into it. The source tree is frozen, stage-installed into a private library with the selected R, analyzed, checked against the `PureRStatic` profile, and written to `target/slinker/<Package>` (or `--output`) only if every step succeeds. The result installs with `R CMD INSTALL` and needs only its External dependencies at runtime.
 
+Rebuilds are incremental. A successful build records its inputs (the frozen source tree, the target R, the `--link`/`--external` selection, the analyzer version, and the exact identity of every installed package analysis consulted, including packages found absent) together with a digest of the generated tree. The next `build` to the same output stops after capturing the target when all of that still matches and the output is untouched, prints the path, and says `up to date` on stderr (`"status": "up_to_date"` in JSON). Otherwise it rebuilds, and an existing output that slinker generated earlier is replaced atomically with unchanged files keeping their modification times; a directory that is not a generated package is never replaced. `slinker cache` lists the recorded builds and `slinker cache clear` forgets them.
+
 Third-party dependencies are Linked by default; base-priority packages and every `--external` package stay External. The generated `DESCRIPTION` drops Linked packages and declares the intersection of every retained requirement on each External package. A build that the profile cannot realize exactly fails with one report listing every blocker. Diagnostics that exist only because analysis continued past one failed prerequisite are grouped under it: a missing package reached from many sites, or one run-time name creator that could bind many free names, is one primary blocker followed by `reached from` the distinct sites, while independent blockers stay separate lines. Grouping changes only the report; the graph still records every reaching edge. See [semantics](semantics.md) for what a build preserves and what blocks it.
 
 The report groups blockers by rejection code. Each blocker names its package and owning binding, the line and column inside that binding's source when analysis has one, and the sites it was reached from. See [JSON output](#json-output) for the machine-readable form.
 
 Snapshotting the source tree skips `.git`, `target`, and `renv` at the package root and every entry matched by a `.Rbuildignore` regular expression (case-insensitive, matched against the path relative to the root, as `R CMD build` does). A pattern the regex engine cannot parse, such as lookaround, fails the build. Symlinks and other non-regular entries fail the build.
 
-`--lib`, `--external`, `--link`, and `--jobs` are accepted by every command and mean the same thing in each. `--jobs` defaults to the number of available CPUs.
+`--lib`, `--external`, `--link`, and `--threads` are accepted by every command and mean the same thing in each. `--threads` sets the number of analysis threads and defaults to 4.
 
 ## Check
 
@@ -38,6 +40,8 @@ slinker analyze voucher --external cli
 slinker analyze voucher --link posterior,distributional
 slinker analyze voucher --json
 ```
+
+The human report lists package roles as a tree. Each package appears once, under the package whose analyzed code first reached it by the shortest recorded path, so the tree shows why a Linked or External package is in the program rather than what DESCRIPTION declares. Root, Linked, and External are coloured; a package with no recorded path from the root is listed after the tree. Colour follows the terminal: it is off when output is piped, and `NO_COLOR` and `CLICOLOR_FORCE` are honoured, as is the coloured `--help`.
 
 `ROOT` (also the first argument of `why` and `path`) is one of:
 
@@ -80,6 +84,21 @@ slinker path touchstone otelsdk
 `why` prints a shortest typed provenance chain. `path` prints distinct cross-package entry/use sites. Missing dependencies remain graph nodes, so one analysis can collate the first-order missing packages and show which retained binding requested each one.
 
 Provenance explains a result and never decides one: finalization reads typed requirements and External binding uses, not the explanation graph, and `build` does not record provenance edges.
+
+## Cache
+
+Slinker keeps a persistent cache of installed-package inspection results (package indexes, binding images, private environments, syntax normalizations, dispatch queries). Entries are content-addressed by the exact installed image, the target R, and the analyzer schema, so a stale entry is never read. Each run adds one packed file.
+
+```text
+slinker cache                  location and total size per analyzer schema
+slinker cache list             every cached package: version, image fingerprint, cache key, counts, size
+slinker cache list --full      untruncated fingerprints and keys
+slinker cache --json           everything above as one JSON document
+slinker cache path             the cache directory
+slinker cache clear            delete everything
+slinker cache clear PKG...     delete the entries of the named packages
+slinker cache clear --obsolete delete caches written by older analyzer versions
+```
 
 ## Environment
 

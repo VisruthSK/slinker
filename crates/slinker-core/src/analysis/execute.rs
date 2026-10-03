@@ -1,34 +1,44 @@
 use super::arguments::{matched_arg_index, namespace_formal, reflective_name_formals};
 use super::guards::GuardVerdict;
-use super::object_world::{ClosureId, EnvironmentId, InstalledObject, ObjectId};
+use super::lattice::{Bounded, Lattice};
+use super::object_world::{
+    ClosureId, EnvironmentId, InstalledObject, ObjectGraph, ObjectId, current_stamps, reads_since,
+    restart_read_log,
+};
 use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParseRequest};
+use super::summary::{Advance, Effect, RequireReason, SummaryKey};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId};
 use crate::package::{
-    BindingName, ClosureSource, EnvironmentLabel, MemberPath, PackageId, PackageImage,
+    Atom, BindingName, ClosureSource, EnvironmentLabel, MemberPath, PackageId, PackageImage,
     PackageProvider,
 };
+use crate::profile::{self, Counter, Probe};
 use crate::syntax::{
     ConstructionArgument, ConstructionCall, ConstructionExpr, ConstructionExprKind,
     ConstructionTarget, ParsedRFile, SourceKey, Span,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+const MAX_CONSTRUCTION_DEPTH: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum AbstractValue {
+    Bottom,
     Unknown,
     Null,
     Logical(bool),
     Integer(i64),
-    String(String),
+    String(Atom),
     Vector(Vec<AbstractValue>),
     Object(ObjectId),
     Function {
-        parameters: Vec<String>,
-        body: ConstructionExpr,
-        captures: BTreeMap<String, AbstractValue>,
+        parameters: Arc<[Atom]>,
+        body: Arc<ConstructionExpr>,
+        captures: BTreeMap<Atom, AbstractValue>,
     },
 }
 
@@ -36,45 +46,42 @@ pub(super) enum AbstractValue {
 pub(super) struct ConstructionCallKey {
     node: NodeId,
     package: PackageId,
-    owner: SourceKey,
-    arguments: Vec<(Option<String>, AbstractValue)>,
+    owner: Arc<SourceKey>,
+    arguments: Arc<[(Option<Atom>, AbstractValue)]>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ExecutionState {
-    pub(super) locals: BTreeMap<String, AbstractValue>,
+    pub(super) locals: BTreeMap<Atom, AbstractValue>,
 }
 
-impl AbstractValue {
-    fn same_as(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Null, Self::Null) => true,
-            (Self::Logical(left), Self::Logical(right)) => left == right,
-            (Self::Integer(left), Self::Integer(right)) => left == right,
-            (Self::String(left), Self::String(right)) => left == right,
-            (Self::Object(left), Self::Object(right)) => left == right,
-            (Self::Vector(left), Self::Vector(right)) => {
-                left.len() == right.len()
-                    && left
-                        .iter()
-                        .zip(right)
-                        .all(|(left, right)| left.same_as(right))
+impl Lattice for AbstractValue {
+    fn join(&mut self, other: &Self) -> bool {
+        match (&*self, other) {
+            (_, Self::Bottom) | (Self::Unknown, _) => false,
+            (Self::Bottom, value) => {
+                *self = value.clone();
+                true
             }
-            _ => false,
+            (left, right) if left == right => false,
+            _ => {
+                *self = Self::Unknown;
+                true
+            }
         }
+    }
+}
+
+impl Bounded for AbstractValue {
+    fn bottom() -> Self {
+        Self::Bottom
     }
 }
 
 impl ExecutionState {
     fn join(&mut self, other: &Self) {
         for (name, value) in &mut self.locals {
-            if !other
-                .locals
-                .get(name)
-                .is_some_and(|candidate| candidate.same_as(value))
-            {
-                *value = AbstractValue::Unknown;
-            }
+            value.join(other.locals.get(name).unwrap_or(&AbstractValue::Unknown));
         }
         for name in other.locals.keys() {
             self.locals
@@ -110,13 +117,13 @@ impl ExecutionOutcome {
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    pub(super) fn prepare_construction_image(
-        &mut self,
+    pub(super) fn construction_bindings(
+        &self,
         package: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
         parsed: &ParsedRFile,
-    ) -> Result<Arc<PackageImage>> {
+    ) -> Result<BTreeSet<BindingName>> {
         let mut bindings = BTreeSet::new();
         for expression in &parsed.expressions {
             if expression.construction.is_empty() {
@@ -137,19 +144,41 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
         }
+        Ok(bindings)
+    }
+
+    pub(super) fn prepare_construction_image(
+        &self,
+        package: PackageId,
+        image: &PackageImage,
+        lexical_environment: &EnvironmentLabel,
+        parsed: &ParsedRFile,
+    ) -> Result<Arc<PackageImage>> {
+        let bindings = self.construction_bindings(package, image, lexical_environment, parsed)?;
+        let missing = bindings
+            .iter()
+            .filter(|binding| {
+                image.binding(binding).is_none()
+                    && image.index.binding_names.contains(binding.as_str())
+            })
+            .map(BindingName::as_str)
+            .collect::<Vec<_>>();
+        if missing.len() > 1 {
+            self.packages.prefetch_binding_images(package, &missing)?;
+        }
         for binding in bindings {
-            self.binding_image(package, &binding)?;
+            self.binding_image(package, &binding, Counter::BindingLoadPrepare)?;
         }
         self.image(package)
     }
 
     pub(super) fn execute_construction(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         expressions: &[ConstructionExpr],
     ) -> Result<()> {
         let mut state = ExecutionState::default();
-        for expression in expressions {
+        for expression in expressions.iter() {
             if self
                 .evaluate_construction(context, &mut state, expression)?
                 .returned
@@ -161,12 +190,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn evaluate_construction(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         state: &mut ExecutionState,
         expression: &ConstructionExpr,
     ) -> Result<ExecutionOutcome> {
-        if context.depth > 16 {
+        if context.depth > MAX_CONSTRUCTION_DEPTH {
+            self.summaries.note_cut();
             return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
         }
         match &expression.kind {
@@ -188,7 +218,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             )),
             ConstructionExprKind::Sequence { expressions } => {
                 let mut outcome = ExecutionOutcome::value(AbstractValue::Null);
-                for expression in expressions {
+                for expression in expressions.iter() {
                     outcome = self.evaluate_construction(context, state, expression)?;
                     if outcome.returned {
                         break;
@@ -201,17 +231,23 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             ConstructionExprKind::Member { object, name } => {
                 let object = self.evaluate_construction(context, state, object)?.value;
+                if object == AbstractValue::Bottom {
+                    return Ok(ExecutionOutcome::value(AbstractValue::Bottom));
+                }
                 Ok(ExecutionOutcome::value(self.construction_member(
                     context,
                     object,
                     name.as_deref(),
-                )))
+                )?))
             }
             ConstructionExprKind::Index { object, index } => {
                 let object = self.evaluate_construction(context, state, object)?.value;
                 let index = self.evaluate_construction(context, state, index)?.value;
+                if object == AbstractValue::Bottom || index == AbstractValue::Bottom {
+                    return Ok(ExecutionOutcome::value(AbstractValue::Bottom));
+                }
                 Ok(ExecutionOutcome::value(
-                    self.construction_index(context, object, index),
+                    self.construction_index(context, object, index)?,
                 ))
             }
             ConstructionExprKind::Assign { target, value } => {
@@ -226,6 +262,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             } => {
                 let condition = self.evaluate_construction(context, state, condition)?.value;
                 match condition {
+                    AbstractValue::Bottom => Ok(ExecutionOutcome::value(AbstractValue::Bottom)),
                     AbstractValue::Logical(true) => {
                         self.evaluate_construction(context, state, consequence)
                     }
@@ -235,23 +272,29 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     ),
                     _ => {
                         let mut alternative_state = state.clone();
-                        self.evaluate_construction(context, state, consequence)?;
-                        if let Some(alternative) = alternative {
-                            self.evaluate_construction(
+                        let taken = self.evaluate_construction(context, state, consequence)?;
+                        let skipped = match alternative {
+                            Some(alternative) => self.evaluate_construction(
                                 context,
                                 &mut alternative_state,
                                 alternative,
-                            )?;
-                        }
+                            )?,
+                            None => ExecutionOutcome::value(AbstractValue::Null),
+                        };
                         state.join(&alternative_state);
-                        Ok(ExecutionOutcome::value(AbstractValue::Unknown))
+                        if taken.returned || skipped.returned {
+                            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+                        }
+                        let mut value = taken.value;
+                        value.join(&skipped.value);
+                        Ok(ExecutionOutcome::value(value))
                     }
                 }
             }
             ConstructionExprKind::Function { parameters, body } => {
                 Ok(ExecutionOutcome::value(AbstractValue::Function {
                     parameters: parameters.clone(),
-                    body: body.as_ref().clone(),
+                    body: Arc::clone(body),
                     captures: state.locals.clone(),
                 }))
             }
@@ -259,7 +302,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn construction_symbol(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         state: &ExecutionState,
         name: &str,
@@ -273,8 +316,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
             context.lexical_environment,
             name,
         )?;
-        let graph = self.objects.graph(context.package);
-        let object = match resolved {
+        if let Resolution::Static(BindingTarget::Namespace { package, binding }) = &resolved
+            && *package == context.package
+        {
+            self.binding_image(*package, binding, Counter::BindingLoadConstruction)?;
+        }
+        let object = self.objects.read(context.package, |graph| match resolved {
             Resolution::Static(BindingTarget::Namespace { package, binding })
                 if package == context.package =>
             {
@@ -284,96 +331,142 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 package,
                 environment,
                 binding,
-            }) if package == context.package => {
-                graph.environment_id(&environment).and_then(|environment| {
-                    graph
-                        .environment(environment)
-                        .bindings
-                        .get(binding.as_str())
-                        .copied()
-                })
-            }
+            }) if package == context.package => graph
+                .environment_id(&environment)
+                .and_then(|environment| graph.environment_binding(environment, binding.as_str())),
             Resolution::Static(BindingTarget::Closure { package, closure })
                 if package == context.package =>
             {
                 Some(graph.closure(closure).object)
             }
             _ => None,
-        };
+        });
         Ok(object.map_or(AbstractValue::Unknown, AbstractValue::Object))
     }
 
     fn construction_member(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         object: AbstractValue,
         name: Option<&str>,
-    ) -> AbstractValue {
+    ) -> Result<AbstractValue> {
         let (AbstractValue::Object(object), Some(name)) = (object, name) else {
-            return AbstractValue::Unknown;
+            return Ok(AbstractValue::Unknown);
         };
-        self.retain_namespace_member(context, object, name);
-        let graph = self.objects.graph(context.package);
-        let member = match graph.object(object) {
-            InstalledObject::Environment(environment) => {
-                graph.lookup_environment_binding(*environment, name).found()
-            }
-            InstalledObject::Structured { members, .. } => {
-                members.get(&MemberPath::root().field(name)).copied()
-            }
-            InstalledObject::Closure(_) | InstalledObject::Atom => None,
-        };
-        member.map_or(AbstractValue::Unknown, AbstractValue::Object)
+        self.retain_namespace_member(context, object, name)?;
+        self.load_namespace_member(context, object, name)?;
+        let member = self
+            .objects
+            .read(context.package, |graph| match graph.object(object) {
+                InstalledObject::Environment(environment) => {
+                    graph.lookup_environment_binding(*environment, name).found()
+                }
+                InstalledObject::Structured { members, .. } => {
+                    members.get(&MemberPath::root().field(name)).copied()
+                }
+                InstalledObject::Closure(_) | InstalledObject::Atom => None,
+            });
+        Ok(member.map_or(AbstractValue::Unknown, AbstractValue::Object))
     }
 
-    fn retain_namespace_member(
-        &mut self,
+    fn load_namespace_member(
+        &self,
         context: ExecutionContext<'_>,
         object: ObjectId,
         name: &str,
-    ) {
-        let graph = self.objects.graph(context.package);
-        let namespace = graph.environment_id(&EnvironmentLabel::namespace(
-            self.packages.name(context.package),
-        ));
-        if namespace.is_none() || graph.environment_of(object) != namespace {
-            return;
+    ) -> Result<()> {
+        let label = EnvironmentLabel::namespace(&self.packages.name(context.package));
+        let in_namespace = self.objects.read(context.package, |graph| {
+            let namespace = graph.environment_id(&label);
+            namespace.is_some() && graph.environment_of(object) == namespace
+        });
+        if in_namespace {
+            self.binding_image(context.package, name, Counter::BindingLoadConstruction)?;
         }
-        if context
-            .image
-            .index
-            .binding_names
-            .iter()
-            .any(|binding| binding == name)
-        {
-            self.require(
-                context.node,
-                Need::Binding {
-                    package: context.package,
-                    binding: name.to_owned().into(),
-                },
-                EdgeKind::Lexical,
-                format!("namespace member access `${name}`"),
-            );
-        }
+        Ok(())
     }
 
-    fn own_namespace_object(&mut self, context: ExecutionContext<'_>) -> AbstractValue {
-        let label = EnvironmentLabel::namespace(self.packages.name(context.package));
-        let graph = self.objects.graph_mut(context.package);
-        graph
-            .environment_id(&label)
-            .map_or(AbstractValue::Unknown, |environment| {
-                AbstractValue::Object(graph.environment_object(environment))
-            })
+    fn retain_namespace_member(
+        &self,
+        context: ExecutionContext<'_>,
+        object: ObjectId,
+        name: &str,
+    ) -> Result<()> {
+        let label = EnvironmentLabel::namespace(&self.packages.name(context.package));
+        let in_namespace = self.objects.read(context.package, |graph| {
+            let namespace = graph.environment_id(&label);
+            namespace.is_some() && graph.environment_of(object) == namespace
+        });
+        if !in_namespace {
+            return Ok(());
+        }
+        if context.image.index.binding_names.contains(name) {
+            self.emit_effect(
+                context,
+                Arc::new(Effect::Require {
+                    need: Need::Binding {
+                        package: context.package,
+                        binding: name.to_owned().into(),
+                    },
+                    kind: EdgeKind::Lexical,
+                    reason: RequireReason::NamespaceMember(name.to_owned().into()),
+                    span: None,
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_effect(&self, context: ExecutionContext<'_>, effect: Arc<Effect>) -> Result<()> {
+        match &*effect {
+            Effect::Require {
+                need,
+                kind,
+                reason,
+                span,
+            } => {
+                self.require_at(
+                    context.node,
+                    need.clone(),
+                    *kind,
+                    reason.to_string(),
+                    span.clone(),
+                );
+            }
+            Effect::ReflectiveName {
+                name,
+                span,
+                lexical_environment,
+            } => self.retain_reflective_name(
+                context.node,
+                context.package,
+                context.image,
+                lexical_environment,
+                name,
+                span,
+            )?,
+        }
+        self.summaries.record(effect);
+        Ok(())
+    }
+
+    fn own_namespace_object(&self, context: ExecutionContext<'_>) -> AbstractValue {
+        let label = EnvironmentLabel::namespace(&self.packages.name(context.package));
+        self.objects.write(context.package, |graph| {
+            graph
+                .environment_id(&label)
+                .map_or(AbstractValue::Unknown, |environment| {
+                    AbstractValue::Object(graph.environment_object(environment))
+                })
+        })
     }
 
     fn construction_index(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         object: AbstractValue,
         index: AbstractValue,
-    ) -> AbstractValue {
+    ) -> Result<AbstractValue> {
         if let AbstractValue::String(name) = index {
             return self.construction_member(context, object, Some(&name));
         }
@@ -382,31 +475,32 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .checked_sub(1)
                 .and_then(|index| usize::try_from(index).ok())
             else {
-                return AbstractValue::Unknown;
+                return Ok(AbstractValue::Unknown);
             };
-            return values
+            return Ok(values
                 .get(offset)
                 .cloned()
-                .unwrap_or(AbstractValue::Unknown);
+                .unwrap_or(AbstractValue::Unknown));
         }
         let (AbstractValue::Object(object), AbstractValue::Integer(index)) = (object, index) else {
-            return AbstractValue::Unknown;
+            return Ok(AbstractValue::Unknown);
         };
         let Ok(index) = usize::try_from(index) else {
-            return AbstractValue::Unknown;
+            return Ok(AbstractValue::Unknown);
         };
-        let graph = self.objects.graph(context.package);
-        let Some(members) = graph.members_of(object) else {
-            return AbstractValue::Unknown;
-        };
-        members
-            .get(&MemberPath::root().element(index))
-            .copied()
-            .map_or(AbstractValue::Unknown, AbstractValue::Object)
+        Ok(self.objects.read(context.package, |graph| {
+            let Some(members) = graph.members_of(object) else {
+                return AbstractValue::Unknown;
+            };
+            members
+                .get(&MemberPath::root().element(index))
+                .copied()
+                .map_or(AbstractValue::Unknown, AbstractValue::Object)
+        }))
     }
 
     fn assign_construction(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         state: &mut ExecutionState,
         target: &ConstructionTarget,
@@ -422,32 +516,38 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let AbstractValue::Object(target) = target else {
                     return Ok(());
                 };
-                let Some(environment) = self.objects.graph(context.package).environment_of(target)
+                if value == AbstractValue::Bottom {
+                    return Ok(());
+                }
+                let Some(environment) = self
+                    .objects
+                    .read(context.package, |graph| graph.environment_of(target))
                 else {
                     return Ok(());
                 };
                 let Some(name) = name else {
-                    self.objects
-                        .graph_mut(context.package)
-                        .mark_environment_unknown_fields(environment);
+                    self.objects.write(context.package, |graph| {
+                        graph.mark_environment_unknown_fields(environment);
+                    });
                     return Ok(());
                 };
                 let object = match value {
                     AbstractValue::Object(object) => object,
-                    AbstractValue::Unknown
+                    AbstractValue::Bottom
+                    | AbstractValue::Unknown
                     | AbstractValue::Null
                     | AbstractValue::Logical(_)
                     | AbstractValue::Integer(_)
                     | AbstractValue::String(_)
                     | AbstractValue::Vector(_)
-                    | AbstractValue::Function { .. } => {
-                        self.objects.graph_mut(context.package).abstract_value()
-                    }
+                    | AbstractValue::Function { .. } => self
+                        .objects
+                        .write(context.package, ObjectGraph::opaque_value),
                 };
-                self.objects
-                    .graph_mut(context.package)
-                    .set_environment_binding(environment, name, object);
-                self.schedule_executable_object(context, object, span);
+                self.objects.write(context.package, |graph| {
+                    graph.set_environment_binding(environment, name, object);
+                });
+                self.schedule_executable_object(context, object, span)?;
             }
             ConstructionTarget::ClosureEnvironment { closure } => {
                 let closure_value = self.evaluate_construction(context, state, closure)?.value;
@@ -458,17 +558,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 else {
                     return Ok(());
                 };
-                let graph = self.objects.graph(context.package);
-                let (Some(closure_id), Some(environment)) = (
-                    graph.closure_of(closure_object),
-                    graph.environment_of(environment_object),
-                ) else {
+                let Some(derived) = self.objects.write(context.package, |graph| {
+                    let (Some(closure_id), Some(environment)) = (
+                        graph.closure_of(closure_object),
+                        graph.environment_of(environment_object),
+                    ) else {
+                        return None;
+                    };
+                    Some(graph.reenclose_closure(closure_id, environment))
+                }) else {
                     return Ok(());
                 };
-                let derived = self
-                    .objects
-                    .graph_mut(context.package)
-                    .reenclose_closure(closure_id, environment);
                 if let ConstructionExprKind::Symbol { name } = &closure.kind {
                     state
                         .locals
@@ -481,38 +581,48 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn schedule_executable_object(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         object: ObjectId,
         span: &Span,
-    ) {
-        if let Some(closure) = self.objects.graph(context.package).closure_of(object) {
-            self.require_at(
-                context.node,
-                Need::ClosureExecution {
-                    package: context.package,
-                    closure,
-                },
-                EdgeKind::ClosureExecution,
-                "runtime construction installs an executable closure",
-                Some(span.clone()),
-            );
+    ) -> Result<()> {
+        if let Some(closure) = self
+            .objects
+            .read(context.package, |graph| graph.closure_of(object))
+        {
+            self.emit_effect(
+                context,
+                Arc::new(Effect::Require {
+                    need: Need::ClosureExecution {
+                        package: context.package,
+                        closure,
+                    },
+                    kind: EdgeKind::ClosureExecution,
+                    reason: RequireReason::ExecutableClosure,
+                    span: Some(span.clone()),
+                }),
+            )?;
         }
+        Ok(())
     }
 
     fn evaluate_construction_call(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         state: &mut ExecutionState,
         call: &ConstructionCall,
         span: &Span,
     ) -> Result<ExecutionOutcome> {
         let mut arguments = Vec::with_capacity(call.arguments.len());
-        for argument in &call.arguments {
+        for argument in call.arguments.iter() {
             arguments.push(match &argument.value {
                 Some(value) => self.evaluate_construction(context, state, value)?.value,
                 None => AbstractValue::Unknown,
             });
+        }
+
+        if arguments.contains(&AbstractValue::Bottom) {
+            return Ok(ExecutionOutcome::value(AbstractValue::Bottom));
         }
 
         if let Some(AbstractValue::Function {
@@ -566,13 +676,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn evaluate_inline_function(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
-        parameters: &[String],
+        parameters: &[Atom],
         body: &ConstructionExpr,
-        captures: BTreeMap<String, AbstractValue>,
+        captures: BTreeMap<Atom, AbstractValue>,
     ) -> Result<ExecutionOutcome> {
         let mut nested = ExecutionState { locals: captures };
         bind_construction_arguments(&mut nested, parameters, call, arguments);
@@ -587,24 +697,32 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn evaluate_installed_function(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
         private_environment: Option<&EnvironmentLabel>,
         binding: &BindingName,
     ) -> Result<ExecutionOutcome> {
+        let _span = profile::span(Probe::EvaluateInstalledFunction);
         let Some((closure, owner)) = installed_closure(context.image, private_environment, binding)
         else {
             return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
         };
+        let owner = Arc::new(owner);
+        let widened;
+        let arguments = if self.summaries.callee_active(context.package, &owner) {
+            widened = vec![AbstractValue::Unknown; arguments.len()];
+            widened.as_slice()
+        } else {
+            arguments
+        };
         let specialized = arguments
             .iter()
             .any(|value| !matches!(value, AbstractValue::Unknown));
-        let memo = ConstructionCallKey {
-            node: context.node,
+        let key = SummaryKey {
             package: context.package,
-            owner: owner.clone(),
+            owner: Arc::clone(&owner),
             arguments: call
                 .arguments
                 .iter()
@@ -612,32 +730,122 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .zip(arguments.iter().cloned())
                 .collect(),
         };
-        if let Some(value) = self.construction_calls.get(&memo) {
-            return Ok(ExecutionOutcome::value(value.clone()));
+        if profile::enabled() {
+            drop(profile::keyed_span(Probe::SummaryKey, &key));
         }
-        self.construction_calls
-            .insert(memo.clone(), AbstractValue::Unknown);
-        self.construction_evaluations += 1;
+        self.objects.read(context.package, |graph| {
+            self.summaries
+                .absorb_writes(context.package, graph.write_log());
+        });
+        if let Some(summary) = self.summaries.lookup(&key) {
+            let (value, effects, reads) = (
+                summary.value.clone(),
+                Arc::clone(&summary.effects),
+                Arc::clone(&summary.reads),
+            );
+            profile::count(Counter::ConstructionSummaryHits);
+            self.summaries.inherit_reads(&reads);
+            for effect in effects.iter() {
+                self.emit_effect(context, Arc::clone(effect))?;
+            }
+            return Ok(ExecutionOutcome::value(value));
+        }
+        if let Some(frame) = self.summaries.in_progress(&key) {
+            return Ok(ExecutionOutcome::value(self.summaries.recursive_hit(frame)));
+        }
+        let memo = ConstructionCallKey {
+            node: context.node,
+            package: context.package,
+            owner: Arc::clone(&owner),
+            arguments: Arc::clone(&key.arguments),
+        };
+        let remembered = self.construction_calls.lock().get(&memo).cloned();
+        if let Some((value, record)) = remembered
+            && self.summaries.assumptions_hold(record.assumed())
+        {
+            profile::count(Counter::ConstructionMemoHits);
+            self.summaries.adopt(&record);
+            return Ok(ExecutionOutcome::value(value));
+        }
+        self.construction_evaluations
+            .fetch_add(1, Ordering::Relaxed);
+        profile::count(Counter::ConstructionEvaluations);
+        let arguments_are_stable = self.objects.read(context.package, |graph| {
+            arguments.iter().all(|value| value_is_stable(graph, value))
+        });
+        if !self.summaries.is_active() {
+            restart_read_log();
+        }
+        let stamps = current_stamps();
+        self.summaries.begin(key, stamps);
+        let value = loop {
+            let produced = self.evaluate_summary_body(
+                context,
+                call,
+                arguments,
+                &closure,
+                &owner,
+                specialized,
+            )?;
+            match self.summaries.advance(produced) {
+                Advance::Done(value) => break value,
+                Advance::Again => {}
+            }
+        };
+        let value =
+            if value == AbstractValue::Bottom && !self.summaries.depends_on_enclosing_frame() {
+                AbstractValue::Unknown
+            } else {
+                value
+            };
+        let finished =
+            self.summaries
+                .finish(&value, current_stamps(), reads_since, arguments_are_stable);
+        profile::count(if finished.cacheable {
+            Counter::ConstructionPure
+        } else {
+            Counter::ConstructionImpure
+        });
+        if !finished.cacheable {
+            self.construction_calls
+                .lock()
+                .insert(memo, (value.clone(), finished.record));
+        }
+        Ok(ExecutionOutcome::value(value))
+    }
+
+    fn evaluate_summary_body(
+        &self,
+        context: ExecutionContext<'_>,
+        call: &ConstructionCall,
+        arguments: &[AbstractValue],
+        closure: &ClosureSource,
+        owner: &SourceKey,
+        specialized: bool,
+    ) -> Result<AbstractValue> {
         let Some(parsed) = self.parsed_source(
             context.package,
             &closure.source,
             context.image,
             &closure.environment,
-            ParseRequest {
-                owner: &owner,
-                source_key: &owner,
-                owner_node: context.node,
-            },
+            ParseRequest { source_key: owner },
         )?
         else {
-            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+            return Ok(AbstractValue::Unknown);
         };
         let Some(expression) = parsed.expressions.first() else {
-            return Ok(ExecutionOutcome::value(AbstractValue::Unknown));
+            return Ok(AbstractValue::Unknown);
         };
+        let image = self.prepare_construction_image(
+            context.package,
+            context.image,
+            &closure.environment,
+            &parsed,
+        )?;
         let mut nested = ExecutionState::default();
         bind_construction_arguments(&mut nested, &expression.parameters, call, arguments);
         let nested_context = ExecutionContext {
+            image: &image,
             lexical_environment: &closure.environment,
             depth: context.depth + 1,
             specialized,
@@ -651,12 +859,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 break;
             }
         }
-        self.construction_calls.insert(memo, value.clone());
-        Ok(ExecutionOutcome::value(value))
+        Ok(value)
     }
 
     fn evaluate_base_construction_call(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         span: &Span,
@@ -669,15 +876,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .first()
                 .and_then(|value| self.abstract_closure(context, value))
                 .map(|closure| {
-                    let graph = self.objects.graph_mut(context.package);
-                    let enclosure = graph.closure(closure).enclosure;
-                    graph.environment_object(enclosure)
+                    self.objects.write(context.package, |graph| {
+                        let enclosure = graph.closure(closure).enclosure;
+                        graph.environment_object(enclosure)
+                    })
                 })
                 .map_or(AbstractValue::Unknown, AbstractValue::Object),
             "is.null" => arguments
                 .first()
                 .map_or(AbstractValue::Unknown, |value| match value {
-                    AbstractValue::Unknown => AbstractValue::Unknown,
+                    AbstractValue::Bottom | AbstractValue::Unknown => AbstractValue::Unknown,
                     AbstractValue::Null => AbstractValue::Logical(true),
                     AbstractValue::Logical(_)
                     | AbstractValue::Integer(_)
@@ -740,26 +948,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn construct_new_env(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
     ) -> AbstractValue {
         let parent = construction_argument(call, arguments, &["hash", "parent", "size"], "parent")
             .and_then(|value| self.abstract_environment(context, value));
-        let environment = self
-            .objects
-            .graph_mut(context.package)
-            .derive_environment(parent);
-        let object = self
-            .objects
-            .graph_mut(context.package)
-            .environment_object(environment);
+        let object = self.objects.write(context.package, |graph| {
+            let environment = graph.derive_environment(parent);
+            graph.environment_object(environment)
+        });
         AbstractValue::Object(object)
     }
 
     fn construct_list2env(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
@@ -775,20 +979,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let parent =
             construction_argument(call, arguments, &["x", "envir", "parent", "hash"], "parent")
                 .and_then(|value| self.abstract_environment(context, value));
-        let environment =
-            self.objects
-                .graph_mut(context.package)
-                .list2env(*values, None, environment, parent);
+        let environment = self.objects.write(context.package, |graph| {
+            graph.list2env(*values, None, environment, parent)
+        });
         self.schedule_environment_closures(context, environment, &call.arguments);
-        let object = self
-            .objects
-            .graph_mut(context.package)
-            .environment_object(environment);
+        let object = self.objects.write(context.package, |graph| {
+            graph.environment_object(environment)
+        });
         AbstractValue::Object(object)
     }
 
     fn construct_assign(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
@@ -818,19 +1020,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
             Some(environment),
         ) = (field, value, environment)
         {
-            self.objects
-                .graph_mut(context.package)
-                .set_environment_binding(environment, field, *value);
+            self.objects.write(context.package, |graph| {
+                graph.set_environment_binding(environment, field, *value);
+            });
         } else if let Some(environment) = environment {
-            self.objects
-                .graph_mut(context.package)
-                .mark_environment_unknown_fields(environment);
+            self.objects.write(context.package, |graph| {
+                graph.mark_environment_unknown_fields(environment);
+            });
         }
         AbstractValue::Null
     }
 
     fn construct_namespace_call(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         span: &Span,
@@ -842,6 +1044,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .and_then(|formal| construction_argument(call, arguments, &[formal], formal))
         {
             self.reflection
+                .lock()
                 .record_contextual_namespace_call(span, package);
         }
         match namespace_formal(name)
@@ -849,7 +1052,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         {
             Some(AbstractValue::String(package))
                 if matches!(name, "getNamespace" | "asNamespace")
-                    && package == self.packages.name(context.package) =>
+                    && package.as_str() == self.packages.name(context.package).as_str() =>
             {
                 self.own_namespace_object(context)
             }
@@ -858,7 +1061,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn construct_finalizer(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         arguments: &[AbstractValue],
@@ -886,7 +1089,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn construct_reflective_call(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         call: &ConstructionCall,
         span: &Span,
@@ -898,13 +1101,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 construction_argument(call, arguments, formals, target)
         {
             let name = name.clone();
-            self.retain_reflective_name(
-                context.node,
-                context.package,
-                context.image,
-                context.lexical_environment,
-                &name,
-                span,
+            self.emit_effect(
+                context,
+                Arc::new(Effect::ReflectiveName {
+                    name,
+                    span: span.clone(),
+                    lexical_environment: context.lexical_environment.clone(),
+                }),
             )?;
         }
         Ok(AbstractValue::Unknown)
@@ -918,7 +1121,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let AbstractValue::Object(object) = value else {
             return None;
         };
-        self.objects.graph(context.package).environment_of(*object)
+        self.objects
+            .read(context.package, |graph| graph.environment_of(*object))
     }
 
     fn abstract_closure(
@@ -929,7 +1133,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let AbstractValue::Object(object) = value else {
             return None;
         };
-        self.objects.graph(context.package).closure_of(*object)
+        self.objects
+            .read(context.package, |graph| graph.closure_of(*object))
     }
 
     fn abstract_length(&self, context: ExecutionContext<'_>, value: &AbstractValue) -> Option<i64> {
@@ -937,11 +1142,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             AbstractValue::Null => Some(0),
             AbstractValue::String(_) => Some(1),
             AbstractValue::Vector(values) => i64::try_from(values.len()).ok(),
-            AbstractValue::Object(object) => self
-                .objects
-                .graph(context.package)
-                .members_of(*object)
-                .and_then(|members| i64::try_from(members.len()).ok()),
+            AbstractValue::Object(object) => self.objects.read(context.package, |graph| {
+                graph
+                    .members_of(*object)
+                    .and_then(|members| i64::try_from(members.len()).ok())
+            }),
             _ => None,
         }
     }
@@ -954,20 +1159,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let AbstractValue::Object(object) = value else {
             return None;
         };
-        let members = self.objects.graph(context.package).members_of(*object)?;
-        let mut names = Vec::with_capacity(members.len());
-        for path in members.keys() {
-            let name = path.strip_prefix("$$")?;
-            if name.is_empty() || name.chars().any(|character| "$[]".contains(character)) {
-                return None;
+        self.objects.read(context.package, |graph| {
+            let members = graph.members_of(*object)?;
+            let mut names = Vec::with_capacity(members.len());
+            for path in members.keys() {
+                let name = path.strip_prefix("$$")?;
+                if name.is_empty() || name.chars().any(|character| "$[]".contains(character)) {
+                    return None;
+                }
+                names.push(AbstractValue::String(Atom::from(name)));
             }
-            names.push(AbstractValue::String(name.to_owned()));
-        }
-        Some(names)
+            Some(names)
+        })
     }
 
     fn evaluate_reenclosing_lapply(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         arguments: &[AbstractValue],
     ) -> AbstractValue {
@@ -977,11 +1184,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(environment) = self.reenclosure_callback(context, function) else {
             return AbstractValue::Unknown;
         };
-        AbstractValue::Object(
-            self.objects
-                .graph_mut(context.package)
-                .reenclose_structured_closures(*object, environment),
-        )
+        AbstractValue::Object(self.objects.write(context.package, |graph| {
+            graph.reenclose_structured_closures(*object, environment)
+        }))
     }
 
     fn reenclosure_callback(
@@ -1001,7 +1206,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let ConstructionExprKind::Sequence { expressions } = &body.kind else {
             return None;
         };
-        let [condition, result] = expressions.as_slice() else {
+        let [condition, result] = &expressions[..] else {
             return None;
         };
         if !matches!(
@@ -1059,18 +1264,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn schedule_environment_closures(
-        &mut self,
+        &self,
         context: ExecutionContext<'_>,
         environment: EnvironmentId,
         arguments: &[ConstructionArgument],
     ) {
-        let graph = self.objects.graph(context.package);
-        let closures = graph
-            .environment(environment)
-            .bindings
-            .values()
-            .filter_map(|object| graph.closure_of(*object))
-            .collect::<Vec<_>>();
+        let closures = self.objects.read(context.package, |graph| {
+            graph
+                .environment(environment)
+                .bindings
+                .values()
+                .filter_map(|object| graph.closure_of(*object))
+                .collect::<Vec<_>>()
+        });
         let span = arguments
             .first()
             .and_then(|argument| argument.value.as_ref())
@@ -1133,7 +1339,7 @@ fn fold_paste0(arguments: &[AbstractValue]) -> AbstractValue {
                     output
                 })
         })
-        .map(AbstractValue::String)
+        .map(|text| AbstractValue::String(Atom::from(text)))
         .collect::<Vec<_>>();
     match values.as_slice() {
         [value] => value.clone(),
@@ -1175,9 +1381,9 @@ fn fold_strsplit(call: &ConstructionCall, arguments: &[AbstractValue]) -> Abstra
             .into_iter()
             .map(|input| {
                 let parts = input
-                    .split(separator)
+                    .split(separator.as_str())
                     .take(33)
-                    .map(|part| AbstractValue::String(part.to_owned()))
+                    .map(|part| AbstractValue::String(Atom::from(part)))
                     .collect::<Vec<_>>();
                 if parts.len() > 32 {
                     AbstractValue::Unknown
@@ -1216,7 +1422,7 @@ fn construction_argument<'a>(
 
 fn bind_construction_arguments(
     state: &mut ExecutionState,
-    parameters: &[String],
+    parameters: &[Atom],
     call: &ConstructionCall,
     values: &[AbstractValue],
 ) {
@@ -1267,5 +1473,86 @@ fn installed_closure(
             let closure = image.binding(binding)?.object.closure.clone()?;
             Some((closure, SourceKey::Binding(binding.clone())))
         }
+    }
+}
+
+fn value_is_stable(graph: &super::object_world::ObjectGraph, value: &AbstractValue) -> bool {
+    match value {
+        AbstractValue::Object(object) => !graph.is_derived_object(*object),
+        AbstractValue::Vector(values) => values.iter().all(|value| value_is_stable(graph, value)),
+        AbstractValue::Function { captures, .. } => {
+            captures.values().all(|value| value_is_stable(graph, value))
+        }
+        AbstractValue::Bottom
+        | AbstractValue::Unknown
+        | AbstractValue::Null
+        | AbstractValue::Logical(_)
+        | AbstractValue::Integer(_)
+        | AbstractValue::String(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::lattice::laws::assert_lattice_laws;
+    use super::super::lattice::{Bounded, Lattice};
+    use super::AbstractValue;
+    use super::{ConstructionExpr, ConstructionExprKind};
+    use crate::syntax::{SourceId, Span};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn function(parameter: &str) -> AbstractValue {
+        AbstractValue::Function {
+            parameters: vec![crate::package::Atom::from(parameter)].into(),
+            body: Arc::new(ConstructionExpr {
+                kind: ConstructionExprKind::Null,
+                span: Span::new(SourceId(0), 0, 0),
+            }),
+            captures: BTreeMap::new(),
+        }
+    }
+
+    fn samples() -> Vec<AbstractValue> {
+        vec![
+            AbstractValue::Bottom,
+            AbstractValue::Null,
+            AbstractValue::Logical(true),
+            AbstractValue::Logical(false),
+            AbstractValue::Integer(1),
+            AbstractValue::Integer(2),
+            AbstractValue::String("a".into()),
+            AbstractValue::String("b".into()),
+            AbstractValue::Vector(vec![AbstractValue::Integer(1)]),
+            AbstractValue::Vector(vec![AbstractValue::Integer(2)]),
+            function("x"),
+            function("y"),
+            AbstractValue::Unknown,
+        ]
+    }
+
+    #[test]
+    fn abstract_values_obey_the_lattice_laws() {
+        assert_lattice_laws(&samples());
+    }
+
+    #[test]
+    fn distinct_exact_values_widen_to_unknown_and_unknown_is_absorbing() {
+        let mut value = AbstractValue::String("a".into());
+        assert!(value.join(&AbstractValue::String("b".into())));
+        assert_eq!(value, AbstractValue::Unknown);
+        for other in samples() {
+            assert!(!value.join(&other));
+            assert_eq!(value, AbstractValue::Unknown);
+        }
+    }
+
+    #[test]
+    fn no_information_is_distinct_from_unknown() {
+        assert_ne!(AbstractValue::bottom(), AbstractValue::Unknown);
+        let mut value = AbstractValue::bottom();
+        assert!(!value.join(&AbstractValue::Bottom));
+        assert!(value.join(&AbstractValue::Null));
+        assert_eq!(value, AbstractValue::Null);
     }
 }

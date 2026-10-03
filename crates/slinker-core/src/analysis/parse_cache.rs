@@ -24,11 +24,10 @@ impl ParseCache {
         self.states.get(key)
     }
 
-    pub(super) fn contains(&self, key: &ParseKey) -> bool {
-        self.states.contains_key(key)
-    }
-
     pub(super) fn register(&mut self, key: ParseKey, package: &str, text: &Arc<str>) -> SourceId {
+        if let Some(known) = self.source_ids.get(&key) {
+            return *known;
+        }
         let source = self.sources.add(package, key.1.clone(), Arc::clone(text));
         self.source_ids.insert(key, source);
         source
@@ -50,6 +49,16 @@ impl ParseCache {
 
     pub(super) fn record_shape(&mut self, key: ParseKey, shape: Digest) {
         self.normalized_shapes.insert(key, shape);
+    }
+
+    pub(super) fn assigned_value_start(&self, key: &ParseKey) -> Option<usize> {
+        match self.states.get(key)? {
+            ParseState::Parsed(parsed) => parsed
+                .expressions
+                .first()
+                .and_then(|expression| expression.assigned_value_start),
+            ParseState::Blocked => None,
+        }
     }
 
     pub(super) fn shape(&self, key: &ParseKey) -> Option<&Digest> {

@@ -1,14 +1,14 @@
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use slinker_core::analysis::{LinkIr, Linker};
 use slinker_core::build::BuildContext;
 use slinker_core::cache::CacheLocation;
 use slinker_core::package::PackageStore;
 use slinker_core::source::{SourcePackageSnapshot, StagedRoot, stage_root};
-use slinker_core::{Description, TargetEnvironment, TargetEnvironmentRequest};
+use slinker_core::{Description, PrimedWorker, TargetEnvironment, TargetEnvironmentRequest};
 
 use crate::UniverseArgs;
 
@@ -47,6 +47,7 @@ pub struct Session {
     root: String,
     root_description: Option<Arc<str>>,
     retained: Option<SourceInputs>,
+    primed: Mutex<Option<PrimedWorker>>,
 }
 
 pub struct SourceSession {
@@ -62,14 +63,14 @@ impl Session {
     ) -> Result<Self, Box<dyn Error>> {
         match root {
             RootSpec::Installed(name) => {
-                let libraries = resolve_libraries(&r_home, universe)?;
+                let libraries = absolute_libraries(universe)?;
                 Self::capture(r_home, name.clone(), None, libraries)
             }
             RootSpec::InstalledDirectory(directory) => {
                 let (parent, name) = installed_directory(directory)?;
                 let libraries = std::iter::once(parent.clone())
                     .chain(
-                        resolve_libraries(&r_home, universe)?
+                        absolute_libraries(universe)?
                             .into_iter()
                             .filter(|library| *library != parent),
                     )
@@ -95,12 +96,14 @@ impl Session {
     ) -> Result<Self, Box<dyn Error>> {
         let mut request = TargetEnvironmentRequest::new(r_home.clone());
         request.libraries = libraries;
+        let (target, primed) = request.capture_primed()?;
         Ok(Self {
-            target: request.capture()?,
+            target,
             r_home,
             root,
             root_description,
             retained: None,
+            primed: Mutex::new(Some(primed)),
         })
     }
 
@@ -117,8 +120,13 @@ impl Session {
         universe: &UniverseArgs,
         provenance: bool,
     ) -> Result<LinkIr, Box<dyn Error>> {
-        let store = PackageStore::new(self.r_home.clone(), self.target.clone(), cache_location())?;
-        let mut linker = Linker::new(store, universe.jobs.get())
+        let store = PackageStore::new(self.r_home.clone(), self.target.clone(), cache_location())?
+            .with_worker_limit(universe.threads.get());
+        let store = match self.primed.lock().expect("primed worker").take() {
+            Some(worker) => store.with_primed_worker(worker),
+            None => store,
+        };
+        let mut linker = Linker::new(store, universe.threads.get())
             .with_external_packages(universe.external.iter().cloned())
             .with_linked_packages(universe.linked.iter().cloned());
         if !provenance {
@@ -131,24 +139,63 @@ impl Session {
     }
 }
 
+pub struct PreparedSource {
+    snapshot: SourcePackageSnapshot,
+    r_home: PathBuf,
+    target: TargetEnvironment,
+}
+
+impl PreparedSource {
+    pub fn snapshot(&self) -> &SourcePackageSnapshot {
+        &self.snapshot
+    }
+
+    pub fn target(&self) -> &TargetEnvironment {
+        &self.target
+    }
+}
+
 impl SourceSession {
+    pub fn prepare(
+        path: &Path,
+        universe: &UniverseArgs,
+        r_home: PathBuf,
+    ) -> Result<PreparedSource, Box<dyn Error>> {
+        let snapshot = SourcePackageSnapshot::capture(path)?;
+        let mut request = TargetEnvironmentRequest::new(r_home.clone());
+        request.libraries = absolute_libraries(universe)?;
+        Ok(PreparedSource {
+            snapshot,
+            r_home,
+            target: request.capture()?,
+        })
+    }
+
     pub fn open(
         path: &Path,
         universe: &UniverseArgs,
         r_home: PathBuf,
     ) -> Result<Self, Box<dyn Error>> {
-        let snapshot = SourcePackageSnapshot::capture(path)?;
-        let libraries = resolve_libraries(&r_home, universe)?;
-        let staged = stage_root(&snapshot, &r_home, &libraries)?;
-        let ordered = std::iter::once(staged.library().to_path_buf())
-            .chain(libraries)
-            .collect();
-        let session = Session::capture(
+        Self::stage(Self::prepare(path, universe, r_home)?)
+    }
+
+    pub fn stage(prepared: PreparedSource) -> Result<Self, Box<dyn Error>> {
+        let PreparedSource {
+            snapshot,
             r_home,
-            snapshot.package().to_owned(),
-            Some(snapshot.description_source().into()),
-            ordered,
-        )?;
+            mut target,
+        } = prepared;
+        let staged = stage_root(&snapshot, &r_home, &target.libraries)?;
+        let staged_library = dunce::canonicalize(staged.library())?;
+        target.libraries.insert(0, staged_library);
+        let session = Session {
+            r_home,
+            target,
+            root: snapshot.package().to_owned(),
+            root_description: Some(snapshot.description_source().into()),
+            retained: None,
+            primed: Mutex::new(None),
+        };
         Ok(Self {
             session,
             inputs: SourceInputs { snapshot, staged },
@@ -212,19 +259,7 @@ pub fn absolute_libraries(universe: &UniverseArgs) -> io::Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn resolve_libraries(
-    r_home: &Path,
-    universe: &UniverseArgs,
-) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    match absolute_libraries(universe)? {
-        explicit if explicit.is_empty() => Ok(TargetEnvironmentRequest::new(r_home.to_path_buf())
-            .capture()?
-            .libraries),
-        explicit => Ok(explicit),
-    }
-}
-
-fn cache_location() -> CacheLocation {
+pub(crate) fn cache_location() -> CacheLocation {
     std::env::var_os("SLINKER_CACHE_DIR").map_or(CacheLocation::Default, |root| {
         CacheLocation::Directory(PathBuf::from(root))
     })

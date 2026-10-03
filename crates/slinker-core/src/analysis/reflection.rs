@@ -1,6 +1,7 @@
 use super::NodeId;
+use super::relocation::NamespaceCall;
 use crate::package::PackageId;
-use crate::syntax::Span;
+use crate::syntax::{CallSite, Span};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
@@ -8,6 +9,15 @@ pub(super) struct ReflectionFacts {
     non_reflective_namespace_uses: HashSet<Span>,
     contextual_namespace_calls: HashMap<Span, Option<String>>,
     computed_namespace_info_reads: Vec<ComputedNamespaceInfoRead>,
+    pending_namespace_operations: Vec<PendingNamespaceOperation>,
+}
+
+pub(super) struct PendingNamespaceOperation {
+    pub(super) node: NodeId,
+    pub(super) package: PackageId,
+    pub(super) binding: String,
+    pub(super) call: CallSite,
+    pub(super) operation: NamespaceCall,
 }
 
 pub(super) struct ComputedNamespaceInfoRead {
@@ -19,8 +29,8 @@ pub(super) struct ComputedNamespaceInfoRead {
 }
 
 impl ReflectionFacts {
-    pub(super) fn set_non_reflective_namespace_uses(&mut self, uses: HashSet<Span>) {
-        self.non_reflective_namespace_uses = uses;
+    pub(super) fn add_non_reflective_namespace_uses(&mut self, uses: HashSet<Span>) {
+        self.non_reflective_namespace_uses.extend(uses);
     }
 
     pub(super) fn is_non_reflective_namespace_use(&self, span: &Span) -> bool {
@@ -58,6 +68,14 @@ impl ReflectionFacts {
                 field: field.to_owned(),
                 span,
             });
+    }
+
+    pub(super) fn defer_namespace_operation(&mut self, pending: PendingNamespaceOperation) {
+        self.pending_namespace_operations.push(pending);
+    }
+
+    pub(super) fn take_pending_namespace_operations(&mut self) -> Vec<PendingNamespaceOperation> {
+        std::mem::take(&mut self.pending_namespace_operations)
     }
 
     pub(super) fn take_computed_namespace_info_reads(&mut self) -> Vec<ComputedNamespaceInfoRead> {

@@ -85,36 +85,29 @@ impl PackageResolver for MemoryProvider {
         &self.target
     }
 
-    fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
+    fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
         Ok((self.image.index.identity.name == name).then(|| self.installed()))
     }
 }
 
 impl PackageProvider for MemoryProvider {
-    fn index(&mut self, _package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
+    fn index(&self, _package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         Ok(Arc::clone(&self.image.index))
     }
 
-    fn binding_image(
-        &mut self,
-        _package: &InstalledPackage,
-        _name: &str,
-    ) -> Result<Arc<PackageImage>> {
+    fn binding_image(&self, _package: &InstalledPackage, _name: &str) -> Result<Arc<PackageImage>> {
         Ok(Arc::clone(&self.image))
     }
 
-    fn dispatch_generics(
-        &mut self,
-        _subject: DispatchSubject<'_>,
-    ) -> Result<BTreeSet<GenericName>> {
+    fn dispatch_generics(&self, _subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
         Ok(BTreeSet::new())
     }
 
-    fn validate_syntax(&mut self, _source: &str) -> Result<SyntaxValidation> {
+    fn validate_syntax(&self, _source: &str) -> Result<SyntaxValidation> {
         Ok(SyntaxValidation::Accepted)
     }
 
-    fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+    fn canonical_syntax(&self, source: &str) -> Result<CanonicalSyntax> {
         Ok(CanonicalSyntax::Stable(source.to_owned()))
     }
 }
@@ -152,7 +145,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
         .map(|(name, source)| {
             (
                 BindingName::from(name.as_str()),
-                BindingImage {
+                Arc::new(BindingImage {
                     name: BindingName::from(name.as_str()),
                     origin: BindingOrigin::Code,
                     object: ObjectImage {
@@ -162,7 +155,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
                         }),
                         ..ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Closure)
                     },
-                },
+                }),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -184,7 +177,7 @@ fn memory_package(sources: &[(String, String)]) -> PackageImage {
             s3: Vec::new(),
             dynlibs: Vec::new(),
             lifecycle: LifecycleMetadata::default(),
-            binding_names,
+            binding_names: binding_names.into(),
             data: slinker_core::package::PackageData::default(),
             files: Vec::new(),
             has_sysdata: false,
@@ -260,7 +253,7 @@ fn installed_images(criterion: &mut Criterion) {
         target.clone(),
         CacheLocation::Directory(warm.path().to_path_buf()),
     )
-    .and_then(|mut store| store.index(&package))
+    .and_then(|store| store.index(&package))
     .expect("populate the warm cache");
 
     let mut group = criterion.benchmark_group("installed");
@@ -271,7 +264,7 @@ fn installed_images(criterion: &mut Criterion) {
     group.bench_function("index_read_rlang_uncached", |bench| {
         bench.iter(|| {
             PackageStore::new(r_home.clone(), target.clone(), CacheLocation::Disabled)
-                .and_then(|mut store| store.index(&package))
+                .and_then(|store| store.index(&package))
                 .expect("read the installed index through the worker")
         });
     });
@@ -282,7 +275,7 @@ fn installed_images(criterion: &mut Criterion) {
                 target.clone(),
                 CacheLocation::Directory(warm.path().to_path_buf()),
             )
-            .and_then(|mut store| store.index(&package))
+            .and_then(|store| store.index(&package))
             .expect("read the cached index")
         });
     });

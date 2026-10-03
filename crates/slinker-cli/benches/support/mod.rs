@@ -25,6 +25,13 @@ pub fn main(run: fn()) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(dead_code)]
+pub fn filter() -> Option<String> {
+    std::env::args()
+        .skip(1)
+        .find(|argument| !argument.starts_with('-'))
+}
+
 pub fn target_request(r_home: &Path) -> slinker_core::TargetEnvironmentRequest {
     let mut request = slinker_core::TargetEnvironmentRequest::new(r_home.to_path_buf());
     if let Some(libraries) = std::env::var_os("R_LIBS_USER") {

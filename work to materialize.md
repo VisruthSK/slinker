@@ -1,7 +1,5 @@
 # slinker plan
 
-Updated: 2026-09-26 (America/Los_Angeles)
-
 This file is the forward plan: what remains and how to know each piece is done. It does not
 describe what the code already does (`docs/` documents behavior). Delete finished items instead
 of turning them into status notes. Breaking changes are always allowed: any item may delete or
@@ -81,6 +79,9 @@ acceptance cases here.
 
 ## Next up
 
+1. Track H: canonical allocation-site identities for derived environments and closures, then allocation effects in summaries.
+2. Track I: finish moving the syntax front end onto Air nodes and Oak definitions (predicates, proofs, guards, declarations, construction, and the remaining text scanners).
+
 ---
 
 ## Track E: Retire heuristics
@@ -103,6 +104,7 @@ acceptance cases here.
 - Constructors with static classes (`class(x) <- "cls"`, `structure(..., class = )`) produce exact
   domains.
 
+
 ## Track G: Coverage and ecosystem
 
 - Realistic fixture: a vendored root package plus one or two pure-R dependencies that read like
@@ -112,56 +114,71 @@ acceptance cases here.
   `requireNamespace`-guarded Suggests code) with a testthat suite. Done when it builds
   and passes the three-way installation harness.
 - Lower Linked `.onLoad` `libname` uses to explicit resources instead of blocking them.
+- Exact private environments may keep dynamic keys: when the environment identity is proven, preserve its
+  reachable contents and allow runtime `get`/`exists`/`[[`/`assign`/`rm`; unknown, caller, namespace, and
+  search-path environments still block. After Track H gives allocations canonical per-call identities,
+  resolve `<<-` only to an exact enclosing mutable binding so closure factories keep distinct captured state.
+- A static Linked package with a dynamic `system.file` resource path may retain that package's resource tree;
+  a dynamic package name that can name a Linked package still blocks. Guarded observation of an undeclared
+  package (`loadedNamespaces()` before `packageVersion()`) must not turn it into a dependency unless the
+  reachable branch requires it.
 - rlang, cli, glue, vctrs, R6 each link in a CRAN harness case where their code allows;
-  R6 generators and re-enclosed methods are modeled or blocked precisely.
+  R6 generators and re-enclosed methods are modeled or blocked precisely. Add `httr` as a native/resource/
+  private-environment stress case and a small Root that links `foreach`/`codetools`/`iterators` as the
+  reflective-environment and captured-state case; analyzing `foreach` itself as Root remains a stricter
+  torture test and need not make unreachable `.packages` attachment a Linked-consumer requirement.
+- Foreign namespace references in retained payload bindings create the corresponding retention/role
+  obligation; keep an `httr` -> R6 regression for this.
 - Typed blockers for S4/S7, representation introspection, and `eval(parse())`/`source()`.
 - Precision cases from real packages: `globals`, `futile.logger`, `gsubfn`.
 
-Milestone: slink testthat. Baseline on 2026-09-25: testthat's own code has 24 blockers (search-path
-attachment in tests, S4 class objects, native code, dynamic lookups); its dependencies add about
-150 (callr 35, processx 20, cli 15, R6 8, others fewer), and rlang, lifecycle, pkgload, and waldo
-do not finish. callr and processx start child R processes that load packages by name, so linking
+Milestone: slink testthat. Analysis of testthat now finishes in about 2 s cold and reports 182 blockers (2026-10-02): testthat itself 29
+(search-path attachment in tests, S4 class objects, native code, dynamic lookups), pkgload 28, waldo 27,
+rlang 22, glue 10, R6 9, otel 9, cli 8, processx 8, and fewer in jsonlite, callr, fs, and pkgbuild.
+callr and processx start child R processes that load packages by name, so linking
 them needs its own design. Reporters are R6. Done when a package's suite runs against a slinked
 testthat with every testthat dependency Linked.
 
+
 ## Track H: Concurrent fixed-point performance
 
-Cold analysis is the priority because it sets worst-case CI and first-run cost. Warm-cache and edit-and-rerun performance must use the same query architecture. No optimization may weaken analysis or make program semantics depend on scheduling.
+Cold analysis is the priority because it sets worst-case CI and first-run cost. No optimization may weaken analysis or make program semantics depend on scheduling. `docs/internals.md` documents the scheduling model and records the measured comparison with the pre-Track-H baseline (rlang cold 25 s to 1.1 s, testthat warm 41 s to 0.7 s, memory 0.33 to 0.86 of the baseline on large packages).
 
-Baseline on `slinker analyze rlang` on 2026-09-26: about 41 s wall time. Current hot counts are about 323k `evaluate_installed_function`, 833k `resolve_lexical_name`, 107k `parsed_source`, 7.1k `binding_image`, and 1.7k construction evaluations. A cold run on 2026-09-30 (Windows) took about 55 s, of which the R worker accounts for about 4 s of binding inspection and about 3 s of syntax normalization, so the target is the Rust-side repeated `evaluate_installed_function` and `resolve_lexical_name`. The Oak parser benchmark is dominated by Air and Oak themselves (about 50 ms of 155 ms at 400 statements).
+What still limits correctness and speed, in order:
 
-Semantic model and scheduler:
-- Make analysis an explicit least-fixed-point computation over finite monotone domains. Add a real bottom/no-information state distinct from `Unknown`/top. Concurrently published semantic facts merge with associative, commutative, idempotent joins. Use bounded exact domains and explicit widening where needed.
-- Facts based on absence or completion are not published until their dependencies are sealed. `.onLoad` and other soundness-critical package activation facts become local readiness dependencies, not global barriers.
-- Replace global frontiers with a concurrent dependency-aware worklist on Rayon's work-stealing runtime. Stable semantic `WorkKey`s deduplicate work, but a transfer may run again when an input fact grows. Coalesce updates and propagate only newly learned deltas.
-- Solve recursive regions with SCC/local fixed-point iteration. Do not seed recursion with semantic `Unknown` or repeatedly reevaluate an entire recursive region when only one fact changed.
-- Workers publish mergeable `AnalysisDelta`s instead of mutating one locked `AnalyzerState`. Keep worker-local buffers, immutable snapshots, atomic scheduling state, and exact quiescence accounting. Do not replace the frontier with `Arc<Mutex<AnalyzerState>>`.
-- Scheduling order is semantically invisible. Different schedules and `--jobs` values must produce the same `ProgramIr` semantics modulo invocation-local IDs, the same diagnostics, and the same provenance graph after canonicalization. Raw numeric IDs, internal table order, and nonsemantic `LinkIr` metrics are not cross-run identities.
-
-Remove repeated semantic work:
-- Intern analyzer names and environment identities. Build immutable indexes for package bindings, imports, native bindings, mutations, and other hot membership queries. Interning pays only if a profile shows name hashing matters; once names are interned, audit the `.clone()` calls on hot paths. Tie each closure id to its package's object graph so `need_node` needs no `expect` for a closure-execution need.
-- Memoize lexical resolution, parsed-source work, parse contexts, and installed-function construction summaries by semantic inputs and epochs. `NodeId` and call-site provenance must never prevent semantic reuse.
-- Separate semantic construction summaries from call-site effects and provenance. Instantiate fresh allocation effects where required.
-- Record query dependencies on the cold path. Recomputed queries whose semantic result is unchanged must stop invalidation propagation. Support stable result fingerprints/backdating and durability so edits to the Root do not force validation of unchanged installed-package work.
-- Persist only reusable semantic summaries keyed by exact source/package inputs, target R identity, analyzer/schema versions, and every semantic context input. Never persist worker-local R object identities.
-
-R/package inspection:
-- Batch binding inspection and syntax-normalization traffic (IPC is about 2 ms per round trip, so batching alone saves at most a few seconds; several worker processes inspecting different packages in parallel are the larger unmeasured candidate).
-- Use a reusable R worker pool with stable package affinity so one installed package stays on one worker during an inspection epoch and private-environment identity remains valid. Reuse initialized workers across analysis/build phases where their target identity permits it.
-- Keep expensive package inspection demand-driven. Instrument package hashing, bytes read, R startup count, protocol bytes, and accidental full-structure cloning so semantic speedups do not merely expose a new I/O bottleneck.
-
-Profiling and benchmarks:
-- `SLINKER_PROFILE=1` prints deterministic inclusive/exclusive timings, calls versus unique query keys, memo/cache hits, lattice growth/SCC iterations, queue depth/steals, worker utilization, R requests/batch sizes/bytes, package bytes hashed, and R startup count. Detailed tracing remains opt-in.
-- Benchmark cold analysis/build with persistent analysis caches disabled, warm unchanged rerun, and one-source edit rerun. Record before/after numbers; do not add a fixed time threshold.
+- Derived environments and closures are labelled `derived:N` by creation order, and `ObjectId`/`ClosureId` are per-run arena indices. Output is schedule-independent today only because ties are broken canonically (blocker owners, creator choice), a task's requests are published when it finishes, and memo hits adopt their recorded effects; exported node ids and evidence strings for derived closures still carry the label. Canonical allocation-site identities (and mergeable per-need `AnalysisDelta`s) remove that class of bug at the source and are the precondition for persisting summaries.
+- Evaluations that allocate environments or closures are memoized per requesting node. Instantiate allocation identities per call site so they can share a summary.
+- Analysis-level incrementality is not built. A rebuild after a one-file edit re-runs analysis over the changed root. Measured ceiling: on `here` analysis plus finalize was 13 percent of a 3.1 s cold build before the fingerprint and finalize work, so R startups and fingerprinting came first; on large dependency closures analysis is the remaining cost (warm testthat 0.7 s). Reuse needs a query dependency graph with fingerprint backdating and durability, canonical allocation-site identities, replayable per-need deltas, and persisted semantic summaries keyed by exact inputs, target R identity, and analyzer schema versions. Parsed-source results hold invocation-local `SourceId`s and need a relocatable form first, and parsing is no longer the warm bottleneck at high thread counts.
+- A cold build starts five R processes. The build runtime now shares one worker between preflight and materialization; the capture worker still becomes an analysis lane and is not reused afterwards, and a second analysis lane starts even for tiny packages (R6, jsonlite, callr peak 30 to 50 percent higher cold than the baseline at 4 or more threads).
+- Cold analysis is bounded by R inspection on `MAX_R_WORKERS` lanes (testthat cold 4.2 s at 1 thread, 1.9 s at 20). Measure lane count and request batching against the inspection floor before adding lanes.
+- The remaining parse-time allocation is mostly Air node handles and `oak_semantic::build_index` (about 2.5M allocations per 3,000 bindings), plus the construction tree walk (about 2.4M); Track I removes the scanning passes that add to it.
+- Audit demand-driven package inspection; the first scan of a large package is still serial R work.
 
 Done when:
-- the global frontier/preparse-frontier scheduler is gone and semantic work uses the monotone query/worklist model;
-- lattice and delta merge laws are tested, including order/permutation tests;
-- adversarial scheduler tests cover cycles, lost wakeups, repeated scheduling, `.onLoad` readiness, private environments, construction recursion, and several `--jobs` values;
-- those schedules produce semantically equivalent `ProgramIr`, diagnostics, and provenance without requiring identical invocation-local IDs;
-- cold `rlang` analysis is materially faster from fewer semantic evaluations plus real CPU/R-worker overlap;
+- semantic work uses the monotone query model with fingerprint backdating;
+- per-need deltas have tested merge laws (order, permutation, idempotence), as the lattice already does;
 - warm and one-file edit reruns use the same dependency graph, prune propagation when recomputation is unchanged, and invalidate only semantic dependents;
 - the existing soundness, three-way installation, and build-materializer corpus remains unchanged.
+
+---
+
+## Track I: Parse on the syntax tree
+
+Air parses every binding and Oak indexes it, yet slinker still re-derives structure by scanning source text with its own lexer. That is a heuristic (no raw strings, a newline ends an expression even after a trailing operator or `%>%`, `=` is detected by character rules, conditions are canonicalised to strings and re-parsed), it costs allocations and time on every binding, and it duplicates what Air nodes and Oak definitions already give exactly. Replace it; do not add scanners.
+
+Still to do:
+- `syntax/oak/scan.rs`, `predicates.rs`, `proofs.rs`, `guards.rs`, `declarations.rs`, `construction.rs`, and `mod.rs` still use text offsets: `static_arg`/`static_string`/`static_symbol` on re-sliced text, `split_arguments` for membership guards, `expression_end`, `skip_trivia`, `statement_start`, `matching_delimiter`, `CodeScanner`, `canonical_condition`, `parse_simple_predicate`, `condition_symbols`, and `contains_call_named(segment, "rm")`.
+- Resolve the remaining Oak `DefinitionKind` pointers (`Parameter`, `ForVariable`, `Assign`) to Air nodes instead of scanning around the target; assignments and super-assignments already resolve through `assignment_of`.
+- Represent branch predicates as typed values built from condition expressions (`!`, `==`, `!=`, `is.null`, literals, `%in%` with `c()`), take condition symbols from Oak uses inside the condition, and detect `rm`/`remove` from resolved base calls.
+- Collect every node class the translation needs in the single `Census` pass (data-mask ranges, declarations, dispatching syntax, namespace-info reads, operators, construction) instead of one tree walk per fact; keep reusing Oak where it already answers (`use_is_bound`, `reaching_definitions`, scope kinds and ranges, `enclosing_bindings`, eager and lazy scopes).
+- Audit `slinker-r-worker` against harp (Ark's Rust wrappers for R objects) and delete hand-rolled R object inspection that harp already provides; keep only slinker-specific protocol and policy.
+- Make `T` and `F` resolve like any other name instead of being accepted as logical literals anywhere that still does so.
+
+Done when:
+- no byte-offset scanning of R source remains under `syntax/oak` and `scan.rs` is deleted;
+- `analyze --json` is byte-identical before and after on R6, jsonlite, rlang, cli, callr, testthat (`--threads 1`), compiler, and grid, or each difference is explained as a soundness fix with its own regression test;
+- raw strings, code-like text in comments and strings, and multi-line continuations (`x <-\n f()`, a trailing `%>%`) each have a regression case that failed under scanning;
+- the `parse.*` probes show fewer allocations per binding than before the migration.
 
 ---
 

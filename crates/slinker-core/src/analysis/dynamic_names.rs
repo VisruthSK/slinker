@@ -80,11 +80,15 @@ impl DynamicNames {
         self.unresolved.push(name);
     }
 
-    pub(super) fn creatable(&self) -> impl Iterator<Item = (&UnresolvedName, &NameCreator)> {
-        self.unresolved.iter().filter_map(|unresolved| {
+    pub(super) fn creatable<K: Ord>(
+        &self,
+        canonical_key: impl Fn(&NameCreator) -> K,
+    ) -> impl Iterator<Item = (&UnresolvedName, &NameCreator)> {
+        self.unresolved.iter().filter_map(move |unresolved| {
             self.creators
                 .iter()
-                .find(|creator| creator.can_bind(&unresolved.name))
+                .filter(|creator| creator.can_bind(&unresolved.name))
+                .min_by_key(|creator| canonical_key(creator))
                 .map(|creator| (unresolved, creator))
         })
     }

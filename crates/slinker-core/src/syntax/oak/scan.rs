@@ -1,3 +1,4 @@
+use crate::package::Atom;
 use crate::syntax::facts::StaticArg;
 use crate::syntax::source::{SourceId, Span, TextRange};
 use std::collections::BTreeSet;
@@ -7,6 +8,13 @@ pub(super) struct RawArgument {
     pub(super) name: Option<String>,
     pub(super) value: TextRange,
     pub(super) static_arg: Option<StaticArg>,
+    pub(super) logical: Option<bool>,
+}
+
+impl RawArgument {
+    pub(super) fn is_hole(&self) -> bool {
+        self.name.is_none() && self.value.start == self.value.end
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,38 +203,11 @@ pub(super) fn function_body_range(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-pub(super) fn static_symbol_range(
-    text: &str,
-    start: usize,
-    end: usize,
-) -> Option<(String, usize, usize)> {
-    let start = skip_trivia(text, start);
-    let end = trim_end_offset(text, end);
-    let value = text.get(start..end)?;
-    match static_arg(value) {
-        Some(StaticArg::Symbol(name)) => Some((name, start, end)),
-        _ => None,
-    }
-}
-
 pub(super) fn static_args(raw: &RawCall) -> Vec<Option<StaticArg>> {
     raw.args
         .iter()
         .map(|argument| argument.static_arg.clone())
         .collect()
-}
-
-pub(super) fn call_after_name(text: &str, name_start: usize, name_end: usize) -> Option<RawCall> {
-    let open = skip_trivia(text, name_end);
-    if text.as_bytes().get(open).copied()? != b'(' {
-        return None;
-    }
-    let close = matching_delimiter(text, open)?;
-    Some(RawCall {
-        start: name_start,
-        end: close + 1,
-        args: split_arguments(text, open + 1, close),
-    })
 }
 
 pub(super) fn split_arguments(text: &str, start: usize, end: usize) -> Vec<RawArgument> {
@@ -274,6 +255,7 @@ pub(super) fn split_arguments(text: &str, start: usize, end: usize) -> Vec<RawAr
                         name: None,
                         value: TextRange::new(cursor, cursor),
                         static_arg: None,
+                        logical: None,
                     });
                 }
                 segment_start = cursor + 1;
@@ -291,6 +273,7 @@ pub(super) fn split_arguments(text: &str, start: usize, end: usize) -> Vec<RawAr
                 name: None,
                 value: TextRange::new(end, end),
                 static_arg: None,
+                logical: None,
             });
         }
     }
@@ -313,6 +296,7 @@ pub(super) fn raw_argument(text: &str, start: usize, end: usize) -> Option<RawAr
         name,
         value: TextRange::new(value_start, value_end),
         static_arg,
+        logical: None,
     })
 }
 
@@ -389,9 +373,9 @@ pub(super) fn static_arg(value: &str) -> Option<StaticArg> {
         return None;
     }
     if let Some(string) = static_string(value) {
-        return Some(StaticArg::String(string));
+        return Some(StaticArg::String(Atom::from(string)));
     }
-    static_symbol(value).map(StaticArg::Symbol)
+    static_symbol(value).map(|symbol| StaticArg::Symbol(Atom::from(symbol)))
 }
 
 pub(super) fn static_string(value: &str) -> Option<String> {
@@ -540,98 +524,6 @@ pub(super) fn matching_delimiter(text: &str, open: usize) -> Option<usize> {
         }
     }
     None
-}
-
-pub(super) fn find_function_regions(text: &str) -> Vec<FunctionRegion> {
-    let mut regions = Vec::new();
-    let bytes = text.as_bytes();
-    let mut scanner = CodeScanner::new(text, 0, bytes.len());
-    while let Some((cursor, byte)) = scanner.next() {
-        let keyword = byte == b'f' && keyword_at(text, cursor, "function");
-        if !keyword && byte != b'\\' {
-            continue;
-        }
-        let after_introducer = if keyword {
-            cursor + "function".len()
-        } else {
-            cursor + 1
-        };
-        let open = skip_trivia(text, after_introducer);
-        if bytes.get(open).copied() == Some(b'(')
-            && let Some(region) = function_region_after_open(text, cursor, open)
-        {
-            regions.push(region);
-        }
-        scanner.skip_to(after_introducer);
-    }
-    regions
-}
-
-pub(super) fn function_region_after_open(
-    text: &str,
-    function_start: usize,
-    open: usize,
-) -> Option<FunctionRegion> {
-    let close = matching_delimiter(text, open)?;
-    let body_start = skip_trivia(text, close + 1);
-    if body_start >= text.len() {
-        return None;
-    }
-    let body_end = expression_end(text, body_start);
-    let parameters = split_arguments(text, open + 1, close)
-        .into_iter()
-        .filter_map(|argument| {
-            let RawArgument { name, value, .. } = argument;
-            name.or_else(|| text.get(value.start..value.end).and_then(static_symbol))
-        })
-        .collect();
-
-    Some(FunctionRegion {
-        function_start,
-        formals: TextRange::new(open + 1, close),
-        body: TextRange::new(body_start, body_end),
-        parameters,
-    })
-}
-
-pub(super) fn find_for_regions(text: &str) -> Vec<ForRegion> {
-    let mut regions = Vec::new();
-    let mut scanner = CodeScanner::new(text, 0, text.len());
-    while let Some((cursor, _)) = scanner.next() {
-        if !keyword_at(text, cursor, "for") {
-            continue;
-        }
-        scanner.skip_to(cursor + 3);
-        regions.extend(for_region_at(text, cursor));
-    }
-    regions
-}
-
-fn for_region_at(text: &str, start: usize) -> Option<ForRegion> {
-    let open = skip_trivia(text, start + 3);
-    if text.as_bytes().get(open).copied() != Some(b'(') {
-        return None;
-    }
-    let close = matching_delimiter(text, open)?;
-    let variable_start = skip_trivia_bounded(text, open + 1, close);
-    let variable_end = name_token_end(text, variable_start)?;
-    let variable = text
-        .get(variable_start..variable_end)
-        .and_then(static_symbol)?;
-    let in_start = skip_trivia_bounded(text, variable_end, close);
-    if !text
-        .get(in_start..close)
-        .is_some_and(|rest| rest.starts_with("in"))
-        || !word_boundary_after(text, in_start + 2)
-    {
-        return None;
-    }
-    let body_start = skip_trivia(text, close + 1);
-    Some(ForRegion {
-        variable,
-        variable_start,
-        body: TextRange::new(body_start, expression_end(text, body_start)),
-    })
 }
 
 pub(super) fn find_if_regions(text: &str) -> Vec<IfRegion> {

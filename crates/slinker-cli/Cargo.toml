@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 slinker-core.workspace = true
 slinker-r-worker.workspace = true
+anstream.workspace = true
 clap.workspace = true
 dunce.workspace = true
 serde_json.workspace = true
@@ -23,6 +24,10 @@ which.workspace = true
 criterion.workspace = true
 tempfile.workspace = true
 
+[[test]]
+name = "schedule_determinism"
+harness = false
+
 [[bench]]
 name = "micro"
 harness = false
@@ -30,6 +35,9 @@ harness = false
 [[bench]]
 name = "end_to_end"
 harness = false
+
+[features]
+profile = ["slinker-core/profile"]
 
 [lints]
 workspace = true

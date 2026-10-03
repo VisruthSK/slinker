@@ -1,4 +1,5 @@
 use crate::package::{Digest, InstalledPackage, PackageIdentity, PackageLocation};
+use crate::profile::{self, Counter, Probe};
 use crate::{Description, Error, Result, TargetEnvironment};
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File};
@@ -73,7 +74,13 @@ impl PackageLocator {
     }
 }
 
+pub fn tree_digest(root: &Path) -> Result<Digest> {
+    fingerprint_image(root)
+}
+
 pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
+    let _span = profile::span(Probe::PackageFingerprint);
+    profile::count(Counter::FingerprintOperations);
     let mut files = Vec::<(String, PathBuf)>::new();
     let mut pending = vec![root.to_path_buf()];
     let io = |path: &Path| {
@@ -102,6 +109,7 @@ pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
     let mut hash = Sha256::new();
     hash.update(b"slinker-installed-image-v2\0");
     let mut buffer = vec![0u8; 128 * 1024];
+    profile::add(Counter::FingerprintFiles, files.len() as u64);
     for (relative, path) in &files {
         hash.update(relative.as_bytes());
         hash.update([0]);
@@ -111,11 +119,44 @@ pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
             if read == 0 {
                 break;
             }
+            profile::add(Counter::FingerprintBytes, read as u64);
             hash.update(&buffer[..read]);
         }
         hash.update([0xff]);
     }
     Ok(Digest::finish(hash))
+}
+
+pub struct Fingerprint(Sha256);
+
+impl Fingerprint {
+    #[must_use]
+    pub fn new(domain: &str) -> Self {
+        Self(Sha256::new()).field(domain)
+    }
+
+    #[must_use]
+    pub fn field(mut self, value: impl AsRef<[u8]>) -> Self {
+        let value = value.as_ref();
+        self.0.update((value.len() as u64).to_le_bytes());
+        self.0.update(value);
+        self
+    }
+
+    #[must_use]
+    pub fn list<T: AsRef<[u8]>>(mut self, items: impl IntoIterator<Item = T>) -> Self {
+        let items = items.into_iter().collect::<Vec<_>>();
+        self.0.update((items.len() as u64).to_le_bytes());
+        for item in &items {
+            self = self.field(item);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn finish(self) -> Digest {
+        Digest::finish(self.0)
+    }
 }
 
 pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<str>>) -> Digest {
@@ -142,6 +183,17 @@ mod tests {
         let after = fingerprint_image(root.path()).expect("fingerprint changed image");
 
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn fingerprint_fields_are_unambiguous() {
+        let split =
+            |left: &str, right: &str| Fingerprint::new("t").field(left).field(right).finish();
+        assert_ne!(split("ab", "c"), split("a", "bc"));
+        let listed = |items: &[&str]| Fingerprint::new("t").list(items.iter().copied()).finish();
+        assert_ne!(listed(&["a", "b"]), listed(&["b", "a"]));
+        assert_ne!(listed(&["a"]), listed(&["a", ""]));
+        assert_eq!(listed(&["a", "b"]), listed(&["a", "b"]));
     }
 
     #[test]

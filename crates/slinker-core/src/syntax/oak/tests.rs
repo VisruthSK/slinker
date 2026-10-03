@@ -80,9 +80,14 @@ fn replacement_call_references_the_replacement_function() {
 #[test]
 fn assigned_value_start_is_the_outer_assignment_value() {
     let source = "`.onLoad` <- function(libname, pkgname) { x <- 1 }";
-    let start = assigned_value_start(source).unwrap();
+    let start = parse_source(source).expressions[0]
+        .assigned_value_start
+        .unwrap();
     assert!(source[start..].starts_with("function(libname"));
-    assert_eq!(assigned_value_start("f(1)"), None);
+    assert_eq!(
+        parse_source("f(1)").expressions[0].assigned_value_start,
+        None
+    );
 }
 
 #[test]
@@ -117,7 +122,7 @@ fn slinker_declaration_is_an_inert_lexical_contract() {
         .find(|call| call.callee == "print")
         .unwrap();
     assert_eq!(
-        parsed.class_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+        parsed.class_domain_for(print.arg_binding(0).unwrap(), print.scope),
         Some(vec![
             vec!["foo".into()],
             vec!["bar".into(), "parent".into()]
@@ -136,7 +141,7 @@ fn string_declarations_narrow_and_never_mix_with_classes() {
         .iter()
         .find(|call| call.callee == "print")
         .unwrap();
-    let binding = print.arg_bindings[0].as_ref().unwrap();
+    let binding = print.arg_binding(0).unwrap();
     assert_eq!(
         parsed.string_domain_for(binding, print.scope),
         Some(["beta".to_owned()].into_iter().collect())
@@ -187,7 +192,7 @@ fn callable_declarations_name_exact_functions() {
         name: BindingName::from(name),
     };
     assert_eq!(
-        parsed.callable_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+        parsed.callable_domain_for(print.arg_binding(0).unwrap(), print.scope),
         Some(
             [
                 callable(Some("pkg"), "g"),
@@ -228,7 +233,7 @@ fn nested_declaration_narrows_the_captured_binding() {
         .find(|call| call.callee == "print")
         .unwrap();
     assert_eq!(
-        parsed.class_domain_for(print.arg_bindings[0].as_ref().unwrap(), print.scope),
+        parsed.class_domain_for(print.arg_binding(0).unwrap(), print.scope),
         Some(vec![vec!["foo".into()]])
     );
 }
@@ -341,7 +346,11 @@ fn superassigned_value_is_a_dependency_only_when_free() {
             .all(|effect| *effect == (SyntaxEffectKind::SuperAssignment, None))
     );
     assert!(free.iter().all(|effect| {
-        *effect == (SyntaxEffectKind::SuperAssignment, Some("other".to_owned()))
+        *effect
+            == (
+                SyntaxEffectKind::SuperAssignment,
+                Some(crate::package::Atom::from("other")),
+            )
     }));
 }
 
@@ -897,16 +906,13 @@ fn call_argument_span_matches_selector_name_reference() {
         .find(|call| call.callee == ".Call")
         .expect("native call");
     let selector = call
-        .arg_names
+        .arguments
         .iter()
-        .position(|name| name.as_deref() == Some(".NAME"))
+        .find(|argument| argument.name.as_deref() == Some(".NAME"))
         .expect("named selector");
 
-    assert_eq!(
-        call.args[selector],
-        Some(StaticArg::Symbol("croot_f".into()))
-    );
-    assert_eq!(call.arg_spans[selector].as_ref(), Some(&reference.span));
+    assert_eq!(selector.value, Some(StaticArg::Symbol("croot_f".into())));
+    assert_eq!(selector.span.as_ref(), Some(&reference.span));
 }
 
 #[test]
@@ -920,7 +926,10 @@ fn call_argument_records_definite_local_closure_identity() {
         .find(|call| call.callee == ".Call")
         .expect("native call");
 
-    assert_eq!(call.local_closure_args, [false, false, true]);
+    let closures = (0..call.arg_count())
+        .map(|index| call.arg_is_local_closure(index))
+        .collect::<Vec<_>>();
+    assert_eq!(closures, [false, false, true]);
 }
 
 #[test]
@@ -1104,4 +1113,25 @@ fn missing_import_all_blocks_only_names_no_later_import_provides() {
         }
     );
     assert_eq!(imports.names(), Err(&PackageName::from("missing")));
+}
+
+#[test]
+fn superassignment_span_covers_a_value_that_starts_with_a_parenthesis() {
+    let text = "f <- function() { x <<- (a == 1) + 0L }";
+    let parsed = parse_source(text);
+    let effect = &parsed.expressions[0].effects[0];
+
+    assert_eq!(
+        &text[effect.span.start..effect.span.end],
+        "x <<- (a == 1) + 0L"
+    );
+}
+
+#[test]
+fn right_superassignment_span_starts_at_the_value() {
+    let text = "f <- function() {\n  other <- 1\n  (a + b) ->> x\n}";
+    let parsed = parse_source(text);
+    let effect = &parsed.expressions[0].effects[0];
+
+    assert_eq!(&text[effect.span.start..effect.span.end], "(a + b) ->> x");
 }

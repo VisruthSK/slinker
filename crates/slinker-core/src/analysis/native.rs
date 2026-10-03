@@ -9,12 +9,13 @@ use crate::Result;
 use crate::analysis::{EdgeKind, Need, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::EnvironmentLabel;
-use crate::package::NativeComponent;
+use crate::package::{BindingName, ComponentName, NativeComponent};
 use crate::package::{
     NameLookup, NativeInterface, NativeLibrary, NativeRoutineSummary, NativeSafety, PackageId,
     PackageImage, PackageIndex, PackageProvider,
 };
 use crate::syntax::{CallSite, DeclaredCallable, Span, StaticArg};
+use std::collections::HashMap;
 
 struct CallbackSite<'a> {
     node: NodeId,
@@ -28,7 +29,7 @@ struct CallbackSite<'a> {
 impl<P: PackageProvider> AnalyzerState<P> {
     fn native_selector(call: &CallSite) -> Option<&str> {
         let index = matched_arg_index(call, &[".NAME"], ".NAME")?;
-        match call.args.get(index)?.as_ref()? {
+        match call.static_arg(index)? {
             StaticArg::Symbol(name) | StaticArg::String(name) => Some(name.as_str()),
         }
     }
@@ -47,7 +48,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn process_native_routine_callbacks(
-        &mut self,
+        &self,
         context: NativeCallbackContext<'_>,
     ) -> Result<()> {
         let NativeCallbackContext {
@@ -103,7 +104,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             let callback_index = native_call_argument_index(call, position);
-            let callback = callback_index.and_then(|index| call.args.get(index)?.as_ref());
+            let callback = callback_index.and_then(|index| call.static_arg(index));
             let Some(StaticArg::Symbol(callback_name)) = callback else {
                 self.diagnostic(
                     native_node,
@@ -117,11 +118,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
                 continue;
             };
-            if callback_index
-                .and_then(|index| call.local_closure_args.get(index))
-                .copied()
-                .unwrap_or(false)
-            {
+            if callback_index.is_some_and(|index| call.arg_is_local_closure(index)) {
                 self.depend(
                     native_node,
                     callback_owner,
@@ -162,7 +159,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn declared_callable_resolution(
-        &mut self,
+        &self,
         current: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
@@ -178,7 +175,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 binding: Some(callable.name.as_str().into()),
             }),
             Some(package) if self.packages.is_external(package) => {
-                self.external.insert(package);
+                self.external.lock().insert(package);
                 Resolution::Static(BindingTarget::External { package, binding })
             }
             Some(package) => Resolution::Static(BindingTarget::Imported { package, binding }),
@@ -186,7 +183,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn require_native_callback(
-        &mut self,
+        &self,
         site: &CallbackSite<'_>,
         callback_name: &str,
         resolution: Resolution,
@@ -270,7 +267,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     }
 
     pub(super) fn linked_native_selector(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         image: &PackageImage,
@@ -280,7 +277,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         let Some(index) = matched_arg_index(call, &[".NAME"], ".NAME") else {
             return;
         };
-        let Some(StaticArg::String(symbol)) = call.args.get(index).and_then(Option::as_ref) else {
+        let Some(StaticArg::String(symbol)) = call.static_arg(index) else {
             return;
         };
         let Some(native) = image
@@ -291,14 +288,10 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         else {
             return;
         };
-        let names_other_library = call
-            .arg_names
-            .iter()
-            .zip(&call.args)
-            .any(|(name, argument)| {
-                name.as_deref() == Some("PACKAGE")
-                    && !matches!(argument, Some(StaticArg::String(library)) if library == component)
-            });
+        let names_other_library = call.arguments.iter().any(|argument| {
+            argument.name.as_deref() == Some("PACKAGE")
+                && !matches!(&argument.value, Some(StaticArg::String(library)) if library == component)
+        });
         let registered = NativeInterface::of_callee(&call.callee)
             .zip(native.library.routines())
             .is_some_and(|(interface, routines)| {
@@ -307,11 +300,11 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                     .iter()
                     .any(|routine| routine == symbol)
             });
-        let source = call.arg_spans.get(index).cloned().flatten();
+        let source = call.arg_span(index).cloned();
         match (native.library.name_lookup(), source) {
             (Some(NameLookup::Forced), _) if !names_other_library => {}
             (Some(NameLookup::Allowed), Some(source)) if registered && !names_other_library => {
-                self.relocations.push(PendingRelocation::NativeSymbol {
+                self.relocations.lock().push(PendingRelocation::NativeSymbol {
                     source,
                     package: current,
                     component: component.into(),
@@ -333,7 +326,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     }
 
     pub(super) fn linked_native_symbol_query(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         image: &PackageImage,
@@ -342,7 +335,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
     ) {
         let formals = ["name", "PACKAGE", "unlist", "withRegistrationInfo"];
         let library = matched_arg_index(call, &formals, "PACKAGE");
-        match library.map(|index| (index, call.args.get(index).and_then(Option::as_ref))) {
+        match library.map(|index| (index, call.static_arg(index))) {
             None => {
                 let Some(StaticArg::String(symbol)) = matched_static_arg(call, &formals, "name")
                 else {
@@ -381,12 +374,12 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 };
                 match (
                     native.library.name_lookup(),
-                    call.arg_spans.get(index).cloned().flatten(),
+                    call.arg_span(index).cloned(),
                 ) {
                     (Some(NameLookup::Forced), _) => {}
                     (Some(NameLookup::Allowed), Some(source)) => {
 
-                        self.relocations.push(PendingRelocation::NativeLibrary {
+                        self.relocations.lock().push(PendingRelocation::NativeLibrary {
                             source,
                             package: current,
                             component: library.as_str().into(),
@@ -415,24 +408,8 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         }
     }
 
-    pub(super) fn native_component_for_binding<'a>(
-        index: &'a PackageIndex,
-        name: &str,
-    ) -> Option<&'a str> {
-        let mut matches = index
-            .dynlibs
-            .iter()
-            .filter(|native| native.bindings().any(|symbol| symbol.binding == name));
-        let first = matches.next()?;
-        if matches.next().is_some() {
-            None
-        } else {
-            Some(first.name.as_str())
-        }
-    }
-
     pub(super) fn native_component_for_call(
-        &mut self,
+        &self,
         current: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
@@ -441,7 +418,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         let Some(selector_index) = matched_arg_index(call, &[".NAME"], ".NAME") else {
             return Ok(None);
         };
-        let Some(selector) = call.args.get(selector_index).and_then(Option::as_ref) else {
+        let Some(selector) = call.static_arg(selector_index) else {
             return Ok(None);
         };
         if let StaticArg::String(symbol) = selector {
@@ -512,5 +489,33 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         } else {
             Some(first.name.as_str())
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct NativeBindingIndex {
+    owners: HashMap<BindingName, Option<ComponentName>>,
+}
+
+impl NativeBindingIndex {
+    pub(super) fn new(index: &PackageIndex) -> Self {
+        let mut owners = HashMap::<BindingName, Option<ComponentName>>::new();
+        for component in &index.dynlibs {
+            for symbol in component.bindings() {
+                owners
+                    .entry(symbol.binding)
+                    .and_modify(|owner| {
+                        if owner.as_ref() != Some(&component.name) {
+                            *owner = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(component.name.clone()));
+            }
+        }
+        Self { owners }
+    }
+
+    pub(super) fn sole_component(&self, binding: &str) -> Option<&ComponentName> {
+        self.owners.get(binding)?.as_ref()
     }
 }

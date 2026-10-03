@@ -1,10 +1,12 @@
+use super::census::{assignment_of, node_range};
 use super::context::OakParseContext;
 use super::scan::{
     IfRegion, contains_call_named, skip_comment, split_top_level_operator, static_string,
     static_symbol, strip_outer_parentheses,
 };
-use super::{assignment_rhs_after, text_offset};
+use super::text_offset;
 use crate::syntax::source::TextRange;
+use air_r_syntax::RRoot;
 use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex};
 use std::collections::BTreeSet;
 
@@ -102,6 +104,7 @@ pub(super) fn effective_predicate(assumption: &BranchAssumption) -> Option<Simpl
 
 pub(super) fn expand_boolean_alias_assumptions(
     text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     scope: ScopeId,
     position: usize,
@@ -130,11 +133,10 @@ pub(super) fn expand_boolean_alias_assumptions(
                     && matches!(definition.kind(), DefinitionKind::Assignment(_))
                     && text_offset(definition.range().start()) < position
             })
-            .filter_map(|(_, definition)| {
-                assignment_rhs_after(text, text_offset(definition.range().end()), "<-")
-            })
-            .max_by_key(|(start, _)| *start)
-            .and_then(|(start, end)| text.get(start..end));
+            .filter_map(|(_, definition)| assignment_of(root, definition.kind()))
+            .map(|assignment| node_range(&assignment.value))
+            .max_by_key(|range| range.start)
+            .and_then(|range| text.get(range.start..range.end));
         let Some(rhs) = rhs.filter(|rhs| parse_simple_predicate(rhs).is_some()) else {
             continue;
         };

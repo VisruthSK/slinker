@@ -1,6 +1,6 @@
 use super::context::OakParseContext;
 use super::scan::static_arg;
-use super::{LexicalScopes, ast_span, ast_text, identifier_callee, text_offset};
+use super::{LexicalScopes, ast_span, ast_str, ast_text, identifier_callee, text_offset};
 use crate::package::{BindingName, PackageName};
 use crate::syntax::facts::{
     BindingDeclaration, DeclaredCallable, DeclaredDomain, LexicalScopeId, SemanticIssue,
@@ -37,6 +37,9 @@ pub(super) fn collect_declarations(
         inert: Vec::new(),
         issues: Vec::new(),
     };
+    if !text.contains("declare") {
+        return collected;
+    }
     for call in root.syntax().descendants().filter_map(RCall::cast) {
         let start = text_offset(call.syntax().text_trimmed_range().start());
         let (scope, lexical) = scopes.at(index, start);
@@ -44,12 +47,12 @@ pub(super) fn collect_declarations(
             continue;
         };
         let is_declare = match &function {
-            AnyRExpression::RIdentifier(_) => identifier_callee(&call).is_some_and(|(name, _)| {
-                name == "declare"
-                    && context.resolves_to_base(&name)
-                    && index.resolve(&name, scope).is_none()
+            AnyRExpression::RIdentifier(_) => identifier_callee(&call).is_some_and(|callee| {
+                callee.name() == "declare"
+                    && context.resolves_to_base(callee.name())
+                    && index.resolve(callee.name(), scope).is_none()
             }),
-            _ => ast_text(text, &function) == "base::declare",
+            _ => ast_str(text, &function) == "base::declare",
         };
         let Ok(arguments) = call.arguments() else {
             continue;
@@ -68,7 +71,7 @@ pub(super) fn collect_declarations(
             let AnyRExpression::RCall(language) = value else {
                 continue;
             };
-            if identifier_callee(&language).is_none_or(|(name, _)| name != "slinker") {
+            if identifier_callee(&language).is_none_or(|callee| callee.name() != "slinker") {
                 continue;
             }
             collect_slinker_declaration(
@@ -185,7 +188,7 @@ pub(super) fn declaration_call(value: &AnyRExpression) -> Option<(String, Vec<An
     let AnyRExpression::RCall(call) = value else {
         return None;
     };
-    let (callee, _) = identifier_callee(call)?;
+    let callee = identifier_callee(call)?.name().to_owned();
     let arguments = call
         .arguments()
         .ok()?
@@ -208,7 +211,7 @@ pub(super) fn literal_strings(text: &str, arguments: &[AnyRExpression]) -> Optio
         .iter()
         .map(
             |argument| match static_arg(ast_text(text, argument).trim()) {
-                Some(StaticArg::String(value)) => Some(value),
+                Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
                 Some(StaticArg::Symbol(_)) | None => None,
             },
         )

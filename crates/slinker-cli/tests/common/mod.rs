@@ -1,9 +1,19 @@
 #![allow(dead_code)]
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+pub fn user_library_arguments() -> Vec<OsString> {
+    std::env::var_os("R_LIBS_USER")
+        .map(|libraries| {
+            std::env::split_paths(&libraries)
+                .flat_map(|library| [OsString::from("--lib"), library.into_os_string()])
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 pub fn slinker(arguments: &[&OsStr]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_slinker"))

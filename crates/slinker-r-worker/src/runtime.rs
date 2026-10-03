@@ -1,22 +1,27 @@
 use super::index::worker_package_index;
-use super::scan::{InspectionEpoch, ObjectScanner, PrivateIds};
+use super::scan::ObjectScanner;
 use super::{Coded, InspectionError, WorkerOperationError, field, protocol};
 use super::{InspectionResult, OperationResult};
 use harp::{RFunctionExt, RObjectExt};
-use protocol::{WorkerErrorCode, WorkerPackageIndex, WorkerRequest, WorkerResponse};
-use slinker_core::package::{BindingName, BindingOrigin, DataSetId, DatasetName};
-use std::collections::{BTreeMap, HashMap};
+use protocol::{
+    NormalizeOutcome, NormalizedSource, WorkerErrorCode, WorkerPackageIndex, WorkerRequest,
+    WorkerResponse,
+};
+use slinker_core::package::{
+    BindingImage, BindingName, BindingOrigin, DataSetId, DatasetName, EnvironmentLabel,
+    PrivateEnvironmentImage,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
 
 struct PackageImageContext {
     image: harp::object::RObject,
     index: WorkerPackageIndex,
-    epoch: InspectionEpoch,
-    private_ids: PrivateIds,
+    delivered: HashSet<EnvironmentLabel>,
+    labels: HashMap<libr::SEXP, EnvironmentLabel>,
 }
 
 pub(super) struct WorkerRuntime {
-    worker: u64,
     _arguments: Vec<CString>,
     contexts: HashMap<String, PackageImageContext>,
 }
@@ -79,7 +84,6 @@ impl WorkerRuntime {
             .into());
         }
         Ok(Self {
-            worker: target.worker,
             _arguments: arguments,
             contexts: HashMap::new(),
         })
@@ -192,11 +196,8 @@ impl WorkerRuntime {
                 PackageImageContext {
                     image,
                     index,
-                    epoch: InspectionEpoch {
-                        worker: self.worker,
-                        context: self.contexts.len() + 1,
-                    },
-                    private_ids: PrivateIds::new(),
+                    delivered: HashSet::new(),
+                    labels: HashMap::new(),
                 },
             );
         }
@@ -323,15 +324,37 @@ impl WorkerRuntime {
         } else {
             BindingOrigin::Code
         };
+        let registries = context.image.elt("lazy_environments")?;
+        let labels = &mut context.labels;
+        let mut identify = |environment: libr::SEXP| -> InspectionResult<EnvironmentLabel> {
+            if let Some(label) = labels.get(&environment) {
+                return Ok(label.clone());
+            }
+            let key = harp::RFunction::new("", ".slinker_environment_key")
+                .add(registries.sexp)
+                .add(environment)
+                .call()
+                .and_then(String::try_from)?;
+            if key.is_empty() {
+                return Err("a private environment has no lazy-load identity"
+                    .to_owned()
+                    .into());
+            }
+            let label = EnvironmentLabel::private(key);
+            labels.insert(environment, label.clone());
+            Ok(label)
+        };
         let mut scanner = ObjectScanner::new(
             environment.inner.sexp,
             package.name.as_str(),
-            &context.private_ids,
-            context.epoch,
+            &mut identify,
+            &context.delivered,
         );
         let binding = scanner.top_binding(name, origin, binding.value)?;
         let outcome = scanner.finish();
-        context.private_ids.extend(outcome.discovered);
+        context
+            .delivered
+            .extend(outcome.private_environments.keys().cloned());
         if binding.name != name
             || context.index.name != package.name
             || context.index.version != package.version
@@ -342,13 +365,44 @@ impl WorkerRuntime {
             )
             .into());
         }
+        let normalizations = self.normalizations(&binding, &outcome.private_environments);
         Ok(protocol::WorkerBinding {
             package_name: package.name.clone(),
             package_version: package.version.clone(),
             image_fingerprint: package.image_fingerprint.clone(),
             binding,
             private_environments: outcome.private_environments,
+            normalizations,
         })
+    }
+
+    fn normalizations(
+        &self,
+        binding: &BindingImage,
+        private_environments: &HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
+    ) -> Vec<protocol::WorkerNormalization> {
+        binding
+            .object
+            .closure_sources()
+            .chain(
+                private_environments
+                    .values()
+                    .flat_map(|environment| environment.bindings.values())
+                    .flat_map(|private| private.object.closure_sources()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|source| {
+                let (canonical, stable) = self.canonical_syntax(source).ok()?;
+                Some(protocol::WorkerNormalization {
+                    original: source.to_owned(),
+                    canonical: protocol::NormalizedSource {
+                        source: canonical,
+                        stable,
+                    },
+                })
+            })
+            .collect()
     }
 
     pub(super) fn image_environment(
@@ -366,14 +420,22 @@ impl WorkerRuntime {
             WorkerRequest::ValidateSyntax { request_id, source } => {
                 syntax_verdict(request_id, self.validate_syntax(&source))
             }
-            WorkerRequest::NormalizeSyntax { request_id, source } => {
-                let (source, stable) = self
-                    .canonical_syntax(&source)
-                    .coded(WorkerErrorCode::TargetSyntaxRejection)?;
+            WorkerRequest::NormalizeSyntax {
+                request_id,
+                sources,
+            } => {
+                let results = sources
+                    .iter()
+                    .map(|source| match self.canonical_syntax(source) {
+                        Ok((source, stable)) => {
+                            NormalizeOutcome::Normalized(NormalizedSource { source, stable })
+                        }
+                        Err(error) => NormalizeOutcome::Rejected(error.to_string()),
+                    })
+                    .collect();
                 WorkerResponse::NormalizedSyntax {
                     request_id,
-                    source,
-                    stable,
+                    results,
                 }
             }
             WorkerRequest::VerifyRelocation {
@@ -401,6 +463,17 @@ impl WorkerRuntime {
             } => WorkerResponse::Binding {
                 request_id,
                 binding: self.binding(&package, name.as_str())?,
+            },
+            WorkerRequest::BindingBatch {
+                request_id,
+                package,
+                names,
+            } => WorkerResponse::Bindings {
+                request_id,
+                bindings: names
+                    .iter()
+                    .map(|name| self.binding(&package, name.as_str()))
+                    .collect::<OperationResult<Vec<_>>>()?,
             },
             WorkerRequest::DataLibrary {
                 request_id,

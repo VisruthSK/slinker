@@ -10,7 +10,7 @@ pub use facts::{
     ParsedExpression, ParsedRFile, PinnedDefault, ResourcePackage, ResourceRef, SemanticIssue,
     SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
-pub use oak::assigned_value_start;
+pub(crate) use oak::SharedNames;
 pub(crate) use oak::{
     NamespaceImportResolution, NamespaceImports, closure_definitely_non_returning,
 };

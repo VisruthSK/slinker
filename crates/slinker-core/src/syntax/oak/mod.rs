@@ -1,9 +1,11 @@
-use crate::package::BindingName;
+use crate::package::{Atom, BindingName};
+use crate::profile::{self, Probe};
 use crate::syntax::facts::{
-    ActiveBindingDef, CallSite, CalleeKind, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef,
-    NameRefKind, NamespaceEnumeration, NamespaceInfoRead, NamespaceInfoReceiver, PackageRef,
-    ParsedExpression, ParsedRFile, PinnedDefault, ResourcePackage, ResourceRef, SemanticIssue,
-    SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    ActiveBindingDef, CallArgument, CallSite, CalleeKind, EvalPhase, LexicalBindingId,
+    LexicalScopeId, NameRef, NameRefKind, NamespaceEnumeration, NamespaceInfoRead,
+    NamespaceInfoReceiver, PackageRef, ParsedExpression, ParsedRFile, PinnedDefault,
+    ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment,
+    SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use air_r_parser::{RParserOptions, parse};
@@ -16,6 +18,8 @@ use oak_semantic::semantic_index::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+mod census;
+use census::{Census, assignment_of, node_range, static_arg_of};
 mod construction;
 mod context;
 mod declarations;
@@ -27,6 +31,7 @@ mod scan;
 mod tests;
 
 pub use context::OakParseContext;
+pub(crate) use context::SharedNames;
 pub(crate) use context::{NamespaceImportResolution, NamespaceImports};
 pub(crate) use proofs::closure_definitely_non_returning;
 
@@ -44,10 +49,8 @@ use proofs::{
     post_for_use_may_fall_through, recursive_closure_binding_is_initialized,
 };
 use scan::{
-    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, argument_spans, call_after_name,
-    expression_end, find_for_regions, find_function_regions, find_if_regions, namespace_extent,
-    skip_trivia, statement_start, static_arg, static_args, static_symbol_range, trim_end_offset,
-    word_boundary_after,
+    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, argument_spans, namespace_extent,
+    skip_trivia, static_arg, static_args,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -73,7 +76,7 @@ struct LiveCall {
 #[derive(Debug, Clone)]
 struct SuperAssignmentParts {
     span: TextRange,
-    value_symbol: Option<(String, usize, usize)>,
+    value_symbol: Option<(Atom, usize, usize)>,
 }
 
 impl OakParser {
@@ -94,14 +97,20 @@ impl OakParser {
         if u32::try_from(text.len()).is_err() {
             return Err("source exceeds the 4 GiB text size Air can address".into());
         }
-        let parsed = parse(text, RParserOptions::default());
+        let parsed = profile::scoped(Probe::ParseSyntax, || {
+            parse(text, RParserOptions::default())
+        });
         if let Some(error) = parsed.error() {
             return Err(error.to_string());
         }
         let root = parsed.tree();
+        let value_start = assignment_value_start(&root);
         let Some(evaluated) = evaluated_quotation_text(text, &root, context) else {
             let index = build_semantic_index(&root, context);
-            return Ok(translate_index(source, text, context, &root, &index));
+            return Ok(with_value_start(
+                translate_index(source, text, context, &root, &index),
+                value_start,
+            ));
         };
         let parsed = parse(&evaluated, RParserOptions::default());
         if let Some(error) = parsed.error() {
@@ -109,43 +118,51 @@ impl OakParser {
         }
         let root = parsed.tree();
         let index = build_semantic_index(&root, context);
-        Ok(translate_index(source, &evaluated, context, &root, &index))
+        Ok(with_value_start(
+            translate_index(source, &evaluated, context, &root, &index),
+            value_start,
+        ))
     }
 }
 
 fn evaluated_quotation_text(text: &str, root: &RRoot, context: &OakParseContext) -> Option<String> {
+    if !text.contains("eval") {
+        return None;
+    }
     let mut blanks = Vec::new();
     for call in root.syntax().descendants().filter_map(RCall::cast) {
-        let Some((callee, callee_range)) = base_callee(&call, context) else {
+        let Some(callee) = base_callee(&call, context) else {
             continue;
         };
+        let callee_range = callee.range.clone();
         let Some(argument) = sole_positional_argument(&call) else {
             continue;
         };
-        match callee.as_str() {
+        match callee.name() {
             "evalq" => blanks.push(callee_range),
             "eval" => {
                 let AnyRExpression::RCall(quotation) = argument else {
                     continue;
                 };
-                let Some((quoter, quoter_range)) = base_callee(&quotation, context) else {
+                let Some(quoter) = base_callee(&quotation, context) else {
                     continue;
                 };
-                if !matches!(quoter.as_str(), "quote" | "bquote")
+                let quoter_range = quoter.range.clone();
+                if !matches!(quoter.name(), "quote" | "bquote")
                     || sole_positional_argument(&quotation).is_none()
                 {
                     continue;
                 }
                 blanks.extend([callee_range, quoter_range]);
-                if quoter == "bquote" {
+                if quoter.name() == "bquote" {
                     blanks.extend(
                         quotation
                             .syntax()
                             .descendants()
                             .filter_map(RCall::cast)
                             .filter_map(|splice| identifier_callee(&splice))
-                            .filter(|(name, _)| name == ".")
-                            .map(|(_, range)| range),
+                            .filter(|callee| callee.name() == ".")
+                            .map(|callee| callee.range),
                     );
                 }
             }
@@ -162,13 +179,23 @@ fn evaluated_quotation_text(text: &str, root: &RRoot, context: &OakParseContext)
     Some(String::from_utf8(bytes).expect("ASCII identifiers are replaced by ASCII spaces"))
 }
 
-fn data_mask_ranges(root: &RRoot, context: &OakParseContext) -> Vec<std::ops::Range<usize>> {
+fn data_mask_ranges(
+    text: &str,
+    root: &RRoot,
+    context: &OakParseContext,
+) -> Vec<std::ops::Range<usize>> {
+    if !["with", "subset", "transform"]
+        .iter()
+        .any(|callee| text.contains(callee))
+    {
+        return Vec::new();
+    }
     root.syntax()
         .descendants()
         .filter_map(RCall::cast)
         .filter(|call| {
-            base_callee(call, context).is_some_and(|(name, _)| {
-                matches!(name.as_str(), "with" | "within" | "subset" | "transform")
+            base_callee(call, context).is_some_and(|callee| {
+                matches!(callee.name(), "with" | "within" | "subset" | "transform")
             })
         })
         .filter_map(|call| call.arguments().ok())
@@ -257,15 +284,17 @@ fn pinned_defaults(
         .filter_map(|parameter| {
             let name = ast_text(text, &parameter.name().ok()?);
             let default = parameter.default()?.value().ok()?;
-            let Some(StaticArg::String(value)) = static_arg(&ast_text(text, &default)) else {
+            let Some(StaticArg::String(value)) = static_arg(ast_str(text, &default)) else {
                 return None;
             };
             let rebound = effects.iter().any(|effect| {
                 effect.kind == SyntaxEffectKind::SuperAssignment
                     && effect.target.as_deref() == Some(name.as_str())
             });
-            (!rebound && definition_count(index, &name) == 1)
-                .then_some(PinnedDefault { name, value })
+            (!rebound && definition_count(index, &name) == 1).then_some(PinnedDefault {
+                name: Atom::from(name),
+                value,
+            })
         })
         .collect()
 }
@@ -297,22 +326,30 @@ fn is_dots_element(name: &str) -> bool {
         .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-fn identifier_callee(call: &RCall) -> Option<(String, std::ops::Range<usize>)> {
+struct Callee {
+    token: air_r_syntax::RSyntaxToken,
+    range: std::ops::Range<usize>,
+}
+
+impl Callee {
+    fn name(&self) -> &str {
+        self.token.text_trimmed()
+    }
+}
+
+fn identifier_callee(call: &RCall) -> Option<Callee> {
     let AnyRExpression::RIdentifier(identifier) = call.function().ok()? else {
         return None;
     };
     let range = identifier.syntax().text_trimmed_range();
-    Some((
-        identifier.syntax().text_trimmed().to_string(),
-        text_offset(range.start())..text_offset(range.end()),
-    ))
+    Some(Callee {
+        token: identifier.name_token().ok()?,
+        range: text_offset(range.start())..text_offset(range.end()),
+    })
 }
 
-fn base_callee(
-    call: &RCall,
-    context: &OakParseContext,
-) -> Option<(String, std::ops::Range<usize>)> {
-    identifier_callee(call).filter(|(name, _)| context.resolves_to_base(name))
+fn base_callee(call: &RCall, context: &OakParseContext) -> Option<Callee> {
+    identifier_callee(call).filter(|callee| context.resolves_to_base(callee.name()))
 }
 
 struct LexicalScopes {
@@ -354,7 +391,7 @@ impl LexicalScopes {
             .resolve(name, scope)
             .map(|(owner, _, _)| LexicalBindingId {
                 defining_scope: self.ids[&owner],
-                name: name.to_owned(),
+                name: Atom::from(name),
             })
     }
 
@@ -376,10 +413,15 @@ impl LexicalScopes {
     }
 }
 
-pub fn assigned_value_start(text: &str) -> Option<usize> {
-    let parsed = parse(text, RParserOptions::default());
-    let assignment = parsed
-        .tree()
+fn with_value_start(mut parsed: ParsedRFile, value_start: Option<usize>) -> ParsedRFile {
+    if let Some(expression) = parsed.expressions.first_mut() {
+        expression.assigned_value_start = value_start;
+    }
+    parsed
+}
+
+fn assignment_value_start(root: &RRoot) -> Option<usize> {
+    let assignment = root
         .syntax()
         .descendants()
         .find_map(RBinaryExpression::cast)?;
@@ -396,7 +438,9 @@ pub fn assigned_value_start(text: &str) -> Option<usize> {
 }
 
 fn build_semantic_index(root: &RRoot, context: &OakParseContext) -> SemanticIndex {
-    build_index(root, SlinkerImportsResolver { context })
+    profile::scoped(Probe::ParseIndex, || {
+        build_index(root, SlinkerImportsResolver { context })
+    })
 }
 
 fn translate_index(
@@ -407,24 +451,23 @@ fn translate_index(
     index: &SemanticIndex,
 ) -> ParsedRFile {
     let scopes = LexicalScopes::new(index);
-    let declarations = collect_declarations(&source, text, root, context, index, &scopes);
+    let declarations = profile::scoped(Probe::ParseDeclarations, || {
+        collect_declarations(&source, text, root, context, index, &scopes)
+    });
     let mut live_uses = collect_live_uses(index, &declarations);
 
-    let function_regions = find_function_regions(text);
-    let for_regions = find_for_regions(text);
-    let if_regions = find_if_regions(text);
-    refine_callee_kinds(
-        text,
-        context,
-        index,
-        &function_regions,
-        &for_regions,
-        &if_regions,
-        &mut live_uses,
-    );
+    let census = profile::scoped(Probe::ParseRegions, || Census::of(root));
+    let (function_regions, for_regions, if_regions) =
+        (&census.functions, &census.fors, &census.ifs);
+    profile::scoped(Probe::ParseRegions, || {
+        refine_callee_kinds(text, root, context, index, &census, &mut live_uses);
+    });
 
-    let mut references = name_references(&source, text, context, root, index, &live_uses);
-    let mut live_calls = lexical_calls(&source, text, index, &scopes, &live_uses);
+    let mut references = profile::scoped(Probe::ParseReferences, || {
+        name_references(&source, text, context, root, index, &census, &live_uses)
+    });
+    let calls_span = profile::span(Probe::ParseCalls);
+    let mut live_calls = lexical_calls(&source, root, index, &scopes, &census, &live_uses);
     let translation = Translation {
         source: &source,
         text,
@@ -432,14 +475,17 @@ fn translate_index(
         index,
         scopes: &scopes,
         declarations: &declarations,
+        census: &census,
     };
     let mut package_refs = namespace_access_facts(translation, &live_uses, &mut live_calls);
     binary_operator_facts(translation, &mut references, &mut live_calls);
     dispatching_syntax_facts(translation, &mut live_calls);
 
     deduplicate_calls(&mut live_calls);
+    drop(calls_span);
 
-    let mut guard_regions = if_guard_regions(text, context, &if_regions, &live_calls);
+    let guards_span = profile::span(Probe::ParseGuards);
+    let mut guard_regions = if_guard_regions(text, context, if_regions, &live_calls);
     apply_guard_regions_to_references(&guard_regions, &mut references);
     apply_guard_regions_to_package_refs(&guard_regions, &mut package_refs);
     apply_guard_regions_to_calls(&guard_regions, &mut live_calls);
@@ -451,29 +497,36 @@ fn translate_index(
     guard_regions.extend(hook_regions);
 
     let resource_refs = collect_resources(source, context, &live_calls);
-    let environment_aliases = collect_environment_aliases(text, context, index, &live_calls);
+    let environment_aliases = collect_environment_aliases(root, context, index, &live_calls);
     let active_bindings = collect_active_bindings(
         source,
         context,
         &live_calls,
         &environment_aliases,
-        &if_regions,
+        if_regions,
     );
     let namespace_enumerations =
         collect_namespace_enumerations(source, context, &live_calls, &environment_aliases);
+    drop(guards_span);
+
+    let effects_span = profile::span(Probe::ParseEffects);
     let (mut effects, suppressed_reference_spans) = collect_superassignments(
         source,
         text,
+        root,
         index,
-        &function_regions,
-        &for_regions,
-        &if_regions,
+        function_regions,
+        for_regions,
+        if_regions,
     );
     suppress_superassignment_references(&mut effects, &mut references, &suppressed_reference_spans);
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
+    drop(effects_span);
 
+    let construction_span = profile::span(Probe::ParseConstruction);
     let (parameters, construction) = collect_construction(source, text, root, &live_calls);
     let namespace_info_reads = collect_namespace_info_reads(source, text, root, &declarations);
+    drop(construction_span);
     let calls: Vec<CallSite> = live_calls.into_iter().map(|call| call.site).collect();
     let mut issues = translate_diagnostics(source, index);
     issues.extend(declarations.issues);
@@ -483,23 +536,29 @@ fn translate_index(
     ParsedRFile {
         expressions: vec![ParsedExpression {
             span: Span::new(source, 0, text.len()),
-            parameters,
-            used_parameters,
+            assigned_value_start: None,
+            parameters: parameters.into_iter().map(Atom::from).collect(),
+            used_parameters: used_parameters.into_iter().map(Atom::from).collect(),
             pinned_defaults,
-            references,
-            package_refs,
-            resource_refs,
-            calls,
+            references: exact(references),
+            package_refs: exact(package_refs),
+            resource_refs: exact(resource_refs),
+            calls: exact(calls),
             active_bindings,
-            effects,
-            construction,
+            effects: exact(effects),
+            construction: exact(construction),
             namespace_info_reads,
             namespace_enumerations,
         }],
         issues,
-        scope_parents: scopes.parents,
-        declarations: declarations.declarations,
+        scope_parents: exact(scopes.parents),
+        declarations: exact(declarations.declarations),
     }
+}
+
+fn exact<T>(mut values: Vec<T>) -> Vec<T> {
+    values.shrink_to_fit();
+    values
 }
 
 const NAMESPACE_INFO: &str = ".__NAMESPACE__.";
@@ -527,7 +586,7 @@ fn collect_namespace_info_reads(
                 span: ast_span(&source, &expression),
             });
         } else if let AnyRExpression::RIdentifier(_) = &expression
-            && unquoted(&ast_text(text, &expression)) == NAMESPACE_INFO
+            && unquoted(ast_str(text, &expression)) == NAMESPACE_INFO
             && let Some(field) = extracted_field(text, &expression)
         {
             reads.push(NamespaceInfoRead {
@@ -547,7 +606,7 @@ fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpress
         {
             Some((
                 extract.left().ok()?,
-                unquoted(&ast_text(text, &extract.right().ok()?)),
+                unquoted(ast_str(text, &extract.right().ok()?)),
             ))
         }
         AnyRExpression::RSubset2(subset) => {
@@ -556,8 +615,10 @@ fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpress
             if arguments.next().is_some() {
                 return None;
             }
-            match static_arg(ast_text(text, &index).trim())? {
-                StaticArg::String(member) => Some((subset.function().ok()?, member)),
+            match static_arg(ast_str(text, &index).trim())? {
+                StaticArg::String(member) => {
+                    Some((subset.function().ok()?, member.as_str().to_owned()))
+                }
                 StaticArg::Symbol(_) => None,
             }
         }
@@ -576,14 +637,14 @@ fn namespace_info_receiver(text: &str, receiver: &AnyRExpression) -> NamespaceIn
         return NamespaceInfoReceiver::Computed;
     };
     let named = call.function().ok().is_some_and(|function| {
-        let callee = ast_text(text, &function);
+        let callee = ast_str(text, &function);
         matches!(
             callee.trim_start_matches("base::"),
             "asNamespace" | "getNamespace"
         )
     });
     match sole_positional_argument(call)
-        .and_then(|argument| static_arg(ast_text(text, &argument).trim()))
+        .and_then(|argument| static_arg(ast_str(text, &argument).trim()))
     {
         Some(StaticArg::String(package)) if named => {
             NamespaceInfoReceiver::Namespace(package.into())
@@ -643,13 +704,14 @@ fn collect_live_uses(index: &SemanticIndex, declarations: &Declarations) -> Vec<
 
 fn refine_callee_kinds(
     text: &str,
+    root: &RRoot,
     context: &OakParseContext,
     index: &SemanticIndex,
-    function_regions: &[FunctionRegion],
-    for_regions: &[ForRegion],
-    if_regions: &[IfRegion],
+    census: &Census,
     live_uses: &mut [LiveUse],
 ) {
+    let (function_regions, for_regions, if_regions) =
+        (&census.functions, &census.fors, &census.ifs);
     for live_use in live_uses.iter_mut() {
         if live_use.callee_kind == CalleeKind::DefinitelyLexical
             && post_for_use_may_fall_through(text, index, for_regions, if_regions, live_use)
@@ -661,7 +723,7 @@ fn refine_callee_kinds(
             && (formal_default_use_is_bound(function_regions, live_use)
                 || for_body_use_is_bound(index, for_regions, live_use)
                 || recursive_closure_binding_is_initialized(
-                    text,
+                    root,
                     index,
                     function_regions,
                     live_use,
@@ -673,6 +735,7 @@ fn refine_callee_kinds(
         if live_use.callee_kind == CalleeKind::ConditionalFallthrough
             && conditional_fallthrough_proven_bound(
                 text,
+                root,
                 context,
                 index,
                 for_regions,
@@ -691,9 +754,10 @@ fn name_references(
     context: &OakParseContext,
     root: &RRoot,
     index: &SemanticIndex,
+    census: &Census,
     live_uses: &[LiveUse],
 ) -> Vec<NameRef> {
-    let data_masks = data_mask_ranges(root, context);
+    let data_masks = data_mask_ranges(text, root, context);
     live_uses
         .iter()
         .filter_map(|live_use| {
@@ -704,7 +768,7 @@ fn name_references(
             let kind = match live_use.callee_kind {
                 CalleeKind::DefinitelyLexical
                     if text.as_bytes().get(skip_trivia(text, live_use.end)) == Some(&b'(')
-                        && !reaches_only_closures(text, index, live_use) =>
+                        && !reaches_only_closures(root, index, live_use) =>
                 {
                     NameRefKind::MaybeLocal
                 }
@@ -715,11 +779,7 @@ fn name_references(
                 CalleeKind::DefinitelyExternal => NameRefKind::External,
                 CalleeKind::ConditionalFallthrough => NameRefKind::ConditionalFallthrough,
             };
-            let replaced =
-                call_after_name(text, live_use.start, live_use.end).is_some_and(|call| {
-                    let rest = &text[skip_trivia(text, call.end)..];
-                    rest.starts_with("<-") || rest.starts_with("<<-")
-                });
+            let replaced = census.is_replacement_target(live_use.start, live_use.end);
             Some(NameRef {
                 name: if replaced {
                     BindingName::from(format!("{}<-", live_use.name))
@@ -737,34 +797,27 @@ fn name_references(
 
 fn lexical_calls(
     source: &SourceId,
-    text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     scopes: &LexicalScopes,
+    census: &Census,
     live_uses: &[LiveUse],
 ) -> Vec<LiveCall> {
     let mut live_calls = Vec::new();
 
     for live_use in live_uses {
-        let Some(raw) = call_after_name(text, live_use.start, live_use.end) else {
+        let Some(raw) = census.call_of(live_use.start, live_use.end) else {
             continue;
         };
         let args = static_args(&raw);
         let (scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
         live_calls.push(LiveCall {
             site: CallSite {
-                callee: live_use.name.clone(),
+                callee: Atom::from(live_use.name.as_str()),
                 callee_kind: live_use.callee_kind,
                 qualified_package: None,
-                args,
-                arg_names: raw
-                    .args
-                    .iter()
-                    .map(|argument| argument.name.clone())
-                    .collect(),
-                arg_spans: argument_spans(source, &raw.args),
-                local_closure_args: local_closure_arguments(text, index, live_uses, &raw.args),
+                arguments: call_arguments(source, root, index, live_uses, &raw, args, arg_bindings),
                 scope,
-                arg_bindings,
                 phase: live_use.phase,
                 guards: Vec::new(),
                 span: Span::new(*source, raw.start, raw.end),
@@ -783,6 +836,7 @@ struct Translation<'a> {
     index: &'a SemanticIndex,
     scopes: &'a LexicalScopes,
     declarations: &'a Declarations,
+    census: &'a Census,
 }
 
 fn namespace_access_facts(
@@ -796,6 +850,7 @@ fn namespace_access_facts(
         index,
         scopes,
         declarations,
+        census,
         ..
     } = translation;
     let mut package_refs = Vec::new();
@@ -822,25 +877,25 @@ fn namespace_access_facts(
             span: Span::new(*source, start, access_end),
         });
 
-        if let Some(raw) = call_after_name(text, start, access_end) {
+        if let Some(raw) = census.call_of(start, access_end) {
             let (scope, _) = index.scope_at(access.offset());
             let args = static_args(&raw);
             let (lexical_scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
             live_calls.push(LiveCall {
                 site: CallSite {
-                    callee: access.symbol().to_owned(),
+                    callee: Atom::from(access.symbol()),
                     callee_kind: CalleeKind::DefinitelyExternal,
-                    qualified_package: Some(access.package().to_owned()),
-                    args,
-                    arg_names: raw
-                        .args
-                        .iter()
-                        .map(|argument| argument.name.clone())
-                        .collect(),
-                    arg_spans: argument_spans(source, &raw.args),
-                    local_closure_args: local_closure_arguments(text, index, live_uses, &raw.args),
+                    qualified_package: Some(Atom::from(access.package())),
+                    arguments: call_arguments(
+                        source,
+                        translation.root,
+                        index,
+                        live_uses,
+                        &raw,
+                        args,
+                        arg_bindings,
+                    ),
                     scope: lexical_scope,
-                    arg_bindings,
                     phase: phase_for_scope(index, scope),
                     guards: Vec::new(),
                     span: Span::new(*source, raw.start, raw.end),
@@ -864,6 +919,7 @@ fn binary_operator_facts(
         index,
         scopes,
         declarations,
+        ..
     } = translation;
     for binary in root
         .syntax()
@@ -912,15 +968,22 @@ fn binary_operator_facts(
         let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &args);
         live_calls.push(LiveCall {
             site: CallSite {
-                callee: operator.clone(),
+                callee: Atom::from(operator.as_str()),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
-                args,
-                arg_names: vec![None, None],
-                arg_spans: vec![left_span, right_span],
-                local_closure_args: vec![false, false],
+                arguments: args
+                    .into_iter()
+                    .zip([left_span, right_span])
+                    .zip(arg_bindings)
+                    .map(|((value, span), binding)| CallArgument {
+                        value,
+                        name: None,
+                        span,
+                        is_local_closure: false,
+                        binding,
+                    })
+                    .collect(),
                 scope: lexical_scope,
-                arg_bindings,
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
                 span: span.clone(),
@@ -937,14 +1000,14 @@ fn binary_operator_facts(
 fn suppress_superassignment_references(
     effects: &mut [SyntaxEffect],
     references: &mut Vec<NameRef>,
-    suppressed_reference_spans: &[(String, usize, usize)],
+    suppressed_reference_spans: &[(Atom, usize, usize)],
 ) {
-    let is_suppressed = |reference: &NameRef, (name, start, end): &(String, usize, usize)| {
+    let is_suppressed = |reference: &NameRef, (name, start, end): &(Atom, usize, usize)| {
         reference.name == *name && reference.span.start == *start && reference.span.end == *end
     };
     for effect in effects.iter_mut() {
         let span = &effect.span;
-        let free = |symbol: &String| {
+        let free = |symbol: &Atom| {
             suppressed_reference_spans.iter().any(|value| {
                 value.0 == *symbol
                     && span.start <= value.1
@@ -972,6 +1035,18 @@ fn ast_span(source: &SourceId, node: &impl AstNode<Language = air_r_syntax::RLan
         text_offset(range.start()),
         text_offset(range.end()),
     )
+}
+
+fn ast_str<'a>(text: &'a str, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> &'a str {
+    let span = node.syntax().text_trimmed_range();
+    &text[text_offset(span.start())..text_offset(span.end())]
+}
+
+fn ast_atom(
+    text: &str,
+    node: &impl AstNode<Language = air_r_syntax::RLanguage>,
+) -> crate::package::Atom {
+    crate::package::Atom::from(ast_str(text, node))
 }
 
 fn ast_text(text: &str, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> String {
@@ -1052,10 +1127,10 @@ fn collect_resources(
             || {
                 ResourcePackage::Computed(
                     call.site
-                        .arg_names
+                        .arguments
                         .iter()
-                        .position(|name| name.as_deref() == Some("package"))
-                        .and_then(|index| call.site.arg_bindings.get(index)?.clone()),
+                        .find(|argument| argument.name.as_deref() == Some("package"))
+                        .and_then(|argument| argument.binding.clone()),
                 )
             },
             ResourcePackage::Literal,
@@ -1136,7 +1211,7 @@ fn collect_active_bindings(
 }
 
 fn collect_environment_aliases(
-    text: &str,
+    root: &RRoot,
     context: &OakParseContext,
     index: &SemanticIndex,
     calls: &[LiveCall],
@@ -1148,13 +1223,10 @@ fn collect_environment_aliases(
                 continue;
             }
             let name = index.symbols(scope).symbol(definition.symbol()).name();
-            let range = definition.range();
-            let target_end = text_offset(range.end());
-            let Some((value_start, value_end)) = assignment_rhs_after(text, target_end, "<-")
-            else {
+            let Some(assignment) = assignment_of(root, definition.kind()) else {
                 continue;
             };
-            let value = TextRange::new(value_start, value_end);
+            let value = node_range(&assignment.value);
             let Some(target) = calls
                 .iter()
                 .find(|call| {
@@ -1180,7 +1252,7 @@ fn environment_target(
     aliases: &BTreeMap<String, StaticEnvironment>,
 ) -> Option<StaticEnvironment> {
     if let Some(StaticArg::Symbol(name)) = &argument.static_arg
-        && let Some(target) = aliases.get(name)
+        && let Some(target) = aliases.get(name.as_str())
     {
         return Some(target.clone());
     }
@@ -1263,7 +1335,7 @@ fn collect_namespace_enumerations(
             continue;
         };
         let environment = match &argument.static_arg {
-            Some(StaticArg::Symbol(name)) => aliases.get(name).cloned(),
+            Some(StaticArg::Symbol(name)) => aliases.get(name.as_str()).cloned(),
             _ => calls
                 .iter()
                 .find(|nested| nested.site.span.range() == argument.value)
@@ -1283,11 +1355,12 @@ fn collect_namespace_enumerations(
 fn collect_superassignments(
     source: SourceId,
     text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     function_regions: &[FunctionRegion],
     for_regions: &[ForRegion],
     if_regions: &[IfRegion],
-) -> (Vec<SyntaxEffect>, Vec<(String, usize, usize)>) {
+) -> (Vec<SyntaxEffect>, Vec<(Atom, usize, usize)>) {
     let mut effects = Vec::new();
     let mut suppressed = Vec::new();
 
@@ -1304,7 +1377,7 @@ fn collect_superassignments(
             let range = definition.range();
             let target_start = text_offset(range.start());
             let target_end = text_offset(range.end());
-            let parts = superassignment_parts(text, target_start, target_end);
+            let parts = superassignment_parts(root, definition.kind(), target_start, target_end);
             let (span_start, span_end, value_symbol) = match parts {
                 Some(parts) => {
                     if let Some((name, start, end)) = &parts.value_symbol {
@@ -1332,7 +1405,7 @@ fn collect_superassignments(
             );
             effects.push(SyntaxEffect {
                 kind: SyntaxEffectKind::SuperAssignment,
-                target: Some(target),
+                target: Some(Atom::from(target)),
                 target_enclosing_local,
                 value_symbol,
                 phase: phase_for_scope(index, scope),
@@ -1511,7 +1584,7 @@ fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<Semanti
 }
 
 fn static_first_string(call: &CallSite) -> Option<&str> {
-    match call.args.first()?.as_ref()? {
+    match call.static_arg(0)? {
         StaticArg::String(value) => Some(value),
         StaticArg::Symbol(_) => None,
     }
@@ -1520,7 +1593,7 @@ fn static_first_string(call: &CallSite) -> Option<&str> {
 fn named_static_string(arguments: &[RawArgument], name: &str) -> Option<String> {
     arguments.iter().find_map(|argument| {
         (argument.name.as_deref() == Some(name)).then(|| match &argument.static_arg {
-            Some(StaticArg::String(value)) => Some(value.clone()),
+            Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
             _ => None,
         })?
     })
@@ -1528,57 +1601,43 @@ fn named_static_string(arguments: &[RawArgument], name: &str) -> Option<String> 
 
 fn named_static_bool(arguments: &[RawArgument], name: &str) -> Option<bool> {
     arguments.iter().find_map(|argument| {
-        if argument.name.as_deref() != Some(name) {
-            return None;
-        }
-        match argument.static_arg.as_ref() {
-            Some(StaticArg::Symbol(value)) if value == "TRUE" || value == "T" => Some(true),
-            Some(StaticArg::Symbol(value)) if value == "FALSE" || value == "F" => Some(false),
-            _ => None,
-        }
+        (argument.name.as_deref() == Some(name))
+            .then_some(argument.logical)
+            .flatten()
     })
 }
 
-fn assignment_rhs_after(text: &str, target_end: usize, operator: &str) -> Option<(usize, usize)> {
-    let mut cursor = skip_trivia(text, target_end);
-    if !text.get(cursor..)?.starts_with(operator) {
-        return None;
-    }
-    cursor += operator.len();
-    let value_start = skip_trivia(text, cursor);
-    let value_end = expression_end(text, value_start);
-    (value_start < value_end).then_some((value_start, value_end))
-}
-
-fn superassignment_parts(
-    text: &str,
-    target_start: usize,
-    target_end: usize,
-) -> Option<SuperAssignmentParts> {
-    let mut cursor = skip_trivia(text, target_end);
-    if text.get(cursor..)?.starts_with("<<-") {
-        cursor += 3;
-        let value_start = skip_trivia(text, cursor);
-        let value_end = expression_end(text, value_start);
-        return Some(SuperAssignmentParts {
-            span: TextRange::new(target_start, value_end),
-            value_symbol: static_symbol_range(text, value_start, value_end),
-        });
-    }
-
-    let statement_start = statement_start(text, target_start);
-    let before_target = text.get(statement_start..target_start)?;
-    let operator = before_target.rfind("->>")?;
-    let value_start = skip_trivia(text, statement_start);
-    let value_end = trim_end_offset(text, statement_start + operator);
-    Some(SuperAssignmentParts {
-        span: TextRange::new(value_start, target_end),
-        value_symbol: static_symbol_range(text, value_start, value_end),
-    })
+fn call_arguments(
+    source: &SourceId,
+    root: &RRoot,
+    index: &SemanticIndex,
+    live_uses: &[LiveUse],
+    raw: &RawCall,
+    values: Vec<Option<StaticArg>>,
+    bindings: Vec<Option<LexicalBindingId>>,
+) -> Box<[CallArgument]> {
+    let spans = argument_spans(source, &raw.args);
+    let closures = local_closure_arguments(root, index, live_uses, &raw.args);
+    raw.args
+        .iter()
+        .zip(values)
+        .zip(spans)
+        .zip(closures)
+        .zip(bindings)
+        .map(
+            |((((argument, value), span), is_local_closure), binding)| CallArgument {
+                value,
+                name: argument.name.as_deref().map(Atom::from),
+                span,
+                is_local_closure,
+                binding,
+            },
+        )
+        .collect()
 }
 
 fn local_closure_arguments(
-    text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     live_uses: &[LiveUse],
     arguments: &[RawArgument],
@@ -1600,34 +1659,32 @@ fn local_closure_arguments(
             index
                 .reaching_definitions(use_site.scope, use_site.use_id)
                 .any(|(scope, definition_id)| {
-                    definition_is_closure(text, index, scope, definition_id)
+                    definition_is_closure(root, index, scope, definition_id)
                 })
         })
         .collect()
 }
 
-fn reaches_only_closures(text: &str, index: &SemanticIndex, live_use: &LiveUse) -> bool {
+fn reaches_only_closures(root: &RRoot, index: &SemanticIndex, live_use: &LiveUse) -> bool {
     let mut definitions = index
         .reaching_definitions(live_use.scope, live_use.use_id)
         .peekable();
     definitions.peek().is_some()
         && definitions
-            .all(|(scope, definition_id)| definition_is_closure(text, index, scope, definition_id))
+            .all(|(scope, definition_id)| definition_is_closure(root, index, scope, definition_id))
 }
 
 fn definition_is_closure(
-    text: &str,
+    root: &RRoot,
     index: &SemanticIndex,
     scope: ScopeId,
     definition_id: oak_semantic::semantic_index::DefinitionId,
 ) -> bool {
     let definition = &index.definitions(scope)[definition_id];
     matches!(definition.kind(), DefinitionKind::Assignment(_))
-        && assignment_rhs_after(text, text_offset(definition.range().end()), "<-")
-            .and_then(|(start, _)| text.get(start..))
-            .is_some_and(|rhs| {
-                rhs.starts_with("function") && word_boundary_after(rhs, "function".len())
-            })
+        && assignment_of(root, definition.kind()).is_some_and(|assignment| {
+            matches!(assignment.value, AnyRExpression::RFunctionDefinition(_))
+        })
 }
 
 fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<LiveCall>) {
@@ -1645,18 +1702,14 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
             return;
         }
         let (scope, _) = index.scope_at(node.syntax().text_trimmed_range().start());
-        let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &[]);
+        let (lexical_scope, _) = scopes.call_context(index, span.start, &[]);
         live_calls.push(LiveCall {
             site: CallSite {
-                callee,
+                callee: Atom::from(callee),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: qualified.then(|| "base".into()),
-                args: Vec::new(),
-                arg_names: Vec::new(),
-                arg_spans: Vec::new(),
-                local_closure_args: Vec::new(),
+                arguments: Box::default(),
                 scope: lexical_scope,
-                arg_bindings,
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
                 span: span.clone(),
@@ -1712,10 +1765,10 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
                             target = extract.left().ok();
                         }
                         AnyRExpression::RCall(call) => {
-                            let Some((name, _)) = identifier_callee(call) else {
+                            let Some(callee) = identifier_callee(call) else {
                                 break;
                             };
-                            record(format!("{name}<-"), false, &current);
+                            record(format!("{}<-", callee.name()), false, &current);
                             target = call
                                 .arguments()
                                 .ok()
@@ -1731,4 +1784,24 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
             _ => {}
         }
     }
+}
+
+fn superassignment_parts(
+    root: &RRoot,
+    kind: &DefinitionKind,
+    target_start: usize,
+    target_end: usize,
+) -> Option<SuperAssignmentParts> {
+    let assignment = assignment_of(root, kind)?;
+    let value = node_range(&assignment.value);
+    let span = if assignment.value_first {
+        TextRange::new(value.start, target_end)
+    } else {
+        TextRange::new(target_start, value.end)
+    };
+    let value_symbol = match static_arg_of(&assignment.value) {
+        Some(StaticArg::Symbol(name)) => Some((name, value.start, value.end)),
+        _ => None,
+    };
+    Some(SuperAssignmentParts { span, value_symbol })
 }

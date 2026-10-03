@@ -11,11 +11,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const ANALYZED: [&str; 3] = ["rlang", "cli", "testthat"];
-const BUILT: [&str; 2] = ["here", "rebus.numbers"];
+#[cfg(feature = "profile")]
+#[global_allocator]
+static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
+    slinker_core::profile::heap::CountingAllocator;
 
-fn jobs() -> usize {
-    std::thread::available_parallelism().map_or(1, usize::from)
+const ANALYZED: [&str; 6] = ["R6", "jsonlite", "rlang", "cli", "callr", "testthat"];
+const BUILT: [&str; 2] = ["here", "rebus.numbers"];
+const DEFAULT_THREADS: usize = 4;
+
+fn threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(DEFAULT_THREADS)
 }
 
 fn analyze(
@@ -23,17 +31,34 @@ fn analyze(
     target: &TargetEnvironment,
     root: &str,
     cache: CacheLocation,
-) -> (Duration, LinkIr) {
+) -> (Duration, LinkIr, String) {
+    #[cfg(feature = "profile")]
+    slinker_core::profile::heap::begin_measurement();
     let start = Instant::now();
     let plan = PackageStore::new(r_home.to_path_buf(), target.clone(), cache)
-        .and_then(|store| Linker::new(store, jobs()).analyze(root))
+        .and_then(|store| Linker::new(store, threads()).analyze(root))
         .unwrap_or_else(|error| panic!("analyze {root}: {error}"));
-    (start.elapsed(), plan)
+    let elapsed = start.elapsed();
+    (elapsed, plan, heap_usage())
 }
 
-fn report_analysis(name: &str, elapsed: Duration, plan: &LinkIr) {
+#[cfg(feature = "profile")]
+fn heap_usage() -> String {
+    let usage = slinker_core::profile::heap::usage();
+    format!(
+        "  heap peak {:>7.1} MiB  allocations {:>10}",
+        usage.peak_mib, usage.allocations
+    )
+}
+
+#[cfg(not(feature = "profile"))]
+fn heap_usage() -> String {
+    String::new()
+}
+
+fn report_analysis(name: &str, elapsed: Duration, plan: &LinkIr, heap: &str) {
     println!(
-        "{name:<32} {:>9.3} s  bindings {:>6}  construction evaluations {:>8}  blockers {:>4}",
+        "{name:<32} {:>9.3} s  bindings {:>6}  construction evaluations {:>8}  blockers {:>4}{heap}",
         elapsed.as_secs_f64(),
         plan.program().bindings().len(),
         plan.construction_evaluations(),
@@ -46,14 +71,14 @@ fn analyze_installed(r_home: &Path) {
         .capture()
         .expect("capture the target R library universe");
     for root in ANALYZED {
-        let (elapsed, plan) = analyze(r_home, &target, root, CacheLocation::Disabled);
-        report_analysis(&format!("analyze {root} cold"), elapsed, &plan);
+        let (elapsed, plan, heap) = analyze(r_home, &target, root, CacheLocation::Disabled);
+        report_analysis(&format!("analyze {root} cold"), elapsed, &plan, &heap);
 
         let warm = tempfile::tempdir().expect("warm cache directory");
         let directory = || CacheLocation::Directory(warm.path().to_path_buf());
         analyze(r_home, &target, root, directory());
-        let (elapsed, plan) = analyze(r_home, &target, root, directory());
-        report_analysis(&format!("analyze {root} warm"), elapsed, &plan);
+        let (elapsed, plan, heap) = analyze(r_home, &target, root, directory());
+        report_analysis(&format!("analyze {root} warm"), elapsed, &plan, &heap);
     }
 }
 
@@ -118,6 +143,63 @@ fn build(r_home: &Path, package: &str) {
     );
 }
 
+fn analyze_edit(r_home: &Path, package: &str) {
+    let (source, library) = provision(r_home, package);
+    let work = tempfile::tempdir().expect("edit work directory");
+    let edited = work.path().join(package);
+    copy_directory(&source, &edited);
+    let cache = work.path().join("cache");
+    let timed = |label: &str| {
+        let start = Instant::now();
+        let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+            .arg("analyze")
+            .arg(&edited)
+            .arg("--lib")
+            .arg(&library)
+            .env("SLINKER_CACHE_DIR", &cache)
+            .output()
+            .expect("run slinker analyze");
+        let elapsed = start.elapsed();
+        common::assert_success(&result, &format!("slinker analyze {package}"));
+        println!(
+            "{:<32} {:>9.3} s",
+            format!("analyze {package} {label}"),
+            elapsed.as_secs_f64()
+        );
+    };
+    timed("source cold");
+    timed("source warm");
+    let entry = std::fs::read_dir(edited.join("R"))
+        .expect("package R directory")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .min()
+        .expect("a source file to edit");
+    let mut text = std::fs::read_to_string(&entry).expect("read source file");
+    text.push_str(
+        "
+.slinker_bench_edit <- function() NULL
+",
+    );
+    std::fs::write(&entry, text).expect("edit source file");
+    timed("one-edit");
+}
+
+fn copy_directory(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create directory");
+    for entry in std::fs::read_dir(from)
+        .expect("list directory")
+        .filter_map(std::result::Result::ok)
+    {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_directory(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy file");
+        }
+    }
+}
+
 fn r_string(value: impl AsRef<OsStr>) -> String {
     let value = value.as_ref().to_string_lossy().replace('\\', "/");
     format!("\"{}\"", value.replace('"', "\\\""))
@@ -125,9 +207,15 @@ fn r_string(value: impl AsRef<OsStr>) -> String {
 
 fn run() {
     let r_home = common::discover_r_home();
-    analyze_installed(&r_home);
-    for package in BUILT {
-        build(&r_home, package);
+    let selected = |section: &str| support::filter().is_none_or(|filter| section.contains(&filter));
+    if selected("analyze") {
+        analyze_installed(&r_home);
+    }
+    if selected("build") {
+        for package in BUILT {
+            build(&r_home, package);
+            analyze_edit(&r_home, package);
+        }
     }
 }
 

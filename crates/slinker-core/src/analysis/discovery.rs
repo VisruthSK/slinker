@@ -13,7 +13,7 @@ use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, ResourcePackage};
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn namespace_access(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         reference: &PackageRef,
@@ -71,7 +71,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         if self.packages.is_external(foreign) {
-            self.external.insert(foreign);
+            self.external.lock().insert(foreign);
             let external = self.external_binding(
                 foreign,
                 &reference.symbol,
@@ -133,17 +133,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ),
             Some(reference.span.clone()),
         );
-        self.relocations.push(PendingRelocation::NamespaceAccess {
-            source: reference.span.clone(),
-            package: foreign,
-            binding,
-            internal: reference.internal,
-        });
+        self.relocations
+            .lock()
+            .push(PendingRelocation::NamespaceAccess {
+                source: reference.span.clone(),
+                package: foreign,
+                binding,
+                internal: reference.internal,
+            });
         Ok(())
     }
 
     pub(super) fn resource_access(
-        &mut self,
+        &self,
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
         expression: &ParsedExpression,
@@ -164,23 +166,27 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             .find(|pinned| pinned.name == binding.name)
                     });
                     let Some(pinned) = pinned else {
-                        self.relocations.defer_dynamic_resource_lookup(
+                        self.relocations.lock().defer_dynamic_resource_lookup(
                             from,
                             current,
                             resource.span.clone(),
                         );
                         return Ok(());
                     };
-                    self.invocations.pin_default(PinnedUse {
+                    self.invocations.lock().pin_default(PinnedUse {
                         node: from,
                         package: current,
                         callable: CallableId {
                             package: current,
                             binding: site.binding.into(),
                         },
-                        formals: expression.parameters.clone(),
-                        formal: pinned.name.clone(),
-                        value: pinned.value.clone(),
+                        formals: expression
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.as_str().to_owned())
+                            .collect(),
+                        formal: pinned.name.as_str().to_owned(),
+                        value: pinned.value.as_str().to_owned(),
                         span: resource.span.clone(),
                     });
                     let names_linked = self
@@ -215,7 +221,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn literal_resource_access(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         resource: &ResourceRef,
@@ -272,16 +278,18 @@ impl<P: PackageProvider> AnalyzerState<P> {
             format!("system.file requires {package_name}/{path}"),
             Some(resource.span.clone()),
         );
-        self.relocations.push(PendingRelocation::ResourceAccess {
-            source: resource.span.clone(),
-            package: foreign,
-            resource: path.into(),
-        });
+        self.relocations
+            .lock()
+            .push(PendingRelocation::ResourceAccess {
+                source: resource.span.clone(),
+                package: foreign,
+                resource: path.into(),
+            });
         Ok(())
     }
 
     fn resource_package(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         resource: &ResourceRef,
@@ -305,14 +313,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(None);
         };
         if self.packages.is_external(foreign) {
-            self.external.insert(foreign);
+            self.external.lock().insert(foreign);
             return Ok(None);
         }
         Ok(Some(foreign))
     }
 
     pub(super) fn dynamic_package_name(
-        &mut self,
+        &self,
         Caller {
             node: from,
             package: current,
@@ -334,7 +342,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn unrewritable_package_call(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         call: &CallSite,
@@ -354,7 +362,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn missing_package_call(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         call: &CallSite,
@@ -371,7 +379,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn discovered_package(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         call: &CallSite,
@@ -404,7 +412,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             });
         };
         if self.packages.is_external(target) {
-            self.external.insert(target);
+            self.external.lock().insert(target);
             return Ok(Discovered::Settled);
         }
         if self.is_root(target) {

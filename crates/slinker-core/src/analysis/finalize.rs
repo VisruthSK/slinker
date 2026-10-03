@@ -1,8 +1,10 @@
 use super::diagnostic::{Cause, Evidence};
 use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
+use super::namespace::NamespaceBuilder;
+use super::need::WorkKey;
 use super::object_world::reachable_environment_labels;
 use super::relocation::PendingRelocation;
-use super::state::{AnalyzerState, LoadedPackage};
+use super::state::AnalyzerState;
 use crate::analysis::Need;
 use crate::analysis::{Diagnostic, NodeKind, RejectCode};
 use crate::ir::CodeIr;
@@ -26,11 +28,13 @@ use crate::package::{
     EnvironmentKind, EnvironmentLabel, NativeComponent, PackageAvailability, PackageId,
     PackageName, PackageProvider,
 };
+use crate::profile::{self, Probe};
 use crate::source::generated_description;
 use crate::syntax::{SourceKey, SourceOrigin, Sources};
 use crate::{Error, Result};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
 pub struct LinkIr {
@@ -39,12 +43,13 @@ pub struct LinkIr {
     provenance: ProvenanceIr,
     blockers: Vec<Diagnostic>,
     sources: Sources,
+    consulted: Vec<(PackageName, Option<PackageIdentity>)>,
     construction_evaluations: usize,
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    fn loaded_ref(&self, package: PackageId) -> Result<&LoadedPackage> {
-        self.loaded.get(&package).ok_or_else(|| {
+    fn loaded_ref(&self, package: PackageId) -> Result<FrozenPackage> {
+        self.frozen(package).ok_or_else(|| {
             Error::Analysis(format!(
                 "package `{}` was retained without being loaded",
                 self.packages.name(package)
@@ -52,12 +57,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
         })
     }
 
-    pub(super) fn finalize(mut self) -> Result<LinkIr> {
+    fn frozen(&self, package: PackageId) -> Option<FrozenPackage> {
+        let loaded = Arc::clone(self.loaded.read().expect("loaded packages").get(&package)?);
+        let image = Arc::clone(&loaded.image.read().expect("package image"));
+        let namespace = loaded.namespace.lock().clone();
+        Some(FrozenPackage { image, namespace })
+    }
+
+    pub(super) fn finalize(self) -> Result<LinkIr> {
         self.finalize_syntax_observations();
         let root = self.root;
         let retained = self
             .encountered
-            .union(&self.external)
+            .lock()
+            .union(&self.external.lock())
             .copied()
             .collect::<BTreeSet<_>>();
         let (program, issues) = self.finalize_program(&retained)?;
@@ -76,7 +89,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .iter()
             .any(|package| self.packages.role(*package) == LinkedPackageRole::Linked)
         {
-            for read in self.reflection.take_computed_namespace_info_reads() {
+            let computed_reads = self.reflection.lock().take_computed_namespace_info_reads();
+            for read in computed_reads {
                 self.diagnostic(
                     read.node,
                     read.package,
@@ -89,7 +103,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(read.span),
                 );
             }
-            for pin in self.invocations.violated_pins() {
+            let pins = self.invocations.lock().violated_pins();
+            for pin in pins {
                 self.diagnostic(
                     pin.node,
                     pin.package,
@@ -102,7 +117,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(pin.span),
                 );
             }
-            for (node, package, span) in self.relocations.take_dynamic_resource_lookups() {
+            let lookups = self.relocations.lock().take_dynamic_resource_lookups();
+            for (node, package, span) in lookups {
                 self.diagnostic(
                     node,
                     package,
@@ -113,16 +129,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
         }
-        self.finalize_s3_dispatch(&retained);
-        self.finalize_unresolved_names();
-        let blockers = self.diagnostics.into_sorted();
+        profile::scoped(Probe::FinalizeDiagnostics, || {
+            self.finalize_s3_dispatch(&retained);
+            self.finalize_unresolved_names();
+        });
+        let consulted = self.packages.consulted();
+        let blockers = std::mem::take(&mut *self.diagnostics.lock()).into_sorted();
+        let sources = std::mem::take(&mut *self.parses.lock()).into_sources();
         Ok(LinkIr {
             program,
-            provenance: ProvenanceIr::new(self.graph, self.roots),
+            provenance: ProvenanceIr::new(self.graph.into_inner(), self.roots.into_inner()),
             blockers,
-            sources: self.parses.into_sources(),
+            sources,
             packages: self.packages.sources(retained),
-            construction_evaluations: self.construction_evaluations,
+            consulted,
+            construction_evaluations: self.construction_evaluations.load(Ordering::Relaxed),
         })
     }
 
@@ -139,7 +160,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 arch: target.arch.clone(),
             },
             root,
-            self.packages.identity(root).clone(),
+            self.packages.identity(root),
         );
         let ordered = retained
             .iter()
@@ -147,11 +168,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .collect::<Vec<_>>();
         let mut issues = Vec::new();
         let contracts = self.finalize_packages(&mut builder, &ordered, retained, &mut issues)?;
-        let mut namespaces =
-            self.finalize_namespaces(&mut builder, ordered, retained, &mut issues)?;
+        let mut namespaces = profile::scoped(Probe::FinalizeNamespaces, || {
+            self.finalize_namespaces(&mut builder, ordered, retained, &mut issues)
+        })?;
         let mut dependencies =
             self.attach_imports(&mut builder, retained, &namespaces.ids, &mut issues);
-        let (root_exports, linked_contents) = self.export_contents(retained, &namespaces.ids)?;
+        let (root_exports, linked_contents) = profile::scoped(Probe::FinalizeExports, || {
+            self.export_contents(retained, &namespaces.ids)
+        })?;
         for (owner, dependency) in self
             .activation_time_dependencies(&namespaces.ids)
             .into_iter()
@@ -180,7 +204,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 removed_bindings,
             });
         }
-        let root_namespace = namespaces.ids[self.packages.name(root)].namespace;
+        let root_namespace = namespaces.ids[&self.packages.name(root)].namespace;
         let root_on_load = namespaces
             .on_load
             .get(&root_namespace)
@@ -191,7 +215,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 closure
             });
-        self.plan_relocations(&mut builder, &namespaces.ids, &mut issues)?;
+        profile::scoped(Probe::FinalizeRelocations, || {
+            self.plan_relocations(&mut builder, &namespaces.ids, &mut issues)
+        })?;
         let description = self.root_description(&contracts, retained, &mut issues);
         let load = builder.root_load(root_namespace);
         let program = builder.finish(RootArtifactIr {
@@ -257,12 +283,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
         issues: &mut Vec<FinalizationIssue>,
     ) -> Result<FinalizedNamespaces> {
         let mut retained_bindings = HashMap::<PackageId, BTreeSet<BindingName>>::new();
-        for need in self.needs.started() {
-            if let Need::Binding { package, binding } = need {
+        for key in self.work.keys() {
+            if let WorkKey::Need(Need::Binding { package, binding }) = key {
                 retained_bindings
-                    .entry(*package)
+                    .entry(package)
                     .or_default()
-                    .insert(binding.clone());
+                    .insert(binding);
             }
         }
         let mut namespaces = FinalizedNamespaces::default();
@@ -274,19 +300,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 LinkedPackageRole::External => {
                     let bindings = self
                         .external_bindings
+                        .lock()
                         .iter()
                         .filter(|((owner, _), _)| *owner == package)
-                        .map(|((_, name), access)| (name.clone(), *access));
+                        .map(|((_, name), access)| (name.clone(), *access))
+                        .collect::<Vec<_>>();
                     let namespace = builder.finish_external_namespace(package, bindings);
-                    namespaces.ids.insert(package_name.to_owned(), namespace);
+                    namespaces.ids.insert(package_name.clone(), namespace);
                     continue;
                 }
             };
-            let LoadedPackage {
+            let FrozenPackage {
                 image,
                 namespace: namespace_builder,
             } = self.loaded_ref(package)?;
-            let namespace_label = EnvironmentLabel::namespace(package_name);
+            let namespace_label = EnvironmentLabel::namespace(&package_name);
             let mut names = retained_bindings.remove(&package).unwrap_or_default();
             names.extend(
                 namespace_builder
@@ -298,17 +326,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let source = match image.binding(name) {
                     None => MaterializedSlotSource::Unbound,
                     Some(binding) => {
-                        match (
-                            &binding.object.closure,
-                            self.parses
-                                .shape(&(package, SourceKey::Binding(name.clone()))),
-                        ) {
-                            (Some(closure), Some(normalized_shape))
+                        match (&binding.object.closure, {
+                            let key = (package, SourceKey::Binding(name.clone()));
+                            let parses = self.parses.lock();
+                            parses
+                                .shape(&key)
+                                .cloned()
+                                .map(|shape| (shape, parses.assigned_value_start(&key)))
+                        }) {
+                            (Some(closure), Some((normalized_shape, assigned_value_start)))
                                 if closure.environment == namespace_label =>
                             {
                                 MaterializedSlotSource::Closure {
                                     source: Arc::clone(&closure.source),
-                                    normalized_shape: normalized_shape.clone(),
+                                    normalized_shape,
+                                    assigned_value_start,
                                 }
                             }
                             _ => MaterializedSlotSource::Payload,
@@ -326,9 +358,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(&binding) => {
                         namespaces.on_load.insert(namespace.namespace, binding);
                     }
-                    None => issues.push(FinalizationIssue::OnLoadNotRetained(
-                        package_name.to_owned(),
-                    )),
+                    None => issues.push(FinalizationIssue::OnLoadNotRetained(package_name.clone())),
                 }
             }
             for registration in &namespace_builder.registrations {
@@ -379,7 +409,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     });
                 }
             }
-            namespaces.ids.insert(package_name.to_owned(), namespace);
+            namespaces.ids.insert(package_name.clone(), namespace);
         }
         Ok(namespaces)
     }
@@ -397,8 +427,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 continue;
             }
             let package_name = self.packages.name(package);
-            let owner = namespace_ids[package_name].namespace;
-            let table = &self.namespace_imports[&package];
+            let owner = namespace_ids[&package_name].namespace;
+            let table = Arc::clone(&self.namespace_imports.lock()[&package]);
             let (names, records) = match table
                 .names()
                 .and_then(|names| Ok((names, table.records()?)))
@@ -467,9 +497,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if self.packages.is_external(package) {
                 continue;
             }
-            let index = &self.loaded_ref(package)?.image.index;
+            let index = Arc::clone(&self.loaded_ref(package)?.image.index);
             let exports = ExportTable::new(index.exports.values().cloned().collect());
-            let finalized = &namespace_ids[self.packages.name(package)];
+            let finalized = &namespace_ids[&self.packages.name(package)];
             if self.packages.role(package) == LinkedPackageRole::Linked {
                 let removed_bindings = index
                     .binding_names
@@ -498,9 +528,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .and_then(|binding| namespace_ids[origin.package.as_str()].bindings.get(binding))
                 .and_then(|binding| builder.binding_code(*binding))
         };
-        let mut payload_codes = HashMap::<&SourceOrigin, Option<CodeId>>::new();
-        for relocation in self.relocations.relocations() {
-            let origin = self.parses.sources().origin(&relocation.source().source);
+        let mut payload_codes = HashMap::<SourceOrigin, Option<CodeId>>::new();
+        let planned = self.relocations.lock().relocations().to_vec();
+        for relocation in &planned {
+            let origin = &self
+                .parses
+                .lock()
+                .sources()
+                .origin(&relocation.source().source)
+                .clone();
             let required = relocation.reaches_removed_installation()
                 || relocation.named_namespace().is_some_and(|package| {
                     self.packages.role(package) == LinkedPackageRole::Linked
@@ -518,11 +554,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     key: origin.key.clone(),
                 });
             }
-            payload_codes.insert(origin, code);
+            payload_codes.insert(origin.clone(), code);
         }
-        for relocation in self.relocations.relocations() {
+        for relocation in &planned {
             let source = relocation.source();
-            let origin = self.parses.sources().origin(&source.source);
+            let origin = &self.parses.lock().sources().origin(&source.source).clone();
             let Some(code) = emitted_code(builder, origin)
                 .or_else(|| payload_codes.get(origin).copied().flatten())
             else {
@@ -535,7 +571,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     internal,
                     ..
                 } => {
-                    let Some(target_namespace) = namespace_ids.get(self.packages.name(*package))
+                    let Some(target_namespace) = namespace_ids.get(&self.packages.name(*package))
                     else {
                         continue;
                     };
@@ -614,7 +650,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }
                 }
                 PendingRelocation::DataArgument { package, sets, .. } => {
-                    let data = &self.loaded_ref(*package)?.image.index.data;
+                    let index = Arc::clone(&self.loaded_ref(*package)?.image.index);
+                    let data = &index.data;
                     let carried = sets.iter().try_for_each(|set| {
                         let objects = data.set(set).unwrap_or_default().to_vec();
                         builder.carry_data_set(*package, set.clone(), objects)
@@ -648,8 +685,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
         origin: &SourceOrigin,
     ) -> Option<CodeId> {
         let package = self.known_package(&origin.package)?;
-        let image = &self.loaded.get(&package)?.image;
-        let shape = self.parses.shape(&(package, origin.key.clone()))?.clone();
+        let image = self.frozen(package)?.image;
+        let (shape, value_start) = {
+            let key = (package, origin.key.clone());
+            let parses = self.parses.lock();
+            (
+                parses.shape(&key)?.clone(),
+                parses.assigned_value_start(&key),
+            )
+        };
         let bundle = builder.payload_bundle(namespace_ids[origin.package.as_str()].namespace)?;
         let (home, binding, closure) = match &origin.key {
             SourceKey::Binding(name) => {
@@ -673,7 +717,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .payload_environment_paths(
                         builder,
                         &namespace_ids[origin.package.as_str()],
-                        image,
+                        &image,
                     )
                     .remove(environment)?;
                 (
@@ -692,7 +736,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             bundle,
             home,
             binding,
-            CodeIr::new(Arc::clone(&closure.source), shape),
+            CodeIr::new(Arc::clone(&closure.source), shape, value_start),
         ))
     }
 
@@ -706,10 +750,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let mut linked = Vec::new();
         for &package in retained {
             let name = self.packages.name(package);
-            let owner = &namespace_ids[name];
+            let owner = &namespace_ids[&name];
             let (Some(bundle), Some(image)) = (
                 builder.payload_bundle(owner.namespace),
-                self.loaded.get(&package).map(|loaded| &loaded.image),
+                self.frozen(package).map(|frozen| frozen.image),
             ) else {
                 continue;
             };
@@ -718,7 +762,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .iter()
                 .filter(|&(_, &binding)| builder.binding_is_payload(binding))
                 .map(|(binding, _)| binding.as_str());
-            for label in reachable_environment_labels(image, payloads) {
+            for label in reachable_environment_labels(&image, payloads) {
                 let EnvironmentKind::Namespace(target) = label.kind() else {
                     continue;
                 };
@@ -727,7 +771,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 let Some(dependency) = namespace_ids.get(target) else {
                     issues.push(FinalizationIssue::PayloadOutsideProgram {
-                        package: name.to_owned(),
+                        package: name.clone(),
                         namespace: target.to_owned(),
                     });
                     continue;
@@ -738,7 +782,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }
                     Ok(Some(PayloadDependency::External(_)) | None) => {}
                     Err(InvalidPayloadDependency::RootNamespace) => {
-                        issues.push(FinalizationIssue::PayloadRefersToRoot(name.to_owned()));
+                        issues.push(FinalizationIssue::PayloadRefersToRoot(name.clone()));
                     }
                 }
             }
@@ -827,8 +871,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn declared_external_requirements(
         &self,
         ordered: &[(PackageId, LinkedPackageRole)],
-    ) -> Result<HashMap<&str, Vec<Relation>>> {
-        let mut declared = HashMap::<&str, Vec<Relation>>::new();
+    ) -> Result<HashMap<PackageName, Vec<Relation>>> {
+        let mut declared = HashMap::<PackageName, Vec<Relation>>::new();
         for (package, role) in ordered {
             if *role == LinkedPackageRole::External {
                 declared.entry(self.packages.name(*package)).or_default();
@@ -838,7 +882,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if *role == LinkedPackageRole::External {
                 continue;
             }
-            let description = &self.loaded_ref(*package)?.image.index.description;
+            let index = Arc::clone(&self.loaded_ref(*package)?.image.index);
+            let description = &index.description;
             let suggested = relations(description, RelationField::Suggests)
                 .unwrap_or_default()
                 .into_iter()
@@ -885,7 +930,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             });
         }
         ExternalPackageContract {
-            package: identity.name.clone(),
+            package: identity.name,
             platform,
             requirements,
         }
@@ -896,7 +941,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         namespace_ids: &HashMap<PackageName, FinalizedNamespace>,
     ) -> Vec<(NamespaceId, NamespaceId)> {
         let mut dependencies = Vec::new();
-        for start in self.graph.nodes.iter().filter(|node| {
+        let graph = self.graph.lock();
+        let dependencies_of = self.dependencies.lock();
+        for start in graph.nodes.iter().filter(|node| {
             matches!(
                 node.kind,
                 NodeKind::Lifecycle { .. } | NodeKind::S3Registration { .. }
@@ -911,8 +958,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 if !seen.insert(node) {
                     continue;
                 }
-                for &next in self.dependencies.get(&node).into_iter().flatten() {
-                    let target = &self.graph.nodes[next.0];
+                let successors = dependencies_of.get(&node).cloned().unwrap_or_default();
+                for next in successors {
+                    let target = &graph.nodes[next.0];
                     if target.package == start.package {
                         stack.push(next);
                     } else if let Some(dependency) = namespace_ids.get(&target.package) {
@@ -924,10 +972,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
         dependencies
     }
 
-    fn finalize_s3_dispatch(&mut self, retained: &BTreeSet<PackageId>) {
+    fn finalize_s3_dispatch(&self, retained: &BTreeSet<PackageId>) {
         let mut open_registrations = Vec::new();
         for &package in retained {
-            if !self.s3.has_generics()
+            if !self.s3.lock().has_generics()
                 || self.packages.role(package) != LinkedPackageRole::External
                 || self.packages.is_platform(package)
             {
@@ -935,17 +983,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             match self.packages.index(package) {
                 Ok(index) => {
-                    open_registrations.extend(index.s3.iter().flat_map(|registration| {
-                        self.s3
+                    for registration in &index.s3 {
+                        let reaching = self
+                            .s3
+                            .lock()
                             .generics_reaching(&registration.class)
-                            .filter(|key| {
-                                key.name == registration.generic.name
-                                    && registration.generic.package.as_deref().is_none_or(|owner| {
-                                        owner == self.packages.name(key.package)
-                                    })
-                            })
-                            .map(move |key| (package, key.clone()))
-                    }));
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        open_registrations.extend(reaching.into_iter().filter_map(|key| {
+                            let owner_matches =
+                                registration.generic.package.as_deref().is_none_or(|owner| {
+                                    owner == self.packages.name(key.package).as_str()
+                                });
+                            (key.name == registration.generic.name && owner_matches)
+                                .then_some((package, key))
+                        }));
+                    }
                 }
                 Err(error) => {
                     let node = self.need_node(&Need::Activation { package });
@@ -966,7 +1019,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 self.packages.name(external),
                 generic.name
             );
-            for (node, package, span) in self.s3.sites(&generic).to_vec() {
+            for (node, package, span) in self.s3.lock().sites(&generic).to_vec() {
                 self.diagnostic(
                     node,
                     package,
@@ -977,15 +1030,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
             }
         }
-        for (node, package, binding, span) in self.s3.take_next_method_calls() {
-            let registered = self.loaded.get(&package).is_some_and(|loaded| {
-                loaded
+        let next_method_calls = self.s3.lock().take_next_method_calls();
+        for (node, package, binding, span) in next_method_calls {
+            let registered = self.frozen(package).is_some_and(|frozen| {
+                frozen
                     .namespace
                     .registrations
                     .iter()
                     .any(|registration| registration.method == binding)
             });
-            if !registered && !self.s3.is_closed_method(package, &binding) {
+            if !registered && !self.s3.lock().is_closed_method(package, &binding) {
                 self.diagnostic(
                     node,
                     package,
@@ -998,25 +1052,27 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    fn finalize_unresolved_names(&mut self) {
-        let unknown_registrations = self
-            .loaded
-            .iter()
-            .flat_map(|(&package, loaded)| {
-                loaded
-                    .image
+    fn finalize_unresolved_names(&self) {
+        let mut loaded = self.loaded_packages();
+        loaded.sort_unstable();
+        let unknown_registrations = loaded
+            .into_iter()
+            .filter_map(|package| self.frozen(package).map(|frozen| (package, frozen.image)))
+            .flat_map(|(package, image)| {
+                image
                     .index
                     .dynlibs
                     .iter()
                     .filter(|native| {
                         native.registration.is_some() && native.library.routines().is_none()
                     })
-                    .map(move |native| (package, native.name.clone()))
+                    .map(|native| (package, native.name.clone()))
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         for (package, component) in unknown_registrations {
             let node = self.need_node(&Need::Activation { package });
-            self.dynamic_names.observe_creator(NameCreator {
+            self.dynamic_names.lock().observe_creator(NameCreator {
                 node,
                 package,
                 binding: BindingName::from(component.as_str()),
@@ -1024,14 +1080,32 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 name: CreatedName::Any,
             });
         }
+        let packages = &self.packages;
+        let graph = self.graph.lock();
+        let owner_rank = |creator: &NameCreator| {
+            let node = &graph.nodes[creator.node.0];
+            (
+                matches!(node.kind, NodeKind::ClosureObject { derived: true, .. }),
+                super::export::semantic_node_id(node),
+            )
+        };
         let creatable = self
             .dynamic_names
-            .creatable()
+            .lock()
+            .creatable(|creator| {
+                (
+                    packages.name(creator.package),
+                    creator.binding.clone(),
+                    creator.operation,
+                    creator.created_name().cloned(),
+                    owner_rank(creator),
+                )
+            })
             .map(|(unresolved, creator)| {
                 (
                     creator.clone(),
                     Evidence {
-                        package: self.packages.name(unresolved.package).clone(),
+                        package: self.packages.name(unresolved.package),
                         binding: unresolved.binding.clone(),
                         span: Some(unresolved.span.clone()),
                         detail: format!("`{}` is bound nowhere", unresolved.name),
@@ -1039,6 +1113,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 )
             })
             .collect::<Vec<_>>();
+        drop(graph);
         for (creator, evidence) in creatable {
             let package = self.packages.name(creator.package).clone();
             let primary = Diagnostic {
@@ -1065,12 +1140,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 operation: creator.operation,
                 binding: creator.binding,
             };
-            self.diagnostics.record_derived(cause, primary, evidence);
+            self.diagnostics
+                .lock()
+                .record_derived(cause, primary, evidence);
         }
     }
 
-    fn finalize_syntax_observations(&mut self) {
-        for observation in self.relocations.observations_of_rewritten_syntax() {
+    fn finalize_syntax_observations(&self) {
+        let observations = self.relocations.lock().observations_of_rewritten_syntax();
+        for observation in observations {
             self.diagnostic(
                 observation.node,
                 observation.package,
@@ -1105,6 +1183,10 @@ impl LinkIr {
 
     pub fn sources(&self) -> &Sources {
         &self.sources
+    }
+
+    pub fn consulted(&self) -> &[(PackageName, Option<PackageIdentity>)] {
+        &self.consulted
     }
 
     pub fn construction_evaluations(&self) -> usize {
@@ -1230,4 +1312,9 @@ fn activation_order<C>(
         order.push(remaining.remove(next));
     }
     order
+}
+
+pub(super) struct FrozenPackage {
+    pub(super) image: Arc<PackageImage>,
+    pub(super) namespace: NamespaceBuilder,
 }

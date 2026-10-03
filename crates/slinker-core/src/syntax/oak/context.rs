@@ -1,6 +1,7 @@
 use crate::package::{BindingName, ExportMap, PackageName};
 use oak_semantic::{EffectsHandlers, ImportsResolver, SourceResolution};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ExternalNameOrigin {
@@ -218,25 +219,51 @@ impl NamespaceImports {
 }
 
 #[derive(Debug, Default, Clone)]
+pub(crate) struct SharedNames(Arc<BTreeSet<BindingName>>);
+
+impl SharedNames {
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert(&mut self, name: BindingName) {
+        Arc::make_mut(&mut self.0).insert(name);
+    }
+}
+
+impl From<Arc<BTreeSet<BindingName>>> for SharedNames {
+    fn from(names: Arc<BTreeSet<BindingName>>) -> Self {
+        Self(names)
+    }
+}
+
+impl From<BTreeSet<BindingName>> for SharedNames {
+    fn from(names: BTreeSet<BindingName>) -> Self {
+        Self(Arc::new(names))
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct OakParseContext {
-    pub(super) shadowed_names: BTreeSet<BindingName>,
-    pub(super) imports: NamespaceImports,
-    pub(super) non_returning_names: BTreeSet<BindingName>,
+    pub(super) shadowed_names: SharedNames,
+    pub(super) imports: Arc<NamespaceImports>,
+    pub(super) non_returning_names: SharedNames,
 }
 
 impl OakParseContext {
     pub fn new(shadowed_names: BTreeSet<BindingName>) -> Self {
         Self {
-            shadowed_names,
-            imports: NamespaceImports::default(),
-            non_returning_names: BTreeSet::new(),
+            shadowed_names: shadowed_names.into(),
+            imports: Arc::default(),
+            non_returning_names: SharedNames::default(),
         }
     }
 
     pub(crate) fn with_imports(
-        shadowed_names: BTreeSet<BindingName>,
-        imports: NamespaceImports,
-        non_returning_names: BTreeSet<BindingName>,
+        shadowed_names: SharedNames,
+        imports: Arc<NamespaceImports>,
+        non_returning_names: SharedNames,
     ) -> Self {
         Self {
             shadowed_names,
@@ -252,7 +279,7 @@ impl OakParseContext {
         package: impl Into<PackageName>,
         remote: impl Into<BindingName>,
     ) {
-        self.imports
+        Arc::make_mut(&mut self.imports)
             .add_import_from(package.into(), [(local.into(), remote.into())]);
     }
 

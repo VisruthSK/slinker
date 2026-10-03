@@ -10,8 +10,10 @@ pub mod explain;
 pub mod export;
 mod finalize;
 pub mod graph;
+mod guarded;
 mod guards;
 mod invocation;
+mod lattice;
 mod namespace;
 mod native;
 pub mod need;
@@ -22,7 +24,9 @@ mod reflection;
 mod relocation;
 mod resolution;
 mod s3;
+mod scheduler;
 mod state;
+mod summary;
 
 use crate::Result;
 use crate::package::{PackageName, PackageProvider};
@@ -43,7 +47,7 @@ pub use export::{
 };
 pub use finalize::LinkIr;
 pub use graph::{Edge, EdgeKind, Graph, Node, NodeId, NodeKind};
-pub use need::{GenericId, LifecycleHook, Need, S3Id};
+pub use need::{GenericId, LifecycleHook, Need, S3Id, Schedule};
 
 pub const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
 
@@ -53,17 +57,25 @@ pub struct Linker<P: PackageProvider> {
 }
 
 impl<P: PackageProvider> Linker<P> {
-    pub fn new(packages: P, jobs: usize) -> Self {
+    pub fn new(packages: P, threads: usize) -> Self {
         Self {
             packages,
             options: AnalysisOptions {
-                jobs,
+                threads,
+                schedule: Schedule::default(),
                 provenance: true,
                 linked_packages: HashSet::new(),
                 explicit_external_packages: HashSet::new(),
                 root_description: None,
             },
         }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_schedule(mut self, schedule: Schedule) -> Self {
+        self.options.schedule = schedule;
+        self
     }
 
     #[must_use]
@@ -101,8 +113,9 @@ impl<P: PackageProvider> Linker<P> {
     }
 
     pub fn analyze(self, root: &str) -> Result<LinkIr> {
-        AnalyzerState::new(self.packages, root, self.options)?
-            .run()?
-            .finalize()
+        let _span = crate::profile::span(crate::profile::Probe::Analysis);
+        let state = AnalyzerState::new(self.packages, root, self.options)?.run()?;
+        let _finalize = crate::profile::span(crate::profile::Probe::Finalize);
+        state.finalize()
     }
 }

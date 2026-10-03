@@ -12,12 +12,7 @@ use crate::syntax::{CallSite, CalleeKind, PackageRef, StaticArg};
 use super::relocation::PendingRelocation;
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    pub(super) fn dataset_access(
-        &mut self,
-        from: NodeId,
-        package: PackageId,
-        reference: &PackageRef,
-    ) {
+    pub(super) fn dataset_access(&self, from: NodeId, package: PackageId, reference: &PackageRef) {
         let dataset = DatasetName::from(reference.symbol.as_str());
         self.require_at(
             from,
@@ -39,15 +34,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ),
             Some(reference.span.clone()),
         );
-        self.relocations.push(PendingRelocation::DatasetAccess {
-            source: reference.span.clone(),
-            package,
-            dataset,
-        });
+        self.relocations
+            .lock()
+            .push(PendingRelocation::DatasetAccess {
+                source: reference.span.clone(),
+                package,
+                dataset,
+            });
     }
 
     pub(super) fn data_call(
-        &mut self,
+        &self,
         caller @ Caller {
             node: from,
             package: current,
@@ -56,9 +53,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
         call: &CallSite,
     ) -> Result<()> {
         let Some(package_index) = call
-            .arg_names
+            .arguments
             .iter()
-            .position(|name| name.as_deref() == Some("package"))
+            .position(|argument| argument.name.as_deref() == Some("package"))
         else {
             self.diagnostic(
                 from,
@@ -70,8 +67,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             return Ok(());
         };
-        let Some(StaticArg::String(name)) = call.args.get(package_index).and_then(Option::as_ref)
-        else {
+        let Some(StaticArg::String(name)) = call.static_arg(package_index) else {
             self.dynamic_package_name(caller, call);
             return Ok(());
         };
@@ -93,7 +89,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn linked_data_call(
-        &mut self,
+        &self,
         from: NodeId,
         current: PackageId,
         call: &CallSite,
@@ -101,7 +97,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         target: PackageId,
         name: &str,
     ) -> Result<()> {
-        let blocked = |state: &mut Self, code: RejectCode, problem: String| {
+        let blocked = |state: &Self, code: RejectCode, problem: String| {
             state.diagnostic(
                 from,
                 current,
@@ -112,9 +108,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
         };
         let mut sets = Vec::<DataSetId>::new();
-        for (index, argument) in call.args.iter().enumerate() {
-            let named = call.arg_names.get(index).and_then(Option::as_deref);
-            match (named, argument) {
+        for argument in call.arguments.iter() {
+            let named = argument.name.as_deref();
+            match (named, &argument.value) {
                 (None | Some("list"), Some(StaticArg::String(set))) => sets.push(set.into()),
                 (None, Some(StaticArg::Symbol(set))) => sets.push(set.into()),
                 (None | Some("list"), _) => {
@@ -144,7 +140,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             );
             return Ok(());
         }
-        let Some(source) = call.arg_spans.get(package_index).cloned().flatten() else {
+        let Some(source) = call.arg_span(package_index).cloned() else {
             blocked(
                 self,
                 RejectCode::UnsupportedRootTransformation,
@@ -194,18 +190,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 Some(call.span.clone()),
             );
         }
-        self.relocations.push(PendingRelocation::DataArgument {
-            source,
-            package: target,
-            sets,
-        });
+        self.relocations
+            .lock()
+            .push(PendingRelocation::DataArgument {
+                source,
+                package: target,
+                sets,
+            });
         Ok(())
     }
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn is_search_path_data_call(
-        &mut self,
+        &self,
         current: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,

@@ -6,22 +6,46 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode};
 
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use slinker_core::TargetEnvironment;
 use slinker_core::analysis::{
     ANALYSIS_STACK_BYTES, Edge, ExplanationDag, LinkIr, Node, NodeId, NodeKind,
 };
+use slinker_core::build::incremental::{
+    BuildRecord, BuildState, consulted_packages, inputs_digest, is_up_to_date,
+};
 use slinker_core::build::{BuildReport, PreflightError, PureRStatic, materialize};
 use slinker_core::package::{BindingName, PackageName};
+use slinker_core::package::{PackageLocator, tree_digest};
 
+#[cfg(feature = "profile")]
+#[global_allocator]
+static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
+    slinker_core::profile::heap::CountingAllocator;
+
+mod cache_command;
+mod roles;
 mod session;
 
 use session::{RootSpec, Session, SourceSession};
 
+const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default())
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Yellow.on_default());
+
+const DEFAULT_THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
 #[derive(Debug, Parser)]
 #[command(
     name = "slinker",
+    styles = STYLES,
     version,
     about = "Link R package dependencies into a generated source package",
     after_help = "Environment:\n  R_HOME             fallback R installation when `R RHOME` is unavailable\n  SLINKER_CACHE_DIR  persistent installed-image analysis cache"
@@ -51,6 +75,8 @@ enum UserCommand {
     Why(QueryArgs),
     #[command(about = "Show semantic paths from ROOT into TARGET")]
     Path(QueryArgs),
+    #[command(about = "Inspect and manage the persistent analysis cache")]
+    Cache(cache_command::CacheArgs),
 }
 
 #[derive(Debug, Args)]
@@ -77,8 +103,8 @@ struct UniverseArgs {
         help = "Select declared optional packages and link them in when reachable code uses them"
     )]
     linked: Vec<PackageName>,
-    #[arg(long, value_name = "N", default_value_t = default_jobs(), help = "Analysis workers")]
-    jobs: NonZeroUsize,
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_THREADS, help = "Analysis threads")]
+    threads: NonZeroUsize,
 }
 
 #[derive(Debug, Args)]
@@ -205,12 +231,17 @@ impl UserCommand {
             Self::Build(args) => args.json.format(),
             Self::Check(args) => args.json.format(),
             Self::Analyze(args) => args.json.format(),
-            Self::Why(_) | Self::Path(_) => OutputFormat::Text,
+            Self::Cache(args) if args.wants_json() => OutputFormat::Json,
+            Self::Why(_) | Self::Path(_) | Self::Cache(_) => OutputFormat::Text,
         }
     }
 }
 
 fn main() -> ExitCode {
+    #[cfg(feature = "profile")]
+    if slinker_core::profile::heap::sampling_requested() {
+        slinker_core::profile::heap::enable_site_sampling();
+    }
     match Cli::parse().command {
         Command::RWorker { protocol } => report(
             slinker_r_worker::run(&protocol).map_err(Into::into),
@@ -221,7 +252,11 @@ fn main() -> ExitCode {
             .stack_size(ANALYSIS_STACK_BYTES)
             .spawn(move || {
                 let format = command.format();
-                report(run(command), format)
+                let code = report(run(command), format);
+                if let Some(summary) = slinker_core::profile::report() {
+                    eprint!("{summary}");
+                }
+                code
             })
             .expect("spawn the slinker command thread")
             .join()
@@ -266,6 +301,7 @@ fn run(command: UserCommand) -> Result<(), Box<dyn Error>> {
         UserCommand::Analyze(args) => analyze(&args),
         UserCommand::Why(args) => explain_why(&args),
         UserCommand::Path(args) => explain_paths(&args),
+        UserCommand::Cache(args) => cache_command::run(&args, &session::cache_location()),
     }
 }
 
@@ -276,10 +312,6 @@ fn package_name(value: &str) -> Result<PackageName, &'static str> {
     Ok(PackageName::from(value))
 }
 
-fn default_jobs() -> NonZeroUsize {
-    std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
-}
-
 fn link(args: &AnalysisArgs) -> Result<(Session, LinkIr), Box<dyn Error>> {
     let session = Session::open(&args.root, &args.universe, discover_r_home()?)?;
     let plan = session.analyze(&args.universe, true)?;
@@ -287,31 +319,108 @@ fn link(args: &AnalysisArgs) -> Result<(Session, LinkIr), Box<dyn Error>> {
 }
 
 fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
-    let session = SourceSession::open(&args.path, &args.universe, discover_r_home()?)?;
-    let ir = session.session().analyze(&args.universe, false)?;
-    let package = session.snapshot().package().to_owned();
+    let prepared = SourceSession::prepare(&args.path, &args.universe, discover_r_home()?)?;
+    let package = prepared.snapshot().package().to_owned();
     let output = args.output.clone().unwrap_or_else(|| {
-        session
+        prepared
             .snapshot()
             .original_root()
             .join("target")
             .join("slinker")
             .join(&package)
     });
+    let output = std::path::absolute(&output)?;
+    let state = BuildState::new(&session::cache_location());
+    let sorted = |names: &[PackageName]| {
+        let mut names = names
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let (linked, external) = (
+        sorted(&args.universe.linked),
+        sorted(&args.universe.external),
+    );
+    let inputs = inputs_digest(
+        &tree_digest(prepared.snapshot().files().root())?,
+        prepared.target(),
+        &linked.iter().map(String::as_str).collect::<Vec<_>>(),
+        &external.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    if let Some(record) = state.load(&output)
+        && is_up_to_date(
+            &record,
+            &inputs,
+            &PackageLocator::new(prepared.target().clone()),
+            &package,
+        )?
+    {
+        print_built(
+            args.json.format(),
+            &package,
+            &output,
+            BuildOutcome::UpToDate,
+        );
+        return Ok(());
+    }
+    let session = SourceSession::stage(prepared)?;
+    let ir = session.session().analyze(&args.universe, false)?;
+    let consulted = consulted_packages(ir.consulted(), &package);
     let context = session.into_build_context();
     let buildable = PureRStatic::check(&ir, &context)?;
     let generated = materialize(buildable, &output)?;
-    if args.json.format() == OutputFormat::Json {
+    state.save(&BuildRecord {
+        package: package.clone(),
+        output,
+        inputs: inputs.as_str().to_owned(),
+        consulted,
+        output_digest: tree_digest(generated.path())?.as_str().to_owned(),
+    })?;
+    print_built(
+        args.json.format(),
+        &package,
+        generated.path(),
+        BuildOutcome::Built,
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildOutcome {
+    Built,
+    UpToDate,
+}
+
+impl BuildOutcome {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Built => "built",
+            Self::UpToDate => "up_to_date",
+        }
+    }
+}
+
+fn print_built(
+    format: OutputFormat,
+    package: &str,
+    output: &std::path::Path,
+    outcome: BuildOutcome,
+) {
+    if format == OutputFormat::Json {
         let rendered = json!({
-            "status": "built",
+            "status": outcome.status(),
             "package": package,
-            "output": generated.path(),
+            "output": output,
         });
         println!("{rendered:#}");
     } else {
-        println!("{}", generated.path().display());
+        println!("{}", output.display());
+        if outcome == BuildOutcome::UpToDate {
+            eprintln!("up to date");
+        }
     }
-    Ok(())
 }
 
 fn check(args: &CheckArgs) -> Result<(), Box<dyn Error>> {
@@ -334,10 +443,16 @@ fn analyze(args: &AnalyzeArgs) -> Result<(), Box<dyn Error>> {
     let (session, plan) = link(&args.analysis)?;
     let target = session.target();
     if args.json.format() == OutputFormat::Json {
-        let graph = ExplanationDag::from_plan(&plan, target, session.root())?;
-        let mut stdout = io::stdout().lock();
+        let graph =
+            slinker_core::profile::scoped(slinker_core::profile::Probe::ExplanationBuild, || {
+                ExplanationDag::from_plan(&plan, target, session.root())
+            })?;
+        let _serialize =
+            slinker_core::profile::span(slinker_core::profile::Probe::ExplanationSerialize);
+        let mut stdout = io::BufWriter::with_capacity(1 << 20, io::stdout().lock());
         serde_json::to_writer_pretty(&mut stdout, &graph)?;
         writeln!(stdout)?;
+        stdout.flush()?;
     } else {
         print_analysis(target, &plan);
     }
@@ -527,15 +642,7 @@ fn print_analysis(target: &TargetEnvironment, plan: &LinkIr) {
         target.target.r_version, target.target.os, target.target.arch
     );
     println!();
-    println!("package roles");
-    for (_, package) in program.packages() {
-        println!(
-            "  {} {}: {:?}",
-            package.identity().name,
-            package.identity().version,
-            package.role()
-        );
-    }
+    roles::print_package_roles(plan);
     println!();
     println!("linked program");
     println!("  namespaces: {}", program.namespaces().len());
@@ -634,7 +741,7 @@ mod tests {
             "--external",
             "cli,glue",
             "--link=foo,bar",
-            "--jobs",
+            "--threads",
             "3",
             "--json",
         ])
@@ -649,7 +756,7 @@ mod tests {
         );
         assert_eq!(args.analysis.universe.external, ["cli", "glue"]);
         assert_eq!(args.analysis.universe.linked, ["foo", "bar"]);
-        assert_eq!(args.analysis.universe.jobs.get(), 3);
+        assert_eq!(args.analysis.universe.threads.get(), 3);
         assert!(args.json.json);
     }
 
@@ -695,7 +802,7 @@ mod tests {
     fn rejects_invalid_arguments() {
         for args in [
             &["slinker", "analyze"][..],
-            &["slinker", "analyze", "voucher", "--jobs=0"],
+            &["slinker", "analyze", "voucher", "--threads=0"],
             &["slinker", "analyze", "voucher", "--external", "cli,,glue"],
             &["slinker", "analyze", "voucher", "--bogus", "json"],
             &["slinker", "why", "voucher"],

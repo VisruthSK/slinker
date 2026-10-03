@@ -5,8 +5,9 @@ use crate::package::{
     PackageRole, SyntaxValidation, fingerprint_image,
 };
 use crate::{Error, Result, TargetEnvironment};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageAvailability {
@@ -36,12 +37,23 @@ pub enum DispatchCallee<'a> {
     },
 }
 
+#[derive(Debug)]
+pub struct PackageEntry {
+    pub package: InstalledPackage,
+    pub role: PackageRole,
+}
+
+#[derive(Default)]
+struct Roster {
+    availability: HashMap<PackageName, PackageAvailability>,
+    packages: Vec<Arc<PackageEntry>>,
+}
+
 pub struct TargetUniverse<P: PackageResolver> {
     store: P,
     root: PackageName,
     explicit_external: HashSet<PackageName>,
-    availability: HashMap<PackageName, PackageAvailability>,
-    packages: Vec<(InstalledPackage, PackageRole)>,
+    roster: RwLock<Roster>,
 }
 
 impl<P: PackageResolver> TargetUniverse<P> {
@@ -54,8 +66,7 @@ impl<P: PackageResolver> TargetUniverse<P> {
             store,
             root: root.into(),
             explicit_external,
-            availability: HashMap::new(),
-            packages: Vec::new(),
+            roster: RwLock::new(Roster::default()),
         }
     }
 
@@ -67,15 +78,15 @@ impl<P: PackageResolver> TargetUniverse<P> {
         self.store.target_environment()
     }
 
-    pub fn resolve(&mut self, name: &str) -> Result<Option<PackageId>> {
-        if let Some(availability) = self.availability.get(name) {
+    pub fn resolve(&self, name: &str) -> Result<Option<PackageId>> {
+        if let Some(availability) = self.availability(name) {
             return Ok(availability.package());
         }
         let located = self.store.locate(name)?;
         Ok(self.ingest(name, located))
     }
 
-    pub fn require(&mut self, name: &str) -> Result<PackageId> {
+    pub fn require(&self, name: &str) -> Result<PackageId> {
         self.resolve(name)?.ok_or_else(|| {
             Error::Analysis(format!(
                 "installed package `{name}` is absent from the frozen target universe"
@@ -83,13 +94,18 @@ impl<P: PackageResolver> TargetUniverse<P> {
         })
     }
 
-    fn ingest(&mut self, name: &str, package: Option<InstalledPackage>) -> Option<PackageId> {
+    fn ingest(&self, name: &str, package: Option<InstalledPackage>) -> Option<PackageId> {
+        let mut roster = self.roster.write().expect("universe roster");
+        if let Some(known) = roster.availability.get(name) {
+            return known.package();
+        }
         let Some(package) = package else {
-            self.availability
+            roster
+                .availability
                 .insert(PackageName::from(name), PackageAvailability::Absent);
             return None;
         };
-        let id = PackageId::from_index(self.packages.len());
+        let id = PackageId::from_index(roster.packages.len());
         let (role, availability) = if self.root == name {
             (PackageRole::Root, PackageAvailability::Root(id))
         } else if self.explicit_external.contains(name) || is_platform(&package) {
@@ -97,30 +113,38 @@ impl<P: PackageResolver> TargetUniverse<P> {
         } else {
             (PackageRole::Linked, PackageAvailability::Linked(id))
         };
-        self.packages.push((package, role));
-        self.availability
+        roster
+            .packages
+            .push(Arc::new(PackageEntry { package, role }));
+        roster
+            .availability
             .insert(PackageName::from(name), availability);
         Some(id)
     }
 
     pub fn availability(&self, name: &str) -> Option<PackageAvailability> {
-        self.availability.get(name).copied()
+        self.roster
+            .read()
+            .expect("universe roster")
+            .availability
+            .get(name)
+            .copied()
     }
 
-    pub fn package(&self, id: PackageId) -> &InstalledPackage {
-        &self.packages[id.index()].0
+    pub fn entry(&self, id: PackageId) -> Arc<PackageEntry> {
+        Arc::clone(&self.roster.read().expect("universe roster").packages[id.index()])
     }
 
-    pub fn identity(&self, id: PackageId) -> &PackageIdentity {
-        &self.package(id).identity
+    pub fn identity(&self, id: PackageId) -> PackageIdentity {
+        self.entry(id).package.identity.clone()
     }
 
-    pub fn name(&self, id: PackageId) -> &PackageName {
-        &self.identity(id).name
+    pub fn name(&self, id: PackageId) -> PackageName {
+        self.entry(id).package.identity.name.clone()
     }
 
     pub fn role(&self, id: PackageId) -> PackageRole {
-        self.packages[id.index()].1
+        self.entry(id).role
     }
 
     pub fn is_external(&self, id: PackageId) -> bool {
@@ -128,19 +152,41 @@ impl<P: PackageResolver> TargetUniverse<P> {
     }
 
     pub fn is_platform(&self, id: PackageId) -> bool {
-        is_platform(self.package(id))
+        is_platform(&self.entry(id).package)
     }
 
     pub fn is_base_binding(&self, name: &str) -> bool {
         self.target_environment().base_bindings.contains(name)
     }
 
+    pub fn consulted(&self) -> Vec<(PackageName, Option<PackageIdentity>)> {
+        let roster = self.roster.read().expect("universe roster");
+        let mut consulted = roster
+            .availability
+            .iter()
+            .map(|(name, availability)| {
+                let identity = availability
+                    .package()
+                    .map(|id| roster.packages[id.index()].package.identity.clone());
+                (name.clone(), identity)
+            })
+            .collect::<Vec<_>>();
+        consulted.sort_by(|left, right| left.0.cmp(&right.0));
+        consulted
+    }
+
     pub fn sources(&self, ids: impl IntoIterator<Item = PackageId>) -> PackageSources {
         PackageSources(
             ids.into_iter()
                 .map(|id| {
-                    let package = self.package(id);
-                    (id, (package.identity.clone(), package.location.clone()))
+                    let entry = self.entry(id);
+                    (
+                        id,
+                        (
+                            entry.package.identity.clone(),
+                            entry.package.location.clone(),
+                        ),
+                    )
                 })
                 .collect(),
         )
@@ -148,38 +194,47 @@ impl<P: PackageResolver> TargetUniverse<P> {
 }
 
 impl<P: PackageProvider> TargetUniverse<P> {
-    pub fn index(&mut self, id: PackageId) -> Result<Arc<PackageIndex>> {
-        self.store.index(&self.packages[id.index()].0)
+    pub fn index(&self, id: PackageId) -> Result<Arc<PackageIndex>> {
+        self.store.index(&self.entry(id).package)
     }
 
-    pub fn binding_image(&mut self, id: PackageId, name: &str) -> Result<Arc<PackageImage>> {
-        self.store.binding_image(&self.packages[id.index()].0, name)
+    pub fn binding_image(&self, id: PackageId, name: &str) -> Result<Arc<PackageImage>> {
+        self.store.binding_image(&self.entry(id).package, name)
     }
 
-    pub fn dispatch_generics(
-        &mut self,
-        callee: DispatchCallee<'_>,
-    ) -> Result<BTreeSet<GenericName>> {
-        self.store.dispatch_generics(match callee {
-            DispatchCallee::Base { binding } => DispatchSubject::Base { binding },
-            DispatchCallee::Package { package, binding } => DispatchSubject::Installed {
-                package: &self.packages[package.index()].0,
-                binding,
-            },
-        })
+    pub fn dispatch_generics(&self, callee: DispatchCallee<'_>) -> Result<BTreeSet<GenericName>> {
+        match callee {
+            DispatchCallee::Base { binding } => self
+                .store
+                .dispatch_generics(DispatchSubject::Base { binding }),
+            DispatchCallee::Package { package, binding } => {
+                self.store.dispatch_generics(DispatchSubject::Installed {
+                    package: &self.entry(package).package,
+                    binding,
+                })
+            }
+        }
     }
 
-    pub fn resource_exists(&mut self, id: PackageId, path: &str) -> Result<bool> {
-        self.store
-            .resource_exists(&self.packages[id.index()].0, path)
+    pub fn resource_exists(&self, id: PackageId, path: &str) -> Result<bool> {
+        self.store.resource_exists(&self.entry(id).package, path)
     }
 
-    pub fn validate_syntax(&mut self, source: &str) -> Result<SyntaxValidation> {
+    pub fn validate_syntax(&self, source: &str) -> Result<SyntaxValidation> {
         self.store.validate_syntax(source)
     }
 
-    pub fn canonical_syntax(&mut self, source: &str) -> Result<CanonicalSyntax> {
+    pub fn canonical_syntax(&self, source: &str) -> Result<CanonicalSyntax> {
         self.store.canonical_syntax(source)
+    }
+
+    pub fn prefetch_canonical_syntax(&self, sources: &[&str]) -> Result<()> {
+        self.store.prefetch_canonical_syntax(sources)
+    }
+
+    pub fn prefetch_binding_images(&self, id: PackageId, names: &[&str]) -> Result<()> {
+        self.store
+            .prefetch_binding_images(&self.entry(id).package, names)
     }
 }
 
@@ -207,8 +262,15 @@ impl PackageSources {
     }
 
     pub fn changed(&self) -> Result<Option<&PackageIdentity>> {
-        for (identity, location) in self.0.values() {
-            if fingerprint_image(&location.root)? != identity.image_fingerprint {
+        let packages = self.0.values().collect::<Vec<_>>();
+        let unchanged = packages
+            .par_iter()
+            .map(|(identity, location)| {
+                Ok(fingerprint_image(&location.root)? == identity.image_fingerprint)
+            })
+            .collect::<Vec<Result<bool>>>();
+        for ((identity, _), package_unchanged) in packages.into_iter().zip(unchanged) {
+            if !package_unchanged? {
                 return Ok(Some(identity));
             }
         }
@@ -223,10 +285,11 @@ mod tests {
     use crate::{Target, TargetEnvironment};
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
 
     struct CountingStore {
         locator: PackageLocator,
-        located: Vec<String>,
+        located: Mutex<Vec<String>>,
     }
 
     impl PackageResolver for CountingStore {
@@ -234,8 +297,8 @@ mod tests {
             self.locator.target()
         }
 
-        fn locate(&mut self, name: &str) -> Result<Option<InstalledPackage>> {
-            self.located.push(name.to_owned());
+        fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
+            self.located.lock().expect("located").push(name.to_owned());
             self.locator.locate(name)
         }
     }
@@ -271,7 +334,7 @@ mod tests {
                     libraries: vec![library.to_path_buf()],
                     base_bindings: Default::default(),
                 }),
-                located: Vec::new(),
+                located: Mutex::new(Vec::new()),
             },
             root,
             explicit_external,
@@ -281,13 +344,13 @@ mod tests {
     #[test]
     fn absence_is_frozen_for_the_invocation() {
         let library = tempfile::tempdir().expect("library");
-        let mut universe = universe(library.path());
+        let universe = universe(library.path());
 
         assert_eq!(universe.resolve("late").expect("first answer"), None);
         install(library.path(), "late");
 
         assert_eq!(universe.resolve("late").expect("frozen answer"), None);
-        assert_eq!(universe.store.located, ["late"]);
+        assert_eq!(*universe.store.located.lock().unwrap(), ["late"]);
         assert_eq!(
             universe.availability("late"),
             Some(PackageAvailability::Absent)
@@ -299,8 +362,8 @@ mod tests {
         let library = tempfile::tempdir().expect("library");
         install(library.path(), "first");
         install(library.path(), "second");
-        let mut forward = universe(library.path());
-        let mut reverse = universe(library.path());
+        let forward = universe(library.path());
+        let reverse = universe(library.path());
 
         let forward_first = forward.require("first").expect("first");
         reverse.require("second").expect("second");
@@ -315,13 +378,32 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_resolution_of_one_new_package_agrees_on_a_single_id() {
+        let library = tempfile::tempdir().expect("library");
+        install(library.path(), "shared");
+        let universe = universe(library.path());
+
+        let ids = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| scope.spawn(|| universe.require("shared").expect("shared")))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("resolver"))
+                .collect::<Vec<_>>()
+        });
+
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(universe.require("shared").expect("memoized"), ids[0]);
+    }
+
+    #[test]
     fn roles_follow_the_policy_given_at_construction() {
         let library = tempfile::tempdir().expect("library");
         for name in ["root", "dependency", "kept"] {
             install(library.path(), name);
         }
-        let mut universe =
-            universe_with_policy(library.path(), "root", HashSet::from(["kept".into()]));
+        let universe = universe_with_policy(library.path(), "root", HashSet::from(["kept".into()]));
 
         let roles = ["root", "dependency", "kept"].map(|name| {
             let package = universe.require(name).expect("installed");
@@ -342,7 +424,7 @@ mod tests {
     fn changed_selected_image_is_detected() {
         let library = tempfile::tempdir().expect("library");
         install(library.path(), "fixture");
-        let mut universe = universe(library.path());
+        let universe = universe(library.path());
         let fixture = universe.require("fixture").expect("fixture");
         let sources = universe.sources([fixture]);
         assert_eq!(sources.changed().expect("unchanged"), None);

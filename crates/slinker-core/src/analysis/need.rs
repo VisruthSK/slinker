@@ -3,7 +3,6 @@ use crate::package::{
     BindingName, ClassName, ComponentName, DatasetName, EnvironmentLabel, GenericName, PackageId,
     ResourcePath,
 };
-use std::collections::{HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LifecycleHook {
@@ -95,53 +94,36 @@ impl Need {
     }
 }
 
-pub(super) enum Popped {
-    Started(Need),
-    AlreadyStarted,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Schedule {
+    #[default]
+    Fifo,
+    Lifo,
+    Seeded(u64),
 }
 
-#[derive(Default)]
-pub(super) struct NeedQueue {
-    pending: VecDeque<Need>,
-    queued: HashSet<Need>,
-    started: HashSet<Need>,
-}
-
-impl NeedQueue {
-    pub(super) fn schedule(&mut self, need: Need) {
-        if !self.started.contains(&need) && self.queued.insert(need.clone()) {
-            self.pending.push_back(need);
+impl Schedule {
+    pub(super) fn arrange(self, needs: &mut [Need]) {
+        match self {
+            Self::Fifo => {}
+            Self::Lifo => needs.reverse(),
+            Self::Seeded(seed) => {
+                let mut state = seed.wrapping_mul(2).wrapping_add(1);
+                for position in (1..needs.len()).rev() {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let other =
+                        usize::try_from(state % (position as u64 + 1)).expect("index fits usize");
+                    needs.swap(position, other);
+                }
+            }
         }
     }
+}
 
-    pub(super) fn len(&self) -> usize {
-        self.pending.len()
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-
-    pub(super) fn upcoming(&self, count: usize) -> impl Iterator<Item = &Need> {
-        self.pending.iter().take(count)
-    }
-
-    pub(super) fn pop(&mut self) -> Option<Popped> {
-        let need = self.pending.pop_front()?;
-        self.queued.remove(&need);
-        Some(if self.started.insert(need.clone()) {
-            Popped::Started(need)
-        } else {
-            Popped::AlreadyStarted
-        })
-    }
-
-    pub(super) fn start(&mut self, need: &Need) -> bool {
-        self.queued.remove(need);
-        self.started.insert(need.clone())
-    }
-
-    pub(super) fn started(&self) -> impl Iterator<Item = &Need> {
-        self.started.iter()
-    }
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum WorkKey {
+    Need(Need),
+    Seal(PackageId),
 }

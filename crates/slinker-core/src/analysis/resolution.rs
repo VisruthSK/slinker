@@ -8,11 +8,13 @@ use crate::package::{
     BindingName, ClosureSource, ComponentName, EnvironmentKind, EnvironmentLabel, ImportSpec,
     NativeComponent, PackageId, PackageImage, PackageName, PackageProvider,
 };
+use crate::profile::{self, Probe};
 use crate::syntax::{
-    NamespaceImportResolution, NamespaceImports, OakParseContext, SourceKey, Span,
+    NamespaceImportResolution, NamespaceImports, OakParseContext, SharedNames, SourceKey, Span,
     closure_definitely_non_returning,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Resolution {
@@ -108,8 +110,11 @@ fn prove_non_returning<'a>(
     proven: &mut BTreeSet<BindingName>,
 ) {
     loop {
-        let context =
-            OakParseContext::with_imports(shadowed.clone(), imports.clone(), proven.clone());
+        let context = OakParseContext::with_imports(
+            SharedNames::from(shadowed.clone()),
+            Arc::new(imports.clone()),
+            SharedNames::from(proven.clone()),
+        );
         let before = proven.len();
         for (name, closure) in candidates.clone() {
             if !proven.contains(name) && closure_definitely_non_returning(&closure.source, &context)
@@ -125,12 +130,13 @@ fn prove_non_returning<'a>(
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn namespace_imports(
-        &mut self,
+        &self,
         package: PackageId,
         image: &PackageImage,
-    ) -> Result<NamespaceImports> {
-        if let Some(imports) = self.namespace_imports.get(&package) {
-            return Ok(imports.clone());
+    ) -> Result<Arc<NamespaceImports>> {
+        let _span = profile::span(Probe::NamespaceImports);
+        if let Some(imports) = self.namespace_imports.lock().get(&package) {
+            return Ok(Arc::clone(imports));
         }
         let mut imports = NamespaceImports::default();
         for import in &image.index.imports {
@@ -153,18 +159,29 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
         }
-        self.namespace_imports.insert(package, imports.clone());
+        let imports = Arc::new(imports);
+        self.namespace_imports
+            .lock()
+            .insert(package, Arc::clone(&imports));
         Ok(imports)
     }
 
     fn namespace_shadowed_names<'a>(
-        &mut self,
+        &self,
         package: PackageId,
         image: &PackageImage,
         indexed: impl Iterator<Item = &'a BindingName>,
     ) -> Result<BTreeSet<BindingName>> {
+        self.seal_namespace(package)?;
         let mut shadowed = indexed.cloned().collect::<BTreeSet<_>>();
-        shadowed.extend(self.loaded(package)?.namespace.bindings.iter().cloned());
+        shadowed.extend(
+            self.loaded(package)?
+                .namespace
+                .lock()
+                .bindings
+                .iter()
+                .cloned(),
+        );
         shadowed.extend(
             image
                 .index
@@ -176,41 +193,72 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(shadowed)
     }
 
+    fn namespace_shadow_base(
+        &self,
+        package: PackageId,
+        image: &PackageImage,
+    ) -> Result<Arc<BTreeSet<BindingName>>> {
+        self.seal_namespace(package)?;
+        let loaded = self.loaded(package)?;
+        let version = loaded.namespace.lock().bindings.len();
+        let known = self.shadow_bases.lock().get(&package).cloned();
+        if let Some((known_version, base)) = known
+            && known_version == version
+        {
+            return Ok(base);
+        }
+        let base = Arc::new(self.namespace_shadowed_names(
+            package,
+            image,
+            image.index.binding_names.iter(),
+        )?);
+        self.shadow_bases
+            .lock()
+            .insert(package, (version, Arc::clone(&base)));
+        Ok(base)
+    }
+
     fn inferred_non_returning_bindings(
-        &mut self,
+        &self,
         package: PackageId,
         image: &PackageImage,
         imports: &NamespaceImports,
-    ) -> Result<BTreeSet<BindingName>> {
-        if let Some(bindings) = self.non_returning_bindings.get(&package) {
-            return Ok(bindings.clone());
+    ) -> Result<Arc<BTreeSet<BindingName>>> {
+        let known = self.non_returning_bindings.lock().get(&package).cloned();
+        if let Some(bindings) = known {
+            return Ok(bindings);
         }
         let shadowed = self.namespace_shadowed_names(package, image, image.bindings.keys())?;
-        let namespace = EnvironmentLabel::namespace(self.packages.name(package));
+        let namespace = EnvironmentLabel::namespace(&self.packages.name(package));
         let candidates = image.bindings.iter().filter_map(|(name, binding)| {
             let closure = binding.object.closure.as_ref()?;
             (closure.environment == namespace).then_some((name, closure))
         });
         let mut proven = BTreeSet::new();
         prove_non_returning(&candidates, &shadowed, imports, &mut proven);
-        self.non_returning_bindings.insert(package, proven.clone());
+        let proven = Arc::new(proven);
+        self.non_returning_bindings
+            .lock()
+            .insert(package, Arc::clone(&proven));
         Ok(proven)
     }
 
     pub(super) fn oak_parse_context(
-        &mut self,
+        &self,
         package: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
     ) -> Result<OakParseContext> {
-        let mut shadowed =
-            self.namespace_shadowed_names(package, image, image.index.binding_names.iter())?;
+        let _span = profile::span(Probe::OakParseContext);
+        let base = self.namespace_shadow_base(package, image)?;
+        let mut extra_shadowed = BTreeSet::new();
         let mut private_shadowed = BTreeSet::new();
         let mut visible_private = BTreeMap::new();
         let mut current = Some(lexical_environment.clone());
-        if let Some(graph) = self.objects.get(package)
-            && let Some(mut environment) = graph.environment_id(lexical_environment)
-        {
+        self.objects.existing(package, |graph| {
+            let Some(mut environment) = graph.environment_id(lexical_environment) else {
+                return;
+            };
             let mut seen = BTreeSet::new();
             while seen.insert(environment) {
                 let shape = graph.environment(environment);
@@ -220,7 +268,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 for name in shape.bindings.keys() {
                     private_shadowed.insert(name.clone());
-                    shadowed.insert(name.clone());
+                    extra_shadowed.insert(name.clone());
                 }
                 match shape.parent {
                     Some(parent) => environment = parent,
@@ -230,7 +278,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }
                 }
             }
-        }
+        });
         let mut seen = HashSet::new();
         while let Some(label) = current.take() {
             let Some(private) = image
@@ -241,38 +289,56 @@ impl<P: PackageProvider> AnalyzerState<P> {
             };
             for (name, binding) in &private.bindings {
                 private_shadowed.insert(name.clone());
-                shadowed.insert(name.clone());
+                extra_shadowed.insert(name.clone());
                 visible_private.entry(name).or_insert(binding);
             }
             current = Some(private.parent.clone());
         }
 
         let imports = self.namespace_imports(package, image)?;
-        let mut non_returning = self.inferred_non_returning_bindings(package, image, &imports)?;
+        let proven = self.inferred_non_returning_bindings(package, image, &imports)?;
+        if private_shadowed.is_empty() && visible_private.is_empty() {
+            return Ok(OakParseContext::with_imports(
+                SharedNames::from(base),
+                imports,
+                SharedNames::from(proven),
+            ));
+        }
+        let mut shadowed = (*base).clone();
+        shadowed.extend(extra_shadowed);
+        let mut non_returning = (*proven).clone();
         non_returning.retain(|name| !private_shadowed.contains(name));
         let candidates = visible_private
             .iter()
             .filter_map(|(&name, binding)| Some((name, binding.object.closure.as_ref()?)));
         prove_non_returning(&candidates, &shadowed, &imports, &mut non_returning);
         Ok(OakParseContext::with_imports(
-            shadowed,
+            SharedNames::from(shadowed),
             imports,
-            non_returning,
+            SharedNames::from(non_returning),
         ))
     }
 
     pub(super) fn resolve_lexical_name(
-        &mut self,
+        &self,
         current: PackageId,
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
         name: &str,
     ) -> Result<Resolution> {
+        let _span = profile::span(Probe::ResolveLexicalName);
         let mut environment = lexical_environment.clone();
-        let mut seen = HashSet::new();
+        let mut checkpoint: Option<EnvironmentLabel> = None;
+        let (mut steps, mut window) = (0_usize, 1_usize);
         loop {
-            if !seen.insert(environment.clone()) {
+            if checkpoint.as_ref() == Some(&environment) {
                 return Ok(Resolution::unresolved(name));
+            }
+            steps += 1;
+            if steps == window {
+                checkpoint = Some(environment.clone());
+                window *= 2;
+                steps = 0;
             }
             if environment.is_derived() {
                 match self.resolve_derived(current, &environment, name) {
@@ -316,25 +382,28 @@ impl<P: PackageProvider> AnalyzerState<P> {
         name: &str,
     ) -> DerivedStep {
         let unresolved = || DerivedStep::Resolved(Resolution::unresolved(name));
-        let Some(graph) = self.objects.get(current) else {
-            return unresolved();
-        };
-        let Some(id) = graph.environment_id(environment) else {
-            return unresolved();
-        };
-        match graph.lookup_environment_binding(id, name) {
-            Lookup::Found(object) => DerivedStep::Resolved(Resolution::Static(
-                derived_binding_target(graph, current, object),
-            )),
-            Lookup::Opaque => unresolved(),
-            Lookup::Absent => match graph.environment(id).parent {
-                Some(parent) => DerivedStep::Parent(graph.environment(parent).label.clone()),
-                None => unresolved(),
-            },
-        }
+        self.objects
+            .existing(current, |graph| {
+                let Some(id) = graph.environment_id(environment) else {
+                    return unresolved();
+                };
+                match graph.lookup_environment_binding(id, name) {
+                    Lookup::Found(object) => DerivedStep::Resolved(Resolution::Static(
+                        derived_binding_target(graph, current, object),
+                    )),
+                    Lookup::Opaque => unresolved(),
+                    Lookup::Absent => match graph.environment(id).parent {
+                        Some(parent) => {
+                            DerivedStep::Parent(graph.environment(parent).label.clone())
+                        }
+                        None => unresolved(),
+                    },
+                }
+            })
+            .unwrap_or_else(unresolved)
     }
 
-    fn resolve_foreign_namespace(&mut self, package: &str, name: &str) -> Result<Resolution> {
+    fn resolve_foreign_namespace(&self, package: &str, name: &str) -> Result<Resolution> {
         let Some(foreign) = self.packages.resolve(package)? else {
             return Ok(Resolution::OpenDynamic(OpenReason::MissingPackage {
                 package: package.into(),
@@ -342,7 +411,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }));
         };
         if self.packages.is_external(foreign) {
-            self.external.insert(foreign);
+            self.external.lock().insert(foreign);
             return Ok(Resolution::Static(BindingTarget::External {
                 package: foreign,
                 binding: name.into(),
@@ -357,9 +426,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         closure: ClosureId,
     ) -> Option<ClosureExecutionSource> {
-        let graph = self.objects.get(package)?;
-        let closure = graph.closure(closure).clone();
-        let environment = graph.environment(closure.enclosure).label.clone();
+        let (closure, environment) = self.objects.existing(package, |graph| {
+            let closure = graph.closure(closure).clone();
+            let environment = graph.environment(closure.enclosure).label.clone();
+            (closure, environment)
+        })?;
         let owner = closure.provenance.owner.source_key();
         let key = SourceKey::Closure {
             owner: Box::new(owner.clone()),
@@ -375,37 +446,29 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn resolve_name(
-        &mut self,
+        &self,
         current: PackageId,
         image: &PackageImage,
         name: &str,
     ) -> Result<Resolution> {
+        self.seal_namespace(current)?;
         if let Some(binding) = MetadataBinding::of(name) {
             return Ok(Resolution::Static(BindingTarget::Metadata {
                 package: current,
                 binding,
             }));
         }
-        if image
-            .index
-            .binding_names
-            .iter()
-            .any(|binding| binding == name)
-            || self
-                .loaded
-                .get(&current)
-                .is_some_and(|loaded| loaded.namespace.contains(name))
-        {
+        if image.index.binding_names.contains(name) || self.namespace_declares(current, name) {
             return Ok(Resolution::Static(BindingTarget::Namespace {
                 package: current,
                 binding: name.into(),
             }));
         }
 
-        if let Some(component) = Self::native_component_for_binding(&image.index, name) {
+        if let Some(component) = self.loaded(current)?.native_bindings.sole_component(name) {
             return Ok(Resolution::Static(BindingTarget::Native {
                 package: current,
-                component: component.into(),
+                component: component.clone(),
                 binding: name.into(),
             }));
         }
@@ -423,7 +486,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }));
                 };
                 return Ok(if self.packages.is_external(foreign) {
-                    self.external.insert(foreign);
+                    self.external.lock().insert(foreign);
                     Resolution::Static(BindingTarget::External {
                         package: foreign,
                         binding,
@@ -452,7 +515,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     pub(super) fn require_resolved(
-        &mut self,
+        &self,
         from: NodeId,
         requester: PackageId,
         binding: Option<&str>,
@@ -548,8 +611,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 package,
                 binding: metadata,
             }) => {
-                let node = self.graph.add_node(
-                    self.packages.name(package).clone(),
+                let node = self.graph.lock().add_node(
+                    self.packages.name(package),
                     NodeKind::PackageMetadata {
                         name: BindingName::from(metadata.name()),
                     },
@@ -591,12 +654,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             Resolution::Static(BindingTarget::Local | BindingTarget::Base) => {}
             Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
-                self.dynamic_names.observe_unresolved(UnresolvedName {
-                    package: requester,
-                    binding: binding.map(BindingName::from),
-                    name: BindingName::from(name.as_str()),
-                    span,
-                });
+                self.dynamic_names
+                    .lock()
+                    .observe_unresolved(UnresolvedName {
+                        package: requester,
+                        binding: binding.map(BindingName::from),
+                        name: BindingName::from(name.as_str()),
+                        span,
+                    });
             }
         }
     }
@@ -649,7 +714,7 @@ pub(super) enum ReferenceUse {
 
 impl<P: PackageProvider> AnalyzerState<P> {
     fn require_binding_at(
-        &mut self,
+        &self,
         from: NodeId,
         need: Need,
         kind: EdgeKind,

@@ -1,12 +1,14 @@
 use super::protocol::*;
 use super::runtime::WorkerRuntime;
-use super::scan::{InspectionEpoch, ObjectScanner, PrivateIds};
+use super::scan::ObjectScanner;
 use super::serve::write_response;
 use super::*;
 use harp::RFunctionExt;
 use slinker_core::package::BindingName;
 use slinker_core::package::BindingOrigin;
 use slinker_core::package::BindingRepresentation;
+use slinker_core::package::EnvironmentLabel;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn protocol_round_trips_binding_request() {
@@ -146,16 +148,16 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
 
     let lazy = harp::environment_iter::Binding::new(&image_environment, "lazy".into())
         .expect("lazy binding");
-    let known = PrivateIds::new();
-    let mut scanner = ObjectScanner::new(
-        image.sexp,
-        "fixture",
-        &known,
-        InspectionEpoch {
-            worker: 0,
-            context: 0,
-        },
-    );
+    let delivered = HashSet::new();
+    let mut ids = HashMap::<libr::SEXP, EnvironmentLabel>::new();
+    let mut identify = |environment: libr::SEXP| {
+        let next = ids.len() + 1;
+        Ok(ids
+            .entry(environment)
+            .or_insert_with(|| EnvironmentLabel::private(format!("fixture:{next}")))
+            .clone())
+    };
+    let mut scanner = ObjectScanner::new(image.sexp, "fixture", &mut identify, &delivered);
     let lazy = scanner
         .top_binding("lazy", BindingOrigin::Code, lazy.value)
         .expect("inspect demanded promise");
@@ -221,27 +223,19 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
             .as_ref()
             .is_some_and(|closure| closure.source.starts_with("handler <- function"))
     );
-    let mut later_epoch = ObjectScanner::new(
-        image.sexp,
-        "fixture",
-        &known,
-        InspectionEpoch {
-            worker: 0,
-            context: 1,
-        },
-    );
+    let mut later_scan = ObjectScanner::new(image.sexp, "fixture", &mut identify, &delivered);
     let rescanned = harp::environment_iter::Binding::new(&image_environment, "holder".into())
         .expect("holder binding");
-    later_epoch
+    later_scan
         .top_binding("holder", BindingOrigin::Code, rescanned.value)
-        .expect("inspect holder in a later epoch");
+        .expect("inspect holder again");
     assert!(
-        later_epoch
+        later_scan
             .finish()
             .private_environments
             .keys()
-            .all(|label| !scanned.private_environments.contains_key(label)),
-        "private labels from separate inspection epochs alias"
+            .all(|label| scanned.private_environments.contains_key(label)),
+        "an environment keeps its label across scans"
     );
     let private_environment = harp::environment::Environment::new(
         field(&fixture, "private").expect("private fixture environment"),

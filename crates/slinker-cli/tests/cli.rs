@@ -1,3 +1,5 @@
+mod common;
+
 use std::process::Command;
 
 fn slinker(args: &[&str]) -> std::process::Output {
@@ -44,4 +46,101 @@ fn unknown_option_is_rejected_before_analysis() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
     assert!(stderr.contains("--bogus"));
+}
+
+fn slinker_with_cache(args: &[&str], cache: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(args)
+        .env("SLINKER_CACHE_DIR", cache)
+        .output()
+        .expect("run slinker binary")
+}
+
+#[test]
+fn cache_commands_report_and_clear_the_persistent_cache() {
+    let cache = tempfile::tempdir().expect("cache directory");
+    let empty = slinker_with_cache(&["cache", "--json"], cache.path());
+    assert!(empty.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&empty.stdout).expect("cache JSON");
+    assert_eq!(document["schemas"], serde_json::json!([]));
+
+    let analysis = slinker_with_cache(&["analyze", "stats4", "--json"], cache.path());
+    assert!(analysis.status.success() || !analysis.stdout.is_empty());
+    let report = slinker_with_cache(&["cache", "--json"], cache.path());
+    let document: serde_json::Value = serde_json::from_slice(&report.stdout).expect("cache JSON");
+    let packages = document["schemas"][0]["packages"]
+        .as_array()
+        .expect("package list");
+    assert!(packages.iter().any(|package| package["name"] == "stats4"));
+    assert!(packages.iter().all(|package| {
+        package["cache_key"]
+            .as_str()
+            .is_some_and(|key| key.len() == 64)
+    }));
+
+    let cleared = slinker_with_cache(&["cache", "clear", "stats4", "--json"], cache.path());
+    assert!(cleared.status.success());
+    let outcome: serde_json::Value = serde_json::from_slice(&cleared.stdout).expect("clear JSON");
+    assert!(outcome["entries_removed"].as_u64().unwrap_or(0) > 0);
+    let report = slinker_with_cache(&["cache", "--json"], cache.path());
+    let document: serde_json::Value = serde_json::from_slice(&report.stdout).expect("cache JSON");
+    assert!(
+        document["schemas"]
+            .as_array()
+            .is_none_or(|schemas| schemas.iter().all(|schema| schema["packages"]
+                .as_array()
+                .is_none_or(|packages| packages
+                    .iter()
+                    .all(|package| package["name"] != "stats4"))))
+    );
+
+    assert!(
+        slinker_with_cache(&["cache", "clear"], cache.path())
+            .status
+            .success()
+    );
+    let path = slinker_with_cache(&["cache", "path"], cache.path());
+    assert!(
+        String::from_utf8_lossy(&path.stdout).contains(cache.path().to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn package_roles_form_a_retention_tree_without_escapes_when_piped() {
+    let cache = tempfile::tempdir().expect("cache directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["analyze", "rlang"])
+        .args(common::user_library_arguments())
+        .env("SLINKER_CACHE_DIR", cache.path())
+        .output()
+        .expect("run slinker binary");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("utf-8 output");
+    assert!(!text.contains('\u{1b}'));
+    let tree = text
+        .split("package roles\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("package roles section");
+    let lines = tree.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines[0],
+        format!("rlang {} root", lines[0].split(' ').nth(1).unwrap())
+    );
+    let roles = [" root", " linked", " external"];
+    let entries = lines
+        .iter()
+        .skip(1)
+        .take_while(|line| !line.starts_with("no recorded path"))
+        .collect::<Vec<_>>();
+    assert!(!entries.is_empty(), "the root has at least one child");
+    for line in &entries {
+        let branch = line.trim_start_matches(['│', ' ']);
+        assert!(
+            branch.starts_with("├── ") || branch.starts_with("└── "),
+            "{line}"
+        );
+        assert!(roles.iter().any(|role| line.ends_with(role)), "{line}");
+    }
+    assert!(entries.iter().any(|line| line.starts_with("└── ")));
 }

@@ -13,18 +13,6 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_DEPTH: usize = 128;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct InspectionEpoch {
-    pub(super) worker: u64,
-    pub(super) context: usize,
-}
-
-impl std::fmt::Display for InspectionEpoch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}", self.worker, self.context)
-    }
-}
-
 #[derive(Clone, Copy)]
 enum PromisePolicy {
     Force,
@@ -37,20 +25,19 @@ enum Site<'a> {
     Member,
 }
 
-pub(super) type PrivateIds = HashMap<libr::SEXP, EnvironmentLabel>;
+pub(super) type Identify<'a> = &'a mut dyn FnMut(libr::SEXP) -> InspectionResult<EnvironmentLabel>;
 
 pub(super) struct ObjectScanner<'a> {
     image_environment: libr::SEXP,
     package: &'a str,
-    known: &'a PrivateIds,
-    epoch: InspectionEpoch,
-    discovered: PrivateIds,
+    identify: Identify<'a>,
+    delivered: &'a HashSet<EnvironmentLabel>,
+    inventoried: HashSet<EnvironmentLabel>,
     walking: HashSet<libr::SEXP>,
     private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
 }
 
 pub(super) struct ScanOutcome {
-    pub(super) discovered: PrivateIds,
     pub(super) private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
 }
 
@@ -58,15 +45,15 @@ impl<'a> ObjectScanner<'a> {
     pub(super) fn new(
         image_environment: libr::SEXP,
         package: &'a str,
-        known: &'a PrivateIds,
-        epoch: InspectionEpoch,
+        identify: Identify<'a>,
+        delivered: &'a HashSet<EnvironmentLabel>,
     ) -> Self {
         Self {
             image_environment,
             package,
-            known,
-            epoch,
-            discovered: HashMap::new(),
+            identify,
+            delivered,
+            inventoried: HashSet::new(),
             walking: HashSet::new(),
             private_environments: HashMap::new(),
         }
@@ -74,7 +61,6 @@ impl<'a> ObjectScanner<'a> {
 
     pub(super) fn finish(self) -> ScanOutcome {
         ScanOutcome {
-            discovered: self.discovered,
             private_environments: self.private_environments,
         }
     }
@@ -314,16 +300,10 @@ impl<'a> ObjectScanner<'a> {
         if let Some(label) = self.distinguished_environment(environment)? {
             return Ok(label);
         }
-        if let Some(label) = self
-            .known
-            .get(&environment)
-            .or(self.discovered.get(&environment))
-        {
-            return Ok(label.clone());
+        let label = (self.identify)(environment)?;
+        if self.delivered.contains(&label) || !self.inventoried.insert(label.clone()) {
+            return Ok(label);
         }
-        let label =
-            EnvironmentLabel::private(self.epoch, self.known.len() + self.discovered.len() + 1);
-        self.discovered.insert(environment, label.clone());
         self.inventory_private(environment, &label)?;
         Ok(label)
     }

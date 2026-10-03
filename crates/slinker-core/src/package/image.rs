@@ -126,6 +126,17 @@ pub struct ObjectImage {
 }
 
 impl ObjectImage {
+    pub fn closure_sources(&self) -> impl Iterator<Item = &str> {
+        self.closure
+            .iter()
+            .map(|closure| closure.source.as_ref())
+            .chain(
+                self.embedded_closures
+                    .iter()
+                    .map(|closure| closure.source.as_ref()),
+            )
+    }
+
     pub fn absorb_members(&mut self, member: ObjectImage) {
         self.embedded_closures.extend(member.embedded_closures);
         self.embedded_environments
@@ -189,17 +200,17 @@ pub struct PrivateEnvironmentImage {
 #[derive(Clone, Debug)]
 pub struct PackageImage {
     pub index: Arc<PackageIndex>,
-    pub bindings: HashMap<BindingName, BindingImage>,
-    pub private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
+    pub bindings: HashMap<BindingName, Arc<BindingImage>>,
+    pub private_environments: HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>>,
 }
 
 impl PackageImage {
     pub fn binding(&self, name: &str) -> Option<&BindingImage> {
-        self.bindings.get(name)
+        self.bindings.get(name).map(AsRef::as_ref)
     }
 
     pub fn private_environment(&self, id: &EnvironmentLabel) -> Option<&PrivateEnvironmentImage> {
-        self.private_environments.get(id)
+        self.private_environments.get(id).map(AsRef::as_ref)
     }
 
     pub fn private_binding(

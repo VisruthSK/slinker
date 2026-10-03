@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+pub const RESPONSE_READY: u8 = 0;
+
 pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,6 +121,14 @@ pub struct WorkerBinding {
     pub image_fingerprint: Digest,
     pub binding: BindingImage,
     pub private_environments: HashMap<EnvironmentLabel, PrivateEnvironmentImage>,
+    #[serde(default)]
+    pub normalizations: Vec<WorkerNormalization>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerNormalization {
+    pub original: String,
+    pub canonical: NormalizedSource,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -144,6 +154,11 @@ pub enum WorkerRequest {
         package: PackageSpec,
         name: BindingName,
     },
+    BindingBatch {
+        request_id: u64,
+        package: PackageSpec,
+        names: Vec<BindingName>,
+    },
     DispatchGenerics {
         request_id: u64,
         package: Option<PackageSpec>,
@@ -166,7 +181,7 @@ pub enum WorkerRequest {
     },
     NormalizeSyntax {
         request_id: u64,
-        source: String,
+        sources: Vec<String>,
     },
     VerifyRelocation {
         request_id: u64,
@@ -193,6 +208,10 @@ pub enum WorkerResponse {
         request_id: u64,
         binding: WorkerBinding,
     },
+    Bindings {
+        request_id: u64,
+        bindings: Vec<WorkerBinding>,
+    },
     DispatchGenerics {
         request_id: u64,
         generics: Vec<String>,
@@ -212,8 +231,7 @@ pub enum WorkerResponse {
     },
     NormalizedSyntax {
         request_id: u64,
-        source: String,
-        stable: bool,
+        results: Vec<NormalizeOutcome>,
     },
     Error {
         error: WorkerFailure,
@@ -226,6 +244,7 @@ impl WorkerResponse {
         match self {
             Self::PackageIndex { request_id, .. }
             | Self::Binding { request_id, .. }
+            | Self::Bindings { request_id, .. }
             | Self::DispatchGenerics { request_id, .. }
             | Self::DataLibrary { request_id, .. }
             | Self::Payloads { request_id, .. }
@@ -234,6 +253,19 @@ impl WorkerResponse {
             Self::Hello { .. } | Self::Error { .. } | Self::Shutdown => None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizeOutcome {
+    Normalized(NormalizedSource),
+    Rejected(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NormalizedSource {
+    pub source: String,
+    pub stable: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

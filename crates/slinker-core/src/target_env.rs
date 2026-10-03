@@ -30,6 +30,12 @@ pub struct TargetEnvironment {
     pub base_bindings: BTreeSet<BindingName>,
 }
 
+#[derive(Debug)]
+pub struct PrimedWorker {
+    pub(crate) client: WorkerClient,
+    pub(crate) target: TargetEnvironment,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetEnvironmentRequest {
     pub r_home: PathBuf,
@@ -45,7 +51,19 @@ impl TargetEnvironmentRequest {
     }
 
     pub fn capture(self) -> Result<TargetEnvironment, TargetEnvironmentError> {
-        WorkerClient::capture_target(self.r_home, self.libraries).map_err(TargetEnvironmentError)
+        self.capture_primed().map(|(target, _)| target)
+    }
+
+    pub fn capture_primed(
+        self,
+    ) -> Result<(TargetEnvironment, PrimedWorker), TargetEnvironmentError> {
+        let (target, client) = WorkerClient::capture_target(self.r_home, self.libraries)
+            .map_err(TargetEnvironmentError)?;
+        let worker = PrimedWorker {
+            client,
+            target: target.clone(),
+        };
+        Ok((target, worker))
     }
 }
 
