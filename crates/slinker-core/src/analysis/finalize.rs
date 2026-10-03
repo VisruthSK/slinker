@@ -592,12 +592,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 } => {
                     let resource_id = builder.add_resource(ResourceIr {
                         package: *package,
-                        path: resource.as_str().into(),
+                        path: resource.clone(),
                     });
                     RelocationTarget::Resource {
                         target: resource_id,
                     }
                 }
+                PendingRelocation::AbsentResource { .. } => RelocationTarget::AbsentResource,
                 PendingRelocation::RequireNamespace { loaded, .. } => {
                     RelocationTarget::RequireNamespace {
                         result: loaded.is_some(),
@@ -666,7 +667,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     RelocationTarget::DescriptionArgument {
                         description: builder.add_resource(ResourceIr {
                             package: *package,
-                            path: "Meta/package.rds".into(),
+                            path: crate::package::ResourcePath::package_metadata(),
                         }),
                     }
                 }

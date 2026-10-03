@@ -1,19 +1,17 @@
-use super::census::{assignment_of, node_range};
+use super::census::{Census, assignment_of, node_range, static_arg_of};
 use super::context::OakParseContext;
-use super::scan::{
-    IfRegion, contains_call_named, skip_comment, split_top_level_operator, static_string,
-    static_symbol, strip_outer_parentheses,
-};
+use super::scan::{contains_call_named, static_symbol};
 use super::text_offset;
+use crate::syntax::StaticArg;
 use crate::syntax::source::TextRange;
-use air_r_syntax::RRoot;
+use air_r_syntax::{AnyRExpression, AnyRValue, RRoot};
+use biome_rowan::{AstNode, AstSeparatedList};
 use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BranchAssumption {
-    pub(super) condition: String,
-    pub(super) truth: bool,
+    pub(super) predicate: Option<SimplePredicate>,
     pub(super) symbols: BTreeSet<String>,
 }
 
@@ -35,19 +33,19 @@ pub(super) enum SimplePredicate {
         value: PredicateValue,
     },
     IsNull {
-        value: String,
+        symbol: String,
         is_null: bool,
     },
     Static(bool),
 }
 
 pub(super) fn branch_assumptions_at(
-    text: &str,
-    regions: &[IfRegion],
+    index: &SemanticIndex,
+    census: &Census,
     position: usize,
 ) -> Vec<BranchAssumption> {
     let mut assumptions = Vec::new();
-    for region in regions {
+    for region in &census.ifs {
         let truth = if position >= region.then_branch.start && position < region.then_branch.end {
             Some(true)
         } else if let Some(TextRange { start, end }) = region.else_branch {
@@ -58,11 +56,7 @@ pub(super) fn branch_assumptions_at(
         let Some(truth) = truth else {
             continue;
         };
-        assumptions.push(BranchAssumption {
-            condition: canonical_condition(text, region.condition.start, region.condition.end),
-            truth,
-            symbols: condition_symbols(text, region.condition.start, region.condition.end),
-        });
+        assumptions.push(assumption(&region.condition, index, truth));
     }
     assumptions
 }
@@ -94,16 +88,10 @@ pub(super) fn assumptions_are_repeatable(
 }
 
 pub(super) fn effective_predicate(assumption: &BranchAssumption) -> Option<SimplePredicate> {
-    let predicate = parse_simple_predicate(&assumption.condition)?;
-    if assumption.truth {
-        Some(predicate)
-    } else {
-        Some(negate_predicate(predicate))
-    }
+    assumption.predicate.clone()
 }
 
 pub(super) fn expand_boolean_alias_assumptions(
-    text: &str,
     root: &RRoot,
     index: &SemanticIndex,
     scope: ScopeId,
@@ -134,17 +122,12 @@ pub(super) fn expand_boolean_alias_assumptions(
                     && text_offset(definition.range().start()) < position
             })
             .filter_map(|(_, definition)| assignment_of(root, definition.kind()))
-            .map(|assignment| node_range(&assignment.value))
-            .max_by_key(|range| range.start)
-            .and_then(|range| text.get(range.start..range.end));
+            .map(|assignment| assignment.value)
+            .max_by_key(|value| node_range(value).start);
         let Some(rhs) = rhs.filter(|rhs| parse_simple_predicate(rhs).is_some()) else {
             continue;
         };
-        assumptions.push(BranchAssumption {
-            condition: rhs.to_owned(),
-            truth,
-            symbols: condition_symbols(rhs, 0, rhs.len()),
-        });
+        assumptions.push(assumption(&rhs, index, truth));
     }
 }
 
@@ -168,87 +151,122 @@ pub(super) fn negate_predicate(predicate: SimplePredicate) -> SimplePredicate {
     match predicate {
         SimplePredicate::Eq { symbol, value } => SimplePredicate::Ne { symbol, value },
         SimplePredicate::Ne { symbol, value } => SimplePredicate::Eq { symbol, value },
-        SimplePredicate::IsNull { value, is_null } => SimplePredicate::IsNull {
-            value,
+        SimplePredicate::IsNull { symbol, is_null } => SimplePredicate::IsNull {
+            symbol,
             is_null: !is_null,
         },
         SimplePredicate::Static(value) => SimplePredicate::Static(!value),
     }
 }
 
-pub(super) fn parse_simple_predicate(condition: &str) -> Option<SimplePredicate> {
-    let condition = strip_outer_parentheses(condition);
-    if condition == "TRUE" {
-        return Some(SimplePredicate::Static(true));
+pub(super) fn unparenthesized(expression: &AnyRExpression) -> AnyRExpression {
+    let mut expression = expression.clone();
+    while let AnyRExpression::RParenthesizedExpression(parentheses) = &expression {
+        let Ok(body) = parentheses.body() else { break };
+        expression = body;
     }
-    if condition == "FALSE" {
-        return Some(SimplePredicate::Static(false));
-    }
-    if let Some(symbol) = condition.strip_prefix('!').and_then(static_symbol) {
-        return Some(SimplePredicate::Eq {
+    expression
+}
+
+pub(super) fn parse_simple_predicate(condition: &AnyRExpression) -> Option<SimplePredicate> {
+    let condition = unparenthesized(condition);
+    match &condition {
+        AnyRExpression::RTrueExpression(_) => Some(SimplePredicate::Static(true)),
+        AnyRExpression::RFalseExpression(_) => Some(SimplePredicate::Static(false)),
+        AnyRExpression::RUnaryExpression(unary) if unary.operator().ok()?.text_trimmed() == "!" => {
+            parse_simple_predicate(&unary.argument().ok()?).map(negate_predicate)
+        }
+        AnyRExpression::RBinaryExpression(binary) => {
+            let operator = binary.operator().ok()?;
+            let (left, right) = (binary.left().ok()?, binary.right().ok()?);
+            let (symbol, value) = symbol_constant_pair(&left, &right)?;
+            match operator.text_trimmed() {
+                "==" => Some(SimplePredicate::Eq { symbol, value }),
+                "!=" => Some(SimplePredicate::Ne { symbol, value }),
+                _ => None,
+            }
+        }
+        AnyRExpression::RCall(call) => {
+            let function = call.function().ok()?;
+            if symbol_of(&function)?.as_str() != "is.null" {
+                return None;
+            }
+            let arguments = call.arguments().ok()?;
+            let mut items = arguments.items().iter();
+            let value = unparenthesized(&items.next()?.ok()?.value()?);
+            if items.next().is_some() {
+                return None;
+            }
+            Some(SimplePredicate::IsNull {
+                symbol: symbol_of(&value)?,
+                is_null: true,
+            })
+        }
+        _ => symbol_of(&condition).map(|symbol| SimplePredicate::Eq {
             symbol,
-            value: PredicateValue::Logical(false),
-        });
+            value: PredicateValue::Logical(true),
+        }),
     }
-    if let Some(inner) = condition
-        .strip_prefix("!is.null(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        let value = strip_outer_parentheses(inner.trim());
-        return (!value.is_empty()).then(|| SimplePredicate::IsNull {
-            value: value.to_owned(),
-            is_null: false,
-        });
-    }
-    if let Some(inner) = condition
-        .strip_prefix("is.null(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        let value = strip_outer_parentheses(inner.trim());
-        return (!value.is_empty()).then(|| SimplePredicate::IsNull {
-            value: value.to_owned(),
-            is_null: true,
-        });
-    }
-    if let Some((left, right)) = split_top_level_operator(condition, "==") {
-        let (symbol, value) = symbol_constant_pair(left, right)?;
-        return Some(SimplePredicate::Eq { symbol, value });
-    }
-    if let Some((left, right)) = split_top_level_operator(condition, "!=") {
-        let (symbol, value) = symbol_constant_pair(left, right)?;
-        return Some(SimplePredicate::Ne { symbol, value });
-    }
-    static_symbol(condition).map(|symbol| SimplePredicate::Eq {
-        symbol,
-        value: PredicateValue::Logical(true),
-    })
 }
 
-pub(super) fn symbol_constant_pair(left: &str, right: &str) -> Option<(String, PredicateValue)> {
-    if let (Some(symbol), Some(value)) = (static_symbol(left), predicate_constant(right)) {
-        return Some((symbol, value));
-    }
-    if let (Some(value), Some(symbol)) = (predicate_constant(left), static_symbol(right)) {
-        return Some((symbol, value));
-    }
-    None
-}
-
-pub(super) fn predicate_constant(value: &str) -> Option<PredicateValue> {
-    if let Some(value) = static_string(value) {
-        return Some(PredicateValue::String(value));
-    }
-    match value {
-        "TRUE" => Some(PredicateValue::Logical(true)),
-        "FALSE" => Some(PredicateValue::Logical(false)),
-        _ if simple_numeric_literal(value) => Some(PredicateValue::Number(value.to_owned())),
+fn symbol_of(expression: &AnyRExpression) -> Option<String> {
+    match unparenthesized(expression) {
+        AnyRExpression::RIdentifier(identifier) => {
+            static_symbol(identifier.name_token().ok()?.text_trimmed())
+        }
         _ => None,
     }
 }
 
-pub(super) fn simple_numeric_literal(value: &str) -> bool {
-    let value = value.strip_suffix('L').unwrap_or(value);
-    !value.is_empty() && value.parse::<f64>().is_ok()
+fn symbol_constant_pair(
+    left: &AnyRExpression,
+    right: &AnyRExpression,
+) -> Option<(String, PredicateValue)> {
+    symbol_of(left).zip(predicate_constant(right)).or_else(|| {
+        predicate_constant(left)
+            .zip(symbol_of(right))
+            .map(|(value, symbol)| (symbol, value))
+    })
+}
+
+fn predicate_constant(value: &AnyRExpression) -> Option<PredicateValue> {
+    let value = unparenthesized(value);
+    match &value {
+        AnyRExpression::RTrueExpression(_) => Some(PredicateValue::Logical(true)),
+        AnyRExpression::RFalseExpression(_) => Some(PredicateValue::Logical(false)),
+        AnyRExpression::AnyRValue(AnyRValue::RStringValue(_)) => match static_arg_of(&value)? {
+            StaticArg::String(value) => Some(PredicateValue::String(value.as_str().to_owned())),
+            StaticArg::Symbol(_) => None,
+        },
+        AnyRExpression::AnyRValue(AnyRValue::RIntegerValue(_) | AnyRValue::RDoubleValue(_)) => {
+            Some(PredicateValue::Number(
+                value.syntax().text_trimmed().to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn assumption(condition: &AnyRExpression, index: &SemanticIndex, truth: bool) -> BranchAssumption {
+    let predicate = parse_simple_predicate(condition).map(|predicate| {
+        if truth {
+            predicate
+        } else {
+            negate_predicate(predicate)
+        }
+    });
+    let range = condition.syntax().text_trimmed_range();
+    let symbols = index
+        .scope_ids()
+        .flat_map(|scope| {
+            index
+                .uses(scope)
+                .iter()
+                .filter(|(_, site)| range.contains_range(site.range()))
+                .map(move |(_, site)| index.symbols(scope).symbol(site.symbol()).name().to_owned())
+        })
+        .collect();
+    BranchAssumption { predicate, symbols }
 }
 
 pub(super) fn case_is_consistent_with(
@@ -286,96 +304,6 @@ pub(super) fn assumption_symbols(assumptions: &[BranchAssumption]) -> BTreeSet<S
         .iter()
         .flat_map(|assumption| assumption.symbols.iter().cloned())
         .collect()
-}
-
-pub(super) fn canonical_condition(text: &str, start: usize, end: usize) -> String {
-    let bytes = text.as_bytes();
-    let mut output = String::new();
-    let mut cursor = start;
-    let mut quote = None;
-    while cursor < end {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            output.push(byte as char);
-            if byte == b'\\' {
-                if cursor + 1 < end {
-                    cursor += 1;
-                    output.push(bytes[cursor] as char);
-                }
-            } else if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                output.push(byte as char);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, end),
-            byte if byte.is_ascii_whitespace() => cursor += 1,
-            _ => {
-                let character = text[cursor..].chars().next().expect("valid UTF-8 source");
-                output.push(character);
-                cursor += character.len_utf8();
-            }
-        }
-    }
-    output
-}
-
-pub(super) fn condition_symbols(text: &str, start: usize, end: usize) -> BTreeSet<String> {
-    let mut symbols = BTreeSet::new();
-    let bytes = text.as_bytes();
-    let mut cursor = start;
-    let mut quote = None;
-    while cursor < end {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(end);
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, end),
-            _ => {
-                let Some(character) = text[cursor..].chars().next() else {
-                    break;
-                };
-                if character.is_alphabetic() || character == '.' || character == '_' {
-                    let token_start = cursor;
-                    cursor += character.len_utf8();
-                    while cursor < end {
-                        let Some(next) = text[cursor..].chars().next() else {
-                            break;
-                        };
-                        if !(next.is_alphanumeric() || next == '.' || next == '_') {
-                            break;
-                        }
-                        cursor += next.len_utf8();
-                    }
-                    if let Some(name) = text.get(token_start..cursor) {
-                        symbols.insert(name.to_owned());
-                    }
-                } else {
-                    cursor += character.len_utf8();
-                }
-            }
-        }
-    }
-    symbols
 }
 
 pub(super) fn condition_symbols_stable(

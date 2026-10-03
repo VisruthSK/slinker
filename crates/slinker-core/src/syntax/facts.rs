@@ -109,11 +109,16 @@ impl CallSite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRef {
     pub package: ResourcePackage,
-    pub path: Option<String>,
-    pub must_work: Option<bool>,
+    pub arguments: ResourceArguments,
     pub guards: Vec<PackageGuard>,
     pub scope: LexicalScopeId,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceArguments {
+    Static { path: String, must_work: bool },
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

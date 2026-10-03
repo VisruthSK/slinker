@@ -115,7 +115,6 @@ name_type!(GenericName);
 name_type!(PackageName);
 name_type!(ComponentName);
 name_type!(DatasetName);
-name_type!(ResourcePath);
 name_type!(SymbolName);
 name_type!(DataSetId);
 name_type!(ExportName);
@@ -267,7 +266,6 @@ from_atom!(
     PackageName,
     ComponentName,
     DatasetName,
-    ResourcePath,
     SymbolName,
     DataSetId,
     ExportName,

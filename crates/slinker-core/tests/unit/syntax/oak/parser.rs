@@ -1,4 +1,56 @@
 use super::*;
+
+#[test]
+fn binary_constant_arguments_are_not_names() {
+    let parsed = parse_source("f <- function(x) x + TRUE");
+    let call = parsed.expressions[0]
+        .calls
+        .iter()
+        .find(|call| call.callee == "+")
+        .unwrap();
+    assert_eq!(call.static_arg(1), None);
+}
+
+#[test]
+fn namespace_queries_only_guard_branches_that_require_their_truth() {
+    for condition in [
+        "!(requireNamespace('optional'))",
+        "isFALSE(requireNamespace('optional'))",
+        "requireNamespace('optional') == FALSE",
+        "identity(requireNamespace('optional'))",
+        "requireNamespace('optional') || flag",
+    ] {
+        let parsed = parse_source(&format!(
+            "f <- function(flag) if ({condition}) optional::run()"
+        ));
+        let reference = parsed.expressions[0]
+            .package_refs
+            .iter()
+            .find(|reference| reference.package == "optional")
+            .expect("namespace reference");
+        assert!(
+            reference.guards.is_empty(),
+            "{condition}: {:?}",
+            reference.guards
+        );
+    }
+}
+
+#[test]
+fn parenthesized_conjunction_preserves_required_namespace_guards() {
+    let parsed = parse_source(
+        "f <- function(flag) if ((requireNamespace('optional')) && flag) optional::run()",
+    );
+    let reference = parsed.expressions[0]
+        .package_refs
+        .iter()
+        .find(|reference| reference.package == "optional")
+        .unwrap();
+    assert_eq!(
+        reference.guards,
+        [crate::syntax::PackageGuard::Available("optional".into())]
+    );
+}
 use crate::package::{BindingName, PackageName};
 use crate::syntax::{ConstructionExprKind, ConstructionTarget, DeclaredCallable, DeclaredDomain};
 use oak_semantic::ImportsResolver;
@@ -478,6 +530,14 @@ fn rebound_predicate_symbol_does_not_prove_local_binding() {
 }
 
 #[test]
+fn rebinding_a_backticked_condition_input_preserves_fallthrough() {
+    let parsed = parse_source(
+        "f <- function(`some name`) { if (!is.null(`some name`)) x <- 1; `some name` <- 1; if (!is.null(`some name`)) x }",
+    );
+    assert!(reference_names(&parsed).contains(&"x"));
+}
+
+#[test]
 fn broader_later_guard_does_not_hide_real_fallthrough() {
     let parsed = parse_source(
         r#"f <- function(alternative) {
@@ -772,11 +832,11 @@ fn repeated_boolean_guard_preserves_exhaustive_inner_assignment() {
 }
 
 #[test]
-fn boolean_alias_correlates_equivalent_null_guard() {
+fn boolean_alias_does_not_correlate_compound_null_guard() {
     let parsed = parse_source(
         "f <- function(obj) { present <- !is.null(obj$field); if (!is.null(obj$field)) value <- 1; if (present) print(value) }",
     );
-    assert!(!reference_names(&parsed).contains(&"value"));
+    assert!(reference_names(&parsed).contains(&"value"));
 }
 
 #[test]
@@ -1036,6 +1096,17 @@ fn explicit_return_prevents_never_returns_summary() {
         "function(flag) { if (flag) return(1); stop('otherwise') }",
         &context,
     ));
+}
+
+#[test]
+fn repeated_null_queries_on_calls_do_not_prove_a_local_binding() {
+    let parsed = parse_source(
+        "f <- function() { if (!is.null(next_value())) fallback <- 1; if (!is.null(next_value())) fallback }",
+    );
+    assert!(
+        reference_names(&parsed).contains(&"fallback"),
+        "repeating a call can produce a different value and reach the namespace fallback"
+    );
 }
 
 #[test]

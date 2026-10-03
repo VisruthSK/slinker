@@ -86,6 +86,8 @@ acceptance cases here.
 
 ## Track E: Retire heuristics
 
+- Extend resource-call lowering to explicit `lib.loc` and computed arguments while preserving their evaluation against the frozen universe. These forms currently block analysis.
+
 - Invocation model: `InvocationModel` records direct calls and base
   `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` `FUN` uses with their forwarded `...`; any
   other retention of a binding (exports, S3 registrations and dispatch, lifecycle hooks, native
@@ -164,12 +166,12 @@ Done when:
 
 ## Track I: Parse on the syntax tree
 
-Air parses every binding and Oak indexes it, yet slinker still re-derives structure by scanning source text with its own lexer. That is a heuristic (no raw strings, a newline ends an expression even after a trailing operator or `%>%`, `=` is detected by character rules, conditions are canonicalised to strings and re-parsed), it costs allocations and time on every binding, and it duplicates what Air nodes and Oak definitions already give exactly. Replace it; do not add scanners.
+Air parses every binding and Oak indexes it, yet slinker still re-derives some structure by scanning source text with its own lexer. The remaining scanners do not understand raw strings, can end an expression at a newline after a trailing operator or `%>%`, and detect `=` by character rules. Replace them; do not add scanners.
 
 Still to do:
-- `syntax/oak/scan.rs`, `predicates.rs`, `proofs.rs`, `guards.rs`, `declarations.rs`, `construction.rs`, and `mod.rs` still use text offsets: `static_arg`/`static_string`/`static_symbol` on re-sliced text, `split_arguments` for membership guards, `expression_end`, `skip_trivia`, `statement_start`, `matching_delimiter`, `CodeScanner`, `canonical_condition`, `parse_simple_predicate`, `condition_symbols`, and `contains_call_named(segment, "rm")`.
+- `syntax/oak/scan.rs`, `predicates.rs`, `proofs.rs`, `declarations.rs`, `construction.rs`, and `mod.rs` still use text offsets: `static_arg`/`static_string`/`static_symbol` on re-sliced text, `expression_end`, `skip_trivia`, `statement_start`, `matching_delimiter`, `CodeScanner`, and `contains_call_named(segment, "rm")`.
 - Resolve the remaining Oak `DefinitionKind` pointers (`Parameter`, `ForVariable`, `Assign`) to Air nodes instead of scanning around the target; assignments and super-assignments already resolve through `assignment_of`.
-- Represent branch predicates as typed values built from condition expressions (`!`, `==`, `!=`, `is.null`, literals, `%in%` with `c()`), take condition symbols from Oak uses inside the condition, and detect `rm`/`remove` from resolved base calls.
+- Detect `rm`/`remove` from resolved base calls when checking predicate stability. Audit repeatability of dispatching operators; expression equality alone does not establish purity.
 - Collect every node class the translation needs in the single `Census` pass (data-mask ranges, declarations, dispatching syntax, namespace-info reads, operators, construction) instead of one tree walk per fact; keep reusing Oak where it already answers (`use_is_bound`, `reaching_definitions`, scope kinds and ranges, `enclosing_bindings`, eager and lazy scopes).
 - Audit `slinker-r-worker` against harp (Ark's Rust wrappers for R objects) and delete hand-rolled R object inspection that harp already provides; keep only slinker-specific protocol and policy.
 - Make `T` and `F` resolve like any other name instead of being accepted as logical literals anywhere that still does so.

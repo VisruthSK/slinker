@@ -2270,14 +2270,14 @@ fn resource_reference_retains_only_required_path() {
     let plan = analyze_images(vec![root, foo]);
     assert!(plan.program().resources().iter().any(|resource| {
         plan.program().package(resource.package).identity().name == "foo"
-            && resource.path == "data/x.json"
+            && resource.path.as_str() == "data/x.json"
     }));
     assert!(
         !plan
             .program()
             .resources()
             .iter()
-            .any(|resource| resource.path == "data/y.json")
+            .any(|resource| resource.path.as_str() == "data/y.json")
     );
 }
 
@@ -2369,6 +2369,26 @@ fn do_call_with_a_literal_list_is_a_typed_invocation() {
 }
 
 #[test]
+fn linked_resource_paths_cannot_escape_the_package() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some("f <- function() system.file('..', package = 'foo')"),
+        )],
+    );
+    let foo = package("foo", &[]);
+    let plan = analyze_images(vec![root, foo]);
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("resource path")
+                && diagnostic.message.contains("package")),
+        "out-of-package resource path was accepted"
+    );
+}
+
+#[test]
 fn base_resource_lookup_is_not_a_package_resource() {
     let root = package(
         "root",
@@ -2377,6 +2397,48 @@ fn base_resource_lookup_is_not_a_package_resource() {
     let plan = analyze_images(vec![root]);
     assert!(plan.blockers().is_empty());
     assert!(plan.program().resources().is_empty());
+}
+
+#[test]
+fn linked_resource_relocation_cannot_discard_argument_evaluation() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some(
+                "f <- function() system.file('DESCRIPTION', package = 'foo', mustWork = { cat('evaluated'); FALSE })",
+            ),
+        )],
+    );
+    let foo = PackageFixture::new("foo", &[])
+        .files(vec!["DESCRIPTION".into()])
+        .build();
+    let plan = analyze_images(vec![root, foo]);
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicLookup),
+        "resource replacement discards observable argument evaluation"
+    );
+}
+
+#[test]
+fn proven_absent_linked_resource_does_not_query_the_real_installation() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some("f <- function() system.file('missing', package = 'foo', mustWork = FALSE)"),
+        )],
+    );
+    let foo = package("foo", &[]);
+    let plan = analyze_images(vec![root, foo]);
+    assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
+    assert_eq!(
+        plan.program().relocations().len(),
+        1,
+        "proven absence must replace the original installation query"
+    );
 }
 
 #[test]

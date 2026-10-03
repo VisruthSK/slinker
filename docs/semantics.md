@@ -86,6 +86,12 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
 
 ## Unproven behavior
 
+Repeated null guards correlate only a bare symbol whose binding stays stable. Calls, member access, and other computed arguments to `is.null` are not treated as repeatable: matching syntax does not prove they evaluate to the same value. Their possible namespace fallback remains reachable.
+
+Linked resource selectors must stay relative to their owning package. Absolute paths, parent-directory components, and NUL bytes fail analysis with `UnsupportedResourcePath`. The checked `ResourcePath` type also validates serialized selectors before the provider or IR can use them.
+
+Linked `system.file()` calls require literal unnamed path components and an omitted or literal logical `mustWork`. An explicit `lib.loc`, other named arguments, duplicate arguments, or computed path or `mustWork` arguments block analysis: replacing those calls could discard evaluation or change their library lookup. A proven absent resource with `mustWork = FALSE` (including the default) becomes the empty string in the IR, so a later real installation cannot change its result. An absent resource with `mustWork = TRUE` blocks analysis.
+
 Anything slinker cannot prove blocks the build; there is no mode that accepts a heuristic instead. In particular these block:
 
 - unanalyzed native code, whose C-to-R callbacks are not checked, unless an audited native summary covers it (the blocker names the exact package, version, and image fingerprint to audit);

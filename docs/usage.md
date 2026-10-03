@@ -22,6 +22,32 @@ Snapshotting the source tree skips `.git`, `target`, and `renv` at the package r
 
 `--lib`, `--external`, `--link`, and `--threads` are accepted by every command and mean the same thing in each. `--threads` sets the number of analysis threads and defaults to 4.
 
+## Library
+
+The CLI uses `slinker_core::session`. Library consumers choose an R installation and a worker executable explicitly:
+
+```rust,no_run
+use std::num::NonZeroUsize;
+use std::path::Path;
+use slinker_core::WorkerExecutable;
+use slinker_core::cache::CacheLocation;
+use slinker_core::session::{SessionOptions, SourceSession};
+
+let options = SessionOptions {
+    libraries: vec!["/project/library".into()],
+    external: vec!["dplyr".into()],
+    linked: Vec::new(),
+    threads: NonZeroUsize::new(4).unwrap(),
+    cache: CacheLocation::Default,
+    worker_executable: WorkerExecutable::Standalone("/path/to/slinker".into()),
+};
+let source = SourceSession::prepare(Path::new("/project/rootpkg"), &options, "/path/to/R".into())?;
+let outcome = source.build(Path::new("/project/out/rootpkg"))?;
+# Ok::<(), slinker_core::session::SessionError>(())
+```
+
+`Session::open` also accepts installed roots through `RootSpec`. Session options are copied at capture; later edits to the caller's options cannot change that invocation. `Session::analyze` returns the semantic plan and diagnostics, while `SourceSession::check` runs build preflight without publishing. Build errors use `SessionError`; a successful build returns `BuildOutcome::Built` or `BuildOutcome::UpToDate`.
+
 ## Check
 
 ```text

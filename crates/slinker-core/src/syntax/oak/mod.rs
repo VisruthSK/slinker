@@ -4,8 +4,8 @@ use crate::syntax::facts::{
     ActiveBindingDef, CallArgument, CallSite, CalleeKind, EvalPhase, LexicalBindingId,
     LexicalScopeId, NameRef, NameRefKind, NamespaceEnumeration, NamespaceInfoRead,
     NamespaceInfoReceiver, PackageRef, ParsedExpression, ParsedRFile, PinnedDefault,
-    ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment,
-    SyntaxEffect, SyntaxEffectKind,
+    ResourceArguments, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg,
+    StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use air_r_parser::{RParserOptions, parse};
@@ -19,7 +19,7 @@ use oak_semantic::semantic_index::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 mod census;
-use census::{Census, assignment_of, node_range, static_arg_of};
+use census::{Census, IfRegion, assignment_of, node_range, static_arg_of};
 mod construction;
 mod context;
 mod declarations;
@@ -28,6 +28,7 @@ mod predicates;
 mod proofs;
 mod scan;
 #[cfg(test)]
+#[path = "../../../tests/unit/syntax/oak/parser.rs"]
 mod tests;
 
 pub use context::OakParseContext;
@@ -48,10 +49,7 @@ use proofs::{
     for_body_use_is_bound, formal_default_use_is_bound, is_base_call,
     post_for_use_may_fall_through, recursive_closure_binding_is_initialized,
 };
-use scan::{
-    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, argument_spans, namespace_extent,
-    skip_trivia, static_arg, static_args,
-};
+use scan::{ForRegion, FunctionRegion, RawArgument, RawCall, namespace_extent, skip_trivia};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OakParser;
@@ -284,7 +282,7 @@ fn pinned_defaults(
         .filter_map(|parameter| {
             let name = ast_text(text, &parameter.name().ok()?);
             let default = parameter.default()?.value().ok()?;
-            let Some(StaticArg::String(value)) = static_arg(ast_str(text, &default)) else {
+            let Some(StaticArg::String(value)) = static_arg_of(&default) else {
                 return None;
             };
             let rebound = effects.iter().any(|effect| {
@@ -395,21 +393,16 @@ impl LexicalScopes {
             })
     }
 
-    fn call_context(
+    fn argument_binding(
         &self,
         index: &SemanticIndex,
-        offset: usize,
-        args: &[Option<StaticArg>],
-    ) -> (LexicalScopeId, Vec<Option<LexicalBindingId>>) {
-        let (scope, lexical) = self.at(index, offset);
-        let bindings = args
-            .iter()
-            .map(|argument| match argument {
-                Some(StaticArg::Symbol(name)) => self.binding(index, name, scope),
-                Some(StaticArg::String(_)) | None => None,
-            })
-            .collect();
-        (lexical, bindings)
+        scope: ScopeId,
+        value: Option<&StaticArg>,
+    ) -> Option<LexicalBindingId> {
+        match value {
+            Some(StaticArg::Symbol(name)) => self.binding(index, name, scope),
+            Some(StaticArg::String(_)) | None => None,
+        }
     }
 }
 
@@ -485,7 +478,7 @@ fn translate_index(
     drop(calls_span);
 
     let guards_span = profile::span(Probe::ParseGuards);
-    let mut guard_regions = if_guard_regions(text, context, if_regions, &live_calls);
+    let mut guard_regions = if_guard_regions(context, index, &census, &live_calls);
     apply_guard_regions_to_references(&guard_regions, &mut references);
     apply_guard_regions_to_package_refs(&guard_regions, &mut package_refs);
     apply_guard_regions_to_calls(&guard_regions, &mut live_calls);
@@ -615,7 +608,7 @@ fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpress
             if arguments.next().is_some() {
                 return None;
             }
-            match static_arg(ast_str(text, &index).trim())? {
+            match static_arg_of(&index)? {
                 StaticArg::String(member) => {
                     Some((subset.function().ok()?, member.as_str().to_owned()))
                 }
@@ -643,9 +636,7 @@ fn namespace_info_receiver(text: &str, receiver: &AnyRExpression) -> NamespaceIn
             "asNamespace" | "getNamespace"
         )
     });
-    match sole_positional_argument(call)
-        .and_then(|argument| static_arg(ast_str(text, &argument).trim()))
-    {
+    match sole_positional_argument(call).and_then(|argument| static_arg_of(&argument)) {
         Some(StaticArg::String(package)) if named => {
             NamespaceInfoReceiver::Namespace(package.into())
         }
@@ -733,15 +724,7 @@ fn refine_callee_kinds(
             continue;
         }
         if live_use.callee_kind == CalleeKind::ConditionalFallthrough
-            && conditional_fallthrough_proven_bound(
-                text,
-                root,
-                context,
-                index,
-                for_regions,
-                if_regions,
-                live_use,
-            )
+            && conditional_fallthrough_proven_bound(text, root, context, index, census, live_use)
         {
             live_use.callee_kind = CalleeKind::DefinitelyLexical;
         }
@@ -809,14 +792,13 @@ fn lexical_calls(
         let Some(raw) = census.call_of(live_use.start, live_use.end) else {
             continue;
         };
-        let args = static_args(&raw);
-        let (scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
+        let (scope, arguments) = call_arguments(source, root, index, live_uses, scopes, &raw);
         live_calls.push(LiveCall {
             site: CallSite {
                 callee: Atom::from(live_use.name.as_str()),
                 callee_kind: live_use.callee_kind,
                 qualified_package: None,
-                arguments: call_arguments(source, root, index, live_uses, &raw, args, arg_bindings),
+                arguments,
                 scope,
                 phase: live_use.phase,
                 guards: Vec::new(),
@@ -879,22 +861,14 @@ fn namespace_access_facts(
 
         if let Some(raw) = census.call_of(start, access_end) {
             let (scope, _) = index.scope_at(access.offset());
-            let args = static_args(&raw);
-            let (lexical_scope, arg_bindings) = scopes.call_context(index, raw.start, &args);
+            let (lexical_scope, arguments) =
+                call_arguments(source, translation.root, index, live_uses, scopes, &raw);
             live_calls.push(LiveCall {
                 site: CallSite {
                     callee: Atom::from(access.symbol()),
                     callee_kind: CalleeKind::DefinitelyExternal,
                     qualified_package: Some(Atom::from(access.package())),
-                    arguments: call_arguments(
-                        source,
-                        translation.root,
-                        index,
-                        live_uses,
-                        &raw,
-                        args,
-                        arg_bindings,
-                    ),
+                    arguments,
                     scope: lexical_scope,
                     phase: phase_for_scope(index, scope),
                     guards: Vec::new(),
@@ -914,7 +888,6 @@ fn binary_operator_facts(
 ) {
     let Translation {
         source,
-        text,
         root,
         index,
         scopes,
@@ -955,34 +928,24 @@ fn binary_operator_facts(
                 ),
             });
         }
-        let argument = |expression: &AnyRExpression| {
-            let span = ast_span(source, expression);
-            (
-                static_arg(text.get(span.start..span.end).unwrap_or_default().trim()),
-                Some(span),
-            )
-        };
-        let (left_arg, left_span) = argument(&left);
-        let (right_arg, right_span) = argument(&right);
-        let args = vec![left_arg, right_arg];
-        let (lexical_scope, arg_bindings) = scopes.call_context(index, span.start, &args);
+        let (argument_scope, lexical_scope) = scopes.at(index, span.start);
         live_calls.push(LiveCall {
             site: CallSite {
                 callee: Atom::from(operator.as_str()),
                 callee_kind: CalleeKind::DefinitelyExternal,
                 qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
-                arguments: args
-                    .into_iter()
-                    .zip([left_span, right_span])
-                    .zip(arg_bindings)
-                    .map(|((value, span), binding)| CallArgument {
-                        value,
-                        name: None,
-                        span,
-                        is_local_closure: false,
-                        binding,
+                arguments: [left, right]
+                    .map(|expression| {
+                        let value = static_arg_of(&expression);
+                        CallArgument {
+                            binding: scopes.argument_binding(index, argument_scope, value.as_ref()),
+                            value,
+                            name: None,
+                            span: Some(ast_span(source, &expression)),
+                            is_local_closure: false,
+                        }
                     })
-                    .collect(),
+                    .into(),
                 scope: lexical_scope,
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
@@ -1135,28 +1098,9 @@ fn collect_resources(
             },
             ResourcePackage::Literal,
         );
-        let must_work = named_static_bool(&call.raw.args, "mustWork");
-        let path_parts = call
-            .raw
-            .args
-            .iter()
-            .filter(|argument| argument.name.is_none())
-            .map(|argument| match &argument.static_arg {
-                Some(StaticArg::String(value)) => Some(value.as_str()),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>();
-        let path = path_parts.map(|parts| {
-            parts
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join("/")
-        });
         resources.push(ResourceRef {
             package,
-            path,
-            must_work,
+            arguments: resource_arguments(&call.raw.args).unwrap_or(ResourceArguments::Unsupported),
             guards: call.site.guards.clone(),
             scope: call.site.scope,
             span: Span::new(source, call.site.span.start, call.site.span.end),
@@ -1599,11 +1543,28 @@ fn named_static_string(arguments: &[RawArgument], name: &str) -> Option<String> 
     })
 }
 
-fn named_static_bool(arguments: &[RawArgument], name: &str) -> Option<bool> {
-    arguments.iter().find_map(|argument| {
-        (argument.name.as_deref() == Some(name))
-            .then_some(argument.logical)
-            .flatten()
+fn resource_arguments(arguments: &[RawArgument]) -> Option<ResourceArguments> {
+    let mut parts = Vec::new();
+    let mut package_seen = false;
+    let mut must_work = None;
+    for argument in arguments {
+        match argument.name.as_deref() {
+            None => match &argument.static_arg {
+                Some(StaticArg::String(value)) => {
+                    if !value.is_empty() {
+                        parts.push(value.as_str());
+                    }
+                }
+                _ => return None,
+            },
+            Some("package") if !package_seen => package_seen = true,
+            Some("mustWork") if must_work.is_none() => must_work = Some(argument.logical?),
+            _ => return None,
+        }
+    }
+    Some(ResourceArguments::Static {
+        path: parts.join("/"),
+        must_work: must_work.unwrap_or(false),
     })
 }
 
@@ -1612,57 +1573,45 @@ fn call_arguments(
     root: &RRoot,
     index: &SemanticIndex,
     live_uses: &[LiveUse],
+    scopes: &LexicalScopes,
     raw: &RawCall,
-    values: Vec<Option<StaticArg>>,
-    bindings: Vec<Option<LexicalBindingId>>,
-) -> Box<[CallArgument]> {
-    let spans = argument_spans(source, &raw.args);
-    let closures = local_closure_arguments(root, index, live_uses, &raw.args);
-    raw.args
+) -> (LexicalScopeId, Box<[CallArgument]>) {
+    let (scope, lexical) = scopes.at(index, raw.start);
+    let arguments = raw
+        .args
         .iter()
-        .zip(values)
-        .zip(spans)
-        .zip(closures)
-        .zip(bindings)
-        .map(
-            |((((argument, value), span), is_local_closure), binding)| CallArgument {
-                value,
-                name: argument.name.as_deref().map(Atom::from),
-                span,
-                is_local_closure,
-                binding,
-            },
-        )
-        .collect()
+        .map(|argument| CallArgument {
+            value: argument.static_arg.clone(),
+            name: argument.name.as_deref().map(Atom::from),
+            span: (argument.value.start < argument.value.end)
+                .then(|| Span::new(*source, argument.value.start, argument.value.end)),
+            is_local_closure: local_closure_argument(root, index, live_uses, argument),
+            binding: scopes.argument_binding(index, scope, argument.static_arg.as_ref()),
+        })
+        .collect();
+    (lexical, arguments)
 }
 
-fn local_closure_arguments(
+fn local_closure_argument(
     root: &RRoot,
     index: &SemanticIndex,
     live_uses: &[LiveUse],
-    arguments: &[RawArgument],
-) -> Vec<bool> {
-    arguments
-        .iter()
-        .map(|argument| {
-            let Some(StaticArg::Symbol(name)) = &argument.static_arg else {
-                return false;
-            };
-            let Some(use_site) = live_uses.iter().find(|live_use| {
-                live_use.name == *name
-                    && live_use.start == argument.value.start
-                    && live_use.end == argument.value.end
-                    && live_use.callee_kind == CalleeKind::DefinitelyLexical
-            }) else {
-                return false;
-            };
-            index
-                .reaching_definitions(use_site.scope, use_site.use_id)
-                .any(|(scope, definition_id)| {
-                    definition_is_closure(root, index, scope, definition_id)
-                })
-        })
-        .collect()
+    argument: &RawArgument,
+) -> bool {
+    let Some(StaticArg::Symbol(name)) = &argument.static_arg else {
+        return false;
+    };
+    let Some(use_site) = live_uses.iter().find(|live_use| {
+        live_use.name == *name
+            && live_use.start == argument.value.start
+            && live_use.end == argument.value.end
+            && live_use.callee_kind == CalleeKind::DefinitelyLexical
+    }) else {
+        return false;
+    };
+    index
+        .reaching_definitions(use_site.scope, use_site.use_id)
+        .any(|(scope, definition_id)| definition_is_closure(root, index, scope, definition_id))
 }
 
 fn reaches_only_closures(root: &RRoot, index: &SemanticIndex, live_use: &LiveUse) -> bool {
@@ -1702,7 +1651,7 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
             return;
         }
         let (scope, _) = index.scope_at(node.syntax().text_trimmed_range().start());
-        let (lexical_scope, _) = scopes.call_context(index, span.start, &[]);
+        let (_, lexical_scope) = scopes.at(index, span.start);
         live_calls.push(LiveCall {
             site: CallSite {
                 callee: Atom::from(callee),

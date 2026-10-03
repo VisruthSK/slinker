@@ -7,6 +7,7 @@ mod inspection;
 mod intern;
 mod locator;
 mod names;
+mod resource;
 mod store;
 mod universe;
 
@@ -32,6 +33,7 @@ pub use index::{
 pub use locator::PackageLocator;
 pub use locator::{Fingerprint, tree_digest};
 pub(crate) use locator::{fingerprint_image, fingerprint_strings};
+pub use resource::{InvalidResourcePath, ResourcePath};
 pub use store::{
     CanonicalSyntax, DispatchSubject, Normalization, PackageProvider, PackageResolver,
     PackageStore, SyntaxValidation, analysis_schema,
@@ -40,6 +42,5 @@ pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUn
 
 pub use names::{
     Atom, BindingName, ClassName, ComponentName, DataSetId, DatasetName, EnvironmentKind,
-    EnvironmentLabel, ExportName, GenericLabel, GenericName, MemberPath, PackageName, ResourcePath,
-    SymbolName,
+    EnvironmentLabel, ExportName, GenericLabel, GenericName, MemberPath, PackageName, SymbolName,
 };

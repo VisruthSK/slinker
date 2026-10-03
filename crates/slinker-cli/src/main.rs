@@ -13,12 +13,8 @@ use slinker_core::TargetEnvironment;
 use slinker_core::analysis::{
     ANALYSIS_STACK_BYTES, Edge, ExplanationDag, LinkIr, Node, NodeId, NodeKind,
 };
-use slinker_core::build::incremental::{
-    BuildRecord, BuildState, consulted_packages, inputs_digest, is_up_to_date,
-};
-use slinker_core::build::{BuildReport, PreflightError, PureRStatic, materialize};
+use slinker_core::build::BuildReport;
 use slinker_core::package::{BindingName, PackageName};
-use slinker_core::package::{PackageLocator, tree_digest};
 
 #[cfg(feature = "profile")]
 #[global_allocator]
@@ -27,9 +23,7 @@ static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
 
 mod cache_command;
 mod roles;
-mod session;
-
-use session::{RootSpec, Session, SourceSession};
+use slinker_core::session::{BuildOutcome, RootSpec, Session, SessionOptions, SourceSession};
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
@@ -105,6 +99,26 @@ struct UniverseArgs {
     linked: Vec<PackageName>,
     #[arg(long, value_name = "N", default_value_t = DEFAULT_THREADS, help = "Analysis threads")]
     threads: NonZeroUsize,
+}
+
+impl UniverseArgs {
+    fn options(&self) -> SessionOptions {
+        SessionOptions {
+            libraries: self.libraries.clone(),
+            external: self.external.clone(),
+            linked: self.linked.clone(),
+            threads: self.threads,
+            cache: cache_location(),
+            worker_executable: slinker_core::WorkerExecutable::CurrentProcess,
+        }
+    }
+}
+
+fn cache_location() -> slinker_core::cache::CacheLocation {
+    use slinker_core::cache::CacheLocation;
+    std::env::var_os("SLINKER_CACHE_DIR").map_or(CacheLocation::Default, |root| {
+        CacheLocation::Directory(PathBuf::from(root))
+    })
 }
 
 #[derive(Debug, Args)]
@@ -282,8 +296,12 @@ fn report(result: Result<(), Box<dyn Error>>, format: OutputFormat) -> ExitCode 
 }
 
 fn failure_document(error: &(dyn Error + 'static)) -> serde_json::Value {
-    if let Some(PreflightError::Blocked(report)) = error.downcast_ref() {
-        return json!({ "status": "blocked", "groups": report.groups() });
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(report) = cause.downcast_ref::<BuildReport>() {
+            return json!({ "status": "blocked", "groups": report.groups() });
+        }
+        current = cause.source();
     }
     let mut causes = Vec::new();
     let mut source = error.source();
@@ -301,7 +319,7 @@ fn run(command: UserCommand) -> Result<(), Box<dyn Error>> {
         UserCommand::Analyze(args) => analyze(&args),
         UserCommand::Why(args) => explain_why(&args),
         UserCommand::Path(args) => explain_paths(&args),
-        UserCommand::Cache(args) => cache_command::run(&args, &session::cache_location()),
+        UserCommand::Cache(args) => cache_command::run(&args, &cache_location()),
     }
 }
 
@@ -313,13 +331,14 @@ fn package_name(value: &str) -> Result<PackageName, &'static str> {
 }
 
 fn link(args: &AnalysisArgs) -> Result<(Session, LinkIr), Box<dyn Error>> {
-    let session = Session::open(&args.root, &args.universe, discover_r_home()?)?;
-    let plan = session.analyze(&args.universe, true)?;
+    let session = Session::open(&args.root, &args.universe.options(), discover_r_home()?)?;
+    let plan = session.analyze(true)?;
     Ok((session, plan))
 }
 
 fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
-    let prepared = SourceSession::prepare(&args.path, &args.universe, discover_r_home()?)?;
+    let prepared =
+        SourceSession::prepare(&args.path, &args.universe.options(), discover_r_home()?)?;
     let package = prepared.snapshot().package().to_owned();
     let output = args.output.clone().unwrap_or_else(|| {
         prepared
@@ -330,76 +349,9 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
             .join(&package)
     });
     let output = std::path::absolute(&output)?;
-    let state = BuildState::new(&session::cache_location());
-    let sorted = |names: &[PackageName]| {
-        let mut names = names
-            .iter()
-            .map(|name| name.as_str().to_owned())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    };
-    let (linked, external) = (
-        sorted(&args.universe.linked),
-        sorted(&args.universe.external),
-    );
-    let inputs = inputs_digest(
-        &tree_digest(prepared.snapshot().files().root())?,
-        prepared.target(),
-        &linked.iter().map(String::as_str).collect::<Vec<_>>(),
-        &external.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
-    if let Some(record) = state.load(&output)
-        && is_up_to_date(
-            &record,
-            &inputs,
-            &PackageLocator::new(prepared.target().clone()),
-            &package,
-        )?
-    {
-        print_built(
-            args.json.format(),
-            &package,
-            &output,
-            BuildOutcome::UpToDate,
-        );
-        return Ok(());
-    }
-    let session = SourceSession::stage(prepared)?;
-    let ir = session.session().analyze(&args.universe, false)?;
-    let consulted = consulted_packages(ir.consulted(), &package);
-    let context = session.into_build_context();
-    let buildable = PureRStatic::check(&ir, &context)?;
-    let generated = materialize(buildable, &output)?;
-    state.save(&BuildRecord {
-        package: package.clone(),
-        output,
-        inputs: inputs.as_str().to_owned(),
-        consulted,
-        output_digest: tree_digest(generated.path())?.as_str().to_owned(),
-    })?;
-    print_built(
-        args.json.format(),
-        &package,
-        generated.path(),
-        BuildOutcome::Built,
-    );
+    let result = prepared.build(&output)?;
+    print_built(args.json.format(), &package, &output, result);
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BuildOutcome {
-    Built,
-    UpToDate,
-}
-
-impl BuildOutcome {
-    fn status(self) -> &'static str {
-        match self {
-            Self::Built => "built",
-            Self::UpToDate => "up_to_date",
-        }
-    }
 }
 
 fn print_built(
@@ -424,12 +376,10 @@ fn print_built(
 }
 
 fn check(args: &CheckArgs) -> Result<(), Box<dyn Error>> {
-    let session = SourceSession::open(&args.path, &args.universe, discover_r_home()?)?;
-    let ir = session.session().analyze(&args.universe, false)?;
+    let session = SourceSession::open(&args.path, &args.universe.options(), discover_r_home()?)?;
     let package = session.snapshot().package().to_owned();
     let version = session.snapshot().version().to_string();
-    let context = session.into_build_context();
-    PureRStatic::check(&ir, &context)?;
+    session.check()?;
     if args.json.format() == OutputFormat::Json {
         let rendered = json!({ "status": "ok", "package": package, "version": version });
         println!("{rendered:#}");
@@ -709,112 +659,5 @@ fn parse_r_home(stdout: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Cli, Command, RootSpec, UserCommand, parse_r_home};
-    use clap::{CommandFactory, Parser};
-    use std::path::Path;
-
-    #[test]
-    fn cli_definition_is_consistent() {
-        Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn build_defaults_to_current_directory() {
-        let Command::User(UserCommand::Build(args)) = Cli::parse_from(["slinker", "build"]).command
-        else {
-            panic!("expected build command");
-        };
-        assert_eq!(args.path, Path::new("."));
-        assert_eq!(args.output, None);
-    }
-
-    #[test]
-    fn analyze_accepts_ordered_libraries_and_package_lists() {
-        let Command::User(UserCommand::Analyze(args)) = Cli::parse_from([
-            "slinker",
-            "analyze",
-            "voucher",
-            "--lib",
-            "one",
-            "--lib=two",
-            "--external",
-            "cli,glue",
-            "--link=foo,bar",
-            "--threads",
-            "3",
-            "--json",
-        ])
-        .command
-        else {
-            panic!("expected analyze command");
-        };
-        assert_eq!(args.analysis.root, RootSpec::Installed("voucher".into()));
-        assert_eq!(
-            args.analysis.universe.libraries,
-            [Path::new("one"), Path::new("two")]
-        );
-        assert_eq!(args.analysis.universe.external, ["cli", "glue"]);
-        assert_eq!(args.analysis.universe.linked, ["foo", "bar"]);
-        assert_eq!(args.analysis.universe.threads.get(), 3);
-        assert!(args.json.json);
-    }
-
-    #[test]
-    fn query_takes_root_then_target() {
-        let Command::User(UserCommand::Why(args)) =
-            Cli::parse_from(["slinker", "why", "voucher", "cli::cli_abort"]).command
-        else {
-            panic!("expected why command");
-        };
-        assert_eq!(args.analysis.root, RootSpec::Installed("voucher".into()));
-        assert_eq!(args.target.to_string(), "cli::cli_abort");
-    }
-
-    #[test]
-    fn root_is_a_package_name_or_a_path() {
-        assert_eq!(
-            RootSpec::parse("voucher"),
-            Ok(RootSpec::Installed("voucher".into()))
-        );
-        for path in ["./voucher", "..", ".", "C:\\src\\voucher"] {
-            assert_eq!(
-                RootSpec::parse(path),
-                Ok(RootSpec::Source(path.into())),
-                "{path}"
-            );
-        }
-        assert!(RootSpec::parse("").is_err());
-    }
-
-    #[test]
-    fn check_takes_a_path_defaulting_to_the_current_directory() {
-        let Command::User(UserCommand::Check(args)) =
-            Cli::parse_from(["slinker", "check", "--json"]).command
-        else {
-            panic!("expected check command");
-        };
-        assert_eq!(args.path, Path::new("."));
-        assert!(args.json.json);
-    }
-
-    #[test]
-    fn rejects_invalid_arguments() {
-        for args in [
-            &["slinker", "analyze"][..],
-            &["slinker", "analyze", "voucher", "--threads=0"],
-            &["slinker", "analyze", "voucher", "--external", "cli,,glue"],
-            &["slinker", "analyze", "voucher", "--bogus", "json"],
-            &["slinker", "why", "voucher"],
-        ] {
-            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
-        }
-    }
-
-    #[test]
-    fn r_home_uses_last_non_warning_line() {
-        let stdout =
-            "WARNING: ignoring environment value of R_HOME\nC:/Program Files/R/R-4.6.1\n\n";
-        assert_eq!(parse_r_home(stdout), Some("C:/Program Files/R/R-4.6.1"));
-    }
-}
+#[path = "../tests/unit/cli.rs"]
+mod tests;

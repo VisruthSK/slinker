@@ -1,20 +1,21 @@
-use super::census::{assignment_of, node_range};
+use super::census::{Census, IfRegion, assignment_of, node_range, raw_call, static_arg_of};
 use super::context::OakParseContext;
 use super::predicates::{
     BranchAssumption, PredicateValue, SimplePredicate, assumption_symbols,
-    assumptions_are_repeatable, assumptions_imply, branch_assumptions_at, canonical_condition,
+    assumptions_are_repeatable, assumptions_imply, branch_assumptions_at,
     captured_condition_symbols_stable, case_is_consistent_with, condition_facts_stable,
-    effective_predicate, expand_boolean_alias_assumptions, parse_simple_predicate,
+    effective_predicate, expand_boolean_alias_assumptions, parse_simple_predicate, unparenthesized,
 };
 use super::scan::{
-    ForRegion, FunctionRegion, IfRegion, contains_call_named, find_if_regions, function_body_range,
+    ForRegion, FunctionRegion, contains_call_named, find_if_regions, function_body_range,
     identifier_occurs_before, last_top_level_expression, matching_delimiter, name_token_end,
-    skip_comment, skip_trivia_bounded, split_arguments, statement_start, static_symbol,
+    skip_comment, skip_trivia_bounded, statement_start, static_symbol,
 };
 use super::{LiveUse, innermost_function_region, text_offset};
 use crate::syntax::facts::{CallSite, CalleeKind, StaticArg};
 use crate::syntax::source::TextRange;
 use air_r_syntax::{AnyRExpression, RRoot};
+use biome_rowan::AstNode;
 use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex};
 use std::collections::BTreeSet;
 
@@ -233,10 +234,10 @@ pub(super) fn conditional_fallthrough_proven_bound(
     root: &RRoot,
     context: &OakParseContext,
     index: &SemanticIndex,
-    for_regions: &[ForRegion],
-    regions: &[IfRegion],
+    census: &Census,
     live_use: &LiveUse,
 ) -> bool {
+    let (for_regions, regions) = (&census.fors, &census.ifs);
     let reaching = index
         .reaching_definitions(live_use.scope, live_use.use_id)
         .filter_map(|(scope, definition_id)| {
@@ -249,7 +250,7 @@ pub(super) fn conditional_fallthrough_proven_bound(
                 return None;
             }
             if scope != live_use.scope {
-                let assumptions = branch_assumptions_at(text, regions, definition_start);
+                let assumptions = branch_assumptions_at(index, census, definition_start);
                 let symbols = assumption_symbols(&assumptions);
                 if !captured_condition_symbols_stable(
                     text,
@@ -283,9 +284,8 @@ pub(super) fn conditional_fallthrough_proven_bound(
         return true;
     }
 
-    let mut use_assumptions = branch_assumptions_at(text, regions, live_use.start);
+    let mut use_assumptions = branch_assumptions_at(index, census, live_use.start);
     expand_boolean_alias_assumptions(
-        text,
         root,
         index,
         live_use.scope,
@@ -297,7 +297,7 @@ pub(super) fn conditional_fallthrough_proven_bound(
         if !definition_is_direct_in_branch(text, regions, *definition_start) {
             continue;
         }
-        let definition_assumptions = branch_assumptions_at(text, regions, *definition_start);
+        let definition_assumptions = branch_assumptions_at(index, census, *definition_start);
         if definition_assumptions.is_empty()
             || !assumptions_imply(&use_assumptions, &definition_assumptions)
             || !assumptions_are_repeatable(context, index, live_use.scope, &definition_assumptions)
@@ -332,7 +332,7 @@ pub(super) fn conditional_fallthrough_proven_bound(
             continue;
         }
 
-        let chain_assumptions = branch_assumptions_at(text, regions, region.if_start);
+        let chain_assumptions = branch_assumptions_at(index, census, region.if_start);
         if !assumptions_imply(&use_assumptions, &chain_assumptions) {
             continue;
         }
@@ -374,7 +374,7 @@ pub(super) fn conditional_fallthrough_proven_bound(
             text,
             context,
             index,
-            regions,
+            census,
             region,
             BindingProofContext {
                 live_use,
@@ -394,10 +394,11 @@ pub(super) fn exhaustive_equality_dispatch_proves_binding(
     text: &str,
     context: &OakParseContext,
     index: &SemanticIndex,
-    regions: &[IfRegion],
+    census: &Census,
     region: &IfRegion,
     proof: BindingProofContext<'_>,
 ) -> bool {
+    let regions = &census.ifs;
     let BindingProofContext {
         live_use,
         use_assumptions,
@@ -408,8 +409,9 @@ pub(super) fn exhaustive_equality_dispatch_proves_binding(
     let mut selector = None::<String>;
     let mut cases = Vec::<(PredicateValue, usize, usize)>::new();
     let final_else = loop {
-        let condition = canonical_condition(text, current.condition.start, current.condition.end);
-        let Some(SimplePredicate::Eq { symbol, value }) = parse_simple_predicate(&condition) else {
+        let Some(SimplePredicate::Eq { symbol, value }) =
+            parse_simple_predicate(&current.condition)
+        else {
             return false;
         };
         if selector
@@ -453,7 +455,7 @@ pub(super) fn exhaustive_equality_dispatch_proves_binding(
                 text,
                 context,
                 index,
-                regions,
+                census,
                 region.if_start,
                 &selector,
             ) else {
@@ -541,11 +543,12 @@ pub(super) fn prior_membership_guard_values(
     text: &str,
     context: &OakParseContext,
     index: &SemanticIndex,
-    regions: &[IfRegion],
+    census: &Census,
     before: usize,
     selector: &str,
 ) -> Option<BTreeSet<String>> {
-    regions
+    census
+        .ifs
         .iter()
         .filter(|region| region.if_start < before && region.then_branch.end <= before)
         .rev()
@@ -554,26 +557,73 @@ pub(super) fn prior_membership_guard_values(
                 text,
                 context,
                 index,
-                regions,
+                &census.ifs,
                 region.then_branch.start,
                 region.then_branch.end,
             ) {
                 return None;
             }
-            let condition = canonical_condition(text, region.condition.start, region.condition.end);
-            let marker = format!("!({selector}%in%c(");
-            let marker_start = condition.find(&marker)?;
-            let open = marker_start + marker.len() - 1;
-            let close = matching_delimiter(&condition, open)?;
-            let values = split_arguments(&condition, open + 1, close)
-                .into_iter()
-                .map(|argument| match argument.static_arg {
-                    Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
-                    Some(StaticArg::Symbol(_)) | None => None,
-                })
-                .collect::<Option<BTreeSet<_>>>()?;
-            (!values.is_empty()).then_some(values)
+            membership_guard_values(&region.condition, selector, context, index)
         })
+}
+
+fn membership_guard_values(
+    condition: &AnyRExpression,
+    selector: &str,
+    context: &OakParseContext,
+    index: &SemanticIndex,
+) -> Option<BTreeSet<String>> {
+    let condition = unparenthesized(condition);
+    if let AnyRExpression::RBinaryExpression(binary) = &condition {
+        let operator = binary.operator().ok()?;
+        let name = operator.text_trimmed();
+        let (scope, _) = index.scope_at(binary.range().start());
+        if matches!(name, "||" | "|")
+            && context.resolves_to_base(name)
+            && index.resolve(name, scope).is_none()
+        {
+            return membership_guard_values(&binary.left().ok()?, selector, context, index)
+                .or_else(|| {
+                    membership_guard_values(&binary.right().ok()?, selector, context, index)
+                });
+        }
+    }
+    let AnyRExpression::RUnaryExpression(negation) = condition else {
+        return None;
+    };
+    let (scope, _) = index.scope_at(negation.range().start());
+    if negation.operator().ok()?.text_trimmed() != "!"
+        || !["!", "%in%", "c"]
+            .iter()
+            .all(|name| context.resolves_to_base(name) && index.resolve(name, scope).is_none())
+    {
+        return None;
+    }
+    let AnyRExpression::RBinaryExpression(membership) = unparenthesized(&negation.argument().ok()?)
+    else {
+        return None;
+    };
+    if membership.operator().ok()?.text_trimmed() != "%in%"
+        || static_arg_of(&unparenthesized(&membership.left().ok()?))
+            != Some(StaticArg::Symbol(selector.into()))
+    {
+        return None;
+    }
+    let AnyRExpression::RCall(vector) = unparenthesized(&membership.right().ok()?) else {
+        return None;
+    };
+    if static_arg_of(&vector.function().ok()?) != Some(StaticArg::Symbol("c".into())) {
+        return None;
+    }
+    let values = raw_call(&vector)?
+        .args
+        .into_iter()
+        .map(|argument| match argument.static_arg {
+            Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
+            _ => None,
+        })
+        .collect::<Option<BTreeSet<_>>>()?;
+    (!values.is_empty()).then_some(values)
 }
 
 pub(super) fn definition_is_direct_in_branch(
@@ -803,20 +853,16 @@ pub(super) fn if_chain_all_paths_exit(
 }
 
 pub(super) fn bare_call_is_external(index: &SemanticIndex, callee: &str, start: usize) -> bool {
-    for scope in index.scope_ids() {
-        for (use_id, use_site) in index.uses(scope).iter() {
-            if text_offset(use_site.range().start()) != start {
-                continue;
-            }
-            let symbol = index.symbols(scope).symbol(use_site.symbol());
-            if symbol.name() != callee {
-                continue;
-            }
-            return !index.use_is_bound(scope, use_id)
-                && index.reaching_definitions(scope, use_id).next().is_none();
-        }
-    }
-    false
+    let Ok(offset) = u32::try_from(start) else {
+        return false;
+    };
+    let Some((scope, use_id, use_site)) = index.use_at(offset.into()) else {
+        return false;
+    };
+    text_offset(use_site.range().start()) == start
+        && index.symbols(scope).symbol(use_site.symbol()).name() == callee
+        && !index.use_is_bound(scope, use_id)
+        && index.reaching_definitions(scope, use_id).next().is_none()
 }
 
 pub(super) fn call_is_non_returning(

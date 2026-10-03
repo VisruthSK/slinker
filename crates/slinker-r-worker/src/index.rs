@@ -218,15 +218,21 @@ fn native_library(compiled: &RObject) -> InspectionResult<NativeLibrary> {
     let Some(library) = strings_field(compiled, "library")?.into_iter().next() else {
         return Ok(NativeLibrary::Missing);
     };
+    let library =
+        library
+            .parse()
+            .map_err(|error: slinker_core::package::InvalidResourcePath| {
+                InspectionError::from(error.to_string())
+            })?;
     if names(compiled.sexp).iter().any(|name| name == "error") {
         return Ok(NativeLibrary::Unloadable {
-            library: library.into(),
+            library,
             error: string_field(compiled, "error")?,
         });
     }
     let routines = field(compiled, "routines")?;
     Ok(NativeLibrary::Loaded {
-        library: library.into(),
+        library,
         routines: NativeRoutines {
             c: typed_strings(&routines, "c")?,
             call: typed_strings(&routines, "call")?,

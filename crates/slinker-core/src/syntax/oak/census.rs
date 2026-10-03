@@ -1,6 +1,4 @@
-use super::scan::{
-    ForRegion, FunctionRegion, IfRegion, RawArgument, RawCall, static_string, static_symbol,
-};
+use super::scan::{ForRegion, FunctionRegion, RawArgument, RawCall, static_string, static_symbol};
 use super::text_offset;
 use crate::package::Atom;
 use crate::syntax::facts::StaticArg;
@@ -19,6 +17,14 @@ pub(super) struct Census {
     pub(super) functions: Vec<FunctionRegion>,
     pub(super) fors: Vec<ForRegion>,
     pub(super) ifs: Vec<IfRegion>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct IfRegion {
+    pub(super) if_start: usize,
+    pub(super) condition: AnyRExpression,
+    pub(super) then_branch: TextRange,
+    pub(super) else_branch: Option<TextRange>,
 }
 
 impl Census {
@@ -48,9 +54,9 @@ impl Census {
                         .extend(RForStatement::cast(node).and_then(|node| for_region(&node)));
                 }
                 RSyntaxKind::R_IF_STATEMENT => {
-                    census
-                        .ifs
-                        .extend(RIfStatement::cast(node).and_then(|node| if_region(&node)));
+                    census.ifs.extend(
+                        RIfStatement::cast(node).and_then(|statement| if_region(&statement)),
+                    );
                 }
                 _ => {}
             }
@@ -242,8 +248,6 @@ fn for_region(statement: &RForStatement) -> Option<ForRegion> {
 }
 
 fn if_region(statement: &RIfStatement) -> Option<IfRegion> {
-    let open = node_range_of_token(&statement.l_paren_token().ok()?);
-    let close = node_range_of_token(&statement.r_paren_token().ok()?);
     let then_branch = node_range(&statement.consequence().ok()?);
     let else_branch = statement
         .else_clause()
@@ -251,7 +255,7 @@ fn if_region(statement: &RIfStatement) -> Option<IfRegion> {
         .map(|alternative| node_range(&alternative));
     Some(IfRegion {
         if_start: node_range(statement).start,
-        condition: TextRange::new(open.end, close.start),
+        condition: statement.condition().ok()?,
         then_branch,
         else_branch,
     })
@@ -263,96 +267,5 @@ fn node_range_of_token(token: &air_r_syntax::RSyntaxToken) -> TextRange {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use air_r_parser::{RParserOptions, parse};
-
-    fn raw_calls(text: &str) -> Vec<RawCall> {
-        let parsed = parse(text, RParserOptions::default());
-        parsed
-            .tree()
-            .syntax()
-            .descendants()
-            .filter_map(RCall::cast)
-            .filter_map(|call| raw_call(&call))
-            .collect()
-    }
-
-    #[test]
-    fn trailing_comma_adds_no_argument_but_leading_hole_does() {
-        assert_eq!(raw_calls("f(x,)")[0].args.len(), 1);
-        assert_eq!(raw_calls("f(,)")[0].args.len(), 1);
-        assert_eq!(raw_calls("f(,x)")[0].args.len(), 2);
-        assert_eq!(raw_calls("f(x,,y)")[0].args.len(), 3);
-        assert!(raw_calls("f()")[0].args.is_empty());
-    }
-
-    #[test]
-    fn argument_names_come_from_name_clauses() {
-        let call = &raw_calls("f(a = 1, \"b c\" = 2, `d` = 3, x == y)")[0];
-        let names = call
-            .args
-            .iter()
-            .map(|argument| argument.name.as_deref())
-            .collect::<Vec<_>>();
-        assert_eq!(names, [Some("a"), Some("b c"), Some("d"), None]);
-    }
-
-    #[test]
-    fn language_constants_are_not_symbol_arguments() {
-        let call = &raw_calls("f(TRUE, NULL, T, ..., \"s\")")[0];
-        let values = call
-            .args
-            .iter()
-            .map(|argument| argument.static_arg.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            values,
-            [
-                None,
-                None,
-                Some(StaticArg::Symbol("T".into())),
-                Some(StaticArg::Symbol("...".into())),
-                Some(StaticArg::String("s".into())),
-            ]
-        );
-    }
-
-    #[test]
-    fn regions_are_the_syntax_nodes_not_scanned_text() {
-        let text = "f <- function(a, b = 2) {\n  if (a) 1 else 2\n  for (i in b) i\n  \\(z) z\n}\n";
-        let parsed = parse(text, RParserOptions::default());
-        let census = Census::of(&parsed.tree());
-        let slice = |range: TextRange| &text[range.start..range.end];
-
-        assert_eq!(census.functions.len(), 2);
-        assert_eq!(
-            census.functions[0].parameters,
-            BTreeSet::from(["a".to_owned(), "b".to_owned()])
-        );
-        assert_eq!(slice(census.functions[0].formals), "a, b = 2");
-        assert_eq!(
-            census.functions[1].parameters,
-            BTreeSet::from(["z".to_owned()])
-        );
-
-        let branch = &census.ifs[0];
-        assert_eq!(slice(branch.condition), "a");
-        assert_eq!(slice(branch.then_branch), "1");
-        assert_eq!(branch.else_branch.map(slice), Some("2"));
-
-        let loop_region = &census.fors[0];
-        assert_eq!(loop_region.variable, "i");
-        assert_eq!(slice(loop_region.body), "i");
-    }
-
-    #[test]
-    fn replacement_targets_are_calls_on_the_left_of_an_assignment() {
-        let text = "names(x) <- v\ny <- names(x)\n";
-        let parsed = parse(text, RParserOptions::default());
-        let census = Census::of(&parsed.tree());
-        assert!(census.is_replacement_target(0, 5));
-        let second = text.rfind("names").unwrap();
-        assert!(!census.is_replacement_target(second, second + 5));
-    }
-}
+#[path = "../../../tests/unit/syntax/oak/census.rs"]
+mod tests;

@@ -2,9 +2,13 @@
 
 ## Workspace
 
-- `slinker-core`: `ProgramIr`, analysis, Air/Oak syntax, package inspection model, build and materialization, and the worker client and protocol. It links no embedded R runtime.
+- `slinker-core`: `ProgramIr`, analysis, Air/Oak syntax, package inspection model, source sessions, build and materialization, and the worker client and protocol. It links no embedded R runtime.
 - `slinker-r-worker`: the Harp/libr inspection worker. It depends on `slinker-core` for the protocol and installed-image types.
-- `slinker-cli`: the `slinker` binary. The same executable hosts the worker through the hidden `__r-worker` subcommand, which is how `slinker-core` launches it.
+- `slinker-cli`: argument parsing and presentation. It consumes the core session API and hosts the worker through the hidden `__r-worker` subcommand. Other library consumers select a separate slinker executable with `WorkerExecutable::Standalone`.
+
+`SessionOptions` freezes library order, package selections, thread count, cache location, and worker executable when a session opens. `SourceSession::check` runs analysis and preflight; `PreparedSource::build` also validates incremental reuse and publishes the result. Construction capabilities and materialization contexts are internal, so callers cannot combine an IR from one session with source files or a target from another. A pending generated package owns its temporary directory until the build record is saved and publication succeeds.
+
+Unit tests live under each crate's `tests/unit/` directory and are included as private test modules. Integration tests exercise the public library and CLI without exposing implementation details for testing.
 
 ## Target R
 
@@ -31,6 +35,8 @@ Analysis runs on one Rayon work-stealing pool (`--threads`, default 4). Each rea
 The construction interpreter evaluates an installed closure body once per package, callee, and abstract argument tuple whenever the evaluation is pure: it allocates no environments or closures, writes no environment binding, and reads no environment that evaluation can mutate. That summary is keyed by semantics and never by the requesting node. Each later call site replays the summary's call-site effects (retention requirements and reflective-name retention) from its own node, so provenance edges are recorded for every caller. A summary is dropped when a binding it read is written. Evaluations that allocate or mutate stay memoized per requesting node.
 
 Abstract values form a flat lattice: `Bottom` (no information yet) below every exact value, and `Unknown` above all of them; distinct exact values join to `Unknown`. A recursive call returns the enclosing call's current approximation, which starts at `Bottom`, and the enclosing call is re-evaluated until the approximation stops growing, so recursion yields the least fixed point instead of `Unknown`. A call to a function that is already being evaluated is widened to `Unknown` arguments, which keeps the set of summary keys finite; a hard depth limit remains as a backstop and makes the result `Unknown`. An `if` whose condition is not statically known evaluates both branches and joins their values. `LinkIr::construction_evaluations` reports how many bodies were evaluated.
+
+Branch conditions stay as Air expressions in the syntax census. Slinker builds typed predicates from those nodes and gets their dependencies from Oak uses. Namespace availability guards accept a query only when the condition's syntax requires its truth, and membership proofs inspect the actual `%in%` and `c()` nodes. These paths do not canonicalize condition text or reparse string fragments.
 
 ## Cache
 

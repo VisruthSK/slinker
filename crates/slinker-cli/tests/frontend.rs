@@ -63,6 +63,43 @@ fn check_runs_preflight_and_writes_nothing() {
 }
 
 #[test]
+fn library_build_uses_a_separate_worker_and_frozen_options() {
+    use slinker_core::WorkerExecutable;
+    use slinker_core::cache::CacheLocation;
+    use slinker_core::session::{BuildOutcome, SessionOptions, SourceSession};
+
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let source = rootonly_fixture(fixture.path());
+    let output = fixture.path().join("generated");
+    let r_home = discover_r_home();
+    let mut options = SessionOptions {
+        libraries: Vec::new(),
+        external: Vec::new(),
+        linked: Vec::new(),
+        threads: std::num::NonZeroUsize::new(2).unwrap(),
+        cache: CacheLocation::Directory(fixture.path().join("cache")),
+        worker_executable: WorkerExecutable::Standalone(env!("CARGO_BIN_EXE_slinker").into()),
+    };
+    let prepared =
+        SourceSession::prepare(&source, &options, r_home.clone()).expect("library capture");
+    let original = options.clone();
+    options
+        .libraries
+        .push(fixture.path().join("missing-library"));
+    options.worker_executable = WorkerExecutable::Standalone(fixture.path().join("missing-worker"));
+    assert_eq!(
+        prepared.build(&output).expect("library build"),
+        BuildOutcome::Built
+    );
+    let prepared = SourceSession::prepare(&source, &original, r_home).expect("second capture");
+    assert_eq!(
+        prepared.build(&output).expect("library rebuild"),
+        BuildOutcome::UpToDate
+    );
+    assert!(output.join("R/zzz-slinker-generated.R").is_file());
+}
+
+#[test]
 fn blocked_check_groups_blockers_and_reports_them_as_json() {
     let fixture = tempfile::tempdir().expect("fixture tempdir");
     let source = blocked_fixture(fixture.path());
@@ -95,6 +132,34 @@ fn blocked_check_groups_blockers_and_reports_them_as_json() {
     assert_eq!(blocker["package"], "blockedroot");
     assert_eq!(blocker["binding"], "discover");
     assert!(blocker["location"]["line"].as_u64().is_some(), "{blocker}");
+}
+
+#[test]
+fn library_does_not_publish_when_build_record_cannot_be_saved() {
+    use slinker_core::WorkerExecutable;
+    use slinker_core::cache::CacheLocation;
+    use slinker_core::session::{SessionOptions, SourceSession};
+
+    let fixture = tempfile::tempdir().expect("fixture tempdir");
+    let source = rootonly_fixture(fixture.path());
+    let output = fixture.path().join("generated");
+    let cache = fixture.path().join("cache");
+    fs::create_dir(&cache).unwrap();
+    fs::write(cache.join("builds"), "blocks the record directory").unwrap();
+    let options = SessionOptions {
+        libraries: Vec::new(),
+        external: Vec::new(),
+        linked: Vec::new(),
+        threads: std::num::NonZeroUsize::new(1).unwrap(),
+        cache: CacheLocation::Directory(cache),
+        worker_executable: WorkerExecutable::Standalone(env!("CARGO_BIN_EXE_slinker").into()),
+    };
+    let prepared = SourceSession::prepare(&source, &options, discover_r_home()).unwrap();
+    assert!(prepared.build(&output).is_err());
+    assert!(
+        !output.exists(),
+        "failed build published a complete package"
+    );
 }
 
 #[test]

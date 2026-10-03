@@ -30,13 +30,5 @@ pub(crate) fn intern(text: &str) -> Arc<str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::intern;
-    use std::sync::Arc;
-
-    #[test]
-    fn equal_text_shares_one_allocation() {
-        assert!(Arc::ptr_eq(&intern("shared"), &intern("shared")));
-        assert!(!Arc::ptr_eq(&intern("one"), &intern("two")));
-    }
-}
+#[path = "../../tests/unit/package/intern.rs"]
+mod tests;
