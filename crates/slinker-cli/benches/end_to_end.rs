@@ -140,13 +140,19 @@ fn reject_build(r_home: &Path, package: &str, blocker: &str) {
         .output()
         .expect("run slinker build");
     let elapsed = start.elapsed();
-    assert!(!result.status.success(), "unproven {package} build succeeded");
+    assert!(
+        !result.status.success(),
+        "unproven {package} build succeeded"
+    );
     assert!(
         String::from_utf8_lossy(&result.stderr).contains(blocker),
         "{package} failed without its expected blocker: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(!output.exists(), "rejected {package} build published output");
+    assert!(
+        !output.exists(),
+        "rejected {package} build published output"
+    );
     println!(
         "{:<32} {:>9.3} s",
         format!("reject build {package} cold"),
