@@ -1,36 +1,21 @@
-use super::census::{Census, IfRegion, assignment_of, node_range, raw_call, static_arg_of};
+use super::census::{Census, IfRegion, assignment_of, node_range, static_arg_of};
 use super::context::OakParseContext;
-use super::predicates::{
-    BranchAssumption, PredicateValue, SimplePredicate, assumption_symbols,
-    assumptions_are_repeatable, assumptions_imply, branch_assumptions_at,
-    captured_condition_symbols_stable, case_is_consistent_with, condition_facts_stable,
-    effective_predicate, expand_boolean_alias_assumptions, parse_simple_predicate, unparenthesized,
-};
 use super::scan::{
     ForRegion, FunctionRegion, contains_call_named, find_if_regions, function_body_range,
     identifier_occurs_before, last_top_level_expression, matching_delimiter, name_token_end,
-    skip_comment, skip_trivia_bounded, statement_start, static_symbol,
+    skip_trivia_bounded, static_symbol,
 };
 use super::{LiveUse, innermost_function_region, text_offset};
 use crate::syntax::facts::{CallSite, CalleeKind, StaticArg};
 use crate::syntax::source::TextRange;
-use air_r_syntax::{AnyRExpression, RRoot};
-use biome_rowan::AstNode;
+use air_r_syntax::{AnyRExpression, RIfStatement, RRoot};
+use biome_rowan::{AstNode, AstNodeList};
 use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex};
-use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
 pub(super) struct ControlRegions<'a> {
     pub(super) for_regions: &'a [ForRegion],
     pub(super) if_regions: &'a [IfRegion],
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct BindingProofContext<'a> {
-    pub(super) live_use: &'a LiveUse,
-    pub(super) use_assumptions: &'a [BranchAssumption],
-    pub(super) definition_starts: &'a [usize],
-    pub(super) defining_scope: Option<ScopeId>,
 }
 
 pub(super) fn formal_default_use_is_bound(regions: &[FunctionRegion], live_use: &LiveUse) -> bool {
@@ -231,423 +216,51 @@ pub(super) fn definition_must_execute_before_position(
 
 pub(super) fn conditional_fallthrough_proven_bound(
     text: &str,
-    root: &RRoot,
     context: &OakParseContext,
     index: &SemanticIndex,
     census: &Census,
     live_use: &LiveUse,
 ) -> bool {
-    let (for_regions, regions) = (&census.fors, &census.ifs);
-    let reaching = index
+    let definitions = index
         .reaching_definitions(live_use.scope, live_use.use_id)
         .filter_map(|(scope, definition_id)| {
             let definition = &index.definitions(scope)[definition_id];
-            let symbol = index.symbols(scope).symbol(definition.symbol());
-            let definition_start = text_offset(definition.range().start());
-            if symbol.name() != live_use.name
-                || !matches!(definition.kind(), DefinitionKind::Assignment(_))
-            {
-                return None;
-            }
-            if scope != live_use.scope {
-                let assumptions = branch_assumptions_at(index, census, definition_start);
-                let symbols = assumption_symbols(&assumptions);
-                if !captured_condition_symbols_stable(
-                    text,
-                    index,
-                    scope,
-                    definition_start,
-                    text.len(),
-                    &symbols,
-                ) {
-                    return None;
-                }
-            }
-            Some((definition, definition_start, scope))
+            (scope == live_use.scope && matches!(definition.kind(), DefinitionKind::Assignment(_)))
+                .then(|| text_offset(definition.range().start()))
         })
-        .filter(|(_, start, _)| *start < live_use.start)
+        .filter(|start| *start < live_use.start)
         .collect::<Vec<_>>();
-
-    if reaching.is_empty() {
-        return false;
-    }
-
-    if reaching.iter().any(|(_, definition_start, _)| {
+    if definitions.iter().any(|start| {
         definition_must_execute_before_position(
             text,
-            *definition_start,
+            *start,
             live_use.start,
-            for_regions,
-            regions,
+            &census.fors,
+            &census.ifs,
         )
     }) {
         return true;
     }
-
-    let mut use_assumptions = branch_assumptions_at(index, census, live_use.start);
-    expand_boolean_alias_assumptions(
-        root,
-        index,
-        live_use.scope,
-        live_use.start,
-        &mut use_assumptions,
-    );
-
-    for (_definition, definition_start, defining_scope) in &reaching {
-        if !definition_is_direct_in_branch(text, regions, *definition_start) {
-            continue;
-        }
-        let definition_assumptions = branch_assumptions_at(index, census, *definition_start);
-        if definition_assumptions.is_empty()
-            || !assumptions_imply(&use_assumptions, &definition_assumptions)
-            || !assumptions_are_repeatable(context, index, live_use.scope, &definition_assumptions)
-        {
-            continue;
-        }
-        let symbols = assumption_symbols(&definition_assumptions);
-        if condition_facts_stable(
-            text,
-            index,
-            live_use.scope,
-            *defining_scope,
-            *definition_start,
-            live_use.start,
-            &symbols,
-        ) {
-            return true;
-        }
-    }
-
-    let definition_starts = reaching
-        .iter()
-        .map(|(_, start, _)| *start)
-        .collect::<Vec<_>>();
-    let defining_scope = reaching.first().map(|(_, _, scope)| *scope);
-
-    for region in regions {
-        let Some(TextRange { end: chain_end, .. }) = region.else_branch else {
-            continue;
-        };
-        if chain_end > live_use.start || region.if_start >= live_use.start {
-            continue;
-        }
-
-        let chain_assumptions = branch_assumptions_at(index, census, region.if_start);
-        if !assumptions_imply(&use_assumptions, &chain_assumptions) {
-            continue;
-        }
-        let symbols = assumption_symbols(&chain_assumptions);
-        if !defining_scope.is_some_and(|scope| {
-            condition_facts_stable(
+    census.ifs.iter().any(|region| {
+        region
+            .else_branch
+            .is_some_and(|branch| branch.end <= live_use.start)
+            && definition_must_execute_before_position(
                 text,
-                index,
-                live_use.scope,
-                scope,
                 region.if_start,
                 live_use.start,
-                &symbols,
+                &census.fors,
+                &census.ifs,
             )
-        }) {
-            continue;
-        }
-
-        if if_chain_all_returning_paths_bind(
-            text,
-            context,
-            index,
-            regions,
-            region,
-            &definition_starts,
-        ) {
-            return true;
-        }
-    }
-
-    for region in regions {
-        let Some(TextRange { end: chain_end, .. }) = region.else_branch else {
-            continue;
-        };
-        if chain_end > live_use.start || region.if_start >= live_use.start {
-            continue;
-        }
-        if exhaustive_equality_dispatch_proves_binding(
-            text,
-            context,
-            index,
-            census,
-            region,
-            BindingProofContext {
-                live_use,
-                use_assumptions: &use_assumptions,
-                definition_starts: &definition_starts,
-                defining_scope,
-            },
-        ) {
-            return true;
-        }
-    }
-
-    false
-}
-
-pub(super) fn exhaustive_equality_dispatch_proves_binding(
-    text: &str,
-    context: &OakParseContext,
-    index: &SemanticIndex,
-    census: &Census,
-    region: &IfRegion,
-    proof: BindingProofContext<'_>,
-) -> bool {
-    let regions = &census.ifs;
-    let BindingProofContext {
-        live_use,
-        use_assumptions,
-        definition_starts,
-        defining_scope,
-    } = proof;
-    let mut current = region;
-    let mut selector = None::<String>;
-    let mut cases = Vec::<(PredicateValue, usize, usize)>::new();
-    let final_else = loop {
-        let Some(SimplePredicate::Eq { symbol, value }) =
-            parse_simple_predicate(&current.condition)
-        else {
-            return false;
-        };
-        if selector
-            .as_ref()
-            .is_some_and(|existing| existing != &symbol)
-        {
-            return false;
-        }
-        selector.get_or_insert(symbol);
-        if cases.iter().any(|(existing, _, _)| existing == &value) {
-            return false;
-        }
-        cases.push((value, current.then_branch.start, current.then_branch.end));
-
-        let Some(TextRange {
-            start: else_start,
-            end: else_end,
-        }) = current.else_branch
-        else {
-            break None;
-        };
-        if let Some(nested) = regions
-            .iter()
-            .find(|candidate| candidate.if_start == else_start)
-        {
-            current = nested;
-            continue;
-        }
-        break Some((else_start, else_end));
-    };
-
-    let selector = selector.expect("equality chain has at least one selector");
-    match final_else {
-        Some((start, end)) => {
-            if !branch_exits_current_function(text, context, index, regions, start, end) {
-                return false;
-            }
-        }
-        None => {
-            let Some(allowed) = prior_membership_guard_values(
-                text,
-                context,
-                index,
-                census,
-                region.if_start,
-                &selector,
-            ) else {
-                return false;
-            };
-            let covered = cases
-                .iter()
-                .filter_map(|(value, _, _)| match value {
-                    PredicateValue::String(value) => Some(value.clone()),
-                    PredicateValue::Logical(_) | PredicateValue::Number(_) => None,
-                })
-                .collect::<BTreeSet<_>>();
-            if covered != allowed {
-                return false;
-            }
-        }
-    }
-
-    if !defining_scope.is_some_and(|scope| {
-        condition_facts_stable(
-            text,
-            index,
-            live_use.scope,
-            scope,
-            region.if_start,
-            live_use.start,
-            &BTreeSet::from([selector.clone()]),
-        )
-    }) {
-        return false;
-    }
-
-    let known = use_assumptions
-        .iter()
-        .filter_map(effective_predicate)
-        .collect::<Vec<_>>();
-    let mut possible_case = false;
-    for (value, branch_start, branch_end) in cases {
-        if !case_is_consistent_with(&selector, &value, &known) {
-            continue;
-        }
-        possible_case = true;
-        if !branch_all_paths_bind_or_exit(
-            text,
-            context,
-            index,
-            regions,
-            branch_start,
-            branch_end,
-            definition_starts,
-        ) {
-            return false;
-        }
-    }
-    possible_case
-}
-
-pub(super) fn branch_all_paths_bind_or_exit(
-    text: &str,
-    context: &OakParseContext,
-    index: &SemanticIndex,
-    regions: &[IfRegion],
-    start: usize,
-    end: usize,
-    definition_starts: &[usize],
-) -> bool {
-    branch_binds_reaching_definition(text, regions, start, end, definition_starts)
-        || branch_exits_current_function(text, context, index, regions, start, end)
-        || regions.iter().any(|nested| {
-            nested.if_start >= start
-                && nested.if_start < end
-                && definition_is_top_level_in_branch(text, start, end, nested.if_start)
-                && if_chain_all_returning_paths_bind(
-                    text,
-                    context,
-                    index,
-                    regions,
-                    nested,
-                    definition_starts,
-                )
-        })
-}
-
-pub(super) fn prior_membership_guard_values(
-    text: &str,
-    context: &OakParseContext,
-    index: &SemanticIndex,
-    census: &Census,
-    before: usize,
-    selector: &str,
-) -> Option<BTreeSet<String>> {
-    census
-        .ifs
-        .iter()
-        .filter(|region| region.if_start < before && region.then_branch.end <= before)
-        .rev()
-        .find_map(|region| {
-            if !branch_exits_current_function(
+            && if_chain_all_returning_paths_bind(
                 text,
                 context,
                 index,
                 &census.ifs,
-                region.then_branch.start,
-                region.then_branch.end,
-            ) {
-                return None;
-            }
-            membership_guard_values(&region.condition, selector, context, index)
-        })
-}
-
-fn membership_guard_values(
-    condition: &AnyRExpression,
-    selector: &str,
-    context: &OakParseContext,
-    index: &SemanticIndex,
-) -> Option<BTreeSet<String>> {
-    let condition = unparenthesized(condition);
-    if let AnyRExpression::RBinaryExpression(binary) = &condition {
-        let operator = binary.operator().ok()?;
-        let name = operator.text_trimmed();
-        let (scope, _) = index.scope_at(binary.range().start());
-        if matches!(name, "||" | "|")
-            && context.resolves_to_base(name)
-            && index.resolve(name, scope).is_none()
-        {
-            return membership_guard_values(&binary.left().ok()?, selector, context, index)
-                .or_else(|| {
-                    membership_guard_values(&binary.right().ok()?, selector, context, index)
-                });
-        }
-    }
-    let AnyRExpression::RUnaryExpression(negation) = condition else {
-        return None;
-    };
-    let (scope, _) = index.scope_at(negation.range().start());
-    if negation.operator().ok()?.text_trimmed() != "!"
-        || !["!", "%in%", "c"]
-            .iter()
-            .all(|name| context.resolves_to_base(name) && index.resolve(name, scope).is_none())
-    {
-        return None;
-    }
-    let AnyRExpression::RBinaryExpression(membership) = unparenthesized(&negation.argument().ok()?)
-    else {
-        return None;
-    };
-    if membership.operator().ok()?.text_trimmed() != "%in%"
-        || static_arg_of(&unparenthesized(&membership.left().ok()?))
-            != Some(StaticArg::Symbol(selector.into()))
-    {
-        return None;
-    }
-    let AnyRExpression::RCall(vector) = unparenthesized(&membership.right().ok()?) else {
-        return None;
-    };
-    if static_arg_of(&vector.function().ok()?) != Some(StaticArg::Symbol("c".into())) {
-        return None;
-    }
-    let values = raw_call(&vector)?
-        .args
-        .into_iter()
-        .map(|argument| match argument.static_arg {
-            Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
-            _ => None,
-        })
-        .collect::<Option<BTreeSet<_>>>()?;
-    (!values.is_empty()).then_some(values)
-}
-
-pub(super) fn definition_is_direct_in_branch(
-    text: &str,
-    regions: &[IfRegion],
-    definition_start: usize,
-) -> bool {
-    regions
-        .iter()
-        .filter_map(|region| {
-            if definition_start >= region.then_branch.start
-                && definition_start < region.then_branch.end
-            {
-                Some((region.then_branch.start, region.then_branch.end))
-            } else if let Some(TextRange { start, end }) = region.else_branch {
-                (definition_start >= start && definition_start < end).then_some((start, end))
-            } else {
-                None
-            }
-        })
-        .min_by_key(|(start, end)| end.saturating_sub(*start))
-        .is_some_and(|(start, end)| {
-            definition_is_top_level_in_branch(text, start, end, definition_start)
-        })
+                region,
+                &definitions,
+            )
+    })
 }
 
 pub(super) fn if_chain_all_returning_paths_bind(
@@ -659,7 +272,6 @@ pub(super) fn if_chain_all_returning_paths_bind(
     definition_starts: &[usize],
 ) -> bool {
     if !branch_binds_reaching_definition(
-        text,
         regions,
         region.then_branch.start,
         region.then_branch.end,
@@ -697,12 +309,11 @@ pub(super) fn if_chain_all_returning_paths_bind(
         );
     }
 
-    branch_binds_reaching_definition(text, regions, else_start, else_end, definition_starts)
+    branch_binds_reaching_definition(regions, else_start, else_end, definition_starts)
         || branch_exits_current_function(text, context, index, regions, else_start, else_end)
 }
 
 pub(super) fn branch_binds_reaching_definition(
-    text: &str,
     regions: &[IfRegion],
     branch_start: usize,
     branch_end: usize,
@@ -711,7 +322,7 @@ pub(super) fn branch_binds_reaching_definition(
     definition_starts.iter().copied().any(|definition_start| {
         definition_start >= branch_start
             && definition_start < branch_end
-            && definition_is_top_level_in_branch(text, branch_start, branch_end, definition_start)
+            && definition_is_top_level_in_branch(regions, branch_start, branch_end, definition_start)
             && !regions.iter().any(|nested| {
                 nested.if_start >= branch_start
                     && nested.if_start < branch_end
@@ -723,66 +334,35 @@ pub(super) fn branch_binds_reaching_definition(
 }
 
 pub(super) fn definition_is_top_level_in_branch(
-    text: &str,
+    regions: &[IfRegion],
     branch_start: usize,
     branch_end: usize,
     definition_start: usize,
 ) -> bool {
-    let start = skip_trivia_bounded(text, branch_start, branch_end);
-    if text.as_bytes().get(start).copied() != Some(b'{') {
-        return start == definition_start;
-    }
-    let Some(close) = matching_delimiter(text, start) else {
+    let Some(expression) = branch_expression(regions, branch_start, branch_end) else {
         return false;
     };
-    if definition_start <= start || definition_start >= close {
-        return false;
+    match expression {
+        AnyRExpression::RBracedExpressions(block) => block
+            .expressions()
+            .iter()
+            .any(|expression| node_range(&expression).start == definition_start),
+        expression => node_range(&expression).start == definition_start,
     }
+}
 
-    let statement = skip_trivia_bounded(
-        text,
-        statement_start(text, definition_start).max(start + 1),
-        definition_start,
-    );
-    if statement != definition_start {
-        return false;
-    }
-
-    let bytes = text.as_bytes();
-    let mut cursor = start + 1;
-    let mut brace_depth = 0usize;
-    let mut quote = None;
-    while cursor < definition_start {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(definition_start);
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => cursor = skip_comment(text, cursor, definition_start),
-            b'{' => {
-                brace_depth += 1;
-                cursor += 1;
-            }
-            b'}' => {
-                brace_depth = brace_depth.saturating_sub(1);
-                cursor += 1;
-            }
-            _ => cursor += 1,
-        }
-    }
-    brace_depth == 0
+fn branch_expression(regions: &[IfRegion], start: usize, end: usize) -> Option<AnyRExpression> {
+    regions.iter().find_map(|region| {
+        let statement = RIfStatement::cast(region.condition.syntax().parent()?)?;
+        let expression = if region.then_branch == TextRange::new(start, end) {
+            statement.consequence().ok()?
+        } else if region.else_branch == Some(TextRange::new(start, end)) {
+            statement.else_clause()?.alternative().ok()?
+        } else {
+            return None;
+        };
+        Some(expression)
+    })
 }
 
 pub(super) fn branch_exits_current_function(
@@ -793,29 +373,56 @@ pub(super) fn branch_exits_current_function(
     start: usize,
     end: usize,
 ) -> bool {
-    let Some((expression_start, expression_end)) = last_top_level_expression(text, start, end)
-    else {
+    let Some(expression) = branch_expression(regions, start, end).and_then(last_expression) else {
         return false;
     };
+    let range = node_range(&expression);
 
     if let Some(region) = regions.iter().find(|region| {
-        region.if_start == expression_start
+        region.if_start == range.start
             && region
                 .else_branch
-                .is_some_and(|branch| branch.end <= expression_end)
+                .is_some_and(|branch| branch.end <= range.end)
     }) {
         return if_chain_all_paths_exit(text, context, index, regions, region);
     }
 
-    let Some((package, callee, callee_start)) =
-        direct_call_expression(text, expression_start, expression_end)
-    else {
+    let Some((package, callee, callee_start)) = ast_direct_call(&expression) else {
         return false;
     };
     if package.is_none() && callee == "return" {
         return true;
     }
     call_is_non_returning(context, index, package.as_deref(), &callee, callee_start)
+}
+
+fn last_expression(expression: AnyRExpression) -> Option<AnyRExpression> {
+    match expression {
+        AnyRExpression::RBracedExpressions(block) => block.expressions().iter().last(),
+        expression => Some(expression),
+    }
+}
+
+fn ast_direct_call(expression: &AnyRExpression) -> Option<(Option<String>, String, usize)> {
+    let AnyRExpression::RCall(call) = expression else {
+        return None;
+    };
+    let function = call.function().ok()?;
+    match &function {
+        AnyRExpression::RIdentifier(_) => match static_arg_of(&function)? {
+            StaticArg::Symbol(name) => Some((None, name.to_string(), node_range(&function).start)),
+            _ => None,
+        },
+        AnyRExpression::RNamespaceExpression(namespace) => {
+            let (package, callee) = (namespace.left().ok()?, namespace.right().ok()?);
+            Some((
+                Some(static_symbol(&package.syntax().text_trimmed().to_string())?),
+                static_symbol(&callee.syntax().text_trimmed().to_string())?,
+                node_range(&callee).start,
+            ))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn if_chain_all_paths_exit(

@@ -87,7 +87,7 @@ fn summarize(report: &CacheReport) -> String {
 ",
         ),
     }
-    let total: u64 = report.schemas.iter().map(|schema| schema.pack_bytes).sum();
+    let total: u64 = report.schemas.iter().map(|schema| schema.bytes).sum();
     let _ = writeln!(out, "size:  {}", size(total));
     for schema in &report.schemas {
         let state = if schema.current {
@@ -99,7 +99,7 @@ fn summarize(report: &CacheReport) -> String {
             out,
             "  {} ({state}): {}, {} entries, {} packages",
             schema.schema,
-            size(schema.pack_bytes),
+            size(schema.bytes),
             schema.entries,
             schema.packages.len()
         );
@@ -210,10 +210,10 @@ fn render_schema(out: &mut String, schema: &SchemaCacheReport, full: bool) {
     };
     let _ = writeln!(
         out,
-        "{} ({state}): {} in {} pack(s), {} entries",
+        "{} ({state}): {} in {} database file(s), {} entries",
         schema.schema,
-        size(schema.pack_bytes),
-        schema.packs,
+        size(schema.bytes),
+        schema.files,
         schema.entries
     );
     let kinds = EntryKind::ALL

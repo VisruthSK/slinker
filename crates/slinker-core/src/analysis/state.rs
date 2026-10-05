@@ -1,19 +1,16 @@
 use super::diagnostic::{Cause, DiagnosticSink, Evidence};
 use super::dynamic_names::DynamicNames;
-use super::execute::{AbstractValue, ConstructionCallKey};
 use super::guarded::Guarded;
 use super::guards::DeclaredDependencies;
 use super::invocation::InvocationModel;
 use super::namespace::NamespaceBuilder;
 use super::native::NativeBindingIndex;
 use super::need::{Schedule, WorkKey};
-use super::object_world::ObjectWorld;
 use super::parse_cache::ParseCache;
 use super::reflection::ReflectionFacts;
 use super::relocation::RelocationPlan;
 use super::s3::{CallableId, S3Model};
 use super::scheduler::{Claim, Machine};
-use super::summary::{FrameRecord, SummaryTable};
 use crate::analysis::{Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::ObjectImage;
@@ -25,7 +22,7 @@ use crate::profile::{self, Counter, Probe};
 use crate::syntax::{CallSite, NamespaceImports, ParsedRFile, SourceKey, Span};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Copy)]
@@ -97,16 +94,11 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) parses: Guarded<ParseCache>,
     pub(super) loaded: RwLock<HashMap<PackageId, Arc<LoadedPackage>>>,
     load_gate: Guarded<()>,
-    pub(super) objects: ObjectWorld,
     pub(super) diagnostics: Guarded<DiagnosticSink>,
     pub(super) relocations: Guarded<RelocationPlan>,
     pub(super) s3: Guarded<S3Model>,
     pub(super) invocations: Guarded<InvocationModel>,
     pub(super) value_closures: Guarded<HashSet<NodeId>>,
-    pub(super) construction_calls:
-        Guarded<HashMap<ConstructionCallKey, (AbstractValue, FrameRecord)>>,
-    pub(super) summaries: SummaryTable,
-    pub(super) construction_evaluations: AtomicUsize,
     pub(super) reflection: Guarded<ReflectionFacts>,
     pub(super) dynamic_names: Guarded<DynamicNames>,
     pub(super) dependencies: Guarded<HashMap<NodeId, HashSet<NodeId>>>,
@@ -161,15 +153,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             parses: Guarded::default(),
             loaded: RwLock::new(HashMap::new()),
             load_gate: Guarded::default(),
-            objects: ObjectWorld::default(),
             diagnostics: Guarded::default(),
             relocations: Guarded::default(),
             s3: Guarded::default(),
             invocations: Guarded::default(),
             value_closures: Guarded::default(),
-            construction_calls: Guarded::default(),
-            summaries: SummaryTable::default(),
-            construction_evaluations: AtomicUsize::new(0),
             reflection: Guarded::default(),
             dynamic_names: Guarded::default(),
             dependencies: Guarded::default(),
@@ -216,7 +204,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
 
         self.settle()?;
-        self.report_dynamic_namespace_operations();
         let materialized = self
             .encountered
             .lock()
@@ -238,15 +225,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .stack_size(super::ANALYSIS_STACK_BYTES)
             .build()
             .map_err(|error| Error::Analysis(format!("failed to create Rayon pool: {error}")))?;
-        loop {
-            pool.install(|| rayon::scope(|scope| self.spawn_injected(scope)));
-            if let Some(error) = self.failure.lock().take() {
-                return Err(error);
-            }
-            debug_assert!(self.work.is_quiescent());
-            if !self.settle_namespace_operations()? && self.work.is_quiescent() {
-                return Ok(());
-            }
+        pool.install(|| rayon::scope(|scope| self.spawn_injected(scope)));
+        debug_assert!(self.work.is_quiescent());
+        match self.failure.lock().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -280,7 +263,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let started = std::time::Instant::now();
         let key = WorkKey::Need(need.clone());
         if self.work.begin(&key) {
-            self.summaries.reset_thread();
             if self.failure.lock().is_none()
                 && let Err(error) = self.process_need(need)
             {
@@ -311,7 +293,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             bindings: HashMap::new(),
             private_environments: HashMap::new(),
         });
-        self.objects.merge(package, &image);
         let loaded = Arc::new(LoadedPackage {
             image: RwLock::new(image),
             namespace: Guarded::new(NamespaceBuilder::new(&index)),
@@ -372,7 +353,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         {
             let _merge = profile::span(Probe::ObjectsMerge);
-            self.objects.merge(package, &partial);
         }
         let sources = partial
             .bindings
@@ -419,9 +399,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 environment,
                 binding,
             } => self.process_private_binding(package, &environment, &binding),
-            Need::ClosureExecution { package, closure } => {
-                self.process_closure_execution(package, closure)
-            }
+            Need::ClosureExecution {
+                package,
+                owner,
+                path,
+                enclosure,
+            } => self.process_closure_execution(package, &owner, &path, &enclosure),
             Need::Activation { package } => self.process_activation(package),
             Need::Resource { package, resource } => self.process_resource(package, &resource),
             Need::Dataset { package, dataset } => self.process_dataset(package, &dataset),
@@ -552,17 +535,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 environment: environment.clone(),
                 name: binding.clone(),
             },
-            Need::ClosureExecution { package, closure } => {
-                let execution = self
-                    .closure_execution_source(*package, *closure)
-                    .expect("closure execution need references the package object graph");
-                NodeKind::ClosureObject {
-                    owner: execution.owner.clone(),
-                    path: execution.closure.provenance.path.clone(),
-                    enclosure: execution.environment.clone(),
-                    derived: execution.closure.derived_from.is_some(),
-                }
-            }
+            Need::ClosureExecution {
+                owner,
+                path,
+                enclosure,
+                ..
+            } => NodeKind::ClosureObject {
+                owner: owner.clone(),
+                path: path.clone(),
+                enclosure: enclosure.clone(),
+            },
             Need::Activation { .. } => NodeKind::Activation,
             Need::Resource { resource, .. } => NodeKind::Resource {
                 path: resource.clone(),

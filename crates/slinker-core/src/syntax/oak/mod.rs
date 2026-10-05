@@ -20,11 +20,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 mod census;
 use census::{Census, IfRegion, assignment_of, node_range, static_arg_of};
-mod construction;
 mod context;
 mod declarations;
 mod guards;
-mod predicates;
 mod proofs;
 mod scan;
 #[cfg(test)]
@@ -36,7 +34,6 @@ pub(crate) use context::SharedNames;
 pub(crate) use context::{NamespaceImportResolution, NamespaceImports};
 pub(crate) use proofs::closure_definitely_non_returning;
 
-use construction::{collect_construction, outer_function};
 use context::SlinkerImportsResolver;
 use declarations::{Declarations, collect_declarations, sole_positional_argument};
 use guards::{
@@ -471,8 +468,8 @@ fn translate_index(
         census: &census,
     };
     let mut package_refs = namespace_access_facts(translation, &live_uses, &mut live_calls);
-    binary_operator_facts(translation, &mut references, &mut live_calls);
-    dispatching_syntax_facts(translation, &mut live_calls);
+    binary_operator_facts(translation, context, &mut references, &mut live_calls);
+    dispatching_syntax_facts(translation, context, &mut references, &mut live_calls);
 
     deduplicate_calls(&mut live_calls);
     drop(calls_span);
@@ -516,10 +513,21 @@ fn translate_index(
     apply_guard_regions_to_effects(&guard_regions, &mut effects);
     drop(effects_span);
 
-    let construction_span = profile::span(Probe::ParseConstruction);
-    let (parameters, construction) = collect_construction(source, text, root, &live_calls);
+    let parameters = root
+        .expressions()
+        .iter()
+        .find_map(|expression| outer_function(&expression))
+        .and_then(|function| function.parameters().ok())
+        .map(|parameters| {
+            parameters
+                .items()
+                .iter()
+                .filter_map(|parameter| parameter.ok()?.name().ok())
+                .map(|name| ast_text(text, &name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let namespace_info_reads = collect_namespace_info_reads(source, text, root, &declarations);
-    drop(construction_span);
     let calls: Vec<CallSite> = live_calls.into_iter().map(|call| call.site).collect();
     let mut issues = translate_diagnostics(source, index);
     issues.extend(declarations.issues);
@@ -539,7 +547,6 @@ fn translate_index(
             calls: exact(calls),
             active_bindings,
             effects: exact(effects),
-            construction: exact(construction),
             namespace_info_reads,
             namespace_enumerations,
         }],
@@ -724,7 +731,7 @@ fn refine_callee_kinds(
             continue;
         }
         if live_use.callee_kind == CalleeKind::ConditionalFallthrough
-            && conditional_fallthrough_proven_bound(text, root, context, index, census, live_use)
+            && conditional_fallthrough_proven_bound(text, context, index, census, live_use)
         {
             live_use.callee_kind = CalleeKind::DefinitelyLexical;
         }
@@ -883,6 +890,7 @@ fn namespace_access_facts(
 
 fn binary_operator_facts(
     translation: Translation<'_>,
+    context: &OakParseContext,
     references: &mut Vec<NameRef>,
     live_calls: &mut Vec<LiveCall>,
 ) {
@@ -914,26 +922,35 @@ fn binary_operator_facts(
             continue;
         }
         let (scope, _) = index.scope_at(binary.range().start());
-        if operator.len() > 2 && operator.starts_with('%') && operator.ends_with('%') {
+        let callee_start = text_offset(operator_token.text_trimmed_range().start());
+        let callee_kind = if index.resolve(&operator, scope).is_some() {
+            CalleeKind::ConditionalFallthrough
+        } else {
+            CalleeKind::DefinitelyExternal
+        };
+        if operator.starts_with('%')
+            || !context.resolves_to_base(&operator)
+            || callee_kind != CalleeKind::DefinitelyExternal
+        {
             let range = operator_token.text_trimmed_range();
             references.push(NameRef {
                 name: BindingName::from(operator.as_str()),
-                kind: NameRefKind::External,
+                kind: if callee_kind == CalleeKind::DefinitelyExternal {
+                    NameRefKind::External
+                } else {
+                    NameRefKind::ConditionalFallthrough
+                },
                 phase: phase_for_scope(index, scope),
                 guards: Vec::new(),
-                span: Span::new(
-                    *source,
-                    text_offset(range.start()),
-                    text_offset(range.end()),
-                ),
+                span: Span::new(*source, callee_start, text_offset(range.end())),
             });
         }
         let (argument_scope, lexical_scope) = scopes.at(index, span.start);
         live_calls.push(LiveCall {
             site: CallSite {
                 callee: Atom::from(operator.as_str()),
-                callee_kind: CalleeKind::DefinitelyExternal,
-                qualified_package: (!operator.starts_with('%')).then(|| "base".into()),
+                callee_kind,
+                qualified_package: None,
                 arguments: [left, right]
                     .map(|expression| {
                         let value = static_arg_of(&expression);
@@ -1003,13 +1020,6 @@ fn ast_span(source: &SourceId, node: &impl AstNode<Language = air_r_syntax::RLan
 fn ast_str<'a>(text: &'a str, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> &'a str {
     let span = node.syntax().text_trimmed_range();
     &text[text_offset(span.start())..text_offset(span.end())]
-}
-
-fn ast_atom(
-    text: &str,
-    node: &impl AstNode<Language = air_r_syntax::RLanguage>,
-) -> crate::package::Atom {
-    crate::package::Atom::from(ast_str(text, node))
 }
 
 fn ast_text(text: &str, node: &impl AstNode<Language = air_r_syntax::RLanguage>) -> String {
@@ -1636,7 +1646,12 @@ fn definition_is_closure(
         })
 }
 
-fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<LiveCall>) {
+fn dispatching_syntax_facts(
+    translation: Translation<'_>,
+    context: &OakParseContext,
+    references: &mut Vec<NameRef>,
+    live_calls: &mut Vec<LiveCall>,
+) {
     let Translation {
         source,
         root,
@@ -1645,18 +1660,36 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
         declarations,
         ..
     } = translation;
-    let mut record = |callee: String, qualified: bool, node: &AnyRExpression| {
+    let mut record = |callee: String, node: &AnyRExpression| {
         let span = ast_span(source, node);
         if declarations.is_inert(span.start) {
             return;
         }
         let (scope, _) = index.scope_at(node.syntax().text_trimmed_range().start());
         let (_, lexical_scope) = scopes.at(index, span.start);
+        let callee_kind = if index.resolve(&callee, scope).is_some() {
+            CalleeKind::ConditionalFallthrough
+        } else {
+            CalleeKind::DefinitelyExternal
+        };
+        if !context.resolves_to_base(&callee) || callee_kind != CalleeKind::DefinitelyExternal {
+            references.push(NameRef {
+                name: BindingName::from(callee.as_str()),
+                kind: if callee_kind == CalleeKind::DefinitelyExternal {
+                    NameRefKind::External
+                } else {
+                    NameRefKind::ConditionalFallthrough
+                },
+                phase: phase_for_scope(index, scope),
+                guards: Vec::new(),
+                span: span.clone(),
+            });
+        }
         live_calls.push(LiveCall {
             site: CallSite {
                 callee: Atom::from(callee),
-                callee_kind: CalleeKind::DefinitelyExternal,
-                qualified_package: qualified.then(|| "base".into()),
+                callee_kind,
+                qualified_package: None,
                 arguments: Box::default(),
                 scope: lexical_scope,
                 phase: phase_for_scope(index, scope),
@@ -1676,14 +1709,14 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
                 if let Ok(operator) = unary.operator()
                     && matches!(operator.text_trimmed(), "-" | "+" | "!")
                 {
-                    record(operator.text_trimmed().to_owned(), true, &expression);
+                    record(operator.text_trimmed().to_owned(), &expression);
                 }
             }
-            AnyRExpression::RSubset(_) => record("[".into(), true, &expression),
-            AnyRExpression::RSubset2(_) => record("[[".into(), true, &expression),
+            AnyRExpression::RSubset(_) => record("[".into(), &expression),
+            AnyRExpression::RSubset2(_) => record("[[".into(), &expression),
             AnyRExpression::RExtractExpression(extract) => {
                 if let Ok(operator) = extract.operator() {
-                    record(operator.text_trimmed().to_owned(), true, &expression);
+                    record(operator.text_trimmed().to_owned(), &expression);
                 }
             }
             AnyRExpression::RBinaryExpression(binary) => {
@@ -1699,25 +1732,25 @@ fn dispatching_syntax_facts(translation: Translation<'_>, live_calls: &mut Vec<L
                 while let Some(current) = target.take() {
                     match &current {
                         AnyRExpression::RSubset(subset) => {
-                            record("[<-".into(), true, &current);
+                            record("[<-".into(), &current);
                             target = subset.function().ok();
                         }
                         AnyRExpression::RSubset2(subset) => {
-                            record("[[<-".into(), true, &current);
+                            record("[[<-".into(), &current);
                             target = subset.function().ok();
                         }
                         AnyRExpression::RExtractExpression(extract) => {
                             let Ok(operator) = extract.operator() else {
                                 break;
                             };
-                            record(format!("{}<-", operator.text_trimmed()), true, &current);
+                            record(format!("{}<-", operator.text_trimmed()), &current);
                             target = extract.left().ok();
                         }
                         AnyRExpression::RCall(call) => {
                             let Some(callee) = identifier_callee(call) else {
                                 break;
                             };
-                            record(format!("{}<-", callee.name()), false, &current);
+                            record(format!("{}<-", callee.name()), &current);
                             target = call
                                 .arguments()
                                 .ok()
@@ -1753,4 +1786,23 @@ fn superassignment_parts(
         _ => None,
     };
     Some(SuperAssignmentParts { span, value_symbol })
+}
+
+pub(super) fn outer_function(
+    expression: &AnyRExpression,
+) -> Option<air_r_syntax::RFunctionDefinition> {
+    match expression {
+        AnyRExpression::RFunctionDefinition(function) => Some(function.clone()),
+        AnyRExpression::RBinaryExpression(binary)
+            if binary
+                .operator()
+                .is_ok_and(|operator| operator.text_trimmed() == "<-") =>
+        {
+            match binary.right().ok()? {
+                AnyRExpression::RFunctionDefinition(function) => Some(function),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }

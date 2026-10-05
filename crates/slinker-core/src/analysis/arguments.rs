@@ -1,44 +1,30 @@
-use crate::syntax::{CallSite, ConstructionCall, DeclaredCallable, ParsedRFile, Span, StaticArg};
+use crate::syntax::{CallSite, DeclaredCallable, ParsedRFile, Span, StaticArg};
 use std::collections::BTreeSet;
 
-pub(super) trait NamedArguments {
-    fn len(&self) -> usize;
-    fn name(&self, index: usize) -> Option<&str>;
-}
+#[cfg(test)]
+#[path = "../../tests/unit/analysis/arguments.rs"]
+mod tests;
 
-impl NamedArguments for CallSite {
-    fn len(&self) -> usize {
-        self.arguments.len()
-    }
-
-    fn name(&self, index: usize) -> Option<&str> {
-        self.arg_name(index)
-    }
-}
-
-impl NamedArguments for ConstructionCall {
-    fn len(&self) -> usize {
-        self.arguments.len()
-    }
-
-    fn name(&self, index: usize) -> Option<&str> {
-        self.arguments.get(index)?.name.as_deref()
-    }
-}
-
-pub(super) fn matched_arg_index<A, S>(arguments: &A, formals: &[S], target: &str) -> Option<usize>
+pub(super) fn matched_arg_index<S>(
+    arguments: &CallSite,
+    formals: &[S],
+    target: &str,
+) -> Option<usize>
 where
-    A: NamedArguments,
     S: AsRef<str>,
 {
     let target_index = formals
         .iter()
         .position(|formal| formal.as_ref() == target)?;
     let mut assigned = vec![None; formals.len()];
-    let mut consumed = vec![false; arguments.len()];
+    let mut consumed = vec![false; arguments.arg_count()];
+    let before_dots = formals
+        .iter()
+        .position(|formal| formal.as_ref() == "...")
+        .unwrap_or(formals.len());
 
     for (arg_index, consumed) in consumed.iter_mut().enumerate() {
-        let Some(name) = arguments.name(arg_index) else {
+        let Some(name) = arguments.arg_name(arg_index) else {
             continue;
         };
         if let Some(formal_index) = formals.iter().position(|formal| formal.as_ref() == name)
@@ -50,7 +36,7 @@ where
     }
 
     for (arg_index, consumed) in consumed.iter_mut().enumerate() {
-        let Some(name) = arguments.name(arg_index) else {
+        let Some(name) = arguments.arg_name(arg_index) else {
             continue;
         };
         if *consumed {
@@ -58,6 +44,7 @@ where
         }
         let candidates = formals
             .iter()
+            .take(before_dots)
             .enumerate()
             .filter(|(formal_index, formal)| {
                 assigned[*formal_index].is_none() && formal.as_ref().starts_with(name)
@@ -73,13 +60,13 @@ where
 
     let mut next_formal = 0;
     for (arg_index, consumed) in consumed.iter_mut().enumerate() {
-        if arguments.name(arg_index).is_some() || *consumed {
+        if arguments.arg_name(arg_index).is_some() || *consumed {
             continue;
         }
-        while next_formal < assigned.len() && assigned[next_formal].is_some() {
+        while next_formal < before_dots && assigned[next_formal].is_some() {
             next_formal += 1;
         }
-        if next_formal == assigned.len() {
+        if next_formal == before_dots {
             break;
         }
         assigned[next_formal] = Some(arg_index);

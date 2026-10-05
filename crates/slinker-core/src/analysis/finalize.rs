@@ -2,7 +2,6 @@ use super::diagnostic::{Cause, Evidence};
 use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
 use super::namespace::NamespaceBuilder;
 use super::need::WorkKey;
-use super::object_world::reachable_environment_labels;
 use super::relocation::PendingRelocation;
 use super::state::AnalyzerState;
 use crate::analysis::Need;
@@ -18,12 +17,14 @@ use crate::ir::{
     InvalidDataset, InvalidPayloadDependency, InvalidRelocation, MaterializedRole,
     MaterializedSlot, MaterializedSlotSource, NamespaceId, ObjectStep,
     PackageRole as LinkedPackageRole, PayloadDependency, ProgramBuilder, ProgramIr,
-    RelocationTarget, RemovedImportIr, RootArtifactIr, TargetContract,
+    ROOT_ON_LOAD_BINDING, ROOT_RUNTIME_BINDING, RelocationTarget, RemovedImportIr, RootArtifactIr,
+    TargetContract,
 };
 use crate::metadata::{Relation, RelationField, intersect_requirements, relations};
 use crate::package::PackageIdentity;
 use crate::package::PackageImage;
 use crate::package::PackageSources;
+use crate::package::reachable_environment_labels;
 use crate::package::{
     EnvironmentKind, EnvironmentLabel, NativeComponent, PackageAvailability, PackageId,
     PackageName, PackageProvider,
@@ -34,7 +35,6 @@ use crate::syntax::{SourceKey, SourceOrigin, Sources};
 use crate::{Error, Result};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
 pub struct LinkIr {
@@ -44,7 +44,6 @@ pub struct LinkIr {
     blockers: Vec<Diagnostic>,
     sources: Sources,
     consulted: Vec<(PackageName, Option<PackageIdentity>)>,
-    construction_evaluations: usize,
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
@@ -143,7 +142,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             sources,
             packages: self.packages.sources(retained),
             consulted,
-            construction_evaluations: self.construction_evaluations.load(Ordering::Relaxed),
         })
     }
 
@@ -322,6 +320,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .iter()
                     .map(|registration| registration.method.clone()),
             );
+            if materialized == MaterializedRole::Root {
+                let imports = self.namespace_imports(package, &image)?;
+                for name in [ROOT_RUNTIME_BINDING, ROOT_ON_LOAD_BINDING] {
+                    if names.contains(name)
+                        || namespace_builder.bindings.contains(name)
+                        || !matches!(
+                            imports.resolve(name),
+                            crate::syntax::NamespaceImportResolution::BaseFallback
+                        )
+                    {
+                        issues.push(FinalizationIssue::ReservedRootName(name.into()));
+                    }
+                }
+            }
             let slots = names.iter().map(|name| {
                 let source = match image.binding(name) {
                     None => MaterializedSlotSource::Unbound,
@@ -335,7 +347,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                 .map(|shape| (shape, parses.assigned_value_start(&key)))
                         }) {
                             (Some(closure), Some((normalized_shape, assigned_value_start)))
-                                if closure.environment == namespace_label =>
+                                if closure.environment == namespace_label
+                                    && !binding.object.has_attributes =>
                             {
                                 MaterializedSlotSource::Closure {
                                     source: Arc::clone(&closure.source),
@@ -1085,10 +1098,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let graph = self.graph.lock();
         let owner_rank = |creator: &NameCreator| {
             let node = &graph.nodes[creator.node.0];
-            (
-                matches!(node.kind, NodeKind::ClosureObject { derived: true, .. }),
-                super::export::semantic_node_id(node),
-            )
+            super::export::semantic_node_id(node)
         };
         let creatable = self
             .dynamic_names
@@ -1189,14 +1199,11 @@ impl LinkIr {
     pub fn consulted(&self) -> &[(PackageName, Option<PackageIdentity>)] {
         &self.consulted
     }
-
-    pub fn construction_evaluations(&self) -> usize {
-        self.construction_evaluations
-    }
 }
 
 #[derive(Debug)]
 pub(super) enum FinalizationIssue {
+    ReservedRootName(BindingName),
     UnreachedExternal(PackageName),
     OnLoadNotRetained(PackageName),
     CyclicLinkedImports,
@@ -1228,6 +1235,7 @@ pub(super) enum FinalizationIssue {
 impl std::fmt::Display for FinalizationIssue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ReservedRootName(name) => write!(f, "Root name `{name}` collides with generated runtime support"),
             Self::UnreachedExternal(name) => write!(
                 f,
                 "`--external {name}` names a package the retained program never reaches"

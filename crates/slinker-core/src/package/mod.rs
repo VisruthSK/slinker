@@ -44,3 +44,5 @@ pub use names::{
     Atom, BindingName, ClassName, ComponentName, DataSetId, DatasetName, EnvironmentKind,
     EnvironmentLabel, ExportName, GenericLabel, GenericName, MemberPath, PackageName, SymbolName,
 };
+
+pub(crate) use image::reachable_environment_labels;

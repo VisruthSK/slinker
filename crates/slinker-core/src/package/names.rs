@@ -128,7 +128,6 @@ pub enum EnvironmentKind<'a> {
     Base,
     Empty,
     Private,
-    Derived,
     Unsupported(&'a str),
     Other,
 }
@@ -150,10 +149,6 @@ impl EnvironmentLabel {
         Self(intern(&format!("private:{key}")))
     }
 
-    pub fn derived(sequence: usize) -> Self {
-        Self(intern(&format!("derived:{sequence}")))
-    }
-
     pub fn unsupported(detail: &str) -> Self {
         Self(intern(&format!("unsupported:{detail}")))
     }
@@ -164,8 +159,6 @@ impl EnvironmentLabel {
             EnvironmentKind::Namespace(package)
         } else if let Some(detail) = label.strip_prefix("unsupported:") {
             EnvironmentKind::Unsupported(detail)
-        } else if label.starts_with("derived:") {
-            EnvironmentKind::Derived
         } else if label.starts_with("private:") {
             EnvironmentKind::Private
         } else if label == "base:base" {
@@ -175,10 +168,6 @@ impl EnvironmentLabel {
         } else {
             EnvironmentKind::Other
         }
-    }
-
-    pub fn is_derived(&self) -> bool {
-        self.kind() == EnvironmentKind::Derived
     }
 
     pub fn is_unsupported(&self) -> bool {

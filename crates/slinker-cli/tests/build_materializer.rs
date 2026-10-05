@@ -1980,6 +1980,58 @@ fn repeated_null_queries_preserve_the_namespace_fallback() {
     );
 }
 
+#[test]
+fn linked_operator_binding_preserves_r_lookup() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("operator fixture");
+    let dependency = fixture.path().join("operatorleaf");
+    write_package(
+        &dependency,
+        "operatorleaf",
+        "",
+        "export(compute)\n",
+        "`+` <- function(a, b) 42L\ncompute <- function() 1L + 2L\n",
+    );
+    let root = fixture.path().join("operatorprobe");
+    write_package(
+        &root,
+        "operatorprobe",
+        "Imports: operatorleaf\n",
+        "export(probe)\n",
+        "probe <- function() operatorleaf::compute()\n",
+    );
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency, &original);
+    install_package(&r_home, &root, &original);
+    let behavior = "library(operatorprobe); stopifnot(identical(probe(), 42L))";
+    run_r(&r_home, &original, behavior);
+    let output = fixture.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&original)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root)
+        .output()
+        .expect("build operator package");
+    assert_success(&result, "build operator package");
+    let absent = fixture.path().join("absent");
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&absent).expect("absent library");
+    fs::create_dir(&installed).expect("installed library");
+    install_package(&r_home, &output, &absent);
+    install_package(&r_home, &dependency, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    run_r(&r_home, &installed, behavior);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('operatorleaf'); {behavior}"),
+    );
+}
+
 fn write_package(root: &Path, name: &str, extra: &str, namespace: &str, code: &str) {
     fs::create_dir_all(root.join("R")).expect("R directory");
     fs::write(

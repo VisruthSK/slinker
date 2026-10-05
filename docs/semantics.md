@@ -54,7 +54,7 @@ These block: a data set named by anything but a bare name or string (`list = nm`
 
 ## Lifecycle
 
-The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then calls the Root's original `.onLoad`. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
+The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then restores and calls the Root's original `.onLoad`. A recursive call to the hook reaches that original function and does not repeat bootstrap. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
 
 ## Native packages
 
@@ -86,7 +86,11 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
 
 ## Unproven behavior
 
-Repeated null guards correlate only a bare symbol whose binding stays stable. Calls, member access, and other computed arguments to `is.null` are not treated as repeatable: matching syntax does not prove they evaluate to the same value. Their possible namespace fallback remains reachable.
+Computed `do.call` and `match.fun` targets require a proven local closure or a declared callable/string domain. Passing a string through local assignments, helper calls, recursion, or string operations does not establish its target. Computed namespace names also require explicit declarations; analysis does not execute helpers to infer them. Runtime `environment<-`, `list2env`, and `reg.finalizer` operations block because this static profile does not establish their construction or callback effects.
+
+Closure attributes are retained through serialized payloads. A namespace-enclosed closure with attributes is never regenerated from its body alone. The Root's `.onLoad` still requires relocatable source; an attributed hook blocks. Root names defined, imported, or declared by lifecycle code as `.slinker_runtime` or `.slinker_original_on_load` block before publication because those names belong to generated support.
+
+Repeated predicates do not establish binding or assignment. S3 dispatch can change a comparison result, and a called function can mutate a guard binding through its evaluation environment. Analysis retains the possible namespace fallback instead of correlating conditions or inferring exhaustiveness from membership tests.
 
 Linked resource selectors must stay relative to their owning package. Absolute paths, parent-directory components, and NUL bytes fail analysis with `UnsupportedResourcePath`. The checked `ResourcePath` type also validates serialized selectors before the provider or IR can use them.
 

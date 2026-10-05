@@ -191,6 +191,7 @@ impl<'a> ObjectScanner<'a> {
         if !matches!(kind, libr::LANGSXP | libr::EXPRSXP) {
             let mut attributes = Vec::new();
             harp::r::attrib_for_each(value, |tag, attribute| attributes.push((tag, attribute)));
+            image.has_attributes = !attributes.is_empty();
             for (tag, attribute) in attributes {
                 let name = String::from(harp::symbol::RSymbol::new(tag)?);
                 let member = self.scan_value(

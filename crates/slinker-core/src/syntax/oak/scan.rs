@@ -413,19 +413,6 @@ pub(super) fn expression_end(text: &str, start: usize) -> usize {
     trim_end_offset(text, cursor)
 }
 
-pub(super) fn statement_start(text: &str, position: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut cursor = position;
-    while cursor > 0 {
-        let byte = bytes[cursor - 1];
-        if matches!(byte, b';' | b'\n' | b'{' | b'}') {
-            break;
-        }
-        cursor -= 1;
-    }
-    cursor
-}
-
 pub(super) fn skip_trivia(text: &str, mut cursor: usize) -> usize {
     let bytes = text.as_bytes();
     loop {

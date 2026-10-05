@@ -162,12 +162,10 @@ pub(super) fn semantic_node_id(node: &Node) -> String {
             owner,
             path,
             enclosure,
-            derived,
         } => {
             format!(
-                "closure:{}::{owner}{path}@{enclosure}:{}",
-                node.package,
-                if *derived { "derived" } else { "installed" }
+                "closure:{}::{owner}{path}@{enclosure}:installed",
+                node.package
             )
         }
         NodeKind::Activation => format!("package:{}", node.package),

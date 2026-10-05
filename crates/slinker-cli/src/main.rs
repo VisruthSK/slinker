@@ -562,9 +562,8 @@ fn node_label(plan: &LinkIr, id: NodeId) -> String {
             owner,
             path,
             enclosure,
-            derived,
         } => {
-            let origin = if *derived { "derived" } else { "installed" };
+            let origin = "installed";
             format!(
                 "{} [{owner}{path} {origin} closure in {enclosure}]",
                 node.package

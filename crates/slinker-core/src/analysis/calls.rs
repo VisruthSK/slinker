@@ -1,10 +1,9 @@
 use super::arguments::{
-    declared_strings, matched_arg_index, matched_static_arg, namespace_formal,
+    declared_callables, declared_strings, matched_arg_index, matched_static_arg, namespace_formal,
     only_package_argument, reflective_name_formals, static_package_arg, static_string_arg,
 };
 use super::discovery::Discovered;
 use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
-use super::reflection::PendingNamespaceOperation;
 use super::relocation::{NamespaceCall, PendingRelocation, SyntaxObservation};
 use super::resolution::{BindingTarget, OpenReason, ReferenceUse, Resolution};
 use super::state::{AnalyzerState, Caller, NativeCallbackContext, ParsedSite};
@@ -85,6 +84,48 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let name = name.clone();
         match self.discovered_package(from, current, call, &name)? {
             Discovered::Linked(package) => {
+                let selector = match call.callee.as_str() {
+                    "getExportedValue" => Some("name"),
+                    "getFromNamespace" | "assignInNamespace" => Some("x"),
+                    _ => None,
+                };
+                if let Some(selector) = selector {
+                    let Some(StaticArg::String(symbol)) =
+                        matched_static_arg(call, formals, selector)
+                    else {
+                        self.diagnostic(
+                            from,
+                            current,
+                            None,
+                            RejectCode::DynamicLookup,
+                            format!("{}() has an unproven namespace binding name", call.callee),
+                            Some(call.span.clone()),
+                        );
+                        return Ok(());
+                    };
+                    let image = self.image(package)?;
+                    let binding = if call.callee == "getExportedValue" {
+                        image.index.exports.get(symbol.as_str()).cloned()
+                    } else {
+                        image
+                            .index
+                            .binding_names
+                            .contains(symbol.as_str())
+                            .then(|| BindingName::from(symbol.as_str()))
+                    };
+                    let Some(binding) = binding else {
+                        self.diagnostic(from, current, None, RejectCode::DynamicLookup,
+                            format!("{}() binding `{symbol}` is not established in the installed namespace", call.callee), Some(call.span.clone()));
+                        return Ok(());
+                    };
+                    self.require_at(
+                        from,
+                        Need::Binding { package, binding },
+                        EdgeKind::Discovery,
+                        "a namespace query or write reaches its literal binding",
+                        Some(call.span.clone()),
+                    );
+                }
                 let Some(source) = call.arg_span(index).cloned() else {
                     self.unrewritable_package_call(from, current, call, &name);
                     return Ok(());
@@ -439,7 +480,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             (Some(StaticArg::Symbol(_)) | None, _)
                 if matches!(call.callee.as_str(), "match.fun" | "do.call")
-                    && !self.builds_function_name(call, formals, target) =>
+                    && matched_arg_index(call, formals, target).is_some_and(|index| {
+                        call.arg_is_local_closure(index)
+                            || declared_callables(parsed, call, index).is_some()
+                    }) =>
             {
                 Ok(())
             }
@@ -471,20 +515,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn argument_text(&self, call: &CallSite, name: &str) -> Option<String> {
         let span = self.argument_span(call, name)?;
         Some(self.parses.lock().text(span)?.trim().to_owned())
-    }
-
-    fn builds_function_name(&self, call: &CallSite, formals: &[&str], target: &str) -> bool {
-        matched_arg_index(call, formals, target)
-            .and_then(|index| call.arg_span(index))
-            .and_then(|span| {
-                let text = self.parses.lock().text(span)?.to_owned();
-                Some(
-                    ["paste0(", "paste(", "sprintf(", "as.character("]
-                        .iter()
-                        .any(|builder| text.starts_with(builder)),
-                )
-            })
-            .unwrap_or(false)
     }
 
     pub(super) fn retain_reflective_name(
@@ -598,6 +628,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return self.reflective_lookup(site, parsed, call, formals, target);
         }
         match call.callee.as_str() {
+            "environment<-" | "list2env" | "reg.finalizer" => self.diagnostic(
+                from, current, Some(binding), RejectCode::EnvironmentMutation,
+                "runtime closure or environment construction is not established by the static profile",
+                Some(call.span.clone()),
+            ),
             "library" | "require" => {
                 self.attachment_call(from, current, call)?;
             }
@@ -854,56 +889,17 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
                 return Ok(());
             }
-            self.reflection
-                .lock()
-                .defer_namespace_operation(PendingNamespaceOperation {
-                    node: from,
-                    package: current,
-                    binding: binding.to_owned(),
-                    call: call.clone(),
-                    operation,
-                });
+            self.diagnostic(
+                from,
+                current,
+                Some(binding),
+                RejectCode::DynamicPackageDiscovery,
+                format!("{}() with an unproven namespace name", call.callee),
+                Some(call.span.clone()),
+            );
             return Ok(());
         };
         self.namespace_operation_named(caller, call, operation, name, true)
-    }
-
-    pub(super) fn settle_namespace_operations(&self) -> Result<bool> {
-        let mut settled = false;
-        let pending_operations = self.reflection.lock().take_pending_namespace_operations();
-        for pending in pending_operations {
-            let contextual = self
-                .reflection
-                .lock()
-                .contextual_namespace(&pending.call.span)
-                .map(str::to_owned);
-            let Some(name) = contextual else {
-                self.reflection.lock().defer_namespace_operation(pending);
-                continue;
-            };
-            settled = true;
-            let caller = Caller {
-                node: pending.node,
-                package: pending.package,
-                binding: &pending.binding,
-            };
-            self.namespace_operation_named(caller, &pending.call, pending.operation, &name, false)?;
-        }
-        Ok(settled)
-    }
-
-    pub(super) fn report_dynamic_namespace_operations(&self) {
-        let pending_operations = self.reflection.lock().take_pending_namespace_operations();
-        for pending in pending_operations {
-            self.diagnostic(
-                pending.node,
-                pending.package,
-                Some(&pending.binding),
-                RejectCode::DynamicPackageDiscovery,
-                format!("{}() with a dynamic namespace name", pending.call.callee),
-                Some(pending.call.span.clone()),
-            );
-        }
     }
 
     fn namespace_operation_named(

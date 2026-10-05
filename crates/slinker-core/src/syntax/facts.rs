@@ -1,6 +1,5 @@
 use crate::package::{Atom, BindingName, PackageName};
 use crate::syntax::source::Span;
-use std::sync::Arc;
 
 use std::collections::BTreeSet;
 
@@ -139,89 +138,6 @@ pub enum StaticEnvironment {
     Namespace(PackageName),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConstructionExpr {
-    pub kind: ConstructionExprKind,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ConstructionExprKind {
-    Unknown,
-    Null,
-    Logical {
-        value: bool,
-    },
-    Integer {
-        value: i64,
-    },
-    Double {
-        value: Atom,
-    },
-    String {
-        value: Atom,
-    },
-    Symbol {
-        name: Atom,
-    },
-    Sequence {
-        expressions: Arc<[ConstructionExpr]>,
-    },
-    Call {
-        call: Arc<ConstructionCall>,
-    },
-    Member {
-        object: Arc<ConstructionExpr>,
-        name: Option<Atom>,
-    },
-    Index {
-        object: Arc<ConstructionExpr>,
-        index: Arc<ConstructionExpr>,
-    },
-    Assign {
-        target: ConstructionTarget,
-        value: Arc<ConstructionExpr>,
-    },
-    If {
-        condition: Arc<ConstructionExpr>,
-        consequence: Arc<ConstructionExpr>,
-        alternative: Option<Arc<ConstructionExpr>>,
-    },
-    Function {
-        parameters: Arc<[Atom]>,
-        body: Arc<ConstructionExpr>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConstructionCall {
-    pub callee: Atom,
-    pub callee_kind: CalleeKind,
-    pub qualified_package: Option<Atom>,
-    pub arguments: Arc<[ConstructionArgument]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConstructionArgument {
-    pub name: Option<Atom>,
-    pub value: Option<ConstructionExpr>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ConstructionTarget {
-    Local {
-        name: Atom,
-    },
-    Member {
-        object: Arc<ConstructionExpr>,
-        name: Option<Atom>,
-    },
-    ClosureEnvironment {
-        closure: Arc<ConstructionExpr>,
-    },
-    Unknown,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveBindingDef {
     pub name: Atom,
@@ -278,7 +194,6 @@ pub struct ParsedExpression {
     pub calls: Vec<CallSite>,
     pub active_bindings: Vec<ActiveBindingDef>,
     pub effects: Vec<SyntaxEffect>,
-    pub construction: Vec<ConstructionExpr>,
     pub namespace_info_reads: Vec<NamespaceInfoRead>,
     pub namespace_enumerations: Vec<NamespaceEnumeration>,
 }

@@ -28,7 +28,7 @@ fn identifiers(source: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v15";
+pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v19";
 
 #[must_use]
 pub fn analysis_schema() -> &'static str {
@@ -535,9 +535,9 @@ impl PackageStore {
                 .expect("published environments")
                 .insert((package.identity.clone(), label.clone()));
             if fresh {
-                self.cache.publish_deferred(
-                    self.environment_cache_name(&package.identity, label),
-                    CachedEnvironment {
+                self.cache.publish(
+                    &self.environment_cache_name(&package.identity, label),
+                    &CachedEnvironment {
                         schema: ANALYSIS_SCHEMA.into(),
                         target: self.target_fingerprint.clone(),
                         package_fingerprint: package.identity.image_fingerprint.clone(),
@@ -548,9 +548,9 @@ impl PackageStore {
         }
         let mut fragment = binding.clone();
         fragment.private_environments.clear();
-        self.cache.publish_deferred(
-            self.binding_cache_name(&package.identity, name),
-            CachedBinding {
+        self.cache.publish(
+            &self.binding_cache_name(&package.identity, name),
+            &CachedBinding {
                 schema: ANALYSIS_SCHEMA.into(),
                 target: self.target_fingerprint.clone(),
                 package_fingerprint: package.identity.image_fingerprint.clone(),
@@ -670,9 +670,9 @@ impl PackageStore {
     }
 
     fn persist_normalization(&self, source: &str, result: &CanonicalSyntax) {
-        self.cache.publish_deferred(
-            self.normalization_cache_name(source),
-            CachedNormalization {
+        self.cache.publish(
+            &self.normalization_cache_name(source),
+            &CachedNormalization {
                 schema: ANALYSIS_SCHEMA.into(),
                 target: self.target_fingerprint.clone(),
                 source: source.to_owned(),
@@ -935,9 +935,9 @@ impl PackageProvider for PackageStore {
                 .dispatch_generics(package, binding)?
                 .into_iter()
                 .collect::<BTreeSet<String>>();
-            self.cache.publish_deferred(
-                name,
-                CachedDispatch {
+            self.cache.publish(
+                &name,
+                &CachedDispatch {
                     schema: ANALYSIS_SCHEMA.into(),
                     target: self.target_fingerprint.clone(),
                     generics: generics.clone(),

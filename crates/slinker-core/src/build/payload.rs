@@ -19,6 +19,10 @@ fn registered_name(program: &ProgramIr, namespace: NamespaceId) -> &str {
         .as_str()
 }
 
+#[cfg(test)]
+#[path = "../../tests/unit/build/payload.rs"]
+mod tests;
+
 pub(super) fn check_payload_bundles(
     program: &ProgramIr,
     serialization: PayloadSerialization,
@@ -30,18 +34,33 @@ pub(super) fn check_payload_bundles(
             .identity()
             .name
     };
-    let site =
-        |site: &PayloadSite| format!("{}::{}", package_name(&bundles[site.payload]), site.binding);
+    let site = |site: &PayloadSite| {
+        bundles
+            .get(site.payload)
+            .map(|bundle| format!("{}::{}", package_name(bundle), site.binding))
+            .ok_or_else(|| {
+                BuildReport::preflight(vec![
+                    "worker returned an invalid payload identity index".into(),
+                ])
+            })
+    };
     let serialized = match serialization {
         PayloadSerialization::SharedIdentity { first, second } => {
             return Err(BuildReport::preflight(vec![format!(
                 "payload `{}` and payload `{}` reach one environment or reference object, which separate namespace bundles would split into two",
-                site(&first),
-                site(&second)
+                site(&first)?,
+                site(&second)?
             )]));
         }
         PayloadSerialization::Serialized { bundles } => bundles,
     };
+    if serialized.len() != bundles.len() {
+        return Err(BuildReport::preflight(vec![format!(
+            "worker returned {} payload bundles, expected {}",
+            serialized.len(),
+            bundles.len()
+        )]));
+    }
     let mut blockers = Vec::new();
     let mut checked = Vec::new();
     for ((id, bundle), SerializedPayload { bytes, namespaces }) in

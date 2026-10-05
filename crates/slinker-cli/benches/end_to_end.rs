@@ -58,10 +58,9 @@ fn heap_usage() -> String {
 
 fn report_analysis(name: &str, elapsed: Duration, plan: &LinkIr, heap: &str) {
     println!(
-        "{name:<32} {:>9.3} s  bindings {:>6}  construction evaluations {:>8}  blockers {:>4}{heap}",
+        "{name:<32} {:>9.3} s  bindings {:>6}  blockers {:>4}{heap}",
         elapsed.as_secs_f64(),
         plan.program().bindings().len(),
-        plan.construction_evaluations(),
         plan.blockers().len()
     );
 }

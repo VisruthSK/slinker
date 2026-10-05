@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub(crate) const ROOT_RUNTIME_BINDING: &str = ".slinker_runtime";
+pub(crate) const ROOT_ON_LOAD_BINDING: &str = ".slinker_original_on_load";
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
