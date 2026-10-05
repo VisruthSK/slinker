@@ -281,6 +281,37 @@ fn recursive_root_hook_does_not_repeat_bootstrap() {
 }
 
 #[test]
+fn attributed_private_closures_with_reserved_names_match_original_r() {
+    let r = discover_r_home();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    package(
+        &root,
+        "soundroot",
+        "Imports: methods\n",
+        "box <- local({ e <- new.env(parent=baseenv()); assign('function', methods::new('MethodDefinition', .Data=function() 42L), envir=e); e })\nrun <- function() box[['function']]()",
+    );
+    let original = temp.path().join("original");
+    fs::create_dir(&original).unwrap();
+    install_package(&r, &root, &original);
+    run_r(&r, &original, "stopifnot(identical(soundroot::run(),42L))");
+    let output = temp.path().join("generated");
+    assert_success(
+        &slinker(&[
+            "build".as_ref(),
+            root.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+        ]),
+        "build attributed private closure with reserved name",
+    );
+    let generated = temp.path().join("generated-library");
+    fs::create_dir(&generated).unwrap();
+    install_package(&r, &output, &generated);
+    run_r(&r, &generated, "stopifnot(identical(soundroot::run(),42L))");
+}
+
+#[test]
 fn namespace_queries_and_private_environment_callbacks_link_their_functions() {
     let r = discover_r_home();
     for code in [

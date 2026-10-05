@@ -36,7 +36,7 @@ Branch conditions stay as Air expressions in the syntax census. Namespace availa
 
 ## Cache
 
-Disposable typed artifacts use schema `slinker-analysis-v19` and a SQLite database per schema directory. Keys include the installed image and target R. Reads verify the serialized bytes against their SHA-256 digest before decoding them. Corrupt entries or an unavailable database are cache misses. SQLite owns indexing and atomic publication; each invocation commits its artifact transaction when the cache closes. WAL permits readers alongside a writer. Serialization and deserialization run outside the connection lock. Installed-package fingerprints hash files in parallel. `slinker cache` inspects and clears artifacts; validated build records remain under `builds/`.
+Disposable typed artifacts use schema `slinker-analysis-v20` and a SQLite database per schema directory. Keys include the installed image and target R. Reads verify the serialized bytes against their SHA-256 digest before decoding them. Corrupt entries or an unavailable database are cache misses. SQLite owns indexing and atomic publication; each invocation commits its artifact transaction when the cache closes. WAL permits readers alongside a writer. Serialization and deserialization run outside the connection lock. Installed-package fingerprints hash files in parallel. `slinker cache` inspects and clears artifacts; validated build records remain under `builds/`.
 
 At the cache migration checkpoint, the storage comparison used the same release analyzer, R 4.6.1, one analysis thread, three sequential cold/warm samples per package, and identical JSON output in every sample. These timings precede the subsequent predicate and private-environment corrections. Median milliseconds:
 

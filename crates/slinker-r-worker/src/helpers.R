@@ -135,6 +135,9 @@
 
 
 .slinker_deparse_binding <- function(name, value) {
+  if (typeof(value) == "closure") {
+    value <- as.call(list(as.name("function"), formals(value), body(value)))
+  }
   rhs <- paste(
     deparse(
       value,
@@ -143,13 +146,7 @@
     ),
     collapse = "\n"
   )
-  simple <- grepl("^[A-Za-z.][A-Za-z0-9._]*$", name) &&
-    !grepl("^\\.[0-9]", name)
-  lhs <- if (simple) {
-    name
-  } else {
-    paste0("`", gsub("([`\\\\])", "\\\\\\1", name), "`")
-  }
+  lhs <- deparse(as.name(name), backtick = TRUE)
   paste0(lhs, " <- ", rhs)
 }
 
