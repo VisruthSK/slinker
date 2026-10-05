@@ -17,7 +17,13 @@ static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
     slinker_core::profile::heap::CountingAllocator;
 
 const ANALYZED: [&str; 6] = ["R6", "jsonlite", "rlang", "cli", "callr", "testthat"];
-const BUILT: [&str; 2] = ["here", "rebus.numbers"];
+const SOURCE_PACKAGES: [(&str, &str); 2] = [
+    ("here", "DynamicLookup in rprojroot::path: do.call()"),
+    (
+        "rebus.numbers",
+        "DynamicLookup in rebus.numbers::number_range: do.call()",
+    ),
+];
 const DEFAULT_THREADS: usize = 4;
 
 fn threads() -> usize {
@@ -118,7 +124,7 @@ fn provision(r_home: &Path, package: &str) -> (PathBuf, PathBuf) {
     (source, library)
 }
 
-fn build(r_home: &Path, package: &str) {
+fn reject_build(r_home: &Path, package: &str, blocker: &str) {
     let (source, library) = provision(r_home, package);
     let work = tempfile::tempdir().expect("build work directory");
     let output = work.path().join("output");
@@ -134,10 +140,16 @@ fn build(r_home: &Path, package: &str) {
         .output()
         .expect("run slinker build");
     let elapsed = start.elapsed();
-    common::assert_success(&result, &format!("slinker build {package}"));
+    assert!(!result.status.success(), "unproven {package} build succeeded");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains(blocker),
+        "{package} failed without its expected blocker: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.exists(), "rejected {package} build published output");
     println!(
         "{:<32} {:>9.3} s",
-        format!("build {package} cold"),
+        format!("reject build {package} cold"),
         elapsed.as_secs_f64()
     );
 }
@@ -211,8 +223,8 @@ fn run() {
         analyze_installed(&r_home);
     }
     if selected("build") {
-        for package in BUILT {
-            build(&r_home, package);
+        for (package, blocker) in SOURCE_PACKAGES {
+            reject_build(&r_home, package, blocker);
             analyze_edit(&r_home, package);
         }
     }
