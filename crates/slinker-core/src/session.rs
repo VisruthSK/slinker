@@ -1,17 +1,17 @@
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::analysis::{LinkIr, Linker};
-use crate::build::incremental::{
-    BuildRecord, BuildState, consulted_packages, inputs_digest, is_up_to_date,
-};
-use crate::build::{BuildContext, PureRStatic, materialize};
+use crate::build::{BuildContext, OutputLease, PureRStatic, materialize};
 use crate::cache::CacheLocation;
-use crate::package::{PackageLocator, PackageName, PackageStore, tree_digest};
+use crate::package::store::NativeSummaryManifest;
+use crate::package::{PackageName, PackageStore};
 use crate::source::{SourcePackageSnapshot, StagedRoot, stage_root};
-use crate::{Description, PrimedWorker, TargetEnvironment, TargetEnvironmentRequest};
+use crate::worker::client::WorkerClient;
+use crate::worker::service::WorkerService;
+use crate::{Description, TargetEnvironment, TargetEnvironmentRequest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -42,6 +42,7 @@ pub struct SessionOptions {
     pub threads: NonZeroUsize,
     pub cache: CacheLocation,
     pub worker_executable: crate::WorkerExecutable,
+    pub native_summaries: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,13 +75,12 @@ struct SourceInputs {
 }
 
 pub struct Session {
-    r_home: PathBuf,
-    target: TargetEnvironment,
+    workers: Arc<WorkerService>,
     root: PackageName,
     options: SessionOptions,
     root_description: Option<Arc<str>>,
     retained: Option<SourceInputs>,
-    primed: Mutex<Option<PrimedWorker>>,
+    native_summaries: Arc<NativeSummaryManifest>,
 }
 
 pub struct SourceSession {
@@ -97,7 +97,7 @@ impl Session {
         match root {
             RootSpec::Installed(name) => {
                 let libraries = absolute_libraries(universe)?;
-                Self::capture(r_home, name.clone(), None, libraries, universe.clone())
+                Self::capture(r_home, name.clone(), libraries, universe.clone())
             }
             RootSpec::InstalledDirectory(directory) => {
                 let (parent, name) = installed_directory(directory)?;
@@ -108,7 +108,7 @@ impl Session {
                             .filter(|library| *library != parent),
                     )
                     .collect();
-                Self::capture(r_home, name, None, libraries, universe.clone())
+                Self::capture(r_home, name, libraries, universe.clone())
             }
             RootSpec::Source(path) => {
                 let SourceSession {
@@ -124,22 +124,23 @@ impl Session {
     fn capture(
         r_home: PathBuf,
         root: PackageName,
-        root_description: Option<Arc<str>>,
         libraries: Vec<PathBuf>,
         options: SessionOptions,
     ) -> Result<Self, SessionError> {
-        let mut request = TargetEnvironmentRequest::new(r_home.clone());
+        let mut request = TargetEnvironmentRequest::new(r_home);
         request.libraries = libraries;
         request.worker_executable = options.worker_executable.clone();
-        let (target, primed) = request.capture_primed()?;
+        let native_summaries = Arc::new(NativeSummaryManifest::load(
+            options.native_summaries.as_deref(),
+        )?);
+        let (_, client) = request.capture_worker()?;
         Ok(Self {
-            target,
-            r_home,
+            workers: WorkerService::primed(options.threads.get(), client),
             root,
             options,
-            root_description,
+            root_description: None,
             retained: None,
-            primed: Mutex::new(Some(primed)),
+            native_summaries,
         })
     }
 
@@ -148,22 +149,16 @@ impl Session {
     }
 
     pub fn target(&self) -> &TargetEnvironment {
-        &self.target
+        self.workers.target()
     }
 
     pub fn analyze(&self, provenance: bool) -> Result<LinkIr, SessionError> {
         let universe = &self.options;
-        let store = PackageStore::new(
-            self.r_home.clone(),
-            self.target.clone(),
+        let store = PackageStore::for_session(
+            &self.workers,
             universe.cache.clone(),
-        )?
-        .with_worker_limit(universe.threads.get())
-        .with_worker_executable(universe.worker_executable.clone());
-        let store = match self.primed.lock().expect("primed worker").take() {
-            Some(worker) => store.with_primed_worker(worker),
-            None => store,
-        };
+            Arc::clone(&self.native_summaries),
+        )?;
         let mut linker = Linker::new(store, universe.threads.get())
             .with_external_packages(universe.external.iter().cloned())
             .with_linked_packages(universe.linked.iter().cloned());
@@ -173,75 +168,34 @@ impl Session {
         if let Some(description) = &self.root_description {
             linker = linker.with_root_source(Arc::clone(description));
         }
-        Ok(linker.analyze(&self.root)?)
+        let ir = linker.analyze(&self.root)?;
+        self.workers.check()?;
+        Ok(ir)
     }
 }
 
 pub struct PreparedSource {
     snapshot: SourcePackageSnapshot,
-    r_home: PathBuf,
-    target: TargetEnvironment,
     options: SessionOptions,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BuildOutcome {
-    Built,
-    UpToDate,
-}
-
-impl BuildOutcome {
-    pub fn status(self) -> &'static str {
-        match self {
-            Self::Built => "built",
-            Self::UpToDate => "up_to_date",
-        }
-    }
+    client: WorkerClient,
+    native_summaries: Arc<NativeSummaryManifest>,
 }
 
 impl PreparedSource {
-    /// Build this frozen source, reusing an output only after validating its read set and contents.
-    pub fn build(self, output: &Path) -> Result<BuildOutcome, SessionError> {
-        let output = std::path::absolute(output)?;
-        let package = self.snapshot.package().to_owned();
-        let state = BuildState::new(&self.options.cache);
-        fn sorted(names: &[PackageName]) -> Vec<&str> {
-            let mut names = names.iter().map(PackageName::as_str).collect::<Vec<_>>();
-            names.sort_unstable();
-            names.dedup();
-            names
-        }
-        let inputs = inputs_digest(
-            &tree_digest(self.snapshot.files().root())?,
-            &self.target,
-            &sorted(&self.options.linked),
-            &sorted(&self.options.external),
-        );
-        if let Some(record) = state.load(&output)
-            && is_up_to_date(
-                &record,
-                &inputs,
-                &PackageLocator::new(self.target.clone()),
-                &package,
-            )?
+    /// Stage the frozen source, analyze it, and publish a checked package.
+    pub fn build(self, output: &Path) -> Result<(), SessionError> {
+        let output = OutputLease::acquire(output)?;
+        if let Ok(relative) = output.path().strip_prefix(self.snapshot.original_root())
+            && self.snapshot.root().join(relative).exists()
         {
-            return Ok(BuildOutcome::UpToDate);
+            return Err(SessionError::InvalidRoot("output is included in the frozen source; exclude it with .Rbuildignore or choose an output outside the source".into()));
         }
         let session = SourceSession::stage(self)?;
         let ir = session.session().analyze(false)?;
-        let consulted = consulted_packages(ir.consulted(), &package);
         let context = session.into_build_context();
         let buildable = PureRStatic::check(&ir, &context)?;
-        let generated = materialize(buildable, &output)?;
-        state.save(&BuildRecord {
-            package,
-            output,
-            inputs: inputs.as_str().to_owned(),
-            consulted,
-            output_digest: tree_digest(generated.root())?.as_str().to_owned(),
-        })?;
-        generated.publish()?;
-        Ok(BuildOutcome::Built)
+        materialize(buildable, output)?.publish()?;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> &SourcePackageSnapshot {
@@ -249,7 +203,7 @@ impl PreparedSource {
     }
 
     pub fn target(&self) -> &TargetEnvironment {
-        &self.target
+        self.client.target()
     }
 }
 
@@ -267,15 +221,19 @@ impl SourceSession {
         universe: &SessionOptions,
         r_home: PathBuf,
     ) -> Result<PreparedSource, SessionError> {
-        let snapshot = SourcePackageSnapshot::capture(path)?;
-        let mut request = TargetEnvironmentRequest::new(r_home.clone());
+        let native_summaries = Arc::new(NativeSummaryManifest::load(
+            universe.native_summaries.as_deref(),
+        )?);
+        let mut request = TargetEnvironmentRequest::new(r_home);
         request.libraries = absolute_libraries(universe)?;
         request.worker_executable = universe.worker_executable.clone();
+        let (target, client) = request.capture_worker()?;
+        let snapshot = SourcePackageSnapshot::capture(path, &target.r_home)?;
         Ok(PreparedSource {
             snapshot,
-            r_home,
-            target: request.capture()?,
             options: universe.clone(),
+            client,
+            native_summaries,
         })
     }
 
@@ -290,21 +248,41 @@ impl SourceSession {
     pub fn stage(prepared: PreparedSource) -> Result<Self, SessionError> {
         let PreparedSource {
             snapshot,
-            r_home,
-            mut target,
             options,
+            mut client,
+            native_summaries,
         } = prepared;
-        let staged = stage_root(&snapshot, &r_home, &target.libraries)?;
+        let mut target = client.target().clone();
+        let staged = stage_root(&snapshot, &target.r_home, &target.libraries)?;
         let staged_library = dunce::canonicalize(staged.library())?;
         target.libraries.insert(0, staged_library);
+        let actual = client.configure_libraries(target.libraries.clone())?;
+        if actual != target {
+            return Err(crate::Error::Analysis(
+                "target changed while freezing the staged library universe".into(),
+            )
+            .into());
+        }
+        let root = client
+            .packages()
+            .locate(snapshot.package())?
+            .ok_or_else(|| {
+                SessionError::InvalidRoot("staged Root is absent from its library universe".into())
+            })?;
+        let native_summaries = Arc::new(native_summaries.bind_root(
+            root.identity,
+            snapshot.fingerprint().clone(),
+            target.target.clone(),
+        )?);
         let session = Session {
-            r_home,
-            target,
+            workers: WorkerService::primed(options.threads.get(), client),
             root: snapshot.package().into(),
             options,
-            root_description: Some(snapshot.description_source().into()),
+            root_description: Some(
+                std::fs::read_to_string(staged.package_root().join("DESCRIPTION"))?.into(),
+            ),
             retained: None,
-            primed: Mutex::new(None),
+            native_summaries,
         };
         Ok(Self {
             session,
@@ -321,13 +299,7 @@ impl SourceSession {
     }
 
     fn into_build_context(self) -> BuildContext {
-        BuildContext::new(
-            self.inputs.snapshot,
-            self.inputs.staged,
-            self.session.r_home,
-            self.session.target,
-        )
-        .with_worker_executable(self.session.options.worker_executable)
+        BuildContext::new(self.inputs.staged, self.session.workers)
     }
 }
 

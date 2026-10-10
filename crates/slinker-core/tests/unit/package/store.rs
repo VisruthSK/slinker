@@ -37,6 +37,7 @@ fn exact_image_native_manifest_attaches_routine_callbacks() {
             "packages": [{
                 "package": "fixture",
                 "version": "1.0.0",
+                "origin": "installed",
                 "image_fingerprint": "exact-image",
                 "components": [{
                     "component": "fixture",
@@ -69,6 +70,7 @@ fn native_manifest_rejects_zero_callback_position() {
             "packages": [{
                 "package": "fixture",
                 "version": "1.0.0",
+                "origin": "installed",
                 "image_fingerprint": "exact-image",
                 "components": [{
                     "component": "fixture",

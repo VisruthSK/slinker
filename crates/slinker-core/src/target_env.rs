@@ -22,7 +22,10 @@ impl WorkerExecutable {
                 path: "<current-executable>".into(),
                 source,
             }),
-            Self::Standalone(path) => Ok(path.clone()),
+            Self::Standalone(path) => std::path::absolute(path).map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            }),
         }
     }
 }
@@ -37,7 +40,7 @@ pub fn r_executable(r_home: &Path) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     pub r_version: String,
     pub os: String,
@@ -50,12 +53,6 @@ pub struct TargetEnvironment {
     pub target: Target,
     pub libraries: Vec<PathBuf>,
     pub base_bindings: BTreeSet<BindingName>,
-}
-
-#[derive(Debug)]
-pub struct PrimedWorker {
-    pub(crate) client: WorkerClient,
-    pub(crate) target: TargetEnvironment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,20 +72,16 @@ impl TargetEnvironmentRequest {
     }
 
     pub fn capture(self) -> Result<TargetEnvironment, TargetEnvironmentError> {
-        self.capture_primed().map(|(target, _)| target)
+        self.capture_worker().map(|(target, _)| target)
     }
 
-    pub fn capture_primed(
+    pub(crate) fn capture_worker(
         self,
-    ) -> Result<(TargetEnvironment, PrimedWorker), TargetEnvironmentError> {
+    ) -> Result<(TargetEnvironment, WorkerClient), TargetEnvironmentError> {
         let (target, client) =
             WorkerClient::capture_target(self.r_home, self.libraries, &self.worker_executable)
                 .map_err(TargetEnvironmentError)?;
-        let worker = PrimedWorker {
-            client,
-            target: target.clone(),
-        };
-        Ok((target, worker))
+        Ok((target, client))
     }
 }
 

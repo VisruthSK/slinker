@@ -3,17 +3,18 @@ use crate::package::cache_names::EntryKind;
 use crate::package::inspection::{Batcher, Lanes, Slot};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, ComponentName, Digest, EnvironmentKind, EnvironmentLabel, GenericName,
-    InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
-    ObjectImage, PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocator,
+    BindingName, ComponentName, Digest, EnvironmentKind, EnvironmentLabel, FrozenPackages,
+    GenericName, InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary,
+    NativeSafety, ObjectImage, PackageData, PackageIdentity, PackageImage, PackageIndex,
     PackageName, PrivateEnvironmentImage, ResourcePath,
 };
-use crate::target_env::PrimedWorker;
 use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{
     NormalizeOutcome, NormalizedSource, WorkerBinding, WorkerNormalization, WorkerPackageIndex,
 };
+use crate::worker::service::WorkerService;
 use crate::{Error, Result, TargetEnvironment};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -28,78 +29,102 @@ fn identifiers(source: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v20";
+pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v1";
 
 #[must_use]
 pub fn analysis_schema() -> &'static str {
     ANALYSIS_SCHEMA
 }
-const MAX_R_WORKERS: usize = 2;
 const SOURCES_PER_WORKER: usize = 48;
 
 #[derive(Deserialize, Serialize)]
-struct CachedIndex {
-    schema: String,
+#[serde(deny_unknown_fields)]
+struct CachedPackage<T> {
     target: Digest,
     package_fingerprint: Digest,
-    index: WorkerPackageIndex,
+    value: T,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CachedDispatch {
-    schema: String,
     target: Digest,
     generics: BTreeSet<String>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CachedNormalization {
-    schema: String,
     target: Digest,
     source: String,
     canonical: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
-struct CachedEnvironment {
-    schema: String,
-    target: Digest,
-    package_fingerprint: Digest,
-    environment: PrivateEnvironmentImage,
-}
-
-#[derive(Deserialize, Serialize)]
-struct CachedBinding {
-    schema: String,
-    target: Digest,
-    package_fingerprint: Digest,
-    binding_name: BindingName,
-    binding: WorkerBinding,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct NativeSummaryManifest {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct NativeSummaryManifest {
     schema: u32,
     #[serde(default)]
     packages: Vec<NativePackageSummary>,
+    #[serde(skip)]
+    root: Option<RootNativeAudit>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug)]
+struct RootNativeAudit {
+    identity: PackageIdentity,
+    source: Digest,
+    target: crate::Target,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash)]
+#[serde(tag = "origin", rename_all = "snake_case")]
+enum NativeAuditScope {
+    Installed {
+        image_fingerprint: Digest,
+    },
+    RootSource {
+        source_fingerprint: Digest,
+        target: crate::Target,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct NativePackageSummary {
     package: PackageName,
     version: String,
-    image_fingerprint: Digest,
+    #[serde(flatten)]
+    scope: NativeAuditScope,
     components: Vec<NativeComponentSummary>,
 }
 
-#[derive(Debug, Deserialize)]
+impl NativePackageSummary {
+    fn applies_to(&self, identity: &PackageIdentity, root: Option<&RootNativeAudit>) -> bool {
+        self.package == identity.name
+            && self.version == identity.version.as_ref()
+            && match &self.scope {
+                NativeAuditScope::Installed { image_fingerprint } => {
+                    image_fingerprint == &identity.image_fingerprint
+                }
+                NativeAuditScope::RootSource {
+                    source_fingerprint,
+                    target,
+                } => root.is_some_and(|root| {
+                    &root.identity == identity
+                        && &root.source == source_fingerprint
+                        && &root.target == target
+                }),
+            }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct NativeComponentSummary {
     component: ComponentName,
     #[serde(flatten)]
     safety: NativeSummarySafety,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "safety", rename_all = "snake_case")]
 enum NativeSummarySafety {
     Safe {
@@ -115,13 +140,12 @@ enum NativeSummarySafety {
 }
 
 impl NativeSummaryManifest {
-    fn load() -> Result<Self> {
-        let Some(path) = std::env::var_os("SLINKER_NATIVE_SUMMARIES") else {
+    pub(crate) fn load(path: Option<&std::path::Path>) -> Result<Self> {
+        let Some(path) = path else {
             return Ok(Self::default());
         };
-        let path = PathBuf::from(path);
-        let text = fs::read_to_string(&path).map_err(|source| Error::Io {
-            path: path.clone(),
+        let text = fs::read_to_string(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
             source,
         })?;
         let manifest: Self = serde_json::from_str(&text).map_err(|error| {
@@ -147,12 +171,12 @@ impl NativeSummaryManifest {
             let key = (
                 package.package.as_str(),
                 package.version.as_str(),
-                package.image_fingerprint.as_str(),
+                &package.scope,
             );
             if !packages.insert(key) {
                 return Err(Error::Analysis(format!(
-                    "duplicate native summary package identity {} {} {}",
-                    package.package, package.version, package.image_fingerprint
+                    "duplicate native summary package identity {} {} {:?}",
+                    package.package, package.version, package.scope
                 )));
             }
             let mut components = HashSet::new();
@@ -186,11 +210,11 @@ impl NativeSummaryManifest {
     }
 
     fn apply(&self, index: &mut PackageIndex) {
-        let Some(package) = self.packages.iter().find(|summary| {
-            index.identity.name == summary.package
-                && summary.version == index.identity.version.as_ref()
-                && summary.image_fingerprint == index.identity.image_fingerprint
-        }) else {
+        let Some(package) = self
+            .packages
+            .iter()
+            .find(|summary| summary.applies_to(&index.identity, self.root.as_ref()))
+        else {
             return;
         };
         for summary in &package.components {
@@ -213,6 +237,32 @@ impl NativeSummaryManifest {
                 }
             };
         }
+    }
+
+    pub(crate) fn bind_root(
+        &self,
+        identity: PackageIdentity,
+        source: Digest,
+        target: crate::Target,
+    ) -> Result<Self> {
+        let root = RootNativeAudit {
+            identity,
+            source,
+            target,
+        };
+        let matches = self
+            .packages
+            .iter()
+            .filter(|summary| summary.applies_to(&root.identity, Some(&root)))
+            .count();
+        if matches > 1 {
+            return Err(Error::Analysis(
+                "multiple native audits apply to the staged Root".into(),
+            ));
+        }
+        let mut bound = self.clone();
+        bound.root = Some(root);
+        Ok(bound)
     }
 }
 
@@ -284,6 +334,9 @@ pub trait PackageResolver: Send + Sync {
 }
 
 pub trait PackageProvider: PackageResolver {
+    fn native_source_fingerprint(&self, _package: &InstalledPackage) -> Option<Digest> {
+        None
+    }
     fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>>;
     fn binding_image(&self, package: &InstalledPackage, name: &str) -> Result<Arc<PackageImage>>;
     fn resource_exists(&self, package: &InstalledPackage, path: &ResourcePath) -> Result<bool> {
@@ -338,7 +391,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Memo<K, V> {
 type BindingBatcher = Batcher<String, Arc<PackageImage>>;
 
 pub struct PackageStore {
-    locator: PackageLocator,
+    locator: Arc<FrozenPackages>,
     indexes: Memo<PackageIdentity, Arc<PackageIndex>>,
     bindings: Mutex<HashMap<PackageIdentity, Arc<BindingBatcher>>>,
     delivered:
@@ -349,12 +402,26 @@ pub struct PackageStore {
     normalizer: Batcher<String, Normalization>,
     cache: Cache,
     target_fingerprint: Digest,
-    lanes: Lanes,
-    native_summaries: NativeSummaryManifest,
+    lanes: Arc<Lanes>,
+    native_summaries: Arc<NativeSummaryManifest>,
 }
 
 impl PackageStore {
-    pub fn new(r_home: PathBuf, target: TargetEnvironment, cache: CacheLocation) -> Result<Self> {
+    pub fn new(target: TargetEnvironment, cache: CacheLocation) -> Result<Self> {
+        let manifest = std::env::var_os("SLINKER_NATIVE_SUMMARIES").map(PathBuf::from);
+        Self::for_session(
+            &WorkerService::new(target, crate::WorkerExecutable::default(), 1),
+            cache,
+            Arc::new(NativeSummaryManifest::load(manifest.as_deref())?),
+        )
+    }
+
+    pub(crate) fn for_session(
+        workers: &WorkerService,
+        cache: CacheLocation,
+        native_summaries: Arc<NativeSummaryManifest>,
+    ) -> Result<Self> {
+        let target = workers.target().clone();
         let target_fingerprint = fingerprint_strings(
             std::iter::once(target.r_home.to_string_lossy().into_owned())
                 .chain(std::iter::once(format!(
@@ -369,8 +436,8 @@ impl PackageStore {
                 ),
         );
         Ok(Self {
-            lanes: Lanes::new(r_home, target.clone(), 1),
-            locator: PackageLocator::new(target),
+            lanes: workers.inspection(),
+            locator: workers.packages(),
             indexes: Memo::default(),
             bindings: Mutex::new(HashMap::new()),
             delivered: Mutex::new(HashMap::new()),
@@ -380,32 +447,8 @@ impl PackageStore {
             normalizer: Batcher::default(),
             cache: Cache::new(cache, ANALYSIS_SCHEMA)?,
             target_fingerprint,
-            native_summaries: NativeSummaryManifest::load()?,
+            native_summaries,
         })
-    }
-
-    #[must_use]
-    pub fn with_primed_worker(self, worker: PrimedWorker) -> Self {
-        if worker.target == *self.locator.target() {
-            self.lanes.prime(worker.client);
-        }
-        self
-    }
-
-    #[must_use]
-    pub fn with_worker_limit(mut self, limit: usize) -> Self {
-        let target = self.locator.target().clone();
-        let r_home = self.lanes.r_home().to_path_buf();
-        let executable = self.lanes.executable.clone();
-        self.lanes = Lanes::new(r_home, target, limit.clamp(1, MAX_R_WORKERS));
-        self.lanes.executable = executable;
-        self
-    }
-
-    #[must_use]
-    pub fn with_worker_executable(mut self, executable: crate::WorkerExecutable) -> Self {
-        self.lanes.executable = executable;
-        self
     }
 
     fn affine_lane(&self, identity: &PackageIdentity) -> usize {
@@ -497,15 +540,39 @@ impl PackageStore {
     }
 
     fn load_cached_index(&self, package: &InstalledPackage) -> Option<Arc<PackageIndex>> {
-        let cached = self
-            .cache
-            .read::<CachedIndex>(&self.index_cache_name(&package.identity))
+        let worker =
+            self.load_cached_package(&self.index_cache_name(&package.identity), &package.identity)?;
+        self.package_index(worker, package).ok()
+    }
+
+    fn load_cached_package<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        identity: &PackageIdentity,
+    ) -> Option<T> {
+        self.cache
+            .read::<CachedPackage<T>>(name)
             .filter(|entry| {
-                entry.schema == ANALYSIS_SCHEMA
-                    && entry.target == self.target_fingerprint
-                    && entry.package_fingerprint == package.identity.image_fingerprint
-            })?;
-        self.package_index(cached.index, package).ok()
+                entry.target == self.target_fingerprint
+                    && entry.package_fingerprint == identity.image_fingerprint
+            })
+            .map(|entry| entry.value)
+    }
+
+    fn publish_cached_package<T: Serialize>(
+        &self,
+        name: &str,
+        identity: &PackageIdentity,
+        value: T,
+    ) {
+        self.cache.publish(
+            name,
+            &CachedPackage {
+                target: self.target_fingerprint.clone(),
+                package_fingerprint: identity.image_fingerprint.clone(),
+                value,
+            },
+        );
     }
 
     fn environment_cache_name(
@@ -535,28 +602,19 @@ impl PackageStore {
                 .expect("published environments")
                 .insert((package.identity.clone(), label.clone()));
             if fresh {
-                self.cache.publish(
+                self.publish_cached_package(
                     &self.environment_cache_name(&package.identity, label),
-                    &CachedEnvironment {
-                        schema: ANALYSIS_SCHEMA.into(),
-                        target: self.target_fingerprint.clone(),
-                        package_fingerprint: package.identity.image_fingerprint.clone(),
-                        environment: (**environment).clone(),
-                    },
+                    &package.identity,
+                    environment.as_ref(),
                 );
             }
         }
         let mut fragment = binding.clone();
         fragment.private_environments.clear();
-        self.cache.publish(
+        self.publish_cached_package(
             &self.binding_cache_name(&package.identity, name),
-            &CachedBinding {
-                schema: ANALYSIS_SCHEMA.into(),
-                target: self.target_fingerprint.clone(),
-                package_fingerprint: package.identity.image_fingerprint.clone(),
-                binding_name: name.into(),
-                binding: fragment,
-            },
+            &package.identity,
+            fragment,
         );
     }
 
@@ -571,24 +629,21 @@ impl PackageStore {
             if label.kind() != EnvironmentKind::Private || environments.contains_key(&label) {
                 continue;
             }
-            let cached = self
-                .cache
-                .read::<CachedEnvironment>(&self.environment_cache_name(&package.identity, &label))
-                .filter(|entry| {
-                    entry.schema == ANALYSIS_SCHEMA
-                        && entry.target == self.target_fingerprint
-                        && entry.package_fingerprint == package.identity.image_fingerprint
-                        && entry.environment.id == label
-                })?;
-            pending.push(cached.environment.parent.clone());
+            let environment: PrivateEnvironmentImage = self.load_cached_package(
+                &self.environment_cache_name(&package.identity, &label),
+                &package.identity,
+            )?;
+            if environment.id != label {
+                return None;
+            }
+            pending.push(environment.parent.clone());
             pending.extend(
-                cached
-                    .environment
+                environment
                     .bindings
                     .values()
                     .flat_map(|private| private.object.environment_labels().cloned()),
             );
-            environments.insert(label, Arc::new(cached.environment));
+            environments.insert(label, Arc::new(environment));
         }
         Some(environments)
     }
@@ -599,32 +654,23 @@ impl PackageStore {
         index: &Arc<PackageIndex>,
         binding: &str,
     ) -> Option<Arc<PackageImage>> {
-        let cached = self
-            .cache
-            .read::<CachedBinding>(&self.binding_cache_name(&package.identity, binding))
-            .filter(|entry| {
-                entry.schema == ANALYSIS_SCHEMA
-                    && entry.target == self.target_fingerprint
-                    && entry.package_fingerprint == package.identity.image_fingerprint
-                    && entry.binding_name == binding
-            })?;
+        let cached: WorkerBinding = self.load_cached_package(
+            &self.binding_cache_name(&package.identity, binding),
+            &package.identity,
+        )?;
+        if cached.binding.name != binding {
+            return None;
+        }
         let environments = self.load_cached_environments(
             package,
             cached
-                .binding
                 .binding
                 .object
                 .environment_labels()
                 .cloned()
                 .collect(),
         )?;
-        Self::package_image(
-            &package.identity,
-            Arc::clone(index),
-            cached.binding,
-            environments,
-        )
-        .ok()
+        Self::package_image(&package.identity, Arc::clone(index), cached, environments).ok()
     }
 
     fn dispatch_cache_name(&self, identity: Option<&PackageIdentity>, binding: &str) -> String {
@@ -644,11 +690,7 @@ impl PackageStore {
         let cached = self
             .cache
             .read::<CachedNormalization>(&self.normalization_cache_name(source))
-            .filter(|entry| {
-                entry.schema == ANALYSIS_SCHEMA
-                    && entry.target == self.target_fingerprint
-                    && entry.source == source
-            })?;
+            .filter(|entry| entry.target == self.target_fingerprint && entry.source == source)?;
         Some(Ok(cached
             .canonical
             .map_or(CanonicalSyntax::Unstable, CanonicalSyntax::Stable)))
@@ -673,7 +715,6 @@ impl PackageStore {
         self.cache.publish(
             &self.normalization_cache_name(source),
             &CachedNormalization {
-                schema: ANALYSIS_SCHEMA.into(),
                 target: self.target_fingerprint.clone(),
                 source: source.to_owned(),
                 canonical: result.stable_form().map(str::to_owned),
@@ -859,6 +900,13 @@ impl PackageResolver for PackageStore {
 }
 
 impl PackageProvider for PackageStore {
+    fn native_source_fingerprint(&self, package: &InstalledPackage) -> Option<Digest> {
+        self.native_summaries
+            .root
+            .as_ref()
+            .filter(|root| root.identity == package.identity)
+            .map(|root| root.source.clone())
+    }
     fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         self.indexes.get_or_compute(&package.identity, || {
             match self.load_cached_index(package) {
@@ -867,14 +915,11 @@ impl PackageProvider for PackageStore {
                     let lane = self.affine_lane(&package.identity);
                     let worker = self.lanes.lane(lane).client()?.package_index(package)?;
                     let index = self.package_index(worker.clone(), package)?;
-                    let cached = CachedIndex {
-                        schema: ANALYSIS_SCHEMA.into(),
-                        target: self.target_fingerprint.clone(),
-                        package_fingerprint: package.identity.image_fingerprint.clone(),
-                        index: worker,
-                    };
-                    self.cache
-                        .publish(&self.index_cache_name(&package.identity), &cached);
+                    self.publish_cached_package(
+                        &self.index_cache_name(&package.identity),
+                        &package.identity,
+                        worker,
+                    );
                     Ok(index)
                 }
             }
@@ -922,9 +967,11 @@ impl PackageProvider for PackageStore {
         );
         self.dispatch.get_or_compute(&key, || {
             let name = self.dispatch_cache_name(package.map(|package| &package.identity), binding);
-            if let Some(cached) = self.cache.read::<CachedDispatch>(&name).filter(|entry| {
-                entry.schema == ANALYSIS_SCHEMA && entry.target == self.target_fingerprint
-            }) {
+            if let Some(cached) = self
+                .cache
+                .read::<CachedDispatch>(&name)
+                .filter(|entry| entry.target == self.target_fingerprint)
+            {
                 return Ok(cached.generics.into_iter().map(GenericName::from).collect());
             }
             let lane = package.map_or(0, |package| self.affine_lane(&package.identity));
@@ -938,7 +985,6 @@ impl PackageProvider for PackageStore {
             self.cache.publish(
                 &name,
                 &CachedDispatch {
-                    schema: ANALYSIS_SCHEMA.into(),
                     target: self.target_fingerprint.clone(),
                     generics: generics.clone(),
                 },

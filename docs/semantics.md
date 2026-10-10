@@ -66,7 +66,7 @@ A Linked DLL is a separate copy that loads next to any real one, and its namespa
 
 ### Native effect summaries
 
-Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema `1` keys each JSON entry by package name, version, and slinker's installed-image fingerprint, so a summary cannot silently transfer to a different native build. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and block the build with `UnknownNativeEffects`.
+Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES` or a library session's `native_summaries` path. Schema `1` distinguishes installed-image audits from Root-source declarations. Installed entries require an exact package name, version, and image fingerprint. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and block the build with `UnknownNativeEffects`. The session validates and freezes the manifest once.
 
 ```json
 {
@@ -74,6 +74,7 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
   "packages": [{
     "package": "fixture",
     "version": "1.0.0",
+    "origin": "installed",
     "image_fingerprint": "<installed-image fingerprint>",
     "components": [{
       "component": "fixture",
@@ -83,6 +84,8 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
   }]
 }
 ```
+
+For a source Root, use `"origin": "root_source"` with `"source_fingerprint"` and a `"target"` object containing `"r_version"`, `"os"`, and `"arch"`; omit `"image_fingerprint"`. The native blocker reports these values, and `SourcePackageSnapshot::fingerprint()` exposes the source key. This declaration asserts the callback contract for every native build of that exact frozen source on that target, including configure-generated code and external build inputs. It is bound to the current invocation's staged Root identity and never applies to an installed Linked dependency. Analysis does not infer native safety from source text. Use an installed-image audit when the contract only holds for one particular build.
 
 ## Unproven behavior
 

@@ -66,13 +66,14 @@ fn check_runs_preflight_and_writes_nothing() {
 fn library_build_uses_a_separate_worker_and_frozen_options() {
     use slinker_core::WorkerExecutable;
     use slinker_core::cache::CacheLocation;
-    use slinker_core::session::{BuildOutcome, SessionOptions, SourceSession};
+    use slinker_core::session::{SessionOptions, SourceSession};
 
     let fixture = tempfile::tempdir().expect("fixture tempdir");
     let source = rootonly_fixture(fixture.path());
     let output = fixture.path().join("generated");
     let r_home = discover_r_home();
     let mut options = SessionOptions {
+        native_summaries: None,
         libraries: Vec::new(),
         external: Vec::new(),
         linked: Vec::new(),
@@ -87,15 +88,9 @@ fn library_build_uses_a_separate_worker_and_frozen_options() {
         .libraries
         .push(fixture.path().join("missing-library"));
     options.worker_executable = WorkerExecutable::Standalone(fixture.path().join("missing-worker"));
-    assert_eq!(
-        prepared.build(&output).expect("library build"),
-        BuildOutcome::Built
-    );
+    prepared.build(&output).expect("library build");
     let prepared = SourceSession::prepare(&source, &original, r_home).expect("second capture");
-    assert_eq!(
-        prepared.build(&output).expect("library rebuild"),
-        BuildOutcome::UpToDate
-    );
+    prepared.build(&output).expect("library rebuild");
     assert!(output.join("R/zzz-slinker-generated.R").is_file());
 }
 
@@ -135,7 +130,7 @@ fn blocked_check_groups_blockers_and_reports_them_as_json() {
 }
 
 #[test]
-fn library_does_not_publish_when_build_record_cannot_be_saved() {
+fn library_rejects_a_concurrently_owned_output() {
     use slinker_core::WorkerExecutable;
     use slinker_core::cache::CacheLocation;
     use slinker_core::session::{SessionOptions, SourceSession};
@@ -145,8 +140,15 @@ fn library_does_not_publish_when_build_record_cannot_be_saved() {
     let output = fixture.path().join("generated");
     let cache = fixture.path().join("cache");
     fs::create_dir(&cache).unwrap();
-    fs::write(cache.join("builds"), "blocks the record directory").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(fixture.path().join(".#generated.slinker-lock"))
+        .unwrap();
+    lock.try_lock().expect("hold publication ownership");
     let options = SessionOptions {
+        native_summaries: None,
         libraries: Vec::new(),
         external: Vec::new(),
         linked: Vec::new(),

@@ -1484,7 +1484,7 @@ fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
     fs::write(
         &summaries,
         format!(
-            r#"{{"schema": 1, "packages": [{{"package": "tinyc", "version": "1.0.0", "image_fingerprint": "{fingerprint}", "components": [{{"component": "tinyc", "safety": "safe"}}]}}]}}"#
+            r#"{{"schema": 1, "packages": [{{"package": "tinyc", "version": "1.0.0", "origin": "installed", "image_fingerprint": "{fingerprint}", "components": [{{"component": "tinyc", "safety": "safe"}}]}}]}}"#
         ),
     )
     .expect("audited native summary: tinyc.c makes no R callbacks");

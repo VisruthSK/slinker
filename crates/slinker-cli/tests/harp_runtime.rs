@@ -9,6 +9,27 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
+fn repeated_worker_startup_is_rejected_without_reinitializing_r() {
+    let r_home = discover_r_home().expect("selected R installation");
+    let mut worker = WorkerProbe::start(&r_home, Vec::new()).expect("worker");
+    let response = worker
+        .exchange(&WorkerRequest::Hello {
+            protocol: PROTOCOL_VERSION,
+            target: TargetSpec {
+                r_home,
+                arch: std::env::consts::ARCH.into(),
+                worker: 2,
+                libraries: Vec::new(),
+            },
+        })
+        .expect("duplicate handshake response");
+    assert!(matches!(response, WorkerResponse::Error { error }
+        if matches!(error.code, slinker_core::worker::protocol::WorkerErrorCode::Protocol)));
+    assert!(worker.parses("1L"));
+    worker.shutdown();
+}
+
+#[test]
 fn worker_library_selection_matches_target_r_semantics() {
     let r_home = discover_r_home().expect("selected R installation");
     let expected_default = target_r_libraries(&r_home);
@@ -286,6 +307,7 @@ impl WorkerProbe {
             .map_err(|error| error.to_string())?;
         self.input.flush().map_err(|error| error.to_string())?;
         let mut line = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             let read = self
                 .output
@@ -296,6 +318,11 @@ impl WorkerProbe {
             }
             if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
                 return Err(format!("worker exited before response: {status}"));
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err("worker response timed out".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

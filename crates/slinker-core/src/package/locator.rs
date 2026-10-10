@@ -1,10 +1,61 @@
+use crate::package::PackageName;
 use crate::package::{Digest, InstalledPackage, PackageIdentity, PackageLocation};
 use crate::profile::{self, Counter, Probe};
 use crate::{Description, Error, Result, TargetEnvironment};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+#[derive(Debug)]
+pub(crate) struct FrozenPackages {
+    locator: PackageLocator,
+    images: Mutex<HashMap<PackageName, Option<InstalledPackage>>>,
+}
+
+impl FrozenPackages {
+    pub(crate) fn new(target: TargetEnvironment) -> Self {
+        Self {
+            locator: PackageLocator::new(target),
+            images: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn target(&self) -> &TargetEnvironment {
+        self.locator.target()
+    }
+
+    pub(crate) fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
+        let mut images = self.images.lock().expect("frozen package registry");
+        if let Some(image) = images.get(name) {
+            return Ok(image.clone());
+        }
+        let image = self.locator.locate(name)?;
+        images.insert(name.into(), image.clone());
+        Ok(image)
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        for (name, expected) in self.images.lock().expect("frozen package registry").iter() {
+            let actual = self.locator.locate(name)?;
+            let unchanged = match (expected, actual) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => {
+                    expected.identity == actual.identity && expected.location == actual.location
+                }
+                _ => false,
+            };
+            if !unchanged {
+                return Err(Error::Analysis(format!(
+                    "selected package image changed during the invocation: {name}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PackageLocator {
@@ -21,6 +72,11 @@ impl PackageLocator {
     }
 
     pub fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
+        if name.is_empty() || name.contains(['/', '\\', ':', '\0']) || matches!(name, "." | "..") {
+            return Err(Error::Analysis(format!(
+                "invalid package path component: {name:?}"
+            )));
+        }
         for candidate_library in &self.target.libraries {
             let candidate_root = candidate_library.join(name);
             let description_path = candidate_root.join("DESCRIPTION");
@@ -81,7 +137,7 @@ pub fn tree_digest(root: &Path) -> Result<Digest> {
 pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
     let _span = profile::span(Probe::PackageFingerprint);
     profile::count(Counter::FingerprintOperations);
-    let mut files = Vec::<(String, PathBuf)>::new();
+    let mut files = Vec::<(String, PathBuf, fs::FileType)>::new();
     let mut pending = vec![root.to_path_buf()];
     let io = |path: &Path| {
         let path = path.to_path_buf();
@@ -92,27 +148,47 @@ pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
             let entry = entry.map_err(io(&directory))?;
             let path = entry.path();
             let file_type = entry.file_type().map_err(io(&path))?;
-            if file_type.is_dir() {
-                pending.push(path);
-            } else if file_type.is_file() {
+            if file_type.is_dir() || file_type.is_file() {
                 let relative = path
                     .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                files.push((relative, path));
+                    .map_err(|error| Error::Analysis(error.to_string()))?
+                    .components()
+                    .map(|component| {
+                        component.as_os_str().to_str().ok_or_else(|| {
+                            Error::Analysis(format!(
+                                "package image path is not UTF-8: {}",
+                                path.display()
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .join("/");
+                if file_type.is_dir() {
+                    pending.push(path.clone());
+                }
+                files.push((relative, path, file_type));
+            } else {
+                return Err(Error::Analysis(format!(
+                    "package image contains an unsupported filesystem entry: {}",
+                    path.display()
+                )));
             }
         }
     }
     files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
-    let mut hash = Sha256::new();
-    hash.update(b"slinker-installed-image-v2\0");
+    let mut image = Fingerprint::new("slinker-installed-image-v1");
     let mut buffer = vec![0u8; 128 * 1024];
-    profile::add(Counter::FingerprintFiles, files.len() as u64);
-    for (relative, path) in &files {
-        hash.update(relative.as_bytes());
-        hash.update([0]);
+    profile::add(
+        Counter::FingerprintFiles,
+        files.iter().filter(|(_, _, kind)| kind.is_file()).count() as u64,
+    );
+    for (relative, path, kind) in &files {
+        if kind.is_dir() {
+            image = image.field("directory").field(relative);
+            continue;
+        }
+        let mut hash = Sha256::new();
         let mut reader = BufReader::new(File::open(path).map_err(io(path))?);
         loop {
             let read = reader.read(&mut buffer).map_err(io(path))?;
@@ -122,9 +198,12 @@ pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
             profile::add(Counter::FingerprintBytes, read as u64);
             hash.update(&buffer[..read]);
         }
-        hash.update([0xff]);
+        image = image
+            .field("file")
+            .field(relative)
+            .field(Digest::finish(hash).as_str());
     }
-    Ok(Digest::finish(hash))
+    Ok(image.finish())
 }
 
 pub struct Fingerprint(Sha256);

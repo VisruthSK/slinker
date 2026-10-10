@@ -88,33 +88,17 @@ exact unproven behavior until a sound rule covers it); `crates/slinker-cli/tests
 replacements and rejects parseable unplanned changes and malformed rewrites). Each item adds its own
 acceptance cases here.
 
+`crates/slinker-cli/tests/source_ownership.rs` covers installation inputs, R exclusions, configure outputs, source-native audits, hook-free inspection, generated paths, and publication failures. `crates/slinker-core/tests/image_identity.rs` guards fingerprint framing. Preserve repeated-startup and thread/cache determinism regressions alongside these cases.
+
 ## Next up
 
 1. Capture the independent failures in `fixes.md` as regressions under `crates/*/tests/`; retain original R as the oracle. Delete unsound helper-body exit inference and unresolved-selector/sole-DLL guesses.
 2. Tracks E/F: unify call/caller facts and settle pending resource/namespace obligations. Close reflective S3 retention, default-resource discovery order, exported lookup, argument/error preservation, and loaded-state contradictions.
-3. Track D: repair source staging, configuration, reuse, and generated-path ownership. Establish the worker's one-time startup and non-executing inspection boundary.
-4. Tracks G/I: share object traversal with structural identities and finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
-5. Track J: lower checked native/load plans and move complete R/NAMESPACE/output validation into preflight. Preserve native linking and installation independence.
-6. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
+3. Tracks G/I: share object traversal with structural identities and finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
+4. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
+5. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
 
 ---
-
-## Track D: Frozen source and output ownership
-
-- Frame installed-image fingerprints so different file trees cannot encode the same hash input. Use typed path/content framing, invalidate dependent identities/caches, and establish a consistent symlink policy for inspection and copying.
-- Validate/freeze native summaries once as an explicit session input before any reuse decision. Bind Root native audits to the same staged invocation; keep exact image matching for installed Linked dependencies.
-- Stage the Root before downstream reuse. Remove the pre-staging whole-build shortcut and its JSON build-record/reporting machinery unless a complete installation-input contract justifies retaining them. Ordinary typed inspection caching remains.
-- Delegate source exclusion semantics to target R's tools. Rust owns snapshot/copying; it must not implement a competing PCRE/default-exclusion language.
-- Treat configure outputs and install/build exclusions as build inputs, not inert copied resources. Prevent later installation from rewriting the checked R, NAMESPACE, or DESCRIPTION; preserve supported configured native builds.
-- Check ownership of every generated path, including `inst/slinker`, before granting a buildable capability. Validate direct source installation and `R CMD build` followed by tarball installation.
-- One session service owns worker configuration/epochs. Reject repeated startup before touching Harp/libr. Resolve lazy foreign namespace references through registered inspection images without running package hooks. Keep mutated payload-preparation images isolated from observation epochs.
-
-Done when:
-- the one-file/two-file digest reproducer in `fixes.md` produces distinct identities, and changed images cannot reuse artifacts from the old fingerprint format;
-- changing an install-time dependency, invalid native-summary input, or relevant source/configuration input cannot reuse a stale successful output;
-- source/configure/exclusion/resource-collision regressions either preserve original behavior or block before publication;
-- inspection executes no package `.onLoad`; duplicate handshake requests return a protocol error without a second initialization or hang;
-- publication preserves the prior complete output on ordinary failure, and unsupported same-output concurrency is mechanically rejected or supported by one publication owner.
 
 ## Track E: Resolved calls and settled observations
 
@@ -196,13 +180,13 @@ Record allocation measurements separately; a correctness and ownership improveme
 
 ## Track J: Checked construction with one restoration path
 
-- Lower native observations into checked Root-build and Linked-load operations. Preserve registration interface, R call form including `.External2`, forced-symbol behavior, argument validation, exact binding maps, callback obligations, and the declared installed native resource tree.
+- Lower native observations into checked Root and Linked load operations. Preserve registration interface, R call form including `.External2`, forced-symbol behavior, argument validation, exact binding maps, callback obligations, and the declared installed native resource tree.
 - Flatten the redundant value/closure/environment construction tables. Namespace parent chains belong to namespace construction; binding initialization directly describes its source/bundle, lifecycle/native operation, or External access. Keep typed code occurrences, relocations, imports, and bundle identities.
 - Evaluate uniform retained-function/value bundles. Preserve untouched installed formals/body/attributes and sharing; verify any actual edited closure sites and reject unsupported aliases/patch homes. Do not assume `body<-` or deparse/reparse preserves metadata.
 - Establish original activation boundaries before using uniform restoration. Root exports/S3 methods and hooks must become available at the correct stage; the original `.onLoad` must replace the bootstrap before recursive invocation. Restore the absent-hook state when appropriate. Preserve supported Root `.onAttach` behavior and the accepted shared-S3-registry exception.
 - Evaluate object-based relocations carrying established namespace references in target-R language objects to remove persistent named Root support state. Preserve original function enclosures, untouched subtrees/attributes, aliases, and private namespace restoration. A real-namespace serialization control is not proof of this migration.
 - When the unified path passes its oracle, delete source/payload classification, ordinary function assignment emission, per-closure `eval(parse(...))`, `.slinker_original_on_load`, obsolete Root load splits, and replaced tables/APIs in the same change.
-- Preflight renders and validates complete R/NAMESPACE/metadata/output paths and freezes physical artifacts. Remove writer access to workers, installed-package locations, inspection records, and the unused generic profile parameter. Only `PureRStatic::check` grants the buildable value.
+- Remove remaining inspection/safety records from execution IR; native load plans must expose only checked operations. Keep metadata and output-layout validation in preflight, with `PureRStatic::check` as the sole buildable constructor.
 
 Done when:
 - direct source and built-tarball installations match the original across defaults, attributes, operators, sharing/cycles, payload patches, imports, hooks, S3, native calls/resources, and all relevant dependency load states;

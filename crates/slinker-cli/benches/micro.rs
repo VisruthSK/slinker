@@ -69,11 +69,10 @@ fn installed_package(target: &TargetEnvironment) -> InstalledPackage {
 }
 
 fn installed_images(criterion: &mut Criterion) {
-    let (r_home, target) = installed_target();
+    let (_, target) = installed_target();
     let package = installed_package(&target);
     let warm = tempfile::tempdir().expect("warm cache directory");
     PackageStore::new(
-        r_home.clone(),
         target.clone(),
         CacheLocation::Directory(warm.path().to_path_buf()),
     )
@@ -87,7 +86,7 @@ fn installed_images(criterion: &mut Criterion) {
     });
     group.bench_function("index_read_rlang_uncached", |bench| {
         bench.iter(|| {
-            PackageStore::new(r_home.clone(), target.clone(), CacheLocation::Disabled)
+            PackageStore::new(target.clone(), CacheLocation::Disabled)
                 .and_then(|store| store.index(&package))
                 .expect("read the installed index through the worker")
         });
@@ -95,7 +94,6 @@ fn installed_images(criterion: &mut Criterion) {
     group.bench_function("index_cache_hit_rlang", |bench| {
         bench.iter(|| {
             PackageStore::new(
-                r_home.clone(),
                 target.clone(),
                 CacheLocation::Directory(warm.path().to_path_buf()),
             )

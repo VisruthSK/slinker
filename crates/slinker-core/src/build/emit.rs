@@ -1,4 +1,4 @@
-use super::MaterializeError;
+use super::BuildContextError;
 use super::relocated::RelocatedCode;
 use crate::ir::{
     BindingId, BindingName, ClosureId, ExternalBindingAccess, GenericHome, ImportSlotIr,
@@ -53,7 +53,7 @@ macro_rules! emit {
 pub(super) fn generate_r_source(
     program: &ProgramIr,
     code: &RelocatedCode,
-) -> Result<String, MaterializeError> {
+) -> Result<String, BuildContextError> {
     let mut out = String::new();
     out.push_str(&format!("{ROOT_RUNTIME_BINDING} <- base::new.env(parent = base::baseenv())\nbase::local(envir = {ROOT_RUNTIME_BINDING}, {{\n"));
     out.push_str(GENERATED_RUNTIME);
@@ -79,7 +79,7 @@ pub(super) fn generate_r_source(
 fn root_closures_source(
     program: &ProgramIr,
     code: &RelocatedCode,
-) -> Result<String, MaterializeError> {
+) -> Result<String, BuildContextError> {
     let root_on_load = program.root_artifact().on_load;
     let mut source = String::new();
     for closure in namespace_closures(program, program.root_namespace()) {
@@ -90,7 +90,7 @@ fn root_closures_source(
                 .code(code_id)
                 .assigned_value_start()
                 .ok_or_else(|| {
-                    MaterializeError::InvalidR("Root .onLoad code is not an assignment".into())
+                    BuildContextError::InvalidCode("Root .onLoad code is not an assignment".into())
                 })?;
             source.push_str(ROOT_ON_LOAD_BINDING);
             source.push_str(" <- ");

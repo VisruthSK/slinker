@@ -6,9 +6,13 @@
 - `slinker-r-worker`: the Harp/libr inspection worker. It depends on `slinker-core` for the protocol and installed-image types.
 - `slinker-cli`: argument parsing and presentation. It consumes the core session API and hosts the worker through the hidden `__r-worker` subcommand. Other library consumers select a separate slinker executable with `WorkerExecutable::Standalone`.
 
-`SessionOptions` freezes library order, package selections, thread count, cache location, and worker executable when a session opens. `SourceSession::check` runs analysis and preflight; `PreparedSource::build` also validates incremental reuse and publishes the result. Construction capabilities and materialization contexts are internal, so callers cannot combine an IR from one session with source files or a target from another. A pending generated package owns its temporary directory until the build record is saved and publication succeeds.
+`SessionOptions` freezes library order, package selections, thread count, cache location, worker executable, and native-summary input when a session opens. Native summaries are read and validated once. `SourceSession::check` runs analysis and preflight; `PreparedSource::build` always restages and publishes the result under an exclusive output lease. Construction capabilities and materialization contexts are internal. Preflight owns generated R/NAMESPACE validation and frozen output resources; the materializer receives no source configuration or worker. A pending generated package owns its temporary directory and output lease until publication succeeds.
+
+One session worker service owns the frozen package-image registry and inspection lanes. The capture worker selects the staged Root library before any inspection and then freezes configuration. Serialized foreign namespace references request registered images rather than running package hooks. Payload preparation uses a separate worker type that cannot return its mutated images to inspection. Embedded R startup is a one-time server transition; initialization failures retire the process.
 
 Unit tests live under each crate's `tests/unit/` directory and are included as private test modules. Integration tests exercise the public library and CLI without exposing implementation details for testing.
+
+Slinker's schemas, worker protocol, and fingerprint formats remain at version 1 until the first release.
 
 ## Target R
 
@@ -36,18 +40,7 @@ Branch conditions stay as Air expressions in the syntax census. Namespace availa
 
 ## Cache
 
-Disposable typed artifacts use schema `slinker-analysis-v20` and a SQLite database per schema directory. Keys include the installed image and target R. Reads verify the serialized bytes against their SHA-256 digest before decoding them. Corrupt entries or an unavailable database are cache misses. SQLite owns indexing and atomic publication; each invocation commits its artifact transaction when the cache closes. WAL permits readers alongside a writer. Serialization and deserialization run outside the connection lock. Installed-package fingerprints hash files in parallel. `slinker cache` inspects and clears artifacts; validated build records remain under `builds/`.
-
-At the cache migration checkpoint, the storage comparison used the same release analyzer, R 4.6.1, one analysis thread, three sequential cold/warm samples per package, and identical JSON output in every sample. These timings precede the subsequent predicate and private-environment corrections. Median milliseconds:
-
-| package | phase | pack | SQLite |
-|---|---|---:|---:|
-| rlang | cold | 1872 | 2135 |
-| rlang | warm | 1190 | 1361 |
-| testthat | cold | 3261 | 3677 |
-| testthat | warm | 1706 | 1947 |
-
-SQLite trades roughly 13 to 14 percent analysis time in this measurement for removal of the pack reader, writer thread, footer format, compaction, and pack deletion machinery. `cargo bench --bench cache` separately measures publication, opening, readback, and deletion with independent checks of all stored values.
+Disposable typed artifacts use schema `slinker-analysis-v1` and a SQLite database per schema directory. Keys include the installed image and target R. Reads verify the serialized bytes against their SHA-256 digest before decoding them. Corrupt entries or an unavailable database are cache misses. SQLite owns indexing and atomic publication; each invocation commits its artifact transaction when the cache closes. WAL permits readers alongside a writer. Serialization and deserialization run outside the connection lock. Installed-package fingerprints frame entry kinds, relative paths, and content digests, including empty directories; unsupported filesystem entries are rejected. `slinker cache` inspects and clears these artifacts.
 
 ## Benchmarks
 

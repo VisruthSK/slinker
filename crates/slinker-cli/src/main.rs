@@ -23,7 +23,7 @@ static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
 
 mod cache_command;
 mod roles;
-use slinker_core::session::{BuildOutcome, RootSpec, Session, SessionOptions, SourceSession};
+use slinker_core::session::{RootSpec, Session, SessionOptions, SourceSession};
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
@@ -104,6 +104,7 @@ struct UniverseArgs {
 impl UniverseArgs {
     fn options(&self) -> SessionOptions {
         SessionOptions {
+            native_summaries: std::env::var_os("SLINKER_NATIVE_SUMMARIES").map(PathBuf::from),
             libraries: self.libraries.clone(),
             external: self.external.clone(),
             linked: self.linked.clone(),
@@ -150,7 +151,7 @@ struct BuildArgs {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Generated source package directory [default: PATH/target/slinker/<Package>]"
+        help = "Generated source package directory [default: <Package>-slinked beside the source]"
     )]
     output: Option<PathBuf>,
     #[command(flatten)]
@@ -344,34 +345,24 @@ fn build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
         prepared
             .snapshot()
             .original_root()
-            .join("target")
-            .join("slinker")
-            .join(&package)
+            .with_file_name(format!("{package}-slinked"))
     });
     let output = std::path::absolute(&output)?;
-    let result = prepared.build(&output)?;
-    print_built(args.json.format(), &package, &output, result);
+    prepared.build(&output)?;
+    print_built(args.json.format(), &package, &output);
     Ok(())
 }
 
-fn print_built(
-    format: OutputFormat,
-    package: &str,
-    output: &std::path::Path,
-    outcome: BuildOutcome,
-) {
+fn print_built(format: OutputFormat, package: &str, output: &std::path::Path) {
     if format == OutputFormat::Json {
         let rendered = json!({
-            "status": outcome.status(),
+            "status": "built",
             "package": package,
             "output": output,
         });
         println!("{rendered:#}");
     } else {
         println!("{}", output.display());
-        if outcome == BuildOutcome::UpToDate {
-            eprintln!("up to date");
-        }
     }
 }
 

@@ -3,18 +3,18 @@ mod cache_report;
 mod identity;
 mod image;
 mod index;
-mod inspection;
+pub(crate) mod inspection;
 mod intern;
 mod locator;
 mod names;
 mod resource;
-mod store;
+pub(crate) mod store;
 mod universe;
 
 pub use cache_names::EntryKind;
 pub use cache_report::{
-    BuildCacheReport, CacheReport, ClearOutcome, ClearScope, KindTotals, PackageCacheReport,
-    SchemaCacheReport, clear_cache, inspect_cache,
+    CacheReport, ClearOutcome, ClearScope, KindTotals, PackageCacheReport, SchemaCacheReport,
+    clear_cache, inspect_cache,
 };
 pub use identity::{
     Digest, InstalledPackage, PackageId, PackageIdentity, PackageLocation, PackageRole,
@@ -30,9 +30,10 @@ pub use index::{
     NativeRegistration, NativeRoutineSummary, NativeRoutines, NativeSafety, NativeSymbolBinding,
     PackageData, PackageIndex, S3Registration,
 };
+pub(crate) use locator::FrozenPackages;
 pub use locator::PackageLocator;
+pub(crate) use locator::fingerprint_image;
 pub use locator::{Fingerprint, tree_digest};
-pub(crate) use locator::{fingerprint_image, fingerprint_strings};
 pub use resource::{InvalidResourcePath, ResourcePath};
 pub use store::{
     CanonicalSyntax, DispatchSubject, Normalization, PackageProvider, PackageResolver,

@@ -104,9 +104,6 @@ fn summarize(report: &CacheReport) -> String {
             schema.packages.len()
         );
     }
-    if !report.builds.is_empty() {
-        let _ = writeln!(out, "  recorded builds: {}", report.builds.len());
-    }
     out.push_str("run `slinker cache list` for packages, `slinker cache --json` for everything\n");
     out
 }
@@ -184,19 +181,6 @@ fn render(report: &CacheReport, full: bool) -> String {
     for schema in &report.schemas {
         out.push('\n');
         render_schema(&mut out, schema, full);
-    }
-    if !report.builds.is_empty() {
-        out.push_str("\nrecorded builds (skipped while their inputs are unchanged):\n");
-        for build in &report.builds {
-            let _ = writeln!(
-                out,
-                "  {} -> {} ({} packages consulted, inputs {})",
-                build.package,
-                build.output.display(),
-                build.consulted_packages,
-                shortened(&build.inputs, full)
-            );
-        }
     }
     out
 }

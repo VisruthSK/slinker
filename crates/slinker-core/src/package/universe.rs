@@ -194,6 +194,10 @@ impl<P: PackageResolver> TargetUniverse<P> {
 }
 
 impl<P: PackageProvider> TargetUniverse<P> {
+    pub fn native_source_fingerprint(&self, id: PackageId) -> Option<super::Digest> {
+        self.store
+            .native_source_fingerprint(&self.entry(id).package)
+    }
     pub fn index(&self, id: PackageId) -> Result<Arc<PackageIndex>> {
         self.store.index(&self.entry(id).package)
     }

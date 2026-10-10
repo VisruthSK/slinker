@@ -277,9 +277,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
             match &native.safety {
                 NativeSafety::Unanalyzed => {
                     let identity = self.packages.identity(id);
+                    let audit = match self.packages.native_source_fingerprint(id) {
+                        Some(source) => {
+                            let target = &self.packages.target_environment().target;
+                            format!(
+                                "source_fingerprint `{source}` target R `{}` OS `{}` arch `{}`",
+                                target.r_version, target.os, target.arch
+                            )
+                        }
+                        None => format!("image `{}`", identity.image_fingerprint),
+                    };
                     let message = format!(
-                        "native component `{component}` has unanalyzed C-to-R callbacks; an audited SLINKER_NATIVE_SUMMARIES entry for package `{}` version `{}` image `{}` makes it analyzable",
-                        identity.name, identity.version, identity.image_fingerprint
+                        "native component `{component}` has unanalyzed C-to-R callbacks; an audited SLINKER_NATIVE_SUMMARIES entry for package `{}` version `{}` {audit} makes it analyzable",
+                        identity.name, identity.version
                     );
                     self.diagnostic(
                         node,

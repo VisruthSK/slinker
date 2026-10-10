@@ -33,7 +33,6 @@ fn threads() -> usize {
 }
 
 fn analyze(
-    r_home: &Path,
     target: &TargetEnvironment,
     root: &str,
     cache: CacheLocation,
@@ -41,7 +40,7 @@ fn analyze(
     #[cfg(feature = "profile")]
     slinker_core::profile::heap::begin_measurement();
     let start = Instant::now();
-    let plan = PackageStore::new(r_home.to_path_buf(), target.clone(), cache)
+    let plan = PackageStore::new(target.clone(), cache)
         .and_then(|store| Linker::new(store, threads()).analyze(root))
         .unwrap_or_else(|error| panic!("analyze {root}: {error}"));
     let elapsed = start.elapsed();
@@ -76,13 +75,13 @@ fn analyze_installed(r_home: &Path) {
         .capture()
         .expect("capture the target R library universe");
     for root in ANALYZED {
-        let (elapsed, plan, heap) = analyze(r_home, &target, root, CacheLocation::Disabled);
+        let (elapsed, plan, heap) = analyze(&target, root, CacheLocation::Disabled);
         report_analysis(&format!("analyze {root} cold"), elapsed, &plan, &heap);
 
         let warm = tempfile::tempdir().expect("warm cache directory");
         let directory = || CacheLocation::Directory(warm.path().to_path_buf());
-        analyze(r_home, &target, root, directory());
-        let (elapsed, plan, heap) = analyze(r_home, &target, root, directory());
+        analyze(&target, root, directory());
+        let (elapsed, plan, heap) = analyze(&target, root, directory());
         report_analysis(&format!("analyze {root} warm"), elapsed, &plan, &heap);
     }
 }
