@@ -263,14 +263,19 @@ impl WorkerProbe {
             .create_new(true)
             .open(&protocol_path)
             .map_err(|error| error.to_string())?;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_slinker"));
+        command
             .arg("__r-worker")
             .arg(&protocol_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| error.to_string())?;
+            .stderr(Stdio::null());
+        #[cfg(all(unix, not(target_os = "macos")))]
+        command.env(
+            "LD_LIBRARY_PATH",
+            slinker_core::worker::target_library_path(r_home).map_err(|error| error.to_string())?,
+        );
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
         let input = child.stdin.take().ok_or("worker stdin")?;
         let mut probe = Self {
             child,
