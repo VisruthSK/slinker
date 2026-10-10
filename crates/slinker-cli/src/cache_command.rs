@@ -87,7 +87,7 @@ fn summarize(report: &CacheReport) -> String {
 ",
         ),
     }
-    let total: u64 = report.schemas.iter().map(|schema| schema.pack_bytes).sum();
+    let total: u64 = report.schemas.iter().map(|schema| schema.bytes).sum();
     let _ = writeln!(out, "size:  {}", size(total));
     for schema in &report.schemas {
         let state = if schema.current {
@@ -99,13 +99,10 @@ fn summarize(report: &CacheReport) -> String {
             out,
             "  {} ({state}): {}, {} entries, {} packages",
             schema.schema,
-            size(schema.pack_bytes),
+            size(schema.bytes),
             schema.entries,
             schema.packages.len()
         );
-    }
-    if !report.builds.is_empty() {
-        let _ = writeln!(out, "  recorded builds: {}", report.builds.len());
     }
     out.push_str("run `slinker cache list` for packages, `slinker cache --json` for everything\n");
     out
@@ -185,19 +182,6 @@ fn render(report: &CacheReport, full: bool) -> String {
         out.push('\n');
         render_schema(&mut out, schema, full);
     }
-    if !report.builds.is_empty() {
-        out.push_str("\nrecorded builds (skipped while their inputs are unchanged):\n");
-        for build in &report.builds {
-            let _ = writeln!(
-                out,
-                "  {} -> {} ({} packages consulted, inputs {})",
-                build.package,
-                build.output.display(),
-                build.consulted_packages,
-                shortened(&build.inputs, full)
-            );
-        }
-    }
     out
 }
 
@@ -210,10 +194,10 @@ fn render_schema(out: &mut String, schema: &SchemaCacheReport, full: bool) {
     };
     let _ = writeln!(
         out,
-        "{} ({state}): {} in {} pack(s), {} entries",
+        "{} ({state}): {} in {} database file(s), {} entries",
         schema.schema,
-        size(schema.pack_bytes),
-        schema.packs,
+        size(schema.bytes),
+        schema.files,
         schema.entries
     );
     let kinds = EntryKind::ALL

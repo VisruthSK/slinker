@@ -54,7 +54,7 @@ These block: a data set named by anything but a bare name or string (`list = nm`
 
 ## Lifecycle
 
-The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then calls the Root's original `.onLoad`. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
+The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then restores and calls the Root's original `.onLoad`. A recursive call to the hook reaches that original function and does not repeat bootstrap. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
 
 ## Native packages
 
@@ -66,7 +66,7 @@ A Linked DLL is a separate copy that loads next to any real one, and its namespa
 
 ### Native effect summaries
 
-Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema `1` keys each JSON entry by package name, version, and slinker's installed-image fingerprint, so a summary cannot silently transfer to a different native build. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and block the build with `UnknownNativeEffects`.
+Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES` or a library session's `native_summaries` path. Schema `1` distinguishes installed-image audits from Root-source declarations. Installed entries require an exact package name, version, and image fingerprint. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and block the build with `UnknownNativeEffects`. The session validates and freezes the manifest once.
 
 ```json
 {
@@ -74,6 +74,7 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
   "packages": [{
     "package": "fixture",
     "version": "1.0.0",
+    "origin": "installed",
     "image_fingerprint": "<installed-image fingerprint>",
     "components": [{
       "component": "fixture",
@@ -84,7 +85,19 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
 }
 ```
 
+For a source Root, use `"origin": "root_source"` with `"source_fingerprint"` and a `"target"` object containing `"r_version"`, `"os"`, and `"arch"`; omit `"image_fingerprint"`. The native blocker reports these values, and `SourcePackageSnapshot::fingerprint()` exposes the source key. This declaration asserts the callback contract for every native build of that exact frozen source on that target, including configure-generated code and external build inputs. It is bound to the current invocation's staged Root identity and never applies to an installed Linked dependency. Analysis does not infer native safety from source text. Use an installed-image audit when the contract only holds for one particular build.
+
 ## Unproven behavior
+
+Computed `do.call` and `match.fun` targets require a proven local closure or a declared callable/string domain. Passing a string through local assignments, helper calls, recursion, or string operations does not establish its target. Computed namespace names also require explicit declarations; analysis does not execute helpers to infer them. Runtime `environment<-`, `list2env`, and `reg.finalizer` operations block because this static profile does not establish their construction or callback effects.
+
+Closure attributes are retained through serialized payloads. A namespace-enclosed closure with attributes is never regenerated from its body alone. The Root's `.onLoad` still requires relocatable source; an attributed hook blocks. Root names defined, imported, or declared by lifecycle code as `.slinker_runtime` or `.slinker_original_on_load` block before publication because those names belong to generated support.
+
+Repeated predicates do not establish binding or assignment. S3 dispatch can change a comparison result, and a called function can mutate a guard binding through its evaluation environment. Analysis retains the possible namespace fallback instead of correlating conditions or inferring exhaustiveness from membership tests.
+
+Linked resource selectors must stay relative to their owning package. Absolute paths, parent-directory components, and NUL bytes fail analysis with `UnsupportedResourcePath`. The checked `ResourcePath` type also validates serialized selectors before the provider or IR can use them.
+
+Linked `system.file()` calls require literal unnamed path components and an omitted or literal logical `mustWork`. An explicit `lib.loc`, other named arguments, duplicate arguments, or computed path or `mustWork` arguments block analysis: replacing those calls could discard evaluation or change their library lookup. A proven absent resource with `mustWork = FALSE` (including the default) becomes the empty string in the IR, so a later real installation cannot change its result. An absent resource with `mustWork = TRUE` blocks analysis.
 
 Anything slinker cannot prove blocks the build; there is no mode that accepts a heuristic instead. In particular these block:
 

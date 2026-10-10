@@ -1,14 +1,11 @@
+use crate::package::Digest;
 use crate::{Error, Result};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheLocation {
@@ -17,394 +14,138 @@ pub enum CacheLocation {
     Disabled,
 }
 
-type WriteJob = Box<dyn FnOnce() + Send>;
-
-#[derive(Debug, Default)]
-struct Writer {
-    sender: Mutex<Option<mpsc::Sender<WriteJob>>>,
-    handles: Mutex<Vec<thread::JoinHandle<()>>>,
-}
-
-impl Writer {
-    fn submit(&self, job: WriteJob) {
-        let mut sender = self.sender.lock().expect("cache writer");
-        let channel = sender.get_or_insert_with(|| {
-            let (channel, jobs) = mpsc::channel::<WriteJob>();
-            *self.handles.lock().expect("cache writer handles") =
-                vec![thread::spawn(move || jobs.iter().for_each(|job| job()))];
-            channel
-        });
-        let _ = channel.send(job);
-    }
-
-    fn finish(&self) {
-        self.sender.lock().expect("cache writer").take();
-        for handle in self.handles.lock().expect("cache writer handles").drain(..) {
-            let _ = handle.join();
-        }
-    }
-}
-
-const PACK_MAGIC: &[u8; 6] = b"SLKP2\n";
-const TRAILER_MAGIC: &[u8; 4] = b"SLKE";
-const TRAILER_LENGTH: u64 = 16;
-const PACK_EXTENSION: &str = "pack";
-const COMPACTION_THRESHOLD: usize = 8;
-
-#[derive(Debug)]
-struct Entry {
-    pack: usize,
-    start: u64,
-    length: usize,
-}
-
-#[derive(Debug, Default)]
-struct Loaded {
-    packs: Vec<Mutex<fs::File>>,
-    entries: HashMap<String, Entry>,
-    files: Vec<PathBuf>,
-}
-
-impl Loaded {
-    fn open(directory: &Path) -> Self {
-        let mut loaded = Self::default();
-        let Ok(listing) = fs::read_dir(directory) else {
-            return loaded;
-        };
-        let mut files = listing
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|value| value == PACK_EXTENSION)
-            })
-            .collect::<Vec<_>>();
-        files.sort();
-        for file in files {
-            loaded.add_pack(&file);
-            loaded.files.push(file);
-        }
-        loaded
-    }
-
-    fn add_pack(&mut self, path: &Path) {
-        let Ok(file) = fs::File::open(path) else {
-            return;
-        };
-        let Some(entries) = Self::scan(&file) else {
-            return;
-        };
-        let pack = self.packs.len();
-        for (name, start, length) in entries {
-            self.entries.entry(name).or_insert(Entry {
-                pack,
-                start,
-                length,
-            });
-        }
-        self.packs.push(Mutex::new(file));
-    }
-
-    fn scan(file: &fs::File) -> Option<Vec<(String, u64, usize)>> {
-        let mut file = file;
-        let size = file.metadata().ok()?.len();
-        if size < PACK_MAGIC.len() as u64 + TRAILER_LENGTH {
-            return None;
-        }
-        let mut magic = [0u8; PACK_MAGIC.len()];
-        file.seek(SeekFrom::Start(0)).ok()?;
-        file.read_exact(&mut magic).ok()?;
-        let mut trailer = [0u8; TRAILER_LENGTH as usize];
-        file.seek(SeekFrom::Start(size - TRAILER_LENGTH)).ok()?;
-        file.read_exact(&mut trailer).ok()?;
-        let footer_start = u64::from_le_bytes(trailer[..8].try_into().ok()?);
-        let count = u32::from_le_bytes(trailer[8..12].try_into().ok()?);
-        let footer_end = size - TRAILER_LENGTH;
-        if &magic != PACK_MAGIC
-            || &trailer[12..] != TRAILER_MAGIC
-            || footer_start < PACK_MAGIC.len() as u64
-            || footer_start > footer_end
-        {
-            return None;
-        }
-        let mut footer = vec![0u8; usize::try_from(footer_end - footer_start).ok()?];
-        file.seek(SeekFrom::Start(footer_start)).ok()?;
-        file.read_exact(&mut footer).ok()?;
-        let mut entries = Vec::with_capacity(usize::try_from(count).ok()?);
-        let mut rest = footer.as_slice();
-        for _ in 0..count {
-            let name_length =
-                usize::try_from(u32::from_le_bytes(take(&mut rest, 4)?.try_into().ok()?)).ok()?;
-            let name = String::from_utf8(take(&mut rest, name_length)?.to_vec()).ok();
-            let start = u64::from_le_bytes(take(&mut rest, 8)?.try_into().ok()?);
-            let length = u32::from_le_bytes(take(&mut rest, 4)?.try_into().ok()?);
-            if start < PACK_MAGIC.len() as u64 || start + u64::from(length) > footer_start {
-                return None;
-            }
-            if let Some(name) = name {
-                entries.push((name, start, usize::try_from(length).ok()?));
-            }
-        }
-        Some(entries)
-    }
-
-    fn get(&self, name: &str) -> Option<Vec<u8>> {
-        let entry = self.entries.get(name)?;
-        let mut file = self.packs.get(entry.pack)?.lock().ok()?;
-        file.seek(SeekFrom::Start(entry.start)).ok()?;
-        let mut data = vec![0u8; entry.length];
-        file.read_exact(&mut data).ok()?;
-        Some(data)
-    }
-}
-
-fn take<'a>(bytes: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
-    let (head, tail) = bytes.split_at_checked(length)?;
-    *bytes = tail;
-    Some(head)
-}
-
-fn write_pack<N: AsRef<str>, D: AsRef<[u8]>>(
-    writer: &mut impl Write,
-    entries: impl Iterator<Item = (N, D)>,
-) -> io::Result<()> {
-    let too_large = |what| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cache {what} too large"),
-        )
-    };
-    writer.write_all(PACK_MAGIC)?;
-    let mut at = PACK_MAGIC.len() as u64;
-    let mut footer = Vec::new();
-    let mut count = 0u32;
-    for (name, data) in entries {
-        let (name, data) = (name.as_ref().as_bytes(), data.as_ref());
-        let name_length = u32::try_from(name.len()).map_err(|_| too_large("entry name"))?;
-        let data_length = u32::try_from(data.len()).map_err(|_| too_large("entry"))?;
-        writer.write_all(data)?;
-        footer.extend_from_slice(&name_length.to_le_bytes());
-        footer.extend_from_slice(name);
-        footer.extend_from_slice(&at.to_le_bytes());
-        footer.extend_from_slice(&data_length.to_le_bytes());
-        at += u64::from(data_length);
-        count += 1;
-    }
-    writer.write_all(&footer)?;
-    writer.write_all(&at.to_le_bytes())?;
-    writer.write_all(&count.to_le_bytes())?;
-    writer.write_all(TRAILER_MAGIC)
-}
-
-#[derive(Debug)]
-struct Shared {
-    directory: Option<PathBuf>,
-    loaded: Loaded,
-    pending: Mutex<BTreeMap<String, Vec<u8>>>,
-}
-
 #[derive(Debug)]
 pub struct Cache {
-    shared: Arc<Shared>,
-    writer: Writer,
+    database: Option<Mutex<Connection>>,
 }
 
 impl Cache {
     pub fn new(location: CacheLocation, schema: &str) -> Result<Self> {
         let (root, explicit) = match location {
-            CacheLocation::Disabled => return Ok(Self::at(None)),
+            CacheLocation::Disabled => return Ok(Self { database: None }),
             CacheLocation::Directory(root) => (root, true),
             CacheLocation::Default => (default_root(), false),
         };
-        let analysis = root.join("analysis").join(schema);
-        if let Err(source) = fs::create_dir_all(&analysis) {
+        let mut directory = root.join("analysis").join(schema);
+        if let Err(source) = fs::create_dir_all(&directory) {
             if explicit {
                 return Err(Error::Io {
-                    path: analysis,
+                    path: directory,
                     source,
                 });
             }
-            let fallback = std::env::temp_dir()
+            directory = std::env::temp_dir()
                 .join(format!("slinker-cache-{}", std::process::id()))
                 .join("analysis")
                 .join(schema);
-            fs::create_dir_all(&fallback).map_err(|source| Error::Io {
-                path: fallback.clone(),
+            fs::create_dir_all(&directory).map_err(|source| Error::Io {
+                path: directory.clone(),
                 source,
             })?;
-            return Ok(Self::at(Some(fallback)));
         }
-        Ok(Self::at(Some(analysis)))
-    }
-
-    fn at(directory: Option<PathBuf>) -> Self {
-        let loaded = directory.as_deref().map(Loaded::open).unwrap_or_default();
-        Self {
-            shared: Arc::new(Shared {
-                directory,
-                loaded,
-                pending: Mutex::new(BTreeMap::new()),
-            }),
-            writer: Writer::default(),
-        }
+        // These artifacts are disposable. A damaged or unavailable database is a cache miss.
+        let database = Connection::open(directory.join("cache.sqlite")).and_then(|database| {
+            database.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS entries (name TEXT PRIMARY KEY, bytes BLOB NOT NULL, digest TEXT NOT NULL) WITHOUT ROWID; BEGIN DEFERRED;")?;
+            Ok(Mutex::new(database))
+        }).ok();
+        Ok(Self { database })
     }
 
     pub fn read<T: DeserializeOwned>(&self, name: &str) -> Option<T> {
-        self.shared.directory.as_ref()?;
-        if let Some(bytes) = self.shared.pending.lock().expect("cache pending").get(name) {
-            return serde_json::from_slice(bytes).ok();
+        let database = self.database.as_ref()?.lock().ok()?;
+        let (bytes, digest): (Vec<u8>, String) = database
+            .prepare_cached("SELECT bytes, digest FROM entries WHERE name=?1")
+            .ok()?
+            .query_row([name], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+            .ok()??;
+        drop(database);
+        if Digest::of(&bytes).as_str() != digest {
+            return None;
         }
-        serde_json::from_slice(&self.shared.loaded.get(name)?).ok()
+        serde_json::from_slice(&bytes).ok()
     }
 
     #[must_use]
     pub fn entries(&self) -> Vec<(String, usize)> {
-        let mut entries = self
-            .shared
-            .loaded
-            .entries
-            .iter()
-            .map(|(name, entry)| (name.clone(), entry.length))
-            .collect::<Vec<_>>();
-        entries.sort();
-        entries
+        let Some(database) = self
+            .database
+            .as_ref()
+            .and_then(|database| database.lock().ok())
+        else {
+            return Vec::new();
+        };
+        let Ok(mut statement) =
+            database.prepare_cached("SELECT name, length(bytes) FROM entries ORDER BY name")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|row| {
+            let (name, length) = row.ok()?;
+            Some((name, usize::try_from(length).ok()?))
+        })
+        .collect()
     }
 
     pub fn remove_where(&self, remove: impl Fn(&str) -> bool) -> Result<usize> {
-        let Some(directory) = &self.shared.directory else {
+        let names = self
+            .entries()
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| remove(name))
+            .collect::<Vec<_>>();
+        let Some(database) = self.database.as_ref() else {
             return Ok(0);
         };
-        let loaded = &self.shared.loaded;
-        let kept = loaded
-            .entries
-            .keys()
-            .filter(|name| !remove(name))
-            .collect::<BTreeSet<_>>();
-        let removed = loaded.entries.len() - kept.len();
-        if removed == 0 {
-            return Ok(0);
-        }
-        if !kept.is_empty() {
-            let stem = format!("{}-retained", std::process::id());
-            let temporary = directory.join(format!("{stem}.tmp"));
-            let published = directory.join(format!("{stem}.{PACK_EXTENSION}"));
-            let rewrite = fs::File::create(&temporary)
-                .map(BufWriter::new)
-                .and_then(|mut file| {
-                    write_pack(
-                        &mut file,
-                        kept.iter()
-                            .filter_map(|name| Some((name.as_str(), loaded.get(name)?))),
-                    )?;
-                    file.flush()
-                });
-            rewrite.map_err(|source| Error::Io {
-                path: temporary.clone(),
-                source,
-            })?;
-            fs::rename(&temporary, &published).map_err(|source| Error::Io {
-                path: published,
-                source,
-            })?;
-        }
-        for file in &loaded.files {
-            fs::remove_file(file).map_err(|source| Error::Io {
-                path: file.clone(),
-                source,
-            })?;
-        }
-        Ok(removed)
-    }
-
-    pub fn publish_deferred<T: Serialize + Send + 'static>(&self, name: String, value: T) {
-        if self.shared.directory.is_none() {
-            return;
-        }
-        let shared = Arc::clone(&self.shared);
-        self.writer
-            .submit(Box::new(move || shared.remember(&name, &value)));
+        let database = database
+            .lock()
+            .expect("cache database lock is never poisoned");
+        let delete = || -> rusqlite::Result<usize> {
+            let mut statement = database.prepare_cached("DELETE FROM entries WHERE name=?1")?;
+            let mut removed = 0;
+            for name in names {
+                removed += statement.execute([name])?;
+            }
+            database.execute_batch("COMMIT; BEGIN DEFERRED;")?;
+            Ok(removed)
+        };
+        delete()
+            .map_err(|error| Error::Analysis(format!("failed to remove cached artifacts: {error}")))
     }
 
     pub fn publish<T: Serialize>(&self, name: &str, value: &T) {
-        if self.shared.directory.is_some() {
-            self.shared.remember(name, value);
-        }
-    }
-}
-
-impl Shared {
-    fn remember(&self, name: &str, value: &impl Serialize) {
-        if self.loaded.entries.contains_key(name) {
+        let Some(database) = self.database.as_ref() else {
             return;
-        }
+        };
         let Ok(bytes) = serde_json::to_vec(value) else {
             return;
         };
-        self.pending
-            .lock()
-            .expect("cache pending")
-            .entry(name.to_owned())
-            .or_insert(bytes);
-    }
-
-    fn flush(&self) {
-        let Some(directory) = &self.directory else {
+        let digest = Digest::of(&bytes);
+        let Ok(database) = database.lock() else {
             return;
         };
-        let pending = std::mem::take(&mut *self.pending.lock().expect("cache pending"));
-        if pending.is_empty() {
-            return;
-        }
-        let compact = self.loaded.files.len() >= COMPACTION_THRESHOLD;
-        let names = pending
-            .keys()
-            .map(String::as_str)
-            .chain(
-                self.loaded
-                    .entries
-                    .keys()
-                    .map(String::as_str)
-                    .filter(|_| compact),
-            )
-            .collect::<BTreeSet<_>>();
-        let entries = names.into_iter().filter_map(|name| {
-            let data = match pending.get(name) {
-                Some(data) => Cow::Borrowed(data.as_slice()),
-                None => Cow::Owned(self.loaded.get(name)?),
-            };
-            Some((name, data))
-        });
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let stem = format!(
-            "{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let temporary = directory.join(format!("{stem}.tmp"));
-        let published = directory.join(format!("{stem}.{PACK_EXTENSION}"));
-        if fs::File::create(&temporary)
-            .map(BufWriter::new)
-            .and_then(|mut file| {
-                write_pack(&mut file, entries)?;
-                file.flush()
-            })
-            .and_then(|()| fs::rename(&temporary, &published))
-            .is_err()
+        if let Ok(mut statement) = database
+            .prepare_cached("INSERT OR IGNORE INTO entries(name,bytes,digest) VALUES (?1,?2,?3)")
         {
-            let _ = fs::remove_file(&temporary);
-            return;
-        }
-        if compact {
-            for file in &self.loaded.files {
-                let _ = fs::remove_file(file);
-            }
+            let _ = statement.execute((name, bytes, digest.as_str()));
         }
     }
 }
 
 impl Drop for Cache {
     fn drop(&mut self) {
-        self.writer.finish();
-        self.shared.flush();
+        if let Some(database) = self
+            .database
+            .as_mut()
+            .and_then(|database| database.get_mut().ok())
+        {
+            let _ = database.execute_batch("COMMIT");
+        }
     }
 }
 
@@ -412,7 +153,7 @@ impl Drop for Cache {
 pub struct SchemaDirectory {
     pub schema: String,
     pub directory: PathBuf,
-    pub packs: usize,
+    pub files: usize,
     pub bytes: u64,
 }
 
@@ -451,12 +192,12 @@ pub fn schema_directories(location: &CacheLocation) -> Vec<SchemaDirectory> {
             SchemaDirectory {
                 schema: entry.file_name().to_string_lossy().into_owned(),
                 directory: entry.path(),
-                packs: files
+                files: files
                     .iter()
                     .filter(|file| {
                         file.path()
                             .extension()
-                            .is_some_and(|value| value == PACK_EXTENSION)
+                            .is_some_and(|value| value == "sqlite")
                     })
                     .count(),
                 bytes: files
@@ -500,151 +241,5 @@ fn default_root() -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
-
-    fn encode_pack<N: AsRef<str>, D: AsRef<[u8]>>(
-        entries: impl Iterator<Item = (N, D)>,
-    ) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        write_pack(&mut bytes, entries).expect("writing to a Vec never fails");
-        bytes
-    }
-
-    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-    struct Entry {
-        value: usize,
-    }
-
-    fn root() -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "slinker-cache-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
-    fn cache(root: PathBuf) -> Cache {
-        Cache::new(CacheLocation::Directory(root), "schema").expect("create test cache")
-    }
-
-    #[test]
-    fn corrupt_entry_is_a_miss() {
-        let root = root();
-        let directory = root.join("analysis/schema");
-        fs::create_dir_all(&directory).expect("create cache directory");
-        let corrupt = encode_pack([("entry", b"{truncated".as_slice())].into_iter());
-        fs::write(directory.join("corrupt.pack"), corrupt).expect("write corrupt pack");
-
-        assert_eq!(cache(root).read::<Entry>("entry"), None);
-    }
-
-    #[test]
-    fn published_entries_survive_a_reopen_and_compaction() {
-        let root = root();
-        for value in 0..(COMPACTION_THRESHOLD + 3) {
-            let cache = cache(root.clone());
-            cache.publish(&format!("entry-{value}"), &Entry { value });
-        }
-        let cache = cache(root.clone());
-        for value in 0..(COMPACTION_THRESHOLD + 3) {
-            assert_eq!(
-                cache.read::<Entry>(&format!("entry-{value}")),
-                Some(Entry { value })
-            );
-        }
-        let packs = fs::read_dir(root.join("analysis/schema"))
-            .expect("list cache")
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|value| value == PACK_EXTENSION)
-            })
-            .count();
-        assert!(packs <= COMPACTION_THRESHOLD, "{packs} packs");
-    }
-
-    #[test]
-    fn disabled_cache_never_returns_a_published_entry() {
-        let cache = Cache::new(CacheLocation::Disabled, "schema").expect("disabled cache");
-        cache.publish("entry", &Entry { value: 1 });
-
-        assert_eq!(cache.read::<Entry>("entry"), None);
-    }
-
-    #[test]
-    fn concurrent_publication_keeps_one_complete_immutable_entry() {
-        let cache = Arc::new(cache(root()));
-        let writers = (0..8)
-            .map(|value| {
-                let cache = Arc::clone(&cache);
-                std::thread::spawn(move || cache.publish("entry", &Entry { value }))
-            })
-            .collect::<Vec<_>>();
-        for writer in writers {
-            writer.join().expect("cache writer");
-        }
-
-        let winner = cache.read::<Entry>("entry").expect("complete winner");
-        assert!(winner.value < 8);
-        cache.publish("entry", &Entry { value: 99 });
-        assert_eq!(cache.read::<Entry>("entry"), Some(winner));
-    }
-    #[test]
-    fn truncated_and_old_format_packs_are_ignored_without_hiding_complete_ones() {
-        let root = root();
-        let directory = root.join("analysis/schema");
-        fs::create_dir_all(&directory).expect("create cache directory");
-        let complete = encode_pack([("kept", br#"{"value":1}"#.as_slice())].into_iter());
-        let mut truncated = encode_pack([("lost", br#"{"value":2}"#.as_slice())].into_iter());
-        truncated.truncate(truncated.len() - 3);
-        fs::write(directory.join("a.pack"), complete).expect("write complete pack");
-        fs::write(directory.join("b.pack"), truncated).expect("write truncated pack");
-        fs::write(directory.join("c.pack"), b"SLKP1\nentries without a footer")
-            .expect("write old-format pack");
-
-        let cache = cache(root);
-
-        assert_eq!(cache.read::<Entry>("kept"), Some(Entry { value: 1 }));
-        assert_eq!(cache.read::<Entry>("lost"), None);
-        assert_eq!(cache.entries().len(), 1);
-    }
-
-    #[test]
-    fn a_pack_with_many_entries_is_indexed_from_its_footer() {
-        let root = root();
-        let directory = root.join("analysis/schema");
-        fs::create_dir_all(&directory).expect("create cache directory");
-        let values = (0..2000)
-            .map(|value| {
-                (
-                    format!("entry-{value}"),
-                    serde_json::to_vec(&Entry { value }).expect("serialize"),
-                )
-            })
-            .collect::<Vec<_>>();
-        fs::write(
-            directory.join("many.pack"),
-            encode_pack(
-                values
-                    .iter()
-                    .map(|(name, data)| (name.as_str(), data.as_slice())),
-            ),
-        )
-        .expect("write pack");
-
-        let cache = cache(root);
-
-        assert_eq!(cache.entries().len(), 2000);
-        assert_eq!(
-            cache.read::<Entry>("entry-1999"),
-            Some(Entry { value: 1999 })
-        );
-        assert_eq!(cache.read::<Entry>("entry-0"), Some(Entry { value: 0 }));
-    }
-}
+#[path = "../tests/unit/cache.rs"]
+mod tests;

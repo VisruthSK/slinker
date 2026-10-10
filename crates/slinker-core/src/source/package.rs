@@ -1,22 +1,10 @@
 use crate::{Description, Version};
-use regex::{Regex, RegexBuilder};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 use thiserror::Error;
-
-#[derive(Debug)]
-pub struct FrozenSourceFiles {
-    root: PathBuf,
-    _owner: Arc<TempDir>,
-}
-
-impl FrozenSourceFiles {
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-}
 
 #[derive(Debug)]
 pub struct SourcePackageSnapshot {
@@ -26,11 +14,13 @@ pub struct SourcePackageSnapshot {
     description: Description,
     description_source: Arc<str>,
     namespace: Arc<str>,
-    files: FrozenSourceFiles,
+    root: PathBuf,
+    _owner: TempDir,
+    fingerprint: crate::package::Digest,
 }
 
 impl SourcePackageSnapshot {
-    pub fn capture(path: impl AsRef<Path>) -> Result<Self, SourcePackageError> {
+    pub fn capture(path: impl AsRef<Path>, r_home: &Path) -> Result<Self, SourcePackageError> {
         let source = dunce::canonicalize(path.as_ref()).map_err(|source_error| {
             SourcePackageError::Canonicalize {
                 path: path.as_ref().to_path_buf(),
@@ -49,20 +39,18 @@ impl SourcePackageSnapshot {
             }
         }
 
-        let owner = Arc::new(
-            tempfile::Builder::new()
-                .prefix("slinker-source-")
-                .tempdir()?,
-        );
-        let frozen = owner.path().join("package");
-        copy_tree(&source, &frozen)?;
-        let description_path = frozen.join("DESCRIPTION");
-        let description_text =
-            fs::read_to_string(&description_path).map_err(|source| SourcePackageError::Read {
-                path: description_path.clone(),
-                source,
-            })?;
-        let description = Description::parse(&description_text);
+        let owner = tempfile::Builder::new()
+            .prefix("slinker-source-")
+            .tempdir()?;
+        reject_unsupported_entries(&source)?;
+        let executable = crate::r_executable(r_home).ok_or_else(|| {
+            SourcePackageError::Build(format!(
+                "selected R has no executable under {}",
+                r_home.display()
+            ))
+        })?;
+        let original_description = fs::read_to_string(source.join("DESCRIPTION"))?;
+        let description = Description::parse(&original_description);
         let package = description
             .package()
             .ok_or(SourcePackageError::MissingDescriptionField("Package"))?
@@ -72,6 +60,57 @@ impl SourcePackageSnapshot {
             .version_parsed()
             .ok_or(SourcePackageError::MissingDescriptionField("Version"))?
             .map_err(|error| SourcePackageError::InvalidVersion(error.to_string()))?;
+        let build = Command::new(&executable)
+            .args([
+                "CMD",
+                "build",
+                "--no-build-vignettes",
+                "--no-manual",
+                "--no-resave-data",
+                "--no-clean",
+            ])
+            .arg(&source)
+            .current_dir(owner.path())
+            .env_remove("R_HOME")
+            .output()?;
+        if !build.status.success() {
+            return Err(SourcePackageError::Build(format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr)
+            )));
+        }
+        let archive = fs::read_dir(owner.path())?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "gz"))
+            .ok_or_else(|| {
+                SourcePackageError::Build("R CMD build produced no source archive".into())
+            })?;
+        let unpack = owner.path().join("unpack.R");
+        fs::write(
+            &unpack,
+            "args <- commandArgs(TRUE)\nutils::untar(args[[1L]], exdir = args[[2L]], tar = 'internal')\n",
+        )?;
+        let destination = owner.path().join("source");
+        fs::create_dir(&destination)?;
+        let extract = Command::new(executable)
+            .args(["--vanilla", "--slave", "-f"])
+            .arg(unpack)
+            .arg("--args")
+            .arg(&archive)
+            .arg(&destination)
+            .env_remove("R_HOME")
+            .output()?;
+        if !extract.status.success() {
+            return Err(SourcePackageError::Build(
+                String::from_utf8_lossy(&extract.stderr).into_owned(),
+            ));
+        }
+        let frozen = destination.join(&package);
+        // R owns source selection; keep the author's DESCRIPTION rather than build timestamps.
+        fs::write(frozen.join("DESCRIPTION"), &original_description)?;
         let namespace_path = frozen.join("NAMESPACE");
         let namespace =
             fs::read_to_string(&namespace_path).map_err(|source| SourcePackageError::Read {
@@ -79,17 +118,18 @@ impl SourcePackageSnapshot {
                 source,
             })?;
 
+        let fingerprint = crate::package::tree_digest(&frozen)
+            .map_err(|error| SourcePackageError::Build(error.to_string()))?;
         Ok(Self {
             original_root: source,
             package,
             version,
             description,
-            description_source: description_text.into(),
+            description_source: original_description.into(),
             namespace: namespace.into(),
-            files: FrozenSourceFiles {
-                root: frozen,
-                _owner: owner,
-            },
+            fingerprint,
+            root: frozen,
+            _owner: owner,
         })
     }
 
@@ -117,8 +157,12 @@ impl SourcePackageSnapshot {
         &self.namespace
     }
 
-    pub fn files(&self) -> &FrozenSourceFiles {
-        &self.files
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn fingerprint(&self) -> &crate::package::Digest {
+        &self.fingerprint
     }
 }
 
@@ -134,8 +178,8 @@ pub enum SourcePackageError {
     MissingInput(PathBuf),
     #[error("source package contains {0}, which is neither a regular file nor a directory")]
     UnsupportedEntry(PathBuf),
-    #[error("source package .Rbuildignore pattern `{pattern}` is not supported: {message}")]
-    InvalidBuildIgnore { pattern: String, message: String },
+    #[error("target-R source build failed: {0}")]
+    Build(String),
     #[error("source package DESCRIPTION is missing {0}")]
     MissingDescriptionField(&'static str),
     #[error("source package DESCRIPTION has invalid Version: {0}")]
@@ -150,74 +194,14 @@ pub enum SourcePackageError {
     Io(#[from] std::io::Error),
 }
 
-const EXCLUDED_ROOT_ENTRIES: [&str; 3] = [".git", "target", "renv"];
-
-struct BuildIgnore(Vec<Regex>);
-
-impl BuildIgnore {
-    fn load(root: &Path) -> Result<Self, SourcePackageError> {
-        let path = root.join(".Rbuildignore");
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(source) => return Err(SourcePackageError::Read { path, source }),
-        };
-        text.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|pattern| {
-                RegexBuilder::new(pattern)
-                    .case_insensitive(true)
-                    .build()
-                    .map_err(|error| SourcePackageError::InvalidBuildIgnore {
-                        pattern: pattern.to_owned(),
-                        message: error.to_string(),
-                    })
-            })
-            .collect::<Result<_, _>>()
-            .map(Self)
-    }
-
-    fn excludes(&self, relative: &str) -> bool {
-        self.0.iter().any(|pattern| pattern.is_match(relative))
-    }
-}
-
-fn copy_tree(source: &Path, target: &Path) -> Result<(), SourcePackageError> {
-    let ignore = BuildIgnore::load(source)?;
-    copy_directory(source, target, "", &ignore)
-}
-
-fn copy_directory(
-    source: &Path,
-    target: &Path,
-    relative: &str,
-    ignore: &BuildIgnore,
-) -> Result<(), SourcePackageError> {
-    fs::create_dir_all(target)?;
-    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let name = entry.file_name();
-        let name_text = name.to_string_lossy();
-        let entry_relative = if relative.is_empty() {
-            name_text.to_string()
-        } else {
-            format!("{relative}/{name_text}")
-        };
-        let excluded_at_root =
-            relative.is_empty() && EXCLUDED_ROOT_ENTRIES.contains(&name_text.as_ref());
-        if excluded_at_root || ignore.excludes(&entry_relative) {
-            continue;
-        }
+fn reject_unsupported_entries(source: &Path) -> Result<(), SourcePackageError> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
         let path = entry.path();
-        let destination = target.join(&name);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            copy_directory(&path, &destination, &entry_relative, ignore)?;
-        } else if file_type.is_file() {
-            fs::copy(path, destination)?;
-        } else {
+            reject_unsupported_entries(&path)?;
+        } else if !file_type.is_file() {
             return Err(SourcePackageError::UnsupportedEntry(path));
         }
     }
@@ -225,78 +209,5 @@ fn copy_directory(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshot_is_immutable_after_source_changes() {
-        let source = tempfile::tempdir().expect("source tempdir");
-        fs::create_dir(source.path().join("R")).expect("R directory");
-        fs::write(
-            source.path().join("DESCRIPTION"),
-            "Package: fixture\nVersion: 1.0.0\n",
-        )
-        .expect("DESCRIPTION");
-        fs::write(source.path().join("NAMESPACE"), "export(f)\n").expect("NAMESPACE");
-        fs::write(source.path().join("R/f.R"), "f <- function() 1L\n").expect("R source");
-        let snapshot = SourcePackageSnapshot::capture(source.path()).expect("snapshot");
-
-        fs::write(source.path().join("R/f.R"), "f <- function() 2L\n").expect("mutate source");
-
-        assert_eq!(
-            fs::read_to_string(snapshot.files().root().join("R/f.R")).expect("frozen source"),
-            "f <- function() 1L\n"
-        );
-    }
-
-    fn write_package(root: &Path) {
-        fs::create_dir(root.join("R")).expect("R directory");
-        fs::write(
-            root.join("DESCRIPTION"),
-            "Package: fixture\nVersion: 1.0.0\n",
-        )
-        .expect("DESCRIPTION");
-        fs::write(root.join("NAMESPACE"), "export(f)\n").expect("NAMESPACE");
-        fs::write(root.join("R/f.R"), "f <- function() 1L\n").expect("R source");
-    }
-
-    #[test]
-    fn snapshot_skips_vcs_build_output_and_rbuildignore_entries() {
-        let source = tempfile::tempdir().expect("source tempdir");
-        write_package(source.path());
-        for directory in [".git", "target", "renv", "notes"] {
-            fs::create_dir(source.path().join(directory)).expect("excluded directory");
-            fs::write(source.path().join(directory).join("file"), "x").expect("excluded file");
-        }
-        fs::write(source.path().join("scratch.R"), "x").expect("ignored file");
-        fs::write(source.path().join("R/keep_scratch.R"), "y <- 1\n").expect("kept file");
-        fs::write(
-            source.path().join(".Rbuildignore"),
-            "^notes$\n\n^SCRATCH\\.R$\n",
-        )
-        .expect(".Rbuildignore");
-
-        let snapshot = SourcePackageSnapshot::capture(source.path()).expect("snapshot");
-
-        let root = snapshot.files().root();
-        for excluded in [".git", "target", "renv", "notes", "scratch.R"] {
-            assert!(!root.join(excluded).exists(), "{excluded} was copied");
-        }
-        assert!(root.join("R/keep_scratch.R").is_file());
-        assert!(root.join(".Rbuildignore").is_file());
-    }
-
-    #[test]
-    fn snapshot_rejects_unparseable_rbuildignore_pattern() {
-        let source = tempfile::tempdir().expect("source tempdir");
-        write_package(source.path());
-        fs::write(source.path().join(".Rbuildignore"), "(unclosed\n").expect(".Rbuildignore");
-
-        let error = SourcePackageSnapshot::capture(source.path()).expect_err("invalid pattern");
-
-        assert!(matches!(
-            error,
-            SourcePackageError::InvalidBuildIgnore { .. }
-        ));
-    }
-}
+#[path = "../../tests/unit/source/package.rs"]
+mod tests;

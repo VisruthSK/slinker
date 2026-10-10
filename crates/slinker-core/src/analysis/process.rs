@@ -1,8 +1,6 @@
 use super::arguments::native_selector_span;
 use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
-use super::execute::ExecutionContext;
 use super::need::WorkKey;
-use super::object_world::{ClosureId, ObjectId};
 use super::parse_cache::ParseState;
 use super::resolution::{BindingTarget, OpenReason, ReferenceUse, Resolution};
 use super::s3::{CallableId, callable_target};
@@ -13,8 +11,8 @@ use crate::ir::ExternalBindingAccess;
 use crate::package::EnvironmentLabel;
 use crate::package::PackageRole;
 use crate::package::{
-    BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource, Digest, ObjectImage,
-    ObjectKind, PackageId, PackageImage, PackageProvider, SyntaxValidation,
+    BindingName, BindingRepresentation, CanonicalSyntax, ClosureSource, Digest, MemberPath,
+    ObjectImage, ObjectKind, PackageId, PackageImage, PackageProvider, SyntaxValidation,
 };
 use crate::profile::{self, Counter, Probe};
 use crate::syntax::{
@@ -46,38 +44,53 @@ impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn process_closure_execution(
         &self,
         id: PackageId,
-        closure: ClosureId,
+        owner: &SourceKey,
+        path: &MemberPath,
+        enclosure: &EnvironmentLabel,
     ) -> Result<()> {
         let node = self.need_node(&Need::ClosureExecution {
             package: id,
-            closure,
+            owner: owner.clone(),
+            path: path.clone(),
+            enclosure: enclosure.clone(),
         });
-        if self.packages.is_external(id) {
-            self.external.lock().insert(id);
-            return Ok(());
-        }
         let image = self.image(id)?;
-        let Some(execution) = self.closure_execution_source(id, closure) else {
-            self.diagnostic(
-                node,
-                id,
-                None,
-                RejectCode::UnsupportedObject,
-                "executable closure is missing from the package object graph",
-                None,
-            );
-            return Ok(());
+        let object = match owner {
+            SourceKey::Binding(name) => image.binding(name).map(|binding| &binding.object),
+            SourceKey::Private {
+                environment,
+                binding,
+            } => image
+                .private_binding(environment, binding)
+                .map(|binding| &binding.object),
+            SourceKey::Closure { .. } => None,
+        };
+        let closure = object.and_then(|object| {
+            object
+                .embedded_closures
+                .iter()
+                .find(|closure| &closure.path == path && &closure.environment == enclosure)
+        });
+        let Some(closure) = closure else {
+            return Err(Error::Analysis(
+                "installed embedded closure is missing from its frozen binding".into(),
+            ));
+        };
+        let key = SourceKey::Closure {
+            owner: Box::new(owner.clone()),
+            path: path.clone(),
+            environment: enclosure.clone(),
         };
         let source = ClosureSource {
-            source: Arc::clone(&execution.closure.source),
-            environment: execution.environment,
+            source: Arc::clone(&closure.source),
+            environment: enclosure.clone(),
         };
         self.analyze_closure(&ClosureSite {
             node,
             package: id,
             image: &image,
-            owner: &execution.owner,
-            key: &execution.key,
+            owner,
+            key: &key,
             closure: &source,
         })
     }
@@ -104,10 +117,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             },
             &binding_image.object,
         );
-        let object = self
-            .objects
-            .read(id, |graph| graph.namespace_binding(binding));
-        self.require_member_closures(node, id, object);
+        self.require_member_closures(
+            node,
+            id,
+            &image,
+            &SourceKey::Binding(binding.clone()),
+            &binding_image.object,
+        );
         if let Some(closure) = &binding_image.object.closure {
             let key = SourceKey::Binding(binding.clone());
             let site = ClosureSite {
@@ -255,12 +271,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 );
                 return Ok(true);
             }
-            Resolution::Static(
-                BindingTarget::Namespace { .. }
-                | BindingTarget::Private { .. }
-                | BindingTarget::Closure { .. }
-                | BindingTarget::Local,
-            ) => {}
+            Resolution::Static(BindingTarget::Namespace { .. } | BindingTarget::Private { .. }) => {
+            }
         }
         Ok(false)
     }
@@ -318,16 +330,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 
     fn process_closure(&self, site: &ClosureSite<'_>, parsed: &ParsedRFile) -> Result<()> {
-        let image = self.prepare_construction_image(
-            site.package,
-            site.image,
-            &site.closure.environment,
-            parsed,
-        )?;
         self.process_parsed(
             site.node,
             site.package,
-            &image,
+            site.image,
             &site.owner.to_string(),
             &site.closure.environment,
             parsed,
@@ -388,19 +394,46 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    fn require_member_closures(&self, node: NodeId, id: PackageId, object: Option<ObjectId>) {
-        let closures = self.objects.read(id, |graph| {
-            object
-                .and_then(|object| graph.members_of(object))
-                .into_iter()
-                .flat_map(|members| members.values())
-                .filter_map(|member| graph.closure_of(*member))
-                .collect::<Vec<_>>()
-        });
-        for closure in closures {
+    fn require_member_closures(
+        &self,
+        node: NodeId,
+        id: PackageId,
+        image: &PackageImage,
+        owner: &SourceKey,
+        object: &ObjectImage,
+    ) {
+        let environments = object
+            .environment
+            .iter()
+            .filter(|_| object.object_kind == ObjectKind::Environment)
+            .chain(
+                object
+                    .embedded_environments
+                    .iter()
+                    .map(|reference| &reference.environment),
+            );
+        for environment in environments {
+            if let Some(private) = image.private_environment(environment) {
+                for binding in private.bindings.keys() {
+                    self.require(
+                        node,
+                        Need::PrivateBinding {
+                            package: id,
+                            environment: environment.clone(),
+                            binding: binding.clone(),
+                        },
+                        EdgeKind::ClosureExecution,
+                        "a retained environment exposes its installed bindings",
+                    );
+                }
+            }
+        }
+        for closure in &object.embedded_closures {
             let need = Need::ClosureExecution {
                 package: id,
-                closure,
+                owner: owner.clone(),
+                path: closure.path.clone(),
+                enclosure: closure.environment.clone(),
             };
             let closure_node = self.need_node(&need);
             self.value_closures.lock().insert(closure_node);
@@ -449,12 +482,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
             },
             &binding_image.object,
         );
-        let object = self.objects.read(id, |graph| {
-            graph
-                .environment_id(environment)
-                .and_then(|private| graph.environment(private).bindings.get(binding).copied())
-        });
-        self.require_member_closures(node, id, object);
+        self.require_member_closures(
+            node,
+            id,
+            &image,
+            &SourceKey::private(environment.clone(), binding.clone()),
+            &binding_image.object,
+        );
         if let Some(closure) = &binding_image.object.closure {
             let key = SourceKey::private(environment.clone(), binding.clone());
             self.analyze_closure(&ClosureSite {
@@ -487,19 +521,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         };
         self.report_semantic_issues(site, parsed);
         for expression in &parsed.expressions {
-            let construction_span = profile::span(Probe::ExecuteConstruction);
-            self.execute_construction(
-                ExecutionContext {
-                    node,
-                    package,
-                    image,
-                    lexical_environment,
-                    depth: 0,
-                    specialized: false,
-                },
-                &expression.construction,
-            )?;
-            drop(construction_span);
             self.register_active_bindings(site, expression)?;
             let consumed_native_selectors = self.consumed_native_selectors(site, expression)?;
             self.process_references(site, parsed, expression, &consumed_native_selectors)?;
@@ -564,7 +585,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .add_binding(active.name.clone().into())
             {
                 self.non_returning_bindings.lock().remove(&site.package);
-                self.summaries.invalidate_package(site.package);
             }
         }
         Ok(())
@@ -995,10 +1015,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
 
-        self.summaries.suspend();
-        let analyzed = self.analyze_on_load(id);
-        self.summaries.resume();
-        analyzed
+        self.analyze_on_load(id)
     }
 
     fn analyze_on_load(&self, id: PackageId) -> Result<()> {
@@ -1157,8 +1174,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 ),
                 Some(effect.span.clone()),
             ),
-            Resolution::Static(BindingTarget::Local)
-                if lexical_environment.is_derived() => {}
             _ => self.diagnostic(
                 from,
                 package,

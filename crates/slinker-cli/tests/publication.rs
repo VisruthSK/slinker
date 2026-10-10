@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 use std::time::SystemTime;
 
 fn fixture(name: &str) -> PathBuf {
@@ -23,21 +23,19 @@ fn copy_directory(from: &Path, to: &Path) {
     }
 }
 
-fn build(source: &Path, output: &Path, cache: &Path) -> Output {
+fn build(source: &Path, output: &Path, cache: &Path) {
     let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
         .arg("build")
         .arg(source)
         .arg("--output")
         .arg(output)
+        .arg("--json")
         .env("SLINKER_CACHE_DIR", cache)
         .output()
         .expect("run slinker build");
     common::assert_success(&result, "slinker build");
-    result
-}
-
-fn up_to_date(result: &Output) -> bool {
-    String::from_utf8_lossy(&result.stderr).contains("up to date")
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).expect("build report");
+    assert_eq!(report["status"], "built");
 }
 
 fn modified(path: &Path) -> SystemTime {
@@ -70,25 +68,19 @@ fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 #[test]
-fn unchanged_rebuild_is_skipped_and_an_edit_rebuilds_only_what_changed() {
+fn every_build_restages_and_unchanged_files_keep_their_modification_times() {
     let work = tempfile::tempdir().expect("work directory");
     let source = work.path().join("pkgconfig");
     copy_directory(&fixture("pkgconfig"), &source);
     let output = work.path().join("out");
     let cache = work.path().join("cache");
 
-    let first = build(&source, &output, &cache);
-    assert!(!up_to_date(&first));
+    build(&source, &output, &cache);
     let built = tree(&output);
     let description = modified(&output.join("DESCRIPTION"));
 
     std::thread::sleep(std::time::Duration::from_millis(50));
-    let second = build(&source, &output, &cache);
-    assert!(
-        up_to_date(&second),
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
-    );
+    build(&source, &output, &cache);
     assert_eq!(tree(&output), built);
     assert_eq!(modified(&output.join("DESCRIPTION")), description);
 
@@ -102,8 +94,7 @@ fn unchanged_rebuild_is_skipped_and_an_edit_rebuilds_only_what_changed() {
     text.push_str("\n.slinker_edit <- function() 1\n");
     fs::write(&entry, text).expect("edit source");
 
-    let third = build(&source, &output, &cache);
-    assert!(!up_to_date(&third));
+    build(&source, &output, &cache);
     assert_ne!(tree(&output), built);
     assert_eq!(
         modified(&output.join("DESCRIPTION")),
@@ -111,8 +102,7 @@ fn unchanged_rebuild_is_skipped_and_an_edit_rebuilds_only_what_changed() {
         "files the edit did not change keep their modification time"
     );
 
-    let fourth = build(&source, &output, &cache);
-    assert!(up_to_date(&fourth));
+    build(&source, &output, &cache);
 }
 
 #[test]

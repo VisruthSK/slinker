@@ -1,3 +1,4 @@
+use crate::filesystem::copy_entry;
 use crate::r_executable;
 use crate::source::SourcePackageSnapshot;
 use std::path::{Path, PathBuf};
@@ -7,12 +8,17 @@ use thiserror::Error;
 
 #[derive(Debug)]
 pub struct StagedRoot {
+    source_root: PathBuf,
     library: PathBuf,
     package_root: PathBuf,
     _owner: TempDir,
 }
 
 impl StagedRoot {
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
     pub fn library(&self) -> &Path {
         &self.library
     }
@@ -32,12 +38,14 @@ pub fn stage_root(
         .tempdir()?;
     let library = owner.path().join("library");
     std::fs::create_dir(&library)?;
+    let source_root = owner.path().join(snapshot.package());
+    copy_entry(snapshot.root(), &source_root)?;
     let executable = r_executable(r_home).ok_or_else(|| StagingError::MissingR(r_home.into()))?;
     let mut command = Command::new(executable);
     command
         .args(["CMD", "INSTALL", "--no-test-load"])
         .arg(format!("--library={}", library.display()))
-        .arg(snapshot.files().root())
+        .arg(&source_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -68,6 +76,7 @@ pub fn stage_root(
         return Err(StagingError::MissingInstalledRoot(package_root));
     }
     Ok(StagedRoot {
+        source_root,
         library,
         package_root,
         _owner: owner,

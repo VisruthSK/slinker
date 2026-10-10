@@ -1,6 +1,6 @@
 use crate::package::Atom;
 use crate::syntax::facts::StaticArg;
-use crate::syntax::source::{SourceId, Span, TextRange};
+use crate::syntax::source::TextRange;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
@@ -40,73 +40,10 @@ pub(super) struct ForRegion {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct IfRegion {
+pub(super) struct ScannedIfRegion {
     pub(super) if_start: usize,
-    pub(super) condition: TextRange,
     pub(super) then_branch: TextRange,
     pub(super) else_branch: Option<TextRange>,
-}
-
-pub(super) fn strip_outer_parentheses(mut value: &str) -> &str {
-    loop {
-        if !value.starts_with('(') || !value.ends_with(')') {
-            return value;
-        }
-        let Some(close) = matching_delimiter(value, 0) else {
-            return value;
-        };
-        if close + 1 != value.len() {
-            return value;
-        }
-        value = &value[1..value.len() - 1];
-    }
-}
-
-pub(super) fn split_top_level_operator<'a>(
-    value: &'a str,
-    operator: &str,
-) -> Option<(&'a str, &'a str)> {
-    let bytes = value.as_bytes();
-    let operator_bytes = operator.as_bytes();
-    let mut cursor = 0usize;
-    let mut depth = 0usize;
-    let mut quote = None;
-    while cursor < bytes.len() {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'(' => {
-                depth += 1;
-                cursor += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                cursor += 1;
-            }
-            _ if depth == 0
-                && cursor + operator_bytes.len() <= bytes.len()
-                && &bytes[cursor..cursor + operator_bytes.len()] == operator_bytes =>
-            {
-                return Some((&value[..cursor], &value[cursor + operator_bytes.len()..]));
-            }
-            _ => cursor += 1,
-        }
-    }
-    None
 }
 
 pub(super) fn contains_call_named(text: &str, name: &str) -> bool {
@@ -199,170 +136,6 @@ pub(super) fn function_body_range(text: &str) -> Option<(usize, usize)> {
             return Some((body_start, body_close + 1));
         }
         return Some((body_start, expression_end(text, body_start)));
-    }
-    None
-}
-
-pub(super) fn static_args(raw: &RawCall) -> Vec<Option<StaticArg>> {
-    raw.args
-        .iter()
-        .map(|argument| argument.static_arg.clone())
-        .collect()
-}
-
-pub(super) fn split_arguments(text: &str, start: usize, end: usize) -> Vec<RawArgument> {
-    let mut arguments = Vec::new();
-    let mut segment_start = start;
-    let mut cursor = start;
-    let mut stack = Vec::new();
-    let bytes = text.as_bytes();
-    let mut quote = None;
-
-    while cursor < end {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(end);
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'#' => {
-                cursor = skip_comment(text, cursor, end);
-            }
-            b'(' | b'[' | b'{' => {
-                stack.push(byte);
-                cursor += 1;
-            }
-            b')' | b']' | b'}' => {
-                let _ = stack.pop();
-                cursor += 1;
-            }
-            b',' if stack.is_empty() => {
-                if let Some(argument) = raw_argument(text, segment_start, cursor) {
-                    arguments.push(argument);
-                } else {
-                    arguments.push(RawArgument {
-                        name: None,
-                        value: TextRange::new(cursor, cursor),
-                        static_arg: None,
-                        logical: None,
-                    });
-                }
-                segment_start = cursor + 1;
-                cursor += 1;
-            }
-            _ => cursor += 1,
-        }
-    }
-
-    if segment_start < end || !arguments.is_empty() {
-        if let Some(argument) = raw_argument(text, segment_start, end) {
-            arguments.push(argument);
-        } else if segment_start < end {
-            arguments.push(RawArgument {
-                name: None,
-                value: TextRange::new(end, end),
-                static_arg: None,
-                logical: None,
-            });
-        }
-    }
-    arguments
-}
-
-pub(super) fn raw_argument(text: &str, start: usize, end: usize) -> Option<RawArgument> {
-    let start = skip_trivia_bounded(text, start, end);
-    let end = trim_end_offset_bounded(text, start, end);
-    if start >= end {
-        return None;
-    }
-    let (name, value_start) = named_argument_split(text, start, end)
-        .map(|(name, value_start)| (Some(name), value_start))
-        .unwrap_or((None, start));
-    let value_start = skip_trivia_bounded(text, value_start, end);
-    let value_end = trim_end_offset_bounded(text, value_start, end);
-    let static_arg = text.get(value_start..value_end).and_then(static_arg);
-    Some(RawArgument {
-        name,
-        value: TextRange::new(value_start, value_end),
-        static_arg,
-        logical: None,
-    })
-}
-
-pub(super) fn argument_spans(source: &SourceId, arguments: &[RawArgument]) -> Vec<Option<Span>> {
-    arguments
-        .iter()
-        .map(|argument| {
-            (argument.value.start < argument.value.end)
-                .then(|| Span::new(*source, argument.value.start, argument.value.end))
-        })
-        .collect()
-}
-
-pub(super) fn named_argument_split(
-    text: &str,
-    start: usize,
-    end: usize,
-) -> Option<(String, usize)> {
-    let bytes = text.as_bytes();
-    let mut cursor = start;
-    let mut stack = Vec::new();
-    let mut quote = None;
-    while cursor < end {
-        let byte = bytes[cursor];
-        if let Some(delimiter) = quote {
-            if byte == b'\\' {
-                cursor = (cursor + 2).min(end);
-                continue;
-            }
-            if byte == delimiter {
-                quote = None;
-            }
-            cursor += 1;
-            continue;
-        }
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(byte);
-                cursor += 1;
-            }
-            b'(' | b'[' | b'{' => {
-                stack.push(byte);
-                cursor += 1;
-            }
-            b')' | b']' | b'}' => {
-                let _ = stack.pop();
-                cursor += 1;
-            }
-            b'=' if stack.is_empty() => {
-                let previous = cursor
-                    .checked_sub(1)
-                    .and_then(|index| bytes.get(index))
-                    .copied();
-                let next = bytes.get(cursor + 1).copied();
-                if matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) || next == Some(b'=') {
-                    cursor += 1;
-                    continue;
-                }
-                let lhs_start = skip_trivia_bounded(text, start, cursor);
-                let lhs_end = trim_end_offset_bounded(text, lhs_start, cursor);
-                let lhs = text.get(lhs_start..lhs_end)?;
-                let name = static_symbol(lhs)?;
-                return Some((name, cursor + 1));
-            }
-            _ => cursor += 1,
-        }
     }
     None
 }
@@ -526,15 +299,15 @@ pub(super) fn matching_delimiter(text: &str, open: usize) -> Option<usize> {
     None
 }
 
-pub(super) fn find_if_regions(text: &str) -> Vec<IfRegion> {
+pub(super) fn find_if_regions(text: &str) -> Vec<ScannedIfRegion> {
     scan_if_regions(text, usize::MAX)
 }
 
-pub(super) fn first_if_region(text: &str) -> Option<IfRegion> {
+pub(super) fn first_if_region(text: &str) -> Option<ScannedIfRegion> {
     scan_if_regions(text, 1).into_iter().next()
 }
 
-pub(super) fn scan_if_regions(text: &str, limit: usize) -> Vec<IfRegion> {
+pub(super) fn scan_if_regions(text: &str, limit: usize) -> Vec<ScannedIfRegion> {
     let mut regions = Vec::new();
     let mut scanner = CodeScanner::new(text, 0, text.len());
     while regions.len() < limit
@@ -549,7 +322,7 @@ pub(super) fn scan_if_regions(text: &str, limit: usize) -> Vec<IfRegion> {
     regions
 }
 
-fn if_region_at(text: &str, start: usize) -> Option<IfRegion> {
+fn if_region_at(text: &str, start: usize) -> Option<ScannedIfRegion> {
     let open = skip_trivia(text, start + 2);
     if text.as_bytes().get(open).copied() != Some(b'(') {
         return None;
@@ -564,9 +337,8 @@ fn if_region_at(text: &str, start: usize) -> Option<IfRegion> {
     } else {
         None
     };
-    Some(IfRegion {
+    Some(ScannedIfRegion {
         if_start: start,
-        condition: TextRange::new(open + 1, close),
         then_branch: TextRange::new(then_start, then_end),
         else_branch,
     })
@@ -639,19 +411,6 @@ pub(super) fn expression_end(text: &str, start: usize) -> usize {
         }
     }
     trim_end_offset(text, cursor)
-}
-
-pub(super) fn statement_start(text: &str, position: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut cursor = position;
-    while cursor > 0 {
-        let byte = bytes[cursor - 1];
-        if matches!(byte, b';' | b'\n' | b'{' | b'}') {
-            break;
-        }
-        cursor -= 1;
-    }
-    cursor
 }
 
 pub(super) fn skip_trivia(text: &str, mut cursor: usize) -> usize {

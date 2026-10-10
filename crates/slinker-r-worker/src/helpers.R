@@ -1,3 +1,30 @@
+invisible(loadNamespace("tools", lib.loc = R.home("library")))
+
+.slinker_namespace_state <- local({
+  state <- new.env(parent = emptyenv())
+  state$missing <- NULL
+  resolver <- compiler::cmpfun(function(name, where) {
+    namespace <- .Internal(getRegisteredNamespace(name))
+    if (!is.null(namespace)) return(namespace)
+    state$missing <- name[[1L]]
+    stop(sprintf("inspection requires namespace image %s", name[[1L]]), call. = FALSE)
+  })
+  forbidden_load <- compiler::cmpfun(function(...) {
+    stop("loadNamespace is forbidden during installed-image inspection", call. = FALSE)
+  })
+  unlockBinding("..getNamespace", baseenv())
+  assign("..getNamespace", resolver, envir = baseenv())
+  lockBinding("..getNamespace", baseenv())
+  unlockBinding("loadNamespace", baseenv())
+  assign("loadNamespace", forbidden_load, envir = baseenv())
+  lockBinding("loadNamespace", baseenv())
+  function(reset) {
+    missing <- state$missing
+    if (reset) state$missing <- NULL
+    missing
+  }
+})
+
 .slinker_package_context <- function(root, package) {
   root <- normalizePath(root, winslash = "/", mustWork = TRUE)
   required <- file.path(
@@ -20,9 +47,14 @@
   info <- new.env(hash = TRUE, parent = baseenv())
   info$spec <- c(name = package, version = version)
   assign(".__NAMESPACE__.", info, envir = image_env)
-  if (is.null(.getNamespace(package))) {
+  registered <- is.null(.getNamespace(package))
+  complete <- FALSE
+  if (registered) {
     .Internal(registerNamespace(package, image_env))
   }
+  on.exit({
+    if (registered && !complete) .Internal(unregisterNamespace(package))
+  }, add = TRUE)
   code_db <- file.path(root, "R", package)
   if (
     !file.exists(paste0(code_db, ".rdx")) ||
@@ -80,6 +112,7 @@
   )) >
     0L
 
+  complete <- TRUE
   list(
     package = package,
     root = root,
@@ -135,6 +168,9 @@
 
 
 .slinker_deparse_binding <- function(name, value) {
+  if (typeof(value) == "closure") {
+    value <- as.call(list(as.name("function"), formals(value), body(value)))
+  }
   rhs <- paste(
     deparse(
       value,
@@ -143,13 +179,7 @@
     ),
     collapse = "\n"
   )
-  simple <- grepl("^[A-Za-z.][A-Za-z0-9._]*$", name) &&
-    !grepl("^\\.[0-9]", name)
-  lhs <- if (simple) {
-    name
-  } else {
-    paste0("`", gsub("([`\\\\])", "\\\\\\1", name), "`")
-  }
+  lhs <- deparse(as.name(name), backtick = TRUE)
   paste0(lhs, " <- ", rhs)
 }
 

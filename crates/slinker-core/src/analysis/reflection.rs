@@ -1,23 +1,12 @@
 use super::NodeId;
-use super::relocation::NamespaceCall;
 use crate::package::PackageId;
-use crate::syntax::{CallSite, Span};
-use std::collections::{HashMap, HashSet};
+use crate::syntax::Span;
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub(super) struct ReflectionFacts {
     non_reflective_namespace_uses: HashSet<Span>,
-    contextual_namespace_calls: HashMap<Span, Option<String>>,
     computed_namespace_info_reads: Vec<ComputedNamespaceInfoRead>,
-    pending_namespace_operations: Vec<PendingNamespaceOperation>,
-}
-
-pub(super) struct PendingNamespaceOperation {
-    pub(super) node: NodeId,
-    pub(super) package: PackageId,
-    pub(super) binding: String,
-    pub(super) call: CallSite,
-    pub(super) operation: NamespaceCall,
 }
 
 pub(super) struct ComputedNamespaceInfoRead {
@@ -37,21 +26,6 @@ impl ReflectionFacts {
         self.non_reflective_namespace_uses.contains(span)
     }
 
-    pub(super) fn record_contextual_namespace_call(&mut self, span: &Span, package: &str) {
-        self.contextual_namespace_calls
-            .entry(span.clone())
-            .and_modify(|known| {
-                if known.as_deref() != Some(package) {
-                    *known = None;
-                }
-            })
-            .or_insert_with(|| Some(package.to_owned()));
-    }
-
-    pub(super) fn contextual_namespace(&self, span: &Span) -> Option<&str> {
-        self.contextual_namespace_calls.get(span)?.as_deref()
-    }
-
     pub(super) fn defer_computed_namespace_info_read(
         &mut self,
         node: NodeId,
@@ -68,14 +42,6 @@ impl ReflectionFacts {
                 field: field.to_owned(),
                 span,
             });
-    }
-
-    pub(super) fn defer_namespace_operation(&mut self, pending: PendingNamespaceOperation) {
-        self.pending_namespace_operations.push(pending);
-    }
-
-    pub(super) fn take_pending_namespace_operations(&mut self) -> Vec<PendingNamespaceOperation> {
-        std::mem::take(&mut self.pending_namespace_operations)
     }
 
     pub(super) fn take_computed_namespace_info_reads(&mut self) -> Vec<ComputedNamespaceInfoRead> {

@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+pub(crate) const ROOT_RUNTIME_BINDING: &str = ".slinker_runtime";
+pub(crate) const ROOT_ON_LOAD_BINDING: &str = ".slinker_original_on_load";
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -361,6 +364,7 @@ pub enum RelocationTarget {
     Resource {
         target: ResourceId,
     },
+    AbsentResource,
     LoadedQuery,
     NamespaceArgument {
         package: PackageId,
@@ -1257,7 +1261,9 @@ impl ProgramBuilder {
             RelocationTarget::RequireNamespace { .. } => callee.starts_with("requireNamespace("),
             RelocationTarget::Namespace { operation, .. } => callee.starts_with(operation.callee()),
             RelocationTarget::PackageVersion { .. } => callee.starts_with("packageVersion("),
-            RelocationTarget::Resource { .. } => callee.starts_with("system.file("),
+            RelocationTarget::Resource { .. } | RelocationTarget::AbsentResource => {
+                callee.starts_with("system.file(")
+            }
             RelocationTarget::InstalledQuery { check: true } => {
                 callee.starts_with("check_installed(")
             }

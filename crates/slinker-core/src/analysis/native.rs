@@ -211,13 +211,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     format!("native routine `{selector}` invokes argument #{position} as private R binding `{callback}` in {environment}"),
                     Some(call_span.clone()),
                 ),
-                Resolution::Static(BindingTarget::Closure { package, closure }) => self.require_at(
-                    native_node,
-                    Need::ClosureExecution { package, closure },
-                    EdgeKind::Callback,
-                    format!("native routine `{selector}` invokes argument #{position} as a retained closure"),
-                    Some(call_span.clone()),
-                ),
                 Resolution::Static(BindingTarget::Imported { package, binding: callback }) => {
                     self.require_at(
                         native_node,
@@ -250,7 +243,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     );
                 }
                 Resolution::Static(BindingTarget::Base) => {}
-                Resolution::Static(BindingTarget::Local | BindingTarget::Native { .. } |
+                Resolution::Static(BindingTarget::Native { .. } |
 BindingTarget::Metadata { .. }) |
 Resolution::OpenDynamic(OpenReason::MissingPackage { .. } |
 OpenReason::Unresolved(_)) => self.diagnostic(
@@ -451,9 +444,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             }
             Resolution::OpenDynamic(OpenReason::Unresolved(_)) => {}
             Resolution::Static(
-                BindingTarget::Local
-                | BindingTarget::Closure { .. }
-                | BindingTarget::Namespace { .. }
+                BindingTarget::Namespace { .. }
                 | BindingTarget::Private { .. }
                 | BindingTarget::Imported { .. }
                 | BindingTarget::External { .. }

@@ -29,12 +29,11 @@ pub(super) struct CallableId {
 #[derive(Clone, Debug, Default)]
 struct S3Generic {
     sites: Vec<(NodeId, PackageId, Span)>,
-    callable: Option<CallableId>,
-    selector: Option<String>,
-    formals: Vec<String>,
+    definition: Option<GenericDefinition>,
     dispatch: S3Dispatch,
 }
 
+#[derive(Clone, Debug)]
 pub(super) struct GenericDefinition {
     pub(super) callable: CallableId,
     pub(super) selector: String,
@@ -67,17 +66,15 @@ impl S3Model {
         let entry = self.generics.entry(key.clone()).or_default();
         entry.sites.push(site);
         match definition {
-            Some(definition) if entry.callable.is_none() => {
-                entry.callable = Some(definition.callable.clone());
-                entry.selector = Some(definition.selector);
-                entry.formals = definition.formals;
+            Some(definition) if entry.definition.is_none() => {
                 self.callable_generics
-                    .entry(definition.callable)
+                    .entry(definition.callable.clone())
                     .or_default()
                     .insert(key.clone());
+                entry.definition = Some(definition);
             }
             Some(_) => {}
-            None => entry.callable = None,
+            None => entry.definition = None,
         }
     }
 
@@ -90,10 +87,12 @@ impl S3Model {
 
     fn callable_to_check(&self, key: &S3GenericKey) -> Option<&CallableId> {
         let generic = self.generics.get(key)?;
-        match (&generic.dispatch, &generic.callable, &generic.selector) {
-            (S3Dispatch::Open, _, _) => None,
-            (_, Some(callable), Some(_)) => Some(callable),
-            _ => None,
+        match &generic.dispatch {
+            S3Dispatch::Open => None,
+            _ => generic
+                .definition
+                .as_ref()
+                .map(|definition| &definition.callable),
         }
     }
 
@@ -109,14 +108,14 @@ impl S3Model {
         if generic.dispatch == S3Dispatch::Open {
             return DispatchChange::Unchanged;
         }
-        let classes = match (&generic.callable, &generic.selector) {
-            (Some(callable), Some(selector)) if !callable_is_external => invocations
-                .uses(callable)
+        let classes = match &generic.definition {
+            Some(definition) if !callable_is_external => invocations
+                .uses(&definition.callable)
                 .iter()
                 .map(|invocation| {
                     invocation
                         .as_ref()
-                        .and_then(|invocation| selector_domain(invocation, selector, generic))
+                        .and_then(|invocation| selector_domain(invocation, definition))
                 })
                 .collect::<Option<Vec<_>>>(),
             _ => None,
@@ -496,11 +495,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 }
 
-fn selector_domain(invocation: &Invocation, selector: &str, generic: &S3Generic) -> ClassDomain {
+fn selector_domain(invocation: &Invocation, definition: &GenericDefinition) -> ClassDomain {
+    let selector = &definition.selector;
     if let Some(argument) = invocation
         .arguments
         .iter()
-        .find(|argument| argument.name.as_deref() == Some(selector))
+        .find(|argument| argument.name.as_deref() == Some(selector.as_str()))
     {
         return argument.classes.clone();
     }
@@ -509,7 +509,7 @@ fn selector_domain(invocation: &Invocation, selector: &str, generic: &S3Generic)
         .iter()
         .filter_map(|argument| argument.name.as_deref())
         .collect::<BTreeSet<_>>();
-    let position = generic
+    let position = definition
         .formals
         .iter()
         .filter(|formal| !named.contains(formal.as_str()))

@@ -1,4 +1,4 @@
-use super::MaterializeError;
+use super::BuildContextError;
 use super::relocated::RelocatedCode;
 use crate::ir::{
     BindingId, BindingName, ClosureId, ExternalBindingAccess, GenericHome, ImportSlotIr,
@@ -8,6 +8,7 @@ use crate::ir::{
 };
 
 const GENERATED_RUNTIME: &str = include_str!("runtime.R");
+use crate::ir::{ROOT_ON_LOAD_BINDING, ROOT_RUNTIME_BINDING};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RExpr(String);
@@ -52,11 +53,9 @@ macro_rules! emit {
 pub(super) fn generate_r_source(
     program: &ProgramIr,
     code: &RelocatedCode,
-) -> Result<String, MaterializeError> {
+) -> Result<String, BuildContextError> {
     let mut out = String::new();
-    out.push_str(
-        ".slinker_runtime <- base::new.env(parent = base::baseenv())\nbase::local(envir = .slinker_runtime, {\n",
-    );
+    out.push_str(&format!("{ROOT_RUNTIME_BINDING} <- base::new.env(parent = base::baseenv())\nbase::local(envir = {ROOT_RUNTIME_BINDING}, {{\n"));
     out.push_str(GENERATED_RUNTIME);
     emit!(
         out,
@@ -73,16 +72,14 @@ pub(super) fn generate_r_source(
     emit_bootstrap(&mut out, program, code);
     out.push_str("})\n");
     out.push_str(&root_closures_source(program, code)?);
-    out.push_str(
-        ".onLoad <- function(libname, pkgname) {\n  .slinker_runtime[[\"bootstrap\"]](base::asNamespace(pkgname), libname, pkgname)\n}\n",
-    );
+    out.push_str(&format!(".onLoad <- function(libname, pkgname) {{\n  {ROOT_RUNTIME_BINDING}[[\"bootstrap\"]](base::asNamespace(pkgname), libname, pkgname)\n}}\n"));
     Ok(out)
 }
 
 fn root_closures_source(
     program: &ProgramIr,
     code: &RelocatedCode,
-) -> Result<String, MaterializeError> {
+) -> Result<String, BuildContextError> {
     let root_on_load = program.root_artifact().on_load;
     let mut source = String::new();
     for closure in namespace_closures(program, program.root_namespace()) {
@@ -93,9 +90,10 @@ fn root_closures_source(
                 .code(code_id)
                 .assigned_value_start()
                 .ok_or_else(|| {
-                    MaterializeError::InvalidR("Root .onLoad code is not an assignment".into())
+                    BuildContextError::InvalidCode("Root .onLoad code is not an assignment".into())
                 })?;
-            source.push_str(".slinker_original_on_load <- ");
+            source.push_str(ROOT_ON_LOAD_BINDING);
+            source.push_str(" <- ");
             source.push_str(&text[value_start..]);
         } else {
             source.push_str(text);
@@ -158,9 +156,12 @@ fn emit_bootstrap(out: &mut String, program: &ProgramIr, code: &RelocatedCode) {
     }
     out.push_str("  .slinker_unregister()\n");
     if program.root_artifact().on_load.is_some() {
-        out.push_str(
-            "  get(\".slinker_original_on_load\", envir = root, inherits = FALSE)(libname, pkgname)\n",
+        emit!(
+            out,
+            "  assign(\".onLoad\", get({}, envir = root, inherits = FALSE), envir = root)",
+            r_string(ROOT_ON_LOAD_BINDING)
         );
+        out.push_str("  get(\".onLoad\", envir = root, inherits = FALSE)(libname, pkgname)\n");
     }
     out.push_str("}\n");
 }
@@ -348,8 +349,9 @@ pub(super) fn namespace_expression(program: &ProgramIr, package: PackageId) -> R
     RExpr::new(match program.package(package).registered_namespace() {
         RegisteredNamespace::Package(name) => format!("base::asNamespace({})", r_string(name)),
         RegisteredNamespace::Private(key) => format!(
-            "base::asNamespace({})[[\".slinker_runtime\"]][[\"namespaces\"]][[{}]]",
+            "base::asNamespace({})[[{}]][[\"namespaces\"]][[{}]]",
             r_string(&root.identity().name),
+            r_string(ROOT_RUNTIME_BINDING),
             r_string(key.as_str())
         ),
     })

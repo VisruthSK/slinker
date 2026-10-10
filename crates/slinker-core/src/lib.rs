@@ -16,6 +16,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+mod filesystem;
 mod metadata;
 mod target_env;
 pub mod worker;
@@ -26,11 +27,12 @@ pub mod cache;
 pub mod ir;
 pub mod package;
 pub mod profile;
+pub mod session;
 pub mod source;
 pub mod syntax;
 
 pub use metadata::{Description, Relation, RelationField, Version};
 pub use target_env::{
-    PrimedWorker, Target, TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest,
+    Target, TargetEnvironment, TargetEnvironmentError, TargetEnvironmentRequest, WorkerExecutable,
     r_executable,
 };

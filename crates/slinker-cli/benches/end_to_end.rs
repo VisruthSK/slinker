@@ -17,7 +17,13 @@ static ALLOCATOR: slinker_core::profile::heap::CountingAllocator =
     slinker_core::profile::heap::CountingAllocator;
 
 const ANALYZED: [&str; 6] = ["R6", "jsonlite", "rlang", "cli", "callr", "testthat"];
-const BUILT: [&str; 2] = ["here", "rebus.numbers"];
+const SOURCE_PACKAGES: [(&str, &str); 2] = [
+    ("here", "DynamicLookup in rprojroot::path: do.call()"),
+    (
+        "rebus.numbers",
+        "DynamicLookup in rebus.numbers::number_range: do.call()",
+    ),
+];
 const DEFAULT_THREADS: usize = 4;
 
 fn threads() -> usize {
@@ -27,7 +33,6 @@ fn threads() -> usize {
 }
 
 fn analyze(
-    r_home: &Path,
     target: &TargetEnvironment,
     root: &str,
     cache: CacheLocation,
@@ -35,7 +40,7 @@ fn analyze(
     #[cfg(feature = "profile")]
     slinker_core::profile::heap::begin_measurement();
     let start = Instant::now();
-    let plan = PackageStore::new(r_home.to_path_buf(), target.clone(), cache)
+    let plan = PackageStore::new(target.clone(), cache)
         .and_then(|store| Linker::new(store, threads()).analyze(root))
         .unwrap_or_else(|error| panic!("analyze {root}: {error}"));
     let elapsed = start.elapsed();
@@ -58,10 +63,9 @@ fn heap_usage() -> String {
 
 fn report_analysis(name: &str, elapsed: Duration, plan: &LinkIr, heap: &str) {
     println!(
-        "{name:<32} {:>9.3} s  bindings {:>6}  construction evaluations {:>8}  blockers {:>4}{heap}",
+        "{name:<32} {:>9.3} s  bindings {:>6}  blockers {:>4}{heap}",
         elapsed.as_secs_f64(),
         plan.program().bindings().len(),
-        plan.construction_evaluations(),
         plan.blockers().len()
     );
 }
@@ -71,13 +75,13 @@ fn analyze_installed(r_home: &Path) {
         .capture()
         .expect("capture the target R library universe");
     for root in ANALYZED {
-        let (elapsed, plan, heap) = analyze(r_home, &target, root, CacheLocation::Disabled);
+        let (elapsed, plan, heap) = analyze(&target, root, CacheLocation::Disabled);
         report_analysis(&format!("analyze {root} cold"), elapsed, &plan, &heap);
 
         let warm = tempfile::tempdir().expect("warm cache directory");
         let directory = || CacheLocation::Directory(warm.path().to_path_buf());
-        analyze(r_home, &target, root, directory());
-        let (elapsed, plan, heap) = analyze(r_home, &target, root, directory());
+        analyze(&target, root, directory());
+        let (elapsed, plan, heap) = analyze(&target, root, directory());
         report_analysis(&format!("analyze {root} warm"), elapsed, &plan, &heap);
     }
 }
@@ -119,7 +123,7 @@ fn provision(r_home: &Path, package: &str) -> (PathBuf, PathBuf) {
     (source, library)
 }
 
-fn build(r_home: &Path, package: &str) {
+fn reject_build(r_home: &Path, package: &str, blocker: &str) {
     let (source, library) = provision(r_home, package);
     let work = tempfile::tempdir().expect("build work directory");
     let output = work.path().join("output");
@@ -135,10 +139,22 @@ fn build(r_home: &Path, package: &str) {
         .output()
         .expect("run slinker build");
     let elapsed = start.elapsed();
-    common::assert_success(&result, &format!("slinker build {package}"));
+    assert!(
+        !result.status.success(),
+        "unproven {package} build succeeded"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains(blocker),
+        "{package} failed without its expected blocker: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !output.exists(),
+        "rejected {package} build published output"
+    );
     println!(
         "{:<32} {:>9.3} s",
-        format!("build {package} cold"),
+        format!("reject build {package} cold"),
         elapsed.as_secs_f64()
     );
 }
@@ -212,8 +228,8 @@ fn run() {
         analyze_installed(&r_home);
     }
     if selected("build") {
-        for package in BUILT {
-            build(&r_home, package);
+        for (package, blocker) in SOURCE_PACKAGES {
+            reject_build(&r_home, package, blocker);
             analyze_edit(&r_home, package);
         }
     }

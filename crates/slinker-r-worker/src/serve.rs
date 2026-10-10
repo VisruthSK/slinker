@@ -18,39 +18,18 @@ struct RequestContext {
 
 impl RequestContext {
     fn of(request: &WorkerRequest) -> Self {
-        let (request_id, package, binding) = match request {
-            WorkerRequest::Hello { .. } | WorkerRequest::Shutdown => (None, None, None),
-            WorkerRequest::PackageIndex {
-                request_id,
-                package,
+        let (package, binding) = match request {
+            WorkerRequest::PackageIndex { package, .. }
+            | WorkerRequest::DataLibrary { package, .. }
+            | WorkerRequest::BindingBatch { package, .. } => (Some(package), None),
+            WorkerRequest::Binding { package, name, .. } => (Some(package), Some(name.clone())),
+            WorkerRequest::DispatchGenerics { package, name, .. } => {
+                (package.as_ref(), Some(name.clone()))
             }
-            | WorkerRequest::DataLibrary {
-                request_id,
-                package,
-                ..
-            } => (Some(*request_id), Some(package), None),
-            WorkerRequest::Binding {
-                request_id,
-                package,
-                name,
-            } => (Some(*request_id), Some(package), Some(name.clone())),
-            WorkerRequest::BindingBatch {
-                request_id,
-                package,
-                ..
-            } => (Some(*request_id), Some(package), None),
-            WorkerRequest::DispatchGenerics {
-                request_id,
-                package,
-                name,
-            } => (Some(*request_id), package.as_ref(), Some(name.clone())),
-            WorkerRequest::SerializePayloads { request_id, .. }
-            | WorkerRequest::ValidateSyntax { request_id, .. }
-            | WorkerRequest::NormalizeSyntax { request_id, .. }
-            | WorkerRequest::VerifyRelocation { request_id, .. } => (Some(*request_id), None, None),
+            _ => (None, None),
         };
         Self {
-            request_id,
+            request_id: request.request_id(),
             package: package.map(|package| WorkerPackageIdentity {
                 name: package.name.clone(),
                 version: package.version.clone(),
@@ -74,49 +53,102 @@ impl RequestContext {
     }
 }
 
+pub(super) struct Initialization(());
+
+enum Server {
+    AwaitingHello,
+    Configuring(WorkerRuntime),
+    Running(WorkerRuntime),
+    Retired,
+}
+
 fn start_runtime(
-    runtime: &mut Option<WorkerRuntime>,
+    runtime: Server,
     protocol: u32,
     target: &protocol::TargetSpec,
-) -> WorkerResponse {
+) -> (Server, WorkerResponse) {
     let context = RequestContext::default();
-    if protocol != PROTOCOL_VERSION {
-        return context.failure(
-            WorkerErrorCode::Protocol,
-            format!("unsupported worker protocol {protocol}; expected {PROTOCOL_VERSION}"),
+    if !matches!(runtime, Server::AwaitingHello) {
+        return (
+            runtime,
+            context.failure(
+                WorkerErrorCode::Protocol,
+                "worker startup is a one-time transition",
+            ),
         );
     }
-    let started = WorkerRuntime::start(target).and_then(|started| {
+    if protocol != PROTOCOL_VERSION {
+        return (
+            runtime,
+            context.failure(
+                WorkerErrorCode::Protocol,
+                format!("unsupported worker protocol {protocol}; expected {PROTOCOL_VERSION}"),
+            ),
+        );
+    }
+    let started = WorkerRuntime::start(target, Initialization(())).and_then(|started| {
         let target = started.target()?;
         Ok((started, target))
     });
     match started {
-        Ok((started, target)) => {
-            *runtime = Some(started);
+        Ok((started, target)) => (
+            Server::Configuring(started),
             WorkerResponse::Hello {
                 protocol: PROTOCOL_VERSION,
                 harp_worker: true,
                 target,
-            }
-        }
-        Err(error) => context.failure(WorkerErrorCode::RuntimeStartup, error.to_string()),
+            },
+        ),
+        Err(error) => (
+            Server::Retired,
+            context.failure(WorkerErrorCode::RuntimeStartup, error.to_string()),
+        ),
     }
 }
 
-fn respond(runtime: &mut Option<WorkerRuntime>, request: WorkerRequest) -> WorkerResponse {
+fn respond(runtime: Server, request: WorkerRequest) -> (Server, WorkerResponse) {
     let context = RequestContext::of(&request);
     if let WorkerRequest::Hello { protocol, target } = &request {
         return start_runtime(runtime, *protocol, target);
     }
-    let Some(runtime) = runtime.as_mut() else {
-        return context.failure(
-            WorkerErrorCode::RuntimeStartup,
-            "Harp worker must receive hello before semantic requests",
-        );
-    };
-    runtime
-        .answer(request)
-        .unwrap_or_else(|failure| context.failure(failure.code, failure.error.to_string()))
+    match (runtime, request) {
+        (
+            Server::Configuring(mut worker),
+            WorkerRequest::ConfigureLibraries {
+                request_id,
+                libraries,
+            },
+        ) => match worker.configure(&libraries) {
+            Ok(target) => (
+                Server::Running(worker),
+                WorkerResponse::Configured { request_id, target },
+            ),
+            Err(error) => (
+                Server::Retired,
+                context.failure(WorkerErrorCode::PackageMetadata, error.to_string()),
+            ),
+        },
+        (state, WorkerRequest::ConfigureLibraries { .. }) => (
+            state,
+            context.failure(
+                WorkerErrorCode::Protocol,
+                "library configuration is frozen after inspection starts",
+            ),
+        ),
+        (Server::Configuring(mut worker) | Server::Running(mut worker), request) => {
+            let response = worker
+                .answer(request)
+                .unwrap_or_else(|failure| context.failure(failure.code, failure.error.to_string()));
+            (Server::Running(worker), response)
+        }
+        (state, _) => (
+            state,
+            context.failure(
+                WorkerErrorCode::RuntimeStartup,
+                "Harp worker must receive hello before semantic requests",
+            ),
+        ),
+    }
 }
 
 pub fn run(protocol_path: &std::path::Path) -> Result<()> {
@@ -127,7 +159,7 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
             path: protocol_path.to_path_buf(),
             source,
         })?;
-    let mut runtime = None;
+    let mut runtime = Server::AwaitingHello;
 
     for line in io::stdin().lock().lines() {
         let line = line.map_err(|source| Error::Io {
@@ -137,19 +169,30 @@ pub fn run(protocol_path: &std::path::Path) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<WorkerRequest>(&line) {
+        let (state, response) = match serde_json::from_str::<WorkerRequest>(&line) {
             Ok(WorkerRequest::Shutdown) => {
                 write_response(&mut output, &WorkerResponse::Shutdown)?;
                 return signal_response_ready();
             }
-            Ok(request) => respond(&mut runtime, request),
-            Err(error) => RequestContext::default().failure(
-                WorkerErrorCode::Protocol,
-                format!("invalid worker request: {error}"),
+            Ok(request) => respond(runtime, request),
+            Err(error) => (
+                runtime,
+                RequestContext::default().failure(
+                    WorkerErrorCode::Protocol,
+                    format!("invalid worker request: {error}"),
+                ),
             ),
         };
+        runtime = state;
         write_response(&mut output, &response)?;
         signal_response_ready()?;
+        // Namespace resolution can interrupt R's lazy-load decoder after it has
+        // cached an incomplete environment. No observation may reuse that epoch.
+        if matches!(runtime, Server::Retired)
+            || matches!(response, WorkerResponse::NamespaceRequired { .. })
+        {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -179,3 +222,7 @@ pub(super) fn write_response(writer: &mut impl Write, response: &WorkerResponse)
         source,
     })
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/inspection.rs"]
+mod tests;

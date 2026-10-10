@@ -5,8 +5,6 @@ mod runtime;
 mod scan;
 mod serve;
 mod sexp;
-#[cfg(test)]
-mod tests;
 
 pub use serve::run;
 

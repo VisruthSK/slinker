@@ -5,8 +5,8 @@ use super::emit::{
 use crate::ir::{CodeId, ExternalBindingAccess, ProgramIr, RelocationTarget};
 use crate::package::{CanonicalSyntax, Digest, SyntaxValidation};
 use crate::syntax::TextRange;
-use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{AppendedArgumentSpec, RelocationSiteSpec};
+use crate::worker::service::PreparationWorker;
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -17,7 +17,7 @@ pub(super) struct RelocatedCode {
 impl RelocatedCode {
     pub(super) fn verify(
         program: &ProgramIr,
-        worker: &mut WorkerClient,
+        worker: &mut PreparationWorker,
     ) -> Result<Self, BuildContextError> {
         let mut planned = BTreeMap::<CodeId, Vec<(TextRange, Replacement)>>::new();
         for relocation in program.relocations() {
@@ -158,6 +158,7 @@ impl Replacement {
                 "base::package_version({})",
                 r_string(version.as_ref())
             ))),
+            RelocationTarget::AbsentResource => Self::expression(r_string("")),
             RelocationTarget::Resource { target } => {
                 let resource = program.resource(*target);
                 let package = program.package(resource.package).identity();

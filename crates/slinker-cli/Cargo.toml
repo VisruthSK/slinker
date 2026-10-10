@@ -36,6 +36,10 @@ harness = false
 name = "end_to_end"
 harness = false
 
+[[bench]]
+name = "cache"
+harness = false
+
 [features]
 profile = ["slinker-core/profile"]
 

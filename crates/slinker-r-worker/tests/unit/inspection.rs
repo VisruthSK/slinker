@@ -1,8 +1,8 @@
-use super::protocol::*;
-use super::runtime::WorkerRuntime;
-use super::scan::ObjectScanner;
-use super::serve::write_response;
-use super::*;
+use crate::protocol::*;
+use crate::runtime::WorkerRuntime;
+use crate::scan::ObjectScanner;
+use crate::serve::write_response;
+use crate::*;
 use harp::RFunctionExt;
 use slinker_core::package::BindingName;
 use slinker_core::package::BindingOrigin;
@@ -44,7 +44,7 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
             std::process::Command::new(std::env::current_exe().expect("current test executable"))
                 .args([
                     "--exact",
-                    "tests::harp_inspection_preserves_lazy_active_altrep_and_private_state",
+                    "serve::tests::harp_inspection_preserves_lazy_active_altrep_and_private_state",
                     "--nocapture",
                     "--test-threads=1",
                 ])
@@ -75,7 +75,8 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
         },
         libraries: vec![fixture_library.clone()],
     };
-    let mut runtime = WorkerRuntime::start(&target).expect("start selected target R");
+    let mut runtime =
+        WorkerRuntime::start(&target, super::Initialization(())).expect("start selected target R");
     let initial_target = runtime.target().expect("capture initialized target");
     assert_eq!(
         dunce::canonicalize(&initial_target.libraries[0]).expect("canonical first library"),
@@ -307,6 +308,7 @@ fn payload_identity_stays_within_one_bundle(
               attr(unserialize(serialize(image$second, NULL)), "home")
             )
           )
+          .Internal(registerNamespace("root:harpfixture", image))
         }
         "#,
     )
@@ -369,10 +371,13 @@ fn payload_identity_stays_within_one_bundle(
             identical(restored$first$cycle$self, restored$first$cycle),
             identical(get("tag", envir = restored$first$child), "parent"),
             identical(environment(restored$second$counter), environment(restored$third)),
+            identical(get("image", envir = environment(restored$third)),
+              .Internal(getRegisteredNamespace("root:harpfixture"))),
             identical(restored$third(), 1L),
             identical(restored$second$counter(), 2L),
             inherits(restored$second, "tagged")
           )
+          .Internal(unregisterNamespace("root:harpfixture"))
         }})
         "#,
         restored.to_string_lossy().replace('\\', "/")

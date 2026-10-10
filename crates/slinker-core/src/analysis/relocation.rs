@@ -25,6 +25,9 @@ pub(super) enum PendingRelocation {
         package: PackageId,
         resource: ResourcePath,
     },
+    AbsentResource {
+        source: Span,
+    },
     RequireNamespace {
         source: Span,
         loaded: Option<PackageId>,
@@ -97,6 +100,7 @@ impl PendingRelocation {
         match self {
             Self::NamespaceAccess { source, .. }
             | Self::ResourceAccess { source, .. }
+            | Self::AbsentResource { source }
             | Self::RequireNamespace { source, .. }
             | Self::NamespaceLoad { source, .. }
             | Self::PackageVersion { source, .. }
@@ -133,6 +137,7 @@ impl PendingRelocation {
             | Self::InstalledQuery { package, .. } => Some(*package),
             Self::RequireNamespace { loaded, .. } => *loaded,
             Self::ResourceAccess { .. }
+            | Self::AbsentResource { .. }
             | Self::PackageVersion { .. }
             | Self::DescriptionArgument { .. } => None,
         }

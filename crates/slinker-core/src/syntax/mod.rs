@@ -3,11 +3,10 @@ pub mod oak;
 pub mod source;
 
 pub use facts::{
-    ActiveBindingDef, BindingDeclaration, CallSite, CalleeKind, ConstructionArgument,
-    ConstructionCall, ConstructionExpr, ConstructionExprKind, ConstructionTarget, DeclaredCallable,
-    DeclaredDomain, EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind,
-    NamespaceEnumeration, NamespaceInfoRead, NamespaceInfoReceiver, PackageGuard, PackageRef,
-    ParsedExpression, ParsedRFile, PinnedDefault, ResourcePackage, ResourceRef, SemanticIssue,
+    ActiveBindingDef, BindingDeclaration, CallSite, CalleeKind, DeclaredCallable, DeclaredDomain,
+    EvalPhase, LexicalBindingId, LexicalScopeId, NameRef, NameRefKind, NamespaceEnumeration,
+    NamespaceInfoRead, NamespaceInfoReceiver, PackageGuard, PackageRef, ParsedExpression,
+    ParsedRFile, PinnedDefault, ResourceArguments, ResourcePackage, ResourceRef, SemanticIssue,
     SemanticIssueKind, StaticArg, StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
 };
 pub(crate) use oak::SharedNames;
