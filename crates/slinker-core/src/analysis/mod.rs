@@ -1,5 +1,6 @@
 mod activation;
 mod arguments;
+mod call;
 mod calls;
 mod dataset;
 pub mod diagnostic;
@@ -13,6 +14,7 @@ mod guarded;
 mod guards;
 mod invocation;
 mod namespace;
+mod namespace_use;
 mod native;
 pub mod need;
 mod parse_cache;

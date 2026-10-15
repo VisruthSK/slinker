@@ -5,8 +5,8 @@ use crate::Result;
 use crate::analysis::{EdgeKind, GenericId, LifecycleHook, Need, RejectCode, S3Id};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    ComponentName, DatasetName, NativeLibrary, NativeSafety, PackageId, PackageProvider,
-    ResourcePath,
+    ComponentName, DatasetName, ImportSpec, NativeLibrary, NativeSafety, PackageId,
+    PackageProvider, ResourcePath,
 };
 use std::sync::Arc;
 
@@ -19,6 +19,28 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let image = self.image(id)?;
         let index = Arc::clone(&image.index);
         let node = self.need_node(&Need::Activation { package: id });
+
+        for import in &index.imports {
+            let name = match import {
+                ImportSpec::All { package, .. } | ImportSpec::From { package, .. } => package,
+            };
+            match self.packages.resolve(name)? {
+                Some(package) => self.require(
+                    node,
+                    Need::Activation { package },
+                    EdgeKind::Import,
+                    format!("effective import loads `{name}`"),
+                ),
+                None => self.record_missing_package(
+                    node,
+                    id,
+                    name,
+                    EdgeKind::Import,
+                    format!("effective import requires `{name}`"),
+                    None,
+                ),
+            }
+        }
 
         for registration in &index.s3 {
             if let Some(package_name) = registration.generic.package.as_deref()

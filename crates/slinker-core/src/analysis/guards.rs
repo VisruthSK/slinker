@@ -1,6 +1,6 @@
 use super::state::{AnalyzerState, Caller, ParsedSite};
 use crate::analysis::RejectCode;
-use crate::metadata::{RelationField, relations};
+use crate::metadata::{RelationField, relations, required_runtime_relations};
 use crate::package::{ImportSpec, PackageId, PackageImage, PackageName, PackageProvider};
 use crate::profile::{self, Probe};
 use crate::syntax::{PackageGuard, Span};
@@ -9,6 +9,20 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 impl<P: PackageProvider> AnalyzerState<P> {
+    pub(super) fn loaded_state_established(
+        &self,
+        owner: PackageId,
+        image: &PackageImage,
+        name: &str,
+    ) -> bool {
+        name == self.packages.name(owner).as_str()
+            || image.index.imports.iter().any(|import| match import {
+                ImportSpec::All { package, .. } | ImportSpec::From { package, .. } => {
+                    package == name
+                }
+            })
+    }
+
     pub(super) fn guards_active(
         &self,
         site: ParsedSite<'_>,
@@ -92,8 +106,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             match guard {
                 PackageGuard::Selected(_) => return Ok(GuardVerdict::Pruned),
                 PackageGuard::Loaded(_) => {
-                    if !imported {
-                        return Ok(GuardVerdict::Pruned);
+                    if !self.loaded_state_established(owner, image, package) {
+                        continue;
                     }
                 }
                 PackageGuard::Available(_) => {
@@ -145,13 +159,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 };
                 required.insert(package.to_string());
             }
-            for dependency in relations(&index.description, RelationField::Imports)
-                .map_err(Error::Analysis)?
-                .into_iter()
-                .chain(
-                    relations(&index.description, RelationField::Depends)
-                        .map_err(Error::Analysis)?,
-                )
+            for dependency in
+                required_runtime_relations(&index.description).map_err(Error::Analysis)?
             {
                 required.insert(dependency.package().to_owned());
             }

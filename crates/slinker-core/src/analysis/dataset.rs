@@ -211,13 +211,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<bool> {
         if call.callee != "data"
             || call.callee_kind != CalleeKind::DefinitelyExternal
-            || call.qualified_package.is_some()
+            || call.qualification.is_some()
         {
             return Ok(false);
         }
         Ok(matches!(
-            self.resolve_lexical_name(current, image, lexical_environment, "data")?,
-            Resolution::OpenDynamic(OpenReason::Unresolved(_))
+            self.resolved_call(current, image, lexical_environment, call)?
+                .target(),
+            Some(Resolution::OpenDynamic(OpenReason::Unresolved(_)))
         ))
     }
 }

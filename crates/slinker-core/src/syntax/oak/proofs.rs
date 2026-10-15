@@ -1,10 +1,6 @@
 use super::census::{Census, IfRegion, assignment_of, node_range, static_arg_of};
 use super::context::OakParseContext;
-use super::scan::{
-    ForRegion, FunctionRegion, contains_call_named, find_if_regions, function_body_range,
-    identifier_occurs_before, last_top_level_expression, matching_delimiter, name_token_end,
-    skip_trivia_bounded, static_symbol,
-};
+use super::scan::{ForRegion, FunctionRegion, static_symbol};
 use super::{LiveUse, innermost_function_region, text_offset};
 use crate::syntax::facts::{CallSite, CalleeKind, StaticArg};
 use crate::syntax::source::TextRange;
@@ -484,115 +480,7 @@ pub(super) fn call_is_non_returning(
         Some(_) => false,
         None if !bare_call_is_external(index, callee, callee_start) => false,
         None if matches!(callee, "stop" | "q" | "quit") => context.resolves_to_base(callee),
-        None => context.non_returning_names.contains(callee),
-    }
-}
-
-pub(super) fn direct_call_expression(
-    text: &str,
-    start: usize,
-    end: usize,
-) -> Option<(Option<String>, String, usize)> {
-    let start = skip_trivia_bounded(text, start, end);
-    let first_end = name_token_end(text, start)?;
-    let first = static_symbol(text.get(start..first_end)?)?;
-    let mut cursor = skip_trivia_bounded(text, first_end, end);
-
-    let (package, callee, callee_start) = if text
-        .get(cursor..end)
-        .is_some_and(|rest| rest.starts_with(":::"))
-    {
-        cursor += 3;
-        cursor = skip_trivia_bounded(text, cursor, end);
-        let callee_start = cursor;
-        let callee_end = name_token_end(text, cursor)?;
-        let callee = static_symbol(text.get(cursor..callee_end)?)?;
-        cursor = callee_end;
-        (Some(first), callee, callee_start)
-    } else if text
-        .get(cursor..end)
-        .is_some_and(|rest| rest.starts_with("::"))
-    {
-        cursor += 2;
-        cursor = skip_trivia_bounded(text, cursor, end);
-        let callee_start = cursor;
-        let callee_end = name_token_end(text, cursor)?;
-        let callee = static_symbol(text.get(cursor..callee_end)?)?;
-        cursor = callee_end;
-        (Some(first), callee, callee_start)
-    } else {
-        (None, first, start)
-    };
-
-    cursor = skip_trivia_bounded(text, cursor, end);
-    if text.as_bytes().get(cursor).copied() != Some(b'(') {
-        return None;
-    }
-    let close = matching_delimiter(text, cursor)?;
-    let trailing = skip_trivia_bounded(text, close + 1, end);
-    (trailing >= end).then_some((package, callee, callee_start))
-}
-
-pub(crate) fn closure_definitely_non_returning(text: &str, context: &OakParseContext) -> bool {
-    let Some((body_start, body_end)) = function_body_range(text) else {
-        return false;
-    };
-    if contains_call_named(text.get(body_start..body_end).unwrap_or_default(), "return") {
-        return false;
-    }
-    expression_definitely_non_returning(text, context, body_start, body_end)
-}
-
-pub(super) fn expression_definitely_non_returning(
-    text: &str,
-    context: &OakParseContext,
-    start: usize,
-    end: usize,
-) -> bool {
-    let Some((expression_start, expression_end)) = last_top_level_expression(text, start, end)
-    else {
-        return false;
-    };
-
-    let regions = find_if_regions(text);
-    if let Some(region) = regions.iter().find(|region| {
-        region.if_start == expression_start
-            && region
-                .else_branch
-                .is_some_and(|branch| branch.end <= expression_end)
-    }) {
-        let Some(TextRange {
-            start: else_start,
-            end: else_end,
-        }) = region.else_branch
-        else {
-            return false;
-        };
-        return expression_definitely_non_returning(
-            text,
-            context,
-            region.then_branch.start,
-            region.then_branch.end,
-        ) && expression_definitely_non_returning(text, context, else_start, else_end);
-    }
-
-    let Some((package, callee, callee_start)) =
-        direct_call_expression(text, expression_start, expression_end)
-    else {
-        return false;
-    };
-
-    match package.as_deref() {
-        Some("base") => matches!(callee.as_str(), "stop" | "q" | "quit"),
-        Some(_) => false,
-        None if matches!(callee.as_str(), "stop" | "q" | "quit") => {
-            context.resolves_to_base(&callee)
-                && !identifier_occurs_before(text, &callee, callee_start)
-        }
-        None => {
-            context.non_returning_names.contains(callee.as_str())
-                && !identifier_occurs_before(text, &callee, callee_start)
-        }
+        None => false,
     }
 }
 
@@ -600,7 +488,7 @@ pub(super) fn is_base_call(context: &OakParseContext, call: &CallSite) -> bool {
     if call.callee_kind != CalleeKind::DefinitelyExternal {
         return false;
     }
-    match call.qualified_package.as_deref() {
+    match call.qualified_package() {
         Some("base") => true,
         Some(_) => false,
         None => context.resolves_to_base(&call.callee),

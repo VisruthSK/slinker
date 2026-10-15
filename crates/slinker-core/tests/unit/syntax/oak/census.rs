@@ -43,7 +43,7 @@ fn language_constants_are_not_symbol_arguments() {
     assert_eq!(
         values,
         [
-            None,
+            Some(StaticArg::Logical(true)),
             None,
             Some(StaticArg::Symbol("T".into())),
             Some(StaticArg::Symbol("...".into())),

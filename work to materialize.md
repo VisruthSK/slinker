@@ -92,33 +92,17 @@ acceptance cases here.
 
 ## Next up
 
-1. Capture the independent failures in `fixes.md` as regressions under `crates/*/tests/`; retain original R as the oracle. Delete unsound helper-body exit inference and unresolved-selector/sole-DLL guesses.
-2. Tracks E/F: unify call/caller facts and settle pending resource/namespace obligations. Close reflective S3 retention, default-resource discovery order, exported lookup, argument/error preservation, and loaded-state contradictions.
+1. Capture the remaining independent failures in `fixes.md` as regressions under `crates/*/tests/`; retain original R as the oracle. Delete unresolved-selector/sole-DLL guesses.
+2. Track F: establish typed dispatch observations for retained primitive callables and unknown computed generics.
 3. Tracks G/I: share object traversal with structural identities and finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
 4. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
 5. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
 
 ---
 
-## Track E: Resolved calls and settled observations
-
-- Resolve each operation once. Share callee identity, its stability under reachable namespace writes, full argument matching, and explicit unknown/invalid outcomes across retention, callbacks, S3, guards, reflection, and relocation admission. Block unproved replacement of specialized platform/External operations; their role or qualification is not an immutable-callable contract.
-- Preserve exact/partial/positional/dots matching, missing and duplicate arguments, evaluation, and visibility. Use target R as an independent matching oracle; primitive/native call forms need their own established rules.
-- Remove pre-index quote/eval source erasure and helper-body non-returning inference. Control proofs require an established base operation and valid dispatch assumptions.
-- Settle pending resource uses against final package roles and caller coverage. A helper's literal default cannot silently bypass relocation because its dependency was discovered later. Keep invocation/escape tracking free of package discovery.
-- Pruning and rewriting consume the same checked loaded-state fact. Preserve eager effective-import load obligations separately from delayed runtime namespace access; block unproved effectful activation timing and unsupported raw registry observations.
-- Preserve exported lookup operations/names and namespace-value member/escape obligations, including Root observations of generated support bindings. Keep one required-runtime relation definition for role classification and checked External requirement intersection.
-
-Done when:
-- reflective, resource-default, namespace-handle, export-check, semantic-callee mutation, guard/control, visibility, and argument-error oracles in `fixes.md` pass;
-- an internal helper rename, legal work schedule, thread count, or cold/warm cache cannot change the settled program, resources, relocations, or blockers;
-- every required use is discharged before construction; no downstream emitter reconstructs a missing semantic decision.
-
 ## Track F: S3 caller completeness
 
-- One coverage representation distinguishes unknown/unclassified callers from a complete settled invocation set. S3 and default specialization consume it; unknown coverage stays open as new observations arrive.
-- Reflective retrieval, exported/callback uses, callable payload members, and other unclassified retention must not narrow dispatch from an empty direct-call list.
-- Share the checked matcher from Track E. Preserve the existing supported declaration-based precision only when every possible invocation is covered.
+- Preserve the existing supported declaration-based precision only when every possible invocation is covered.
 - Return typed `NoDispatch`, established generics, or unknown dispatch from target-R inspection. Cover primitive callables inside retained objects; do not equate a missing/literal-unrecognized body with no dispatch.
 
 Done when:

@@ -185,6 +185,14 @@ pub fn relations(
     Ok(parsed.values().cloned().collect())
 }
 
+pub(crate) fn required_runtime_relations(
+    description: &Description,
+) -> Result<Vec<Relation>, String> {
+    let mut required = relations(description, RelationField::Imports)?;
+    required.extend(relations(description, RelationField::Depends)?);
+    Ok(required)
+}
+
 #[cfg(test)]
 #[path = "../tests/unit/metadata.rs"]
 mod tests;

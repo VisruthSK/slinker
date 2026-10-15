@@ -28,6 +28,16 @@ pub(super) fn check_payload_bundles(
     serialization: PayloadSerialization,
 ) -> Result<Vec<CheckedPayloadBundle>, BuildReport> {
     let bundles = program.payload_bundles();
+    let namespace_name = |name: &str| {
+        program
+            .packages()
+            .find_map(|(_, package)| {
+                (package.registered_namespace().as_str() == name)
+                    .then_some(package.identity().name.as_str())
+            })
+            .unwrap_or(name)
+            .to_owned()
+    };
     let package_name = |bundle: &PayloadBundleIr| {
         &program
             .package(program.namespace(bundle.namespace()).package)
@@ -79,11 +89,13 @@ pub(super) fn check_payload_bundles(
             .filter(|namespace| *namespace != owner)
             .collect::<BTreeSet<_>>();
         blockers.extend(observed.difference(&established).map(|namespace| {
+            let namespace = namespace_name(namespace);
             format!(
                 "payload bundle of `{package}` refers to namespace `{namespace}`, which analysis did not establish as a dependency"
             )
         }));
         blockers.extend(established.difference(&observed).map(|namespace| {
+            let namespace = namespace_name(namespace);
             format!(
                 "payload bundle of `{package}` does not refer to namespace `{namespace}`, which analysis established as a dependency"
             )

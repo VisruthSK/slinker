@@ -31,6 +31,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let index = matched_arg_index(call, &[".NAME"], ".NAME")?;
         match call.static_arg(index)? {
             StaticArg::Symbol(name) | StaticArg::String(name) => Some(name.as_str()),
+            StaticArg::Logical(_) => None,
         }
     }
 

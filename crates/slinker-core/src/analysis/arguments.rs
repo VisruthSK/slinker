@@ -1,3 +1,6 @@
+use super::relocation::NamespaceCall;
+pub(super) use crate::arguments::{MatchScope, match_arguments};
+use crate::ir::NamespaceOperation;
 use crate::syntax::{CallSite, DeclaredCallable, ParsedRFile, Span, StaticArg};
 use std::collections::BTreeSet;
 
@@ -16,65 +19,16 @@ where
     let target_index = formals
         .iter()
         .position(|formal| formal.as_ref() == target)?;
-    let mut assigned = vec![None; formals.len()];
-    let mut consumed = vec![false; arguments.arg_count()];
-    let before_dots = formals
-        .iter()
-        .position(|formal| formal.as_ref() == "...")
-        .unwrap_or(formals.len());
-
-    for (arg_index, consumed) in consumed.iter_mut().enumerate() {
-        let Some(name) = arguments.arg_name(arg_index) else {
-            continue;
-        };
-        if let Some(formal_index) = formals.iter().position(|formal| formal.as_ref() == name)
-            && assigned[formal_index].is_none()
-        {
-            assigned[formal_index] = Some(arg_index);
-            *consumed = true;
-        }
-    }
-
-    for (arg_index, consumed) in consumed.iter_mut().enumerate() {
-        let Some(name) = arguments.arg_name(arg_index) else {
-            continue;
-        };
-        if *consumed {
-            continue;
-        }
-        let candidates = formals
+    match_arguments(
+        arguments
+            .arguments
             .iter()
-            .take(before_dots)
-            .enumerate()
-            .filter(|(formal_index, formal)| {
-                assigned[*formal_index].is_none() && formal.as_ref().starts_with(name)
-            })
-            .map(|(formal_index, _)| formal_index)
-            .collect::<Vec<_>>();
-        if candidates.len() == 1 {
-            let formal_index = candidates[0];
-            assigned[formal_index] = Some(arg_index);
-            *consumed = true;
-        }
-    }
-
-    let mut next_formal = 0;
-    for (arg_index, consumed) in consumed.iter_mut().enumerate() {
-        if arguments.arg_name(arg_index).is_some() || *consumed {
-            continue;
-        }
-        while next_formal < before_dots && assigned[next_formal].is_some() {
-            next_formal += 1;
-        }
-        if next_formal == before_dots {
-            break;
-        }
-        assigned[next_formal] = Some(arg_index);
-        *consumed = true;
-        next_formal += 1;
-    }
-
-    assigned[target_index]
+            .map(|argument| argument.name.as_deref()),
+        formals,
+        MatchScope::Projection,
+    )
+    .ok()?
+    .argument(target_index)
 }
 
 pub(super) fn matched_static_arg<'a>(
@@ -124,23 +78,30 @@ pub(super) fn static_string_arg(call: &CallSite) -> Option<&str> {
     }?;
     match argument {
         StaticArg::String(value) => Some(value),
-        StaticArg::Symbol(_) => None,
+        StaticArg::Symbol(_) | StaticArg::Logical(_) => None,
     }
 }
 
 pub(super) fn namespace_formal(name: &str) -> Option<&'static str> {
-    match name {
-        "requireNamespace" | "loadNamespace" => Some("package"),
-        "getNamespace" => Some("name"),
-        "asNamespace" => Some("ns"),
-        _ => None,
-    }
+    namespace_formals(name)?.first().copied()
+}
+
+pub(super) fn namespace_formals(name: &str) -> Option<&'static [&'static str]> {
+    let operation = match name {
+        "requireNamespace" => NamespaceCall::Require,
+        "loadNamespace" => NamespaceCall::Operation(NamespaceOperation::Load),
+        "getNamespace" => NamespaceCall::Operation(NamespaceOperation::Get),
+        "asNamespace" => NamespaceCall::Operation(NamespaceOperation::As),
+        _ => return None,
+    };
+    Some(operation.arguments().0)
 }
 
 pub(super) fn static_package_arg(call: &CallSite) -> Option<&str> {
     let argument = matched_static_arg(call, &["package"], "package")?;
     match argument {
         StaticArg::String(value) | StaticArg::Symbol(value) => Some(value),
+        StaticArg::Logical(_) => None,
     }
 }
 
@@ -175,12 +136,54 @@ pub(super) fn reflective_name_formals(
     }
 }
 
-pub(super) fn only_package_argument(call: &CallSite, rewritable: &[&str]) -> bool {
-    call.arg_count()
-        == 1 + call
-            .arguments
+pub(super) fn only_package_argument(
+    call: &CallSite,
+    formals: &[&str],
+    package: &str,
+    rewritable: &[&str],
+) -> bool {
+    if call.arguments.iter().any(|argument| {
+        argument.name.is_none()
+            && matches!(&argument.value, Some(StaticArg::Symbol(name)) if name == "...")
+    }) {
+        return false;
+    }
+    let Ok(matched) = match_arguments(
+        call.arguments
             .iter()
-            .filter_map(|argument| argument.name.as_deref())
-            .filter(|name| rewritable.contains(name))
-            .count()
+            .map(|argument| argument.name.as_deref()),
+        formals,
+        MatchScope::Signature,
+    ) else {
+        return false;
+    };
+    let Some(primary) = formals.iter().position(|formal| *formal == package) else {
+        return false;
+    };
+    if matched.argument(primary).is_none() {
+        return false;
+    }
+    let consumed = formals
+        .iter()
+        .enumerate()
+        .filter(|(_, formal)| **formal == package || rewritable.contains(formal))
+        .filter_map(|(formal, _)| matched.argument(formal))
+        .count();
+    if consumed != call.arg_count() {
+        return false;
+    }
+    let logical_control = match call.callee.as_str() {
+        "requireNamespace" => Some("quietly"),
+        "asNamespace" => Some("base.OK"),
+        _ => None,
+    };
+    if let Some(control) = logical_control
+        && let Some(argument) = formals
+            .iter()
+            .position(|formal| *formal == control)
+            .and_then(|formal| matched.argument(formal))
+    {
+        return matches!(call.static_arg(argument), Some(StaticArg::Logical(_)));
+    }
+    true
 }

@@ -80,6 +80,7 @@ pub(super) struct AnalysisOptions {
 type ShadowBase = (usize, Arc<BTreeSet<BindingName>>);
 
 pub(crate) struct AnalyzerState<P: PackageProvider> {
+    pub(super) calls: Guarded<HashMap<crate::syntax::CallId, Arc<super::call::ResolvedCall>>>,
     pub(super) packages: TargetUniverse<P>,
     pub(super) linked_packages: HashSet<PackageName>,
     pub(super) explicit_external_packages: HashSet<PackageName>,
@@ -108,7 +109,6 @@ pub(crate) struct AnalyzerState<P: PackageProvider> {
     pub(super) root: PackageId,
     pub(super) declared_dependencies: Guarded<HashMap<PackageId, Arc<DeclaredDependencies>>>,
     pub(super) namespace_imports: Guarded<HashMap<PackageId, Arc<NamespaceImports>>>,
-    pub(super) non_returning_bindings: Guarded<HashMap<PackageId, Arc<BTreeSet<BindingName>>>>,
     pub(super) shadow_bases: Guarded<HashMap<PackageId, ShadowBase>>,
     pub(super) root_description: Option<Arc<str>>,
 }
@@ -139,6 +139,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         );
         let root = packages.require(root_name)?;
         Ok(Self {
+            calls: Guarded::default(),
             packages,
             linked_packages: options.linked_packages,
             explicit_external_packages: options.explicit_external_packages,
@@ -166,7 +167,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             root,
             declared_dependencies: Guarded::default(),
             namespace_imports: Guarded::default(),
-            non_returning_bindings: Guarded::default(),
             shadow_bases: Guarded::default(),
             root_description: options.root_description,
         })
@@ -225,11 +225,30 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .stack_size(super::ANALYSIS_STACK_BYTES)
             .build()
             .map_err(|error| Error::Analysis(format!("failed to create Rayon pool: {error}")))?;
-        pool.install(|| rayon::scope(|scope| self.spawn_injected(scope)));
-        debug_assert!(self.work.is_quiescent());
-        match self.failure.lock().take() {
-            Some(error) => Err(error),
-            None => Ok(()),
+        loop {
+            pool.install(|| rayon::scope(|scope| self.spawn_injected(scope)));
+            if let Some(error) = self.failure.lock().take() {
+                return Err(error);
+            }
+            let resources = self.relocations.lock().take_defaulted_resources();
+            if resources.is_empty() {
+                if self.settle_namespace_uses()? {
+                    continue;
+                }
+                if self.settle_caller_coverage()? {
+                    continue;
+                }
+                self.settle_namespace_mutations()?;
+                return self.settle_loaded_queries();
+            }
+            for resource in resources {
+                self.literal_resource_access(
+                    resource.node,
+                    resource.owner,
+                    &resource.reference,
+                    &resource.package,
+                )?;
+            }
         }
     }
 

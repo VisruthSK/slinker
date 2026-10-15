@@ -167,6 +167,7 @@ impl<K: Eq + Hash + Clone> Machine<K> {
         self.table().pending
     }
 
+    #[cfg(test)]
     pub(super) fn is_quiescent(&self) -> bool {
         let table = self.table();
         table.pending == 0 && table.injected.is_empty()

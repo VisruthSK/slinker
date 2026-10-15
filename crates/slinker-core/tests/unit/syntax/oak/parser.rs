@@ -8,7 +8,7 @@ fn binary_constant_arguments_are_not_names() {
         .iter()
         .find(|call| call.callee == "+")
         .unwrap();
-    assert_eq!(call.static_arg(1), None);
+    assert_eq!(call.static_arg(1), Some(&StaticArg::Logical(true)));
 }
 
 #[test]
@@ -82,14 +82,7 @@ fn bquote_analyzes_holes_only() {
 }
 
 #[test]
-fn evaluated_quotation_is_live_code_in_the_calling_frame() {
-    let parsed = parse_source("f <- function(root) eval(bquote(function(...) path(.(root), ...)))");
-    let names = reference_names(&parsed);
-    assert!(names.contains(&"path"));
-    assert!(!names.contains(&"root"));
-    assert!(
-        reference_names(&parse_source("f <- function() eval(quote(helper()))")).contains(&"helper")
-    );
+fn evalq_is_live_code_in_the_calling_frame() {
     assert!(reference_names(&parse_source("f <- function() evalq(helper())")).contains(&"helper"));
 }
 
@@ -573,9 +566,8 @@ fn exhaustive_dispatch_with_stop_proves_local_binding() {
 }
 
 #[test]
-fn package_local_non_returning_helper_proves_local_binding() {
-    let mut context = OakParseContext::default();
-    context.non_returning_names.insert(".die".into());
+fn helper_calls_do_not_prove_local_binding() {
+    let context = OakParseContext::default();
     let parsed = OakParser
         .parse_binding_with_context(
             SourceId(0),
@@ -588,7 +580,7 @@ fn package_local_non_returning_helper_proves_local_binding() {
             &context,
         )
         .unwrap();
-    assert!(!reference_names(&parsed).contains(&"showprob"));
+    assert!(reference_names(&parsed).contains(&"showprob"));
 }
 
 #[test]
@@ -620,9 +612,8 @@ fn zero_iteration_loop_keeps_real_fallthrough() {
 }
 
 #[test]
-fn locally_shadowed_non_returning_helper_does_not_discharge_fallthrough() {
-    let mut context = OakParseContext::default();
-    context.non_returning_names.insert(".die".into());
+fn helper_formal_does_not_discharge_fallthrough() {
+    let context = OakParseContext::default();
     let parsed = OakParser
         .parse_binding_with_context(
             SourceId(0),
@@ -639,25 +630,11 @@ fn locally_shadowed_non_returning_helper_does_not_discharge_fallthrough() {
 }
 
 #[test]
-fn locally_shadowed_stop_is_not_summarized_as_non_returning() {
-    let context = OakParseContext::default();
-    assert!(!closure_definitely_non_returning(
-        "function(stop) stop('not base stop')",
-        &context,
-    ));
-}
-
-#[test]
-fn non_returning_summary_requires_terminal_stop() {
-    let context = OakParseContext::default();
-    assert!(closure_definitely_non_returning(
-        "function(message) { stop(message) }",
-        &context,
-    ));
-    assert!(!closure_definitely_non_returning(
-        "function(flag) { if (flag) stop('bad'); 1 }",
-        &context,
-    ));
+fn locally_shadowed_stop_does_not_discharge_fallthrough() {
+    let parsed = parse_source(
+        "f <- function(flag, stop) { if (flag) x <- 1 else stop('not base stop'); x }",
+    );
+    assert!(reference_names(&parsed).contains(&"x"));
 }
 
 #[test]
@@ -1015,33 +992,6 @@ fn equality_chains_do_not_correlate_later_branches() {
     assert!(names.contains(&"rr"));
     assert!(names.contains(&"lowerrr"));
     assert!(names.contains(&"upperrr"));
-}
-
-#[test]
-fn non_returning_summary_handles_multi_statement_terminal_stop() {
-    let context = OakParseContext::default();
-    assert!(closure_definitely_non_returning(
-        "function(x) { message <- x; stop(message) }",
-        &context,
-    ));
-}
-
-#[test]
-fn non_returning_summary_handles_exhaustive_terminating_if() {
-    let context = OakParseContext::default();
-    assert!(closure_definitely_non_returning(
-        "function(flag) { if (flag) stop('a') else base::stop('b') }",
-        &context,
-    ));
-}
-
-#[test]
-fn explicit_return_prevents_never_returns_summary() {
-    let context = OakParseContext::default();
-    assert!(!closure_definitely_non_returning(
-        "function(flag) { if (flag) return(1); stop('otherwise') }",
-        &context,
-    ));
 }
 
 #[test]

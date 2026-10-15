@@ -1,5 +1,5 @@
 use crate::package::{Digest, PackageId};
-use crate::syntax::{ParsedRFile, SourceId, SourceKey, Sources, Span};
+use crate::syntax::{ParsedRFile, SourceId, SourceKey, Sources};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -67,10 +67,6 @@ impl ParseCache {
 
     pub(super) fn sources(&self) -> &Sources {
         &self.sources
-    }
-
-    pub(super) fn text(&self, span: &Span) -> Option<&str> {
-        self.sources.text(span)
     }
 
     pub(super) fn into_sources(self) -> Sources {

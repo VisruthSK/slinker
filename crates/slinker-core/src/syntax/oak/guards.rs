@@ -68,6 +68,10 @@ pub(super) fn if_guard_regions(
 ) -> Vec<(TextRange, PackageGuard)> {
     let mut guards = Vec::new();
     for region in &census.ifs {
+        let (scope, _) = index.scope_at(region.condition.syntax().text_trimmed_range().start());
+        if !context.resolves_to_base("if") || index.resolve("if", scope).is_some() {
+            continue;
+        }
         let mut required = Vec::new();
         required_calls(&region.condition, context, index, &mut required);
         for range in required {
@@ -124,7 +128,7 @@ pub(super) fn hook_guard_regions(
             .static_arg(1)
             .and_then(|argument| match argument {
                 StaticArg::String(value) => Some(value.as_str()),
-                StaticArg::Symbol(_) => None,
+                StaticArg::Symbol(_) | StaticArg::Logical(_) => None,
             });
         if event == Some("onLoad") {
             guards.push((
@@ -155,7 +159,7 @@ fn required_calls(
             };
             let name = operator.text_trimmed();
             let (scope, _) = index.scope_at(binary.range().start());
-            if matches!(name, "&&" | "&")
+            if name == "&&"
                 && context.resolves_to_base(name)
                 && index.resolve(name, scope).is_none()
                 && let (Ok(left), Ok(right)) = (binary.left(), binary.right())

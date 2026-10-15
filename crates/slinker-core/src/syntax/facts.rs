@@ -56,11 +56,32 @@ pub enum CalleeKind {
     ConditionalFallthrough,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum QualifiedCall {
+    Exported(Atom),
+    Internal(Atom),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallId {
+    pub span: Span,
+    pub callee: Atom,
+    pub qualification: Option<QualifiedCall>,
+}
+
+impl QualifiedCall {
+    pub fn package(&self) -> &str {
+        match self {
+            Self::Exported(package) | Self::Internal(package) => package,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
     pub callee: Atom,
     pub callee_kind: CalleeKind,
-    pub qualified_package: Option<Atom>,
+    pub qualification: Option<QualifiedCall>,
     pub arguments: Box<[CallArgument]>,
     pub scope: LexicalScopeId,
     pub phase: EvalPhase,
@@ -78,6 +99,16 @@ pub struct CallArgument {
 }
 
 impl CallSite {
+    pub fn id(&self) -> CallId {
+        CallId {
+            span: self.span.clone(),
+            callee: self.callee.clone(),
+            qualification: self.qualification.clone(),
+        }
+    }
+    pub fn qualified_package(&self) -> Option<&str> {
+        self.qualification.as_ref().map(QualifiedCall::package)
+    }
     pub fn arg_count(&self) -> usize {
         self.arguments.len()
     }
@@ -128,12 +159,14 @@ pub enum ResourcePackage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaticArg {
+    Logical(bool),
     String(Atom),
     Symbol(Atom),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaticEnvironment {
+    Unproved,
     ClosureBinding(BindingName),
     Namespace(PackageName),
 }
@@ -167,6 +200,7 @@ pub struct SyntaxEffect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticIssueKind {
+    UnsupportedControl,
     AmbiguousEffect,
     AmbiguousAttachOrder,
     UninstalledPackage,
@@ -195,7 +229,7 @@ pub struct ParsedExpression {
     pub active_bindings: Vec<ActiveBindingDef>,
     pub effects: Vec<SyntaxEffect>,
     pub namespace_info_reads: Vec<NamespaceInfoRead>,
-    pub namespace_enumerations: Vec<NamespaceEnumeration>,
+    pub namespace_uses: Vec<NamespaceUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,10 +246,27 @@ pub struct NamespaceInfoRead {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NamespaceEnumeration {
-    pub package: PackageName,
-    pub callee: Atom,
+pub struct NamespaceUse {
+    pub target: StaticEnvironment,
+    pub producer: CallId,
+    pub operation: NamespaceUseKind,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceUseKind {
+    Read {
+        binding: BindingName,
+        accessor: CallId,
+    },
+    Write(BindingName),
+    Metadata,
+    Alias,
+    Argument {
+        call: CallId,
+        index: usize,
+    },
+    Escape,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

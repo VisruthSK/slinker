@@ -346,10 +346,16 @@ pub struct Relocation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BindingLookup {
+    Exported { name: BindingName },
+    Internal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelocationTarget {
     Binding {
         target: BindingId,
-        access: ExternalBindingAccess,
+        lookup: BindingLookup,
     },
     RequireNamespace {
         result: bool,
@@ -400,21 +406,10 @@ pub enum NamespaceOperation {
     As,
 }
 
-impl NamespaceOperation {
-    fn callee(self) -> &'static str {
-        match self {
-            Self::Load => "loadNamespace(",
-            Self::Get => "getNamespace(",
-            Self::As => "asNamespace(",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvalidRelocation {
     OutsideCode,
     Overlap,
-    Mismatch(String),
     UncarriedDataset,
 }
 
@@ -423,12 +418,6 @@ impl std::fmt::Display for InvalidRelocation {
         match self {
             Self::OutsideCode => f.write_str("relocation occurrence lies outside its code unit"),
             Self::Overlap => f.write_str("relocation occurrences overlap in one code unit"),
-            Self::Mismatch(original) => {
-                write!(
-                    f,
-                    "relocation does not match the syntax it rewrites: `{original}`"
-                )
-            }
             Self::UncarriedDataset => {
                 f.write_str("relocation names a dataset that the program does not carry")
             }
@@ -1205,7 +1194,7 @@ impl ProgramBuilder {
         target: RelocationTarget,
     ) -> Result<(), InvalidRelocation> {
         let code_ir = &self.codes[code.index()];
-        let original = code_ir
+        code_ir
             .source
             .get(range.start..range.end)
             .ok_or(InvalidRelocation::OutsideCode)?;
@@ -1215,9 +1204,6 @@ impl ProgramBuilder {
             .any(|occurrence| occurrence.overlaps(range))
         {
             return Err(InvalidRelocation::Overlap);
-        }
-        if !self.relocation_matches(&target, original) {
-            return Err(InvalidRelocation::Mismatch(original.to_owned()));
         }
         if !self.relocation_carries_artifact(&target) {
             return Err(InvalidRelocation::UncarriedDataset);
@@ -1241,51 +1227,6 @@ impl ProgramBuilder {
                 self.dataset_libraries.contains_key(package)
             }
             _ => true,
-        }
-    }
-
-    fn relocation_matches(&self, target: &RelocationTarget, original: &str) -> bool {
-        let callee = original
-            .trim_start_matches("base::")
-            .trim_start_matches("utils::")
-            .trim_start_matches("rlang::");
-        match target {
-            RelocationTarget::Binding { target, .. } => {
-                let unqualified = original
-                    .rsplit(':')
-                    .next()
-                    .unwrap_or(original)
-                    .trim_matches('`');
-                self.bindings[target.index()].name == unqualified
-            }
-            RelocationTarget::RequireNamespace { .. } => callee.starts_with("requireNamespace("),
-            RelocationTarget::Namespace { operation, .. } => callee.starts_with(operation.callee()),
-            RelocationTarget::PackageVersion { .. } => callee.starts_with("packageVersion("),
-            RelocationTarget::Resource { .. } | RelocationTarget::AbsentResource => {
-                callee.starts_with("system.file(")
-            }
-            RelocationTarget::InstalledQuery { check: true } => {
-                callee.starts_with("check_installed(")
-            }
-            RelocationTarget::InstalledQuery { check: false } => {
-                callee.starts_with("is_installed(")
-            }
-            RelocationTarget::LoadedQuery => {
-                callee.starts_with("isNamespaceLoaded(") || original.contains("%in%")
-            }
-            RelocationTarget::Dataset { dataset, .. } => {
-                original
-                    .rsplit(':')
-                    .next()
-                    .unwrap_or(original)
-                    .trim_matches('`')
-                    == dataset.as_str()
-            }
-            RelocationTarget::NamespaceArgument { .. }
-            | RelocationTarget::DescriptionArgument { .. }
-            | RelocationTarget::DataArgument { .. }
-            | RelocationTarget::NativeSymbol { .. }
-            | RelocationTarget::NativeLibrary { .. } => original.starts_with(['"', '\'']),
         }
     }
 

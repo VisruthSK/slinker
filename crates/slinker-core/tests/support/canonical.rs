@@ -89,8 +89,8 @@ impl<'a> Canonical<'a> {
 
     fn relocation_target(&self, target: &RelocationTarget) -> String {
         match target {
-            RelocationTarget::Binding { target, access } => {
-                format!("binding {} {access:?}", self.binding(*target))
+            RelocationTarget::Binding { target, lookup } => {
+                format!("binding {} {lookup:?}", self.binding(*target))
             }
             RelocationTarget::Namespace { package, operation } => {
                 format!("namespace {} {operation:?}", self.package(*package))

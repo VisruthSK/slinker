@@ -1,4 +1,4 @@
-use super::arguments::{declared_callables, matched_arg_index};
+use super::arguments::{MatchScope, declared_callables, match_arguments, matched_arg_index};
 use super::resolution::ReferenceUse;
 use super::s3::{CallableId, callable_target};
 use super::state::{AnalyzerState, ParsedSite};
@@ -7,7 +7,7 @@ use crate::analysis::NodeId;
 use crate::package::PackageProvider;
 use crate::package::{Atom, PackageId};
 use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, Span, StaticArg};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub(super) type ClassDomain = Option<Vec<Vec<String>>>;
 
@@ -24,6 +24,26 @@ pub(super) struct Invocation {
 }
 
 impl Invocation {
+    pub(super) fn argument_for(
+        &self,
+        formals: &[String],
+        formal: &str,
+    ) -> Option<&InvocationArgument> {
+        if self.arguments.iter().any(|argument| argument.forwards_dots) {
+            return None;
+        }
+        let target = formals.iter().position(|candidate| candidate == formal)?;
+        let matched = match_arguments(
+            self.arguments
+                .iter()
+                .map(|argument| argument.name.as_deref()),
+            formals,
+            MatchScope::Signature,
+        )
+        .ok()?;
+        Some(&self.arguments[matched.argument(target)?])
+    }
+
     pub(super) fn from_call(parsed: &ParsedRFile, call: &CallSite) -> Self {
         Self::from_call_arguments(parsed, call, |_| true)
     }
@@ -69,67 +89,90 @@ impl Invocation {
         if self.arguments.iter().any(|argument| argument.forwards_dots) {
             return true;
         }
-        let named = self
-            .arguments
-            .iter()
-            .filter_map(|argument| argument.name.as_deref())
-            .collect::<Vec<_>>();
-        if named
-            .iter()
-            .any(|name| formal.starts_with(name) && !formals.iter().any(|other| other == name))
-            || named.contains(&formal)
-        {
+        let Some(target) = formals.iter().position(|candidate| candidate == formal) else {
             return true;
-        }
-        let before_dots = formals.iter().take_while(|formal| *formal != "...");
-        let unmatched = before_dots
-            .filter(|candidate| {
-                !named
-                    .iter()
-                    .any(|name| candidate.starts_with(name) || *name == candidate.as_str())
-            })
-            .collect::<Vec<_>>();
-        let Some(position) = unmatched.iter().position(|candidate| *candidate == formal) else {
-            return false;
         };
-        self.arguments
-            .iter()
-            .filter(|argument| argument.name.is_none())
-            .count()
-            > position
+        match match_arguments(
+            self.arguments
+                .iter()
+                .map(|argument| argument.name.as_deref()),
+            formals,
+            MatchScope::Signature,
+        ) {
+            Ok(matched) => matched.argument(target).is_some(),
+            Err(_) => true,
+        }
     }
 }
 
 #[derive(Default)]
 pub(super) struct InvocationModel {
-    uses: HashMap<CallableId, Vec<Option<Invocation>>>,
-    unclassified: HashSet<CallableId>,
+    uses: HashMap<CallableId, CallerCoverage>,
     pinned: Vec<PinnedUse>,
+}
+
+#[derive(Default)]
+pub(super) enum CallerCoverage {
+    #[default]
+    Pending,
+    Known {
+        first: Invocation,
+        rest: Vec<Invocation>,
+    },
+    Open,
+}
+
+impl CallerCoverage {
+    pub(super) fn pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+    pub(super) fn open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+    pub(super) fn invocations(&self) -> impl Iterator<Item = &Invocation> {
+        let (first, rest) = match self {
+            Self::Known { first, rest } => (Some(first), rest.as_slice()),
+            Self::Pending | Self::Open => (None, &[][..]),
+        };
+        first.into_iter().chain(rest)
+    }
 }
 
 impl InvocationModel {
     pub(super) fn record(&mut self, callable: CallableId, invocation: Option<Invocation>) {
-        self.uses.entry(callable).or_default().push(invocation);
+        let entry = self.uses.entry(callable).or_default();
+        match (entry, invocation) {
+            (entry, None) => *entry = CallerCoverage::Open,
+            (entry @ CallerCoverage::Pending, Some(first)) => {
+                *entry = CallerCoverage::Known {
+                    first,
+                    rest: Vec::new(),
+                }
+            }
+            (CallerCoverage::Known { rest, .. }, Some(invocation)) => rest.push(invocation),
+            (CallerCoverage::Open, Some(_)) => {}
+        }
     }
 
     pub(super) fn record_unclassified(&mut self, callable: CallableId) {
-        self.unclassified.insert(callable);
+        self.record(callable, None);
     }
 
     fn is_unclassified(&self, callable: &CallableId) -> bool {
-        self.unclassified.contains(callable)
+        self.coverage(callable).open()
     }
 
-    pub(super) fn uses(&self, callable: &CallableId) -> &[Option<Invocation>] {
-        self.uses.get(callable).map_or(&[], Vec::as_slice)
+    pub(super) fn coverage(&self, callable: &CallableId) -> &CallerCoverage {
+        self.uses.get(callable).unwrap_or(&CallerCoverage::Pending)
     }
 
     fn may_supply(&self, callable: &CallableId, formals: &[String], formal: &str) -> bool {
-        self.uses(callable).iter().any(|usage| {
-            usage
-                .as_ref()
-                .is_none_or(|invocation| invocation.may_supply(formals, formal))
-        })
+        let coverage = self.coverage(callable);
+        coverage.open()
+            || coverage.pending()
+            || coverage
+                .invocations()
+                .any(|invocation| invocation.may_supply(formals, formal))
     }
 }
 

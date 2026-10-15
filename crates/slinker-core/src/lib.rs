@@ -16,6 +16,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+mod arguments;
 mod filesystem;
 mod metadata;
 mod target_env;

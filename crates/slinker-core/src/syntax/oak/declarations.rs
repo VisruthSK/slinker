@@ -212,7 +212,7 @@ pub(super) fn literal_strings(text: &str, arguments: &[AnyRExpression]) -> Optio
         .map(
             |argument| match static_arg(ast_text(text, argument).trim()) {
                 Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
-                Some(StaticArg::Symbol(_)) | None => None,
+                Some(StaticArg::Symbol(_) | StaticArg::Logical(_)) | None => None,
             },
         )
         .collect()

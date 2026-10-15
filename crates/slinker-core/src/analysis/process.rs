@@ -522,20 +522,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.report_semantic_issues(site, parsed);
         for expression in &parsed.expressions {
             self.register_active_bindings(site, expression)?;
+            self.process_package_refs(site, expression)?;
+            for call in &expression.calls {
+                if self.guards_active(site, &call.guards, &call.span)? {
+                    self.resolved_call(site.package, site.image, site.lexical_environment, call)?;
+                }
+            }
             let consumed_native_selectors = self.consumed_native_selectors(site, expression)?;
             self.process_references(site, parsed, expression, &consumed_native_selectors)?;
-            self.process_package_refs(site, expression)?;
             for resource in &expression.resource_refs {
                 if !self.guards_active(site, &resource.guards, &resource.span)? {
                     continue;
                 }
                 self.resource_access(site, parsed, expression, resource)?;
             }
-            self.record_non_reflective_namespace_uses(expression);
             self.process_calls(site, parsed, expression)?;
             self.process_declared_callable_calls(site, parsed, expression)?;
             self.process_namespace_info_reads(site, expression);
-            self.process_namespace_enumerations(site, expression);
+            self.process_namespace_uses(site, parsed, expression);
             self.process_effects(site, expression)?;
         }
         Ok(())
@@ -544,6 +548,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     fn report_semantic_issues(&self, site: ParsedSite<'_>, parsed: &ParsedRFile) {
         for issue in &parsed.issues {
             let code = match issue.kind {
+                SemanticIssueKind::UnsupportedControl => RejectCode::SemanticAmbiguity,
                 SemanticIssueKind::AmbiguousEffect => RejectCode::SemanticAmbiguity,
                 SemanticIssueKind::AmbiguousAttachOrder => RejectCode::SemanticAmbiguity,
                 SemanticIssueKind::UninstalledPackage => RejectCode::MissingDependency,
@@ -578,13 +583,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 site.image,
                 site.lexical_environment,
                 active,
-            )? && self
-                .loaded(site.package)?
-                .namespace
-                .lock()
-                .add_binding(active.name.clone().into())
-            {
-                self.non_returning_bindings.lock().remove(&site.package);
+            )? {
+                self.loaded(site.package)?
+                    .namespace
+                    .lock()
+                    .add_binding(active.name.clone().into());
             }
         }
         Ok(())
@@ -681,7 +684,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             if let Some(callable) = callable_target(&resolved)
                 && !expression.calls.iter().any(|call| {
-                    call.qualified_package.is_none() && call.span.start == reference.span.start
+                    call.qualification.is_none()
+                        && call.span.start == reference.span.start
+                        && call.callee.as_str() == reference.name.as_str()
                 })
             {
                 let invocation =
@@ -709,10 +714,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
             if !self.guards_active(site, &reference.guards, &reference.span)? {
                 continue;
             }
-            self.namespace_access(site.node, site.package, reference)?;
+            let direct = expression.calls.iter().any(|call| {
+                call.qualification.is_some()
+                    && call.span.start == reference.span.start
+                    && call.callee.as_str() == reference.symbol.as_str()
+            });
+            self.namespace_access(
+                site.node,
+                site.package,
+                reference,
+                if direct {
+                    ReferenceUse::Recorded
+                } else {
+                    ReferenceUse::Unrecorded
+                },
+            )?;
             if let Some(foreign) = self.known_package(&reference.package)
                 && !expression.calls.iter().any(|call| {
-                    call.qualified_package.is_some() && call.span.start == reference.span.start
+                    call.qualification.is_some() && call.span.start == reference.span.start
                 })
             {
                 self.record_escape(CallableId {
@@ -722,24 +741,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
         }
         Ok(())
-    }
-
-    fn record_non_reflective_namespace_uses(&self, expression: &ParsedExpression) {
-        let uses = expression
-            .calls
-            .iter()
-            .filter(|call| {
-                call.callee == "registerS3method"
-                    || (call.callee == "exists"
-                        && self.argument_text(call, "inherits").as_deref() == Some("FALSE"))
-            })
-            .flat_map(|call| call.arguments.iter())
-            .filter(|argument| argument.name.as_deref() == Some("envir"))
-            .filter_map(|argument| argument.span.clone())
-            .collect();
-        self.reflection
-            .lock()
-            .add_non_reflective_namespace_uses(uses);
     }
 
     fn process_calls(
@@ -760,16 +761,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             self.retain_lexical_s3_methods(site, call)?;
             if matches!(call.callee.as_str(), "UseMethod" | "NextMethod")
-                && call.qualified_package.is_none()
-                && matches!(
-                    self.resolve_lexical_name(
-                        site.package,
-                        site.image,
-                        site.lexical_environment,
-                        &call.callee,
-                    )?,
-                    Resolution::Static(BindingTarget::Base)
-                )
+                && self
+                    .resolved_call(site.package, site.image, site.lexical_environment, call)?
+                    .base()
             {
                 self.s3_dispatch(site, parsed, Some(&expression.parameters), call)?;
                 continue;
@@ -815,24 +809,33 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    fn process_namespace_enumerations(&self, site: ParsedSite<'_>, expression: &ParsedExpression) {
-        for enumeration in &expression.namespace_enumerations {
-            let linked = self
-                .known_package(&enumeration.package)
-                .is_some_and(|package| self.packages.role(package) == PackageRole::Linked);
-            if linked {
-                self.diagnostic(
-                    site.node,
-                    site.package,
-                    Some(site.binding),
-                    RejectCode::UnsupportedRootTransformation,
-                    format!(
-                        "{}() reads every binding of the synthetic `{}` namespace, which holds stubs for bindings the build never reached",
-                        enumeration.callee, enumeration.package
-                    ),
-                    Some(enumeration.span.clone()),
-                );
-            }
+    fn process_namespace_uses(
+        &self,
+        site: ParsedSite<'_>,
+        parsed: &ParsedRFile,
+        expression: &ParsedExpression,
+    ) {
+        for usage in &expression.namespace_uses {
+            let declared_names = expression
+                .calls
+                .iter()
+                .find(|call| call.id() == usage.producer)
+                .and_then(|call| {
+                    super::arguments::namespace_formal(&call.callee).and_then(|formal| {
+                        super::arguments::declared_strings(parsed, call, &[formal], formal)
+                    })
+                })
+                .map(|names| names.into_iter().map(Into::into).collect());
+            self.reflection.lock().observe_namespace_use(
+                super::reflection::NamespaceUseObservation {
+                    node: site.node,
+                    owner: site.package,
+                    binding: site.binding.into(),
+                    environment: site.lexical_environment.clone(),
+                    usage: usage.clone(),
+                    declared_names,
+                },
+            );
         }
     }
 
@@ -1060,6 +1063,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<bool> {
         let expected = EnvironmentLabel::namespace(&self.packages.name(package));
         Ok(match &active.target {
+            StaticEnvironment::Unproved => false,
             StaticEnvironment::Namespace(name) => {
                 name.as_str() == self.packages.name(package).as_str()
             }

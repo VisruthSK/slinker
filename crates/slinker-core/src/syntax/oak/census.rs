@@ -168,7 +168,6 @@ fn raw_argument(argument: &RArgument) -> RawArgument {
             node_range,
         ),
         static_arg: value.as_ref().and_then(static_arg_of),
-        logical: value.as_ref().and_then(logical_literal),
     }
 }
 
@@ -188,6 +187,8 @@ fn argument_name(name: &AnyRArgumentName) -> Option<String> {
 
 pub(super) fn static_arg_of(expression: &AnyRExpression) -> Option<StaticArg> {
     match expression {
+        AnyRExpression::RTrueExpression(_) => Some(StaticArg::Logical(true)),
+        AnyRExpression::RFalseExpression(_) => Some(StaticArg::Logical(false)),
         AnyRExpression::AnyRValue(AnyRValue::RStringValue(value)) => {
             static_string(&value.syntax().text_trimmed().to_string())
                 .map(|string| StaticArg::String(Atom::from(string)))
@@ -195,14 +196,6 @@ pub(super) fn static_arg_of(expression: &AnyRExpression) -> Option<StaticArg> {
         AnyRExpression::RIdentifier(node) => symbol_arg(&node.syntax().text_trimmed().to_string()),
         AnyRExpression::RDots(node) => symbol_arg(&node.syntax().text_trimmed().to_string()),
         AnyRExpression::RDotDotI(node) => symbol_arg(&node.syntax().text_trimmed().to_string()),
-        _ => None,
-    }
-}
-
-fn logical_literal(expression: &AnyRExpression) -> Option<bool> {
-    match expression {
-        AnyRExpression::RTrueExpression(_) => Some(true),
-        AnyRExpression::RFalseExpression(_) => Some(false),
         _ => None,
     }
 }

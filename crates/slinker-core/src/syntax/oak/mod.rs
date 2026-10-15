@@ -2,10 +2,10 @@ use crate::package::{Atom, BindingName};
 use crate::profile::{self, Probe};
 use crate::syntax::facts::{
     ActiveBindingDef, CallArgument, CallSite, CalleeKind, EvalPhase, LexicalBindingId,
-    LexicalScopeId, NameRef, NameRefKind, NamespaceEnumeration, NamespaceInfoRead,
-    NamespaceInfoReceiver, PackageRef, ParsedExpression, ParsedRFile, PinnedDefault,
-    ResourceArguments, ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg,
-    StaticEnvironment, SyntaxEffect, SyntaxEffectKind,
+    LexicalScopeId, NameRef, NameRefKind, NamespaceInfoRead, NamespaceInfoReceiver, NamespaceUse,
+    NamespaceUseKind, PackageRef, ParsedExpression, ParsedRFile, PinnedDefault, ResourceArguments,
+    ResourcePackage, ResourceRef, SemanticIssue, SemanticIssueKind, StaticArg, StaticEnvironment,
+    SyntaxEffect, SyntaxEffectKind,
 };
 use crate::syntax::source::{SourceId, Span, TextRange};
 use air_r_parser::{RParserOptions, parse};
@@ -32,7 +32,6 @@ mod tests;
 pub use context::OakParseContext;
 pub(crate) use context::SharedNames;
 pub(crate) use context::{NamespaceImportResolution, NamespaceImports};
-pub(crate) use proofs::closure_definitely_non_returning;
 
 use context::SlinkerImportsResolver;
 use declarations::{Declarations, collect_declarations, sole_positional_argument};
@@ -100,78 +99,12 @@ impl OakParser {
         }
         let root = parsed.tree();
         let value_start = assignment_value_start(&root);
-        let Some(evaluated) = evaluated_quotation_text(text, &root, context) else {
-            let index = build_semantic_index(&root, context);
-            return Ok(with_value_start(
-                translate_index(source, text, context, &root, &index),
-                value_start,
-            ));
-        };
-        let parsed = parse(&evaluated, RParserOptions::default());
-        if let Some(error) = parsed.error() {
-            return Err(error.to_string());
-        }
-        let root = parsed.tree();
         let index = build_semantic_index(&root, context);
         Ok(with_value_start(
-            translate_index(source, &evaluated, context, &root, &index),
+            translate_index(source, text, context, &root, &index),
             value_start,
         ))
     }
-}
-
-fn evaluated_quotation_text(text: &str, root: &RRoot, context: &OakParseContext) -> Option<String> {
-    if !text.contains("eval") {
-        return None;
-    }
-    let mut blanks = Vec::new();
-    for call in root.syntax().descendants().filter_map(RCall::cast) {
-        let Some(callee) = base_callee(&call, context) else {
-            continue;
-        };
-        let callee_range = callee.range.clone();
-        let Some(argument) = sole_positional_argument(&call) else {
-            continue;
-        };
-        match callee.name() {
-            "evalq" => blanks.push(callee_range),
-            "eval" => {
-                let AnyRExpression::RCall(quotation) = argument else {
-                    continue;
-                };
-                let Some(quoter) = base_callee(&quotation, context) else {
-                    continue;
-                };
-                let quoter_range = quoter.range.clone();
-                if !matches!(quoter.name(), "quote" | "bquote")
-                    || sole_positional_argument(&quotation).is_none()
-                {
-                    continue;
-                }
-                blanks.extend([callee_range, quoter_range]);
-                if quoter.name() == "bquote" {
-                    blanks.extend(
-                        quotation
-                            .syntax()
-                            .descendants()
-                            .filter_map(RCall::cast)
-                            .filter_map(|splice| identifier_callee(&splice))
-                            .filter(|callee| callee.name() == ".")
-                            .map(|callee| callee.range),
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    if blanks.is_empty() {
-        return None;
-    }
-    let mut bytes = text.as_bytes().to_vec();
-    for range in blanks {
-        bytes[range].fill(b' ');
-    }
-    Some(String::from_utf8(bytes).expect("ASCII identifiers are replaced by ASCII spaces"))
 }
 
 fn data_mask_ranges(
@@ -323,7 +256,6 @@ fn is_dots_element(name: &str) -> bool {
 
 struct Callee {
     token: air_r_syntax::RSyntaxToken,
-    range: std::ops::Range<usize>,
 }
 
 impl Callee {
@@ -336,10 +268,8 @@ fn identifier_callee(call: &RCall) -> Option<Callee> {
     let AnyRExpression::RIdentifier(identifier) = call.function().ok()? else {
         return None;
     };
-    let range = identifier.syntax().text_trimmed_range();
     Some(Callee {
         token: identifier.name_token().ok()?,
-        range: text_offset(range.start())..text_offset(range.end()),
     })
 }
 
@@ -398,7 +328,7 @@ impl LexicalScopes {
     ) -> Option<LexicalBindingId> {
         match value {
             Some(StaticArg::Symbol(name)) => self.binding(index, name, scope),
-            Some(StaticArg::String(_)) | None => None,
+            Some(StaticArg::String(_) | StaticArg::Logical(_)) | None => None,
         }
     }
 }
@@ -495,8 +425,15 @@ fn translate_index(
         &environment_aliases,
         if_regions,
     );
-    let namespace_enumerations =
-        collect_namespace_enumerations(source, context, &live_calls, &environment_aliases);
+    let namespace_uses = collect_namespace_uses(
+        source,
+        text,
+        root,
+        index,
+        &scopes,
+        &live_calls,
+        &declarations,
+    );
     drop(guards_span);
 
     let effects_span = profile::span(Probe::ParseEffects);
@@ -531,6 +468,23 @@ fn translate_index(
     let calls: Vec<CallSite> = live_calls.into_iter().map(|call| call.site).collect();
     let mut issues = translate_diagnostics(source, index);
     issues.extend(declarations.issues);
+    for expression in root.syntax().descendants().filter_map(AnyRExpression::cast) {
+        let name = match &expression {
+            AnyRExpression::RIfStatement(_) => "if",
+            AnyRExpression::RReturnExpression(_) => "return",
+            _ => continue,
+        };
+        let (scope, _) = index.scope_at(expression.syntax().text_trimmed_range().start());
+        if !context.resolves_to_base(name) || index.resolve(name, scope).is_some() {
+            issues.push(SemanticIssue {
+                kind: SemanticIssueKind::UnsupportedControl,
+                message: format!(
+                    "shadowed `{name}` control form has no established callee/evaluation contract"
+                ),
+                span: Some(ast_span(&source, &expression)),
+            });
+        }
+    }
 
     let used_parameters = used_parameters(index);
     let pinned_defaults = pinned_defaults(text, root, index, &calls, &effects);
@@ -548,7 +502,7 @@ fn translate_index(
             active_bindings,
             effects: exact(effects),
             namespace_info_reads,
-            namespace_enumerations,
+            namespace_uses,
         }],
         issues,
         scope_parents: exact(scopes.parents),
@@ -619,7 +573,7 @@ fn member_access(text: &str, expression: &AnyRExpression) -> Option<(AnyRExpress
                 StaticArg::String(member) => {
                     Some((subset.function().ok()?, member.as_str().to_owned()))
                 }
-                StaticArg::Symbol(_) => None,
+                StaticArg::Symbol(_) | StaticArg::Logical(_) => None,
             }
         }
         _ => None,
@@ -804,7 +758,7 @@ fn lexical_calls(
             site: CallSite {
                 callee: Atom::from(live_use.name.as_str()),
                 callee_kind: live_use.callee_kind,
-                qualified_package: None,
+                qualification: None,
                 arguments,
                 scope,
                 phase: live_use.phase,
@@ -874,7 +828,11 @@ fn namespace_access_facts(
                 site: CallSite {
                     callee: Atom::from(access.symbol()),
                     callee_kind: CalleeKind::DefinitelyExternal,
-                    qualified_package: Some(Atom::from(access.package())),
+                    qualification: Some(if internal {
+                        crate::syntax::QualifiedCall::Internal(Atom::from(access.package()))
+                    } else {
+                        crate::syntax::QualifiedCall::Exported(Atom::from(access.package()))
+                    }),
                     arguments,
                     scope: lexical_scope,
                     phase: phase_for_scope(index, scope),
@@ -950,7 +908,7 @@ fn binary_operator_facts(
             site: CallSite {
                 callee: Atom::from(operator.as_str()),
                 callee_kind,
-                qualified_package: None,
+                qualification: None,
                 arguments: [left, right]
                     .map(|expression| {
                         let value = static_arg_of(&expression);
@@ -1060,13 +1018,13 @@ fn deduplicate_calls(calls: &mut Vec<LiveCall>) {
         (
             left.site.span.start,
             left.site.span.end,
-            left.site.qualified_package.as_deref(),
+            left.site.qualified_package(),
             left.site.callee.as_str(),
         )
             .cmp(&(
                 right.site.span.start,
                 right.site.span.end,
-                right.site.qualified_package.as_deref(),
+                right.site.qualified_package(),
                 right.site.callee.as_str(),
             ))
     });
@@ -1074,7 +1032,7 @@ fn deduplicate_calls(calls: &mut Vec<LiveCall>) {
         left.site.span.start == right.site.span.start
             && left.site.span.end == right.site.span.end
             && left.site.callee == right.site.callee
-            && left.site.qualified_package == right.site.qualified_package
+            && left.site.qualification == right.site.qualification
     });
 }
 
@@ -1235,75 +1193,213 @@ fn static_environment(context: &OakParseContext, call: &LiveCall) -> Option<Stat
     }
 }
 
-fn enumerated_environment_formals(callee: &str) -> Option<(&'static [&'static str], &'static str)> {
-    match callee {
-        "as.list" | "as.list.environment" => Some((&["x"], "x")),
-        "mget" => Some((&["x", "envir"], "envir")),
-        "eapply" => Some((&["env"], "env")),
-        _ => None,
-    }
-}
-
 fn formal_argument<'a>(
     call: &'a RawCall,
     formals: &[&str],
     target: &str,
 ) -> Option<&'a RawArgument> {
-    if let Some(named) = call
-        .args
-        .iter()
-        .find(|argument| argument.name.as_deref() == Some(target))
-    {
-        return Some(named);
-    }
-    let position = formals.iter().position(|formal| *formal == target)?;
-    let earlier_named = formals[..position]
-        .iter()
-        .filter(|formal| {
-            call.args
-                .iter()
-                .any(|argument| argument.name.as_deref() == Some(**formal))
-        })
-        .count();
-    call.args
-        .iter()
-        .filter(|argument| argument.name.is_none())
-        .nth(position - earlier_named)
+    let target = formals.iter().position(|formal| *formal == target)?;
+    let matched = crate::arguments::match_arguments(
+        call.args.iter().map(|argument| argument.name.as_deref()),
+        formals,
+        crate::arguments::MatchScope::Projection,
+    )
+    .ok()?;
+    call.args.get(matched.argument(target)?)
 }
 
-fn collect_namespace_enumerations(
+fn collect_namespace_uses(
     source: SourceId,
-    context: &OakParseContext,
+    text: &str,
+    root: &RRoot,
+    index: &SemanticIndex,
+    scopes: &LexicalScopes,
     calls: &[LiveCall],
-    aliases: &BTreeMap<String, StaticEnvironment>,
-) -> Vec<NamespaceEnumeration> {
-    let mut enumerations = Vec::new();
-    for call in calls {
-        let Some((formals, target)) = enumerated_environment_formals(&call.site.callee) else {
+    declarations: &Declarations,
+) -> Vec<NamespaceUse> {
+    let mut aliases =
+        HashMap::<LexicalBindingId, Vec<(StaticEnvironment, crate::syntax::CallId)>>::new();
+    for scope in index.scope_ids() {
+        for (_, definition) in index.definitions(scope).iter() {
+            let Some(assignment) = assignment_of(root, definition.kind()) else {
+                continue;
+            };
+            let value = node_range(&assignment.value);
+            let Some(producer) = calls.iter().find(|call| call.site.span.range() == value) else {
+                continue;
+            };
+            let Some(target) = static_environment_candidate(producer) else {
+                continue;
+            };
+            let name = index.symbols(scope).symbol(definition.symbol()).name();
+            if let Some(binding) = scopes.binding(index, name, scope) {
+                aliases
+                    .entry(binding)
+                    .or_default()
+                    .push((target, producer.site.id()));
+            }
+        }
+    }
+    let mut uses = Vec::new();
+    for node in root.syntax().descendants() {
+        let Some(expression) = AnyRExpression::cast(node) else {
             continue;
         };
-        if !is_base_call(context, &call.site) {
+        let span = ast_span(&source, &expression);
+        if declarations.is_inert(span.start) {
             continue;
         }
-        let Some(argument) = formal_argument(&call.raw, formals, target) else {
+        if let Some(AnyRExpression::RBinaryExpression(assignment)) =
+            expression.syntax().parent().and_then(AnyRExpression::cast)
+            && assignment
+                .operator()
+                .ok()
+                .is_some_and(|operator| matches!(operator.text_trimmed(), "<-" | "="))
+            && assignment
+                .left()
+                .ok()
+                .is_some_and(|left| left.syntax() == expression.syntax())
+        {
             continue;
-        };
-        let environment = match &argument.static_arg {
-            Some(StaticArg::Symbol(name)) => aliases.get(name.as_str()).cloned(),
-            _ => calls
+        }
+        let producers = match &expression {
+            AnyRExpression::RIdentifier(identifier) => {
+                let (scope, _) = scopes.at(index, span.start);
+                scopes
+                    .binding(
+                        index,
+                        &identifier
+                            .name_token()
+                            .ok()
+                            .map_or_else(String::new, |token| token.text_trimmed().to_owned()),
+                        scope,
+                    )
+                    .and_then(|binding| aliases.get(&binding))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            AnyRExpression::RCall(_) => calls
                 .iter()
-                .find(|nested| nested.site.span.range() == argument.value)
-                .and_then(|nested| static_environment(context, nested)),
+                .find(|call| call.site.span == span)
+                .and_then(|call| {
+                    static_environment_candidate(call).map(|target| vec![(target, call.site.id())])
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
         };
-        if let Some(StaticEnvironment::Namespace(package)) = environment {
-            enumerations.push(NamespaceEnumeration {
-                package,
-                callee: call.site.callee.clone(),
-                span: Span::new(source, call.site.span.start, call.site.span.end),
+        for (target, producer) in producers {
+            let mut operation = NamespaceUseKind::Escape;
+            if let Some(parent) = expression.syntax().parent().and_then(AnyRExpression::cast) {
+                if let Some((receiver, member)) = member_access(text, &parent) {
+                    if receiver.syntax() == expression.syntax() {
+                        let written = parent
+                            .syntax()
+                            .ancestors()
+                            .filter_map(RBinaryExpression::cast)
+                            .any(|assignment| {
+                                assignment.operator().ok().is_some_and(|operator| {
+                                    matches!(operator.text_trimmed(), "<-" | "=" | "<<-")
+                                }) && assignment.left().ok().is_some_and(|left| {
+                                    node_range(&left).contains_range(node_range(&parent))
+                                })
+                            });
+                        operation = if written {
+                            NamespaceUseKind::Write(member.into())
+                        } else if member == NAMESPACE_INFO {
+                            NamespaceUseKind::Metadata
+                        } else {
+                            let span = ast_span(&source, &parent);
+                            match calls.iter().find(|call| {
+                                call.site.span == span
+                                    && matches!(call.site.callee.as_str(), "$" | "[[")
+                            }) {
+                                Some(call) => NamespaceUseKind::Read {
+                                    binding: member.into(),
+                                    accessor: call.site.id(),
+                                },
+                                None => NamespaceUseKind::Escape,
+                            }
+                        };
+                    }
+                } else if let AnyRExpression::RBinaryExpression(assignment) = &parent
+                    && assignment.operator().ok().is_some_and(|operator| {
+                        matches!(operator.text_trimmed(), "<-" | "=" | "->")
+                    })
+                {
+                    // Alias references receive their own obligations. The value may not otherwise escape.
+                    if assignment
+                        .right()
+                        .ok()
+                        .is_some_and(|right| right.syntax() == expression.syntax())
+                        && matches!(assignment.left().ok(), Some(AnyRExpression::RIdentifier(_)))
+                    {
+                        operation = NamespaceUseKind::Alias;
+                    }
+                }
+            }
+            if operation == NamespaceUseKind::Escape
+                && let Some((call, argument)) = calls.iter().find_map(|call| {
+                    call.raw
+                        .args
+                        .iter()
+                        .enumerate()
+                        .find(|(_, argument)| argument.value == span.range())
+                        .map(|(position, _)| (call, position))
+                })
+            {
+                operation = NamespaceUseKind::Argument {
+                    call: call.site.id(),
+                    index: argument,
+                };
+            }
+            uses.push(NamespaceUse {
+                target,
+                producer,
+                operation,
+                span: span.clone(),
             });
         }
     }
-    enumerations
+    uses
+}
+
+fn static_environment_candidate(call: &LiveCall) -> Option<StaticEnvironment> {
+    match call.site.callee.as_str() {
+        "asNamespace" | "getNamespace" | "loadNamespace" => {
+            let formals: &[&str] = match call.site.callee.as_str() {
+                "asNamespace" => &["ns", "base.OK"],
+                "getNamespace" => &["name"],
+                _ => &[
+                    "package",
+                    "lib.loc",
+                    "keep.source",
+                    "partial",
+                    "versionCheck",
+                    "keep.parse.data",
+                ],
+            };
+            match formal_argument(&call.raw, formals, formals[0])?
+                .static_arg
+                .as_ref()
+            {
+                Some(StaticArg::String(package)) => {
+                    Some(StaticEnvironment::Namespace(package.as_str().into()))
+                }
+                _ => Some(StaticEnvironment::Unproved),
+            }
+        }
+        "environment" => match formal_argument(&call.raw, &["fun"], "fun")?
+            .static_arg
+            .as_ref()?
+        {
+            StaticArg::Symbol(binding) => {
+                Some(StaticEnvironment::ClosureBinding(binding.as_str().into()))
+            }
+            _ => None,
+        },
+        "baseenv" | "baseNamespaceEnv" => Some(StaticEnvironment::Namespace("base".into())),
+        _ => None,
+    }
 }
 
 fn collect_superassignments(
@@ -1540,7 +1636,7 @@ fn translate_diagnostics(source: SourceId, index: &SemanticIndex) -> Vec<Semanti
 fn static_first_string(call: &CallSite) -> Option<&str> {
     match call.static_arg(0)? {
         StaticArg::String(value) => Some(value),
-        StaticArg::Symbol(_) => None,
+        StaticArg::Symbol(_) | StaticArg::Logical(_) => None,
     }
 }
 
@@ -1568,7 +1664,12 @@ fn resource_arguments(arguments: &[RawArgument]) -> Option<ResourceArguments> {
                 _ => return None,
             },
             Some("package") if !package_seen => package_seen = true,
-            Some("mustWork") if must_work.is_none() => must_work = Some(argument.logical?),
+            Some("mustWork") if must_work.is_none() => {
+                let Some(StaticArg::Logical(value)) = argument.static_arg else {
+                    return None;
+                };
+                must_work = Some(value);
+            }
             _ => return None,
         }
     }
@@ -1689,7 +1790,7 @@ fn dispatching_syntax_facts(
             site: CallSite {
                 callee: Atom::from(callee),
                 callee_kind,
-                qualified_package: None,
+                qualification: None,
                 arguments: Box::default(),
                 scope: lexical_scope,
                 phase: phase_for_scope(index, scope),
