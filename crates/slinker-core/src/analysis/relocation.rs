@@ -1,15 +1,37 @@
 use super::NodeId;
 use crate::Version;
-use crate::ir::NamespaceOperation;
+use crate::ir::{BindingLookup, NamespaceOperation};
 use crate::package::{
-    BindingName, ComponentName, DataSetId, DatasetName, PackageId, ResourcePath, SymbolName,
+    BindingName, ComponentName, DataSetId, DatasetName, PackageId, PackageName, ResourcePath,
+    SymbolName,
 };
-use crate::syntax::Span;
+use crate::syntax::{ResourceRef, Span};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NamespaceCall {
     Require,
     Operation(NamespaceOperation),
+}
+
+impl NamespaceCall {
+    pub(super) fn arguments(self) -> (&'static [&'static str], &'static [&'static str]) {
+        match self {
+            Self::Require => (&["package", "...", "quietly"], &["quietly"]),
+            Self::Operation(NamespaceOperation::As) => (&["ns", "base.OK"], &["base.OK"]),
+            Self::Operation(NamespaceOperation::Get) => (&["name"], &[]),
+            Self::Operation(NamespaceOperation::Load) => (
+                &[
+                    "package",
+                    "lib.loc",
+                    "keep.source",
+                    "partial",
+                    "versionCheck",
+                    "keep.parse.data",
+                ],
+                &[],
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -18,12 +40,15 @@ pub(super) enum PendingRelocation {
         source: Span,
         package: PackageId,
         binding: BindingName,
-        internal: bool,
+        lookup: BindingLookup,
     },
     ResourceAccess {
         source: Span,
         package: PackageId,
         resource: ResourcePath,
+    },
+    AbsentResource {
+        source: Span,
     },
     RequireNamespace {
         source: Span,
@@ -97,6 +122,7 @@ impl PendingRelocation {
         match self {
             Self::NamespaceAccess { source, .. }
             | Self::ResourceAccess { source, .. }
+            | Self::AbsentResource { source }
             | Self::RequireNamespace { source, .. }
             | Self::NamespaceLoad { source, .. }
             | Self::PackageVersion { source, .. }
@@ -133,6 +159,7 @@ impl PendingRelocation {
             | Self::InstalledQuery { package, .. } => Some(*package),
             Self::RequireNamespace { loaded, .. } => *loaded,
             Self::ResourceAccess { .. }
+            | Self::AbsentResource { .. }
             | Self::PackageVersion { .. }
             | Self::DescriptionArgument { .. } => None,
         }
@@ -150,11 +177,27 @@ pub(super) struct SyntaxObservation {
 #[derive(Default)]
 pub(super) struct RelocationPlan {
     relocations: Vec<PendingRelocation>,
+    defaulted_resources: Vec<DefaultedResource>,
     dynamic_resource_lookups: Vec<(NodeId, PackageId, Span)>,
     observations: Vec<SyntaxObservation>,
 }
 
+pub(super) struct DefaultedResource {
+    pub(super) node: NodeId,
+    pub(super) owner: PackageId,
+    pub(super) package: PackageName,
+    pub(super) reference: ResourceRef,
+}
+
 impl RelocationPlan {
+    pub(super) fn defer_resource(&mut self, resource: DefaultedResource) {
+        self.defaulted_resources.push(resource);
+    }
+
+    pub(super) fn take_defaulted_resources(&mut self) -> Vec<DefaultedResource> {
+        std::mem::take(&mut self.defaulted_resources)
+    }
+
     pub(super) fn push(&mut self, relocation: PendingRelocation) {
         self.relocations.push(relocation);
     }

@@ -1,41 +1,50 @@
 mod common;
 
 use common::{
-    assert_success, discover_r_home, install_package, install_package_using, run_r_output,
-    run_r_with_site_profile, slinker,
+    assert_success, discover_r_home, install_package_using, run_r_output, run_r_with_site_profile,
+    slinker,
 };
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn rebus_numbers_suite_passes_with_rebus_base_linked() {
+fn rebus_numbers_blocks_on_an_unproven_callable() {
     LinkedSuite {
         package: "rebus.numbers",
         linked: &["rebus.base"],
         checks: &[Check::Testthat],
     }
-    .assert_passes();
+    .assert_blocks(&["DynamicLookup in rebus.numbers::number_range: do.call()"]);
 }
 
 #[test]
-fn rslurm_suite_passes_with_whisker_linked() {
+fn rslurm_blocks_on_unproven_callables() {
     LinkedSuite {
         package: "rslurm",
         linked: &["whisker"],
         checks: &[Check::Testthat],
     }
-    .assert_passes();
+    .assert_blocks(&[
+        "DynamicLookup in rslurm::get_slurm_out: do.call()",
+        "DynamicLookup in whisker::renderTemplate: do.call()",
+    ]);
 }
 
 #[test]
-fn represtools_suite_passes_with_whisker_linked() {
+fn represtools_blocks_on_unproven_callables() {
     LinkedSuite {
         package: "represtools",
         linked: &["whisker"],
         checks: &[Check::Testthat],
     }
-    .assert_passes();
+    .assert_blocks(&[
+        "DynamicLookup in represtools::Analyze: do.call()",
+        "DynamicLookup in represtools::Cook: do.call()",
+        "DynamicLookup in represtools::Gather: do.call()",
+        "DynamicLookup in represtools::Present: do.call()",
+        "DynamicLookup in whisker::renderTemplate: do.call()",
+    ]);
 }
 
 #[test]
@@ -90,7 +99,7 @@ fn config_blocks_on_unaudited_yaml_native_code() {
 }
 
 #[test]
-fn here_suite_passes_with_rprojroot_linked() {
+fn here_blocks_on_an_unproven_rprojroot_callable() {
     LinkedSuite {
         package: "here",
         linked: &["rprojroot"],
@@ -114,7 +123,7 @@ fn here_suite_passes_with_rprojroot_linked() {
             ),
         ],
     }
-    .assert_passes();
+    .assert_blocks(&["DynamicLookup in rprojroot::path: do.call()"]);
 }
 
 #[test]
@@ -127,9 +136,8 @@ fn voucher_blocks_on_unproven_cli_and_fs_behavior() {
     .assert_blocks(&[
         "DynamicLookup in cli::find_function_symbol: exists() looks up a name that is not a static string",
         "DynamicLookup in fs::register_s3_method: get() looks up a name that is not a static string",
-        "asNamespace() with a dynamic namespace name",
+        "asNamespace() with an unproven namespace name",
         "getNamespaceVersion() with a dynamic package name can name a Linked package",
-        "ObjectSystem in fs::compare.fs_path: NextMethod is not inside a registered method",
         "UnknownNativeEffects in cli: native component `cli` has unanalyzed C-to-R callbacks",
         "UnknownNativeEffects in fs: native component `fs` has unanalyzed C-to-R callbacks",
     ]);
@@ -148,7 +156,6 @@ enum Check<'a> {
 
 #[derive(Clone, Copy, Debug)]
 enum State {
-    Absent,
     Installed,
     Loaded,
 }
@@ -158,7 +165,6 @@ struct Provisioned {
     dependencies: PathBuf,
     runtime: PathBuf,
     testing: PathBuf,
-    testing_needs_linked: bool,
     external: Vec<String>,
 }
 
@@ -182,6 +188,7 @@ impl LinkedSuite<'_> {
     fn assert_blocks(&self, expected: &[&str]) {
         let r_home = discover_r_home();
         let provisioned = self.provision(&r_home);
+        self.assert_original(&r_home, &provisioned);
         let work = tempfile::tempdir().expect("work directory");
         let output = work.path().join(self.package);
         let result = self.build(&provisioned, &output);
@@ -201,97 +208,48 @@ impl LinkedSuite<'_> {
         }
     }
 
-    fn assert_passes(&self) {
-        let r_home = discover_r_home();
-        let provisioned = self.provision(&r_home);
-        let work = tempfile::tempdir().expect("work directory");
-        let output = work.path().join(self.package);
-        assert_success(
-            &self.build(&provisioned, &output),
-            &format!("slinker build {}", self.package),
-        );
-
-        let installed = work.path().join("installed");
-        fs::create_dir(&installed).expect("installed library");
-        install_package(&r_home, &output, &installed);
-        let original = work.path().join("original");
+    fn assert_original(&self, r_home: &Path, provisioned: &Provisioned) {
+        if self.checks.is_empty() {
+            return;
+        }
+        let work = tempfile::tempdir().expect("original oracle directory");
+        let original = work.path().join("library");
         fs::create_dir(&original).expect("original library");
-        let libraries = |state: State| {
-            let mut libraries = vec![&installed, &provisioned.runtime];
-            match state {
-                State::Absent if provisioned.testing_needs_linked => {}
-                State::Absent => libraries.push(&provisioned.testing),
-                State::Installed | State::Loaded => {
-                    libraries.extend([&provisioned.testing, &provisioned.dependencies]);
-                }
-            }
-            std::env::join_paths(libraries).expect("runtime library path")
-        };
-
+        install_package_using(
+            r_home,
+            &provisioned.source,
+            &original,
+            provisioned.dependencies.as_os_str(),
+        );
+        let libraries = std::env::join_paths([
+            &original,
+            &provisioned.runtime,
+            &provisioned.testing,
+            &provisioned.dependencies,
+        ])
+        .expect("oracle library path");
         for check in self.checks {
-            let states: &[State] = match check {
-                Check::Testthat if provisioned.testing_needs_linked => {
-                    &[State::Installed, State::Loaded]
-                }
-                Check::Testthat | Check::Script(_) => {
-                    &[State::Absent, State::Installed, State::Loaded]
-                }
-            };
-            let results = states
-                .iter()
-                .map(|&state| {
-                    let summary = work.path().join(format!("summary-{state:?}.csv"));
-                    let stdout = self.run_check(
-                        &r_home,
-                        libraries(state),
-                        state,
-                        check,
-                        &self_tests(&provisioned.source),
-                        &summary,
-                    );
-                    match check {
-                        Check::Testthat => fs::read_to_string(&summary).expect("test summary"),
-                        Check::Script(_) => stdout,
-                    }
-                })
-                .collect::<Vec<_>>();
-            for (state, result) in states.iter().zip(&results).skip(1) {
-                assert_eq!(
-                    &results[0], result,
-                    "{} {state:?} differs from {:?}",
-                    self.package, states[0]
+            let mut results = Vec::new();
+            for state in [State::Installed, State::Loaded] {
+                let summary = work.path().join(format!("summary-{state:?}.csv"));
+                let stdout = self.run_check(
+                    r_home,
+                    libraries.clone(),
+                    state,
+                    check,
+                    &self_tests(&provisioned.source),
+                    &summary,
                 );
+                results.push(match check {
+                    Check::Testthat => fs::read_to_string(summary).expect("test summary"),
+                    Check::Script(_) => stdout,
+                });
             }
-            if let Check::Script(script) = check {
-                if fs::read_dir(&original)
-                    .expect("original library")
-                    .next()
-                    .is_none()
-                {
-                    install_package_using(
-                        &r_home,
-                        &provisioned.source,
-                        &original,
-                        std::env::join_paths([&provisioned.dependencies])
-                            .expect("dependency library path"),
-                    );
-                }
-                let paths = std::env::join_paths([
-                    &original,
-                    &provisioned.runtime,
-                    &provisioned.testing,
-                    &provisioned.dependencies,
-                ])
-                .expect("original library path");
-                let output = run_r_output(&r_home, paths, script);
-                assert_success(&output, &format!("original {} script", self.package));
-                assert_eq!(
-                    results[0],
-                    String::from_utf8_lossy(&output.stdout),
-                    "{} script differs from the original package",
-                    self.package
-                );
-            }
+            assert_eq!(
+                results[0], results[1],
+                "{} original behavior depends on preloading",
+                self.package
+            );
         }
     }
 
@@ -324,10 +282,6 @@ impl LinkedSuite<'_> {
             Check::Script(script) => (*script).to_owned(),
         };
         let setup = match state {
-            State::Absent => format!(
-                "stopifnot(!nzchar(vapply({linked}, function(p) system.file(package = p), \"\")))",
-                linked = r_vector(self.linked)
-            ),
             State::Installed => format!(
                 "stopifnot(nzchar(vapply({linked}, function(p) system.file(package = p), \"\")), !any(vapply({linked}, isNamespaceLoaded, TRUE)))",
                 linked = r_vector(self.linked)
@@ -348,13 +302,11 @@ impl LinkedSuite<'_> {
     fn provision(&self, r_home: &Path) -> Provisioned {
         let cache = cache(self.package);
         let external = cache.join("external");
-        let testing_needs_linked = cache.join("testing-needs-linked");
         let provisioned = Provisioned {
             source: cache.join("source").join(self.package),
             dependencies: cache.join("dependencies"),
             runtime: cache.join("runtime"),
             testing: cache.join("testing"),
-            testing_needs_linked: false,
             external: Vec::new(),
         };
         run_r_with_site_profile(
@@ -403,7 +355,6 @@ impl LinkedSuite<'_> {
                   untar(tarball, exdir = dirname({source}))
                 }}
                 writeLines(external, {external})
-                writeLines(as.character(any(linked %in% testing)), {testing_needs_linked})
                 "#,
                 package = r_string(self.package),
                 linked = r_vector(self.linked),
@@ -412,7 +363,6 @@ impl LinkedSuite<'_> {
                 testing_library = r_string(&provisioned.testing),
                 source = r_string(&provisioned.source),
                 external = r_string(&external),
-                testing_needs_linked = r_string(&testing_needs_linked),
             ),
         );
         Provisioned {
@@ -421,10 +371,6 @@ impl LinkedSuite<'_> {
                 .lines()
                 .map(str::to_owned)
                 .collect(),
-            testing_needs_linked: fs::read_to_string(&testing_needs_linked)
-                .expect("testing dependency marker")
-                .trim()
-                == "TRUE",
             ..provisioned
         }
     }

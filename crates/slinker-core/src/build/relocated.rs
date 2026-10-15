@@ -1,12 +1,10 @@
 use super::BuildContextError;
-use super::emit::{
-    RExpr, binding_reference, namespace_expression, namespace_get, native_library, r_string,
-};
-use crate::ir::{CodeId, ExternalBindingAccess, ProgramIr, RelocationTarget};
+use super::emit::{RExpr, namespace_expression, namespace_get, native_library, r_string};
+use crate::ir::{BindingLookup, CodeId, ProgramIr, RelocationTarget};
 use crate::package::{CanonicalSyntax, Digest, SyntaxValidation};
 use crate::syntax::TextRange;
-use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{AppendedArgumentSpec, RelocationSiteSpec};
+use crate::worker::service::PreparationWorker;
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -17,7 +15,7 @@ pub(super) struct RelocatedCode {
 impl RelocatedCode {
     pub(super) fn verify(
         program: &ProgramIr,
-        worker: &mut WorkerClient,
+        worker: &mut PreparationWorker,
     ) -> Result<Self, BuildContextError> {
         let mut planned = BTreeMap::<CodeId, Vec<(TextRange, Replacement)>>::new();
         for relocation in program.relocations() {
@@ -95,12 +93,25 @@ impl Replacement {
 
     fn planned(program: &ProgramIr, target: &RelocationTarget) -> Self {
         match target {
-            RelocationTarget::Binding { target, access } => Self::expression(match access {
-                ExternalBindingAccess::Exported => binding_reference(program, *target),
-                ExternalBindingAccess::Internal => namespace_get(program, *target),
+            RelocationTarget::Binding { target, lookup } => Self::expression(match lookup {
+                BindingLookup::Exported { name } => RExpr::new(format!(
+                    "base::getExportedValue({}, {})",
+                    namespace_expression(
+                        program,
+                        program
+                            .namespace(program.binding_namespace(*target))
+                            .package
+                    ),
+                    r_string(name),
+                )),
+                BindingLookup::Internal => namespace_get(program, *target),
             }),
             RelocationTarget::RequireNamespace { result } => {
-                Self::expression(RExpr::from(if *result { "TRUE" } else { "FALSE" }))
+                Self::expression(RExpr::from(if *result {
+                    "base::invisible(TRUE)"
+                } else {
+                    "base::invisible(FALSE)"
+                }))
             }
             RelocationTarget::Namespace { package, .. }
             | RelocationTarget::NamespaceArgument { package } => {
@@ -158,6 +169,7 @@ impl Replacement {
                 "base::package_version({})",
                 r_string(version.as_ref())
             ))),
+            RelocationTarget::AbsentResource => Self::expression(r_string("")),
             RelocationTarget::Resource { target } => {
                 let resource = program.resource(*target);
                 let package = program.package(resource.package).identity();

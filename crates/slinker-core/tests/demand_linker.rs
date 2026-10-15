@@ -82,6 +82,12 @@ impl FakeProvider {
                     "packageEvent",
                     "makeActiveBinding",
                     "environment",
+                    "as.list",
+                    "as.list.environment",
+                    "mget",
+                    "eapply",
+                    "ls",
+                    "objects",
                     "UseMethod",
                     "NextMethod",
                     "new.env",
@@ -111,7 +117,12 @@ impl FakeProvider {
                     "/",
                     "[",
                     "[[",
+                    "[<-",
+                    "[[<-",
                     "$",
+                    "$<-",
+                    "@",
+                    "@<-",
                     "<-",
                     "{",
                     "if",
@@ -136,6 +147,9 @@ impl FakeProvider {
     }
 
     fn dispatching(mut self, package: Option<&str>, binding: &str, generics: &[&str]) -> Self {
+        if package.is_none() {
+            self.target_environment.base_bindings.insert(binding.into());
+        }
         self.dispatch.insert(
             (package.map(str::to_owned), binding.to_owned()),
             generics.iter().copied().map(GenericName::from).collect(),
@@ -311,6 +325,7 @@ impl<'a> PackageFixture<'a> {
                     ObjectKind::Integer
                 };
                 let object = ObjectImage {
+                    has_attributes: false,
                     closure,
                     ..ObjectImage::of_kind(BindingRepresentation::Value, object_kind)
                 };
@@ -455,6 +470,7 @@ fn private_closure(name: &str, environment: &str, source: &str) -> PrivateBindin
     PrivateBindingImage {
         name: name.into(),
         object: ObjectImage {
+            has_attributes: false,
             representation: slinker_core::package::BindingRepresentation::Value,
             classes: Vec::new(),
             object_kind: ObjectKind::Closure,
@@ -500,7 +516,7 @@ fn retaining_structured_object_executes_nested_closures() {
 }
 
 #[test]
-fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
+fn runtime_reenclosure_blocks_without_inventing_an_environment() {
     let mut root = PackageFixture::new("root", &[
             (
                 "f",
@@ -543,6 +559,7 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
                 name: format!("{name}_dependency").into(),
                 origin: BindingOrigin::Code,
                 object: ObjectImage {
+                    has_attributes: false,
                     representation: slinker_core::package::BindingRepresentation::Value,
                     classes: Vec::new(),
                     object_kind: ObjectKind::Closure,
@@ -593,9 +610,13 @@ fn runtime_construction_executes_reenclosed_closures_in_derived_environment() {
 
     assert!(retained_binding(&plan, "root", "first_dependency"));
     assert!(retained_binding(&plan, "root", "second_dependency"));
-    assert!(!plan.blockers().iter().any(|diagnostic| {
-        diagnostic.code == RejectCode::UnresolvedBinding && diagnostic.message.contains("self")
-    }));
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::EnvironmentMutation),
+        "{:?}",
+        plan.blockers()
+    );
 }
 
 #[test]
@@ -786,6 +807,7 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
                 PrivateBindingImage {
                     name: "bad".into(),
                     object: ObjectImage {
+                        has_attributes: false,
                         representation: slinker_core::package::BindingRepresentation::Value,
                         classes: Vec::new(),
                         object_kind: ObjectKind::Unsupported(UnsupportedObject::SexpType(22)),
@@ -989,7 +1011,7 @@ fn foreign_binding_can_pull_another_package_without_rounds() {
 }
 
 #[test]
-fn unused_root_import_metadata_does_not_create_reachability() {
+fn unused_root_import_activates_without_retaining_unused_bindings() {
     let root = PackageFixture::new("root", &[("f", Some("f <- function() 1"))])
         .imports(vec![ImportSpec::All {
             package: "foo".into(),
@@ -1011,11 +1033,10 @@ fn unused_root_import_metadata_does_not_create_reachability() {
     .build();
     let plan = analyze_images(vec![root, foo]);
     assert!(
-        !plan
-            .provenance()
+        plan.provenance()
             .nodes()
             .iter()
-            .any(|node| node.package == "foo")
+            .any(|node| node.package == "foo" && matches!(node.kind, NodeKind::Activation))
     );
     assert!(!retained_binding(&plan, "foo", "a"));
     assert!(!retained_binding(&plan, "foo", "b"));
@@ -1159,255 +1180,33 @@ fn namespace_discovery_matches_named_and_mixed_positional_arguments() {
 }
 
 #[test]
-fn constant_argument_specializes_private_namespace_helper() {
-    let root = PackageFixture::new(
-        "root",
-        &[
-            ("f", Some("f <- function() helper(\"foo\")")),
-            (
-                "helper",
-                Some("helper <- function(package) requireNamespace(package)"),
-            ),
-        ],
-    )
-    .exports(export("f"))
-    .build();
-    let foo = package("foo", &[]);
-    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo"])
-        .analyze("root")
-        .unwrap();
-
-    assert!(
-        !plan
-            .blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery),
-        "{:?}",
-        plan.blockers()
-    );
-    assert!(
-        plan.program()
-            .packages()
-            .any(|(_, package)| package.identity().name == "foo"
-                && package.role() == slinker_core::ir::PackageRole::External)
-    );
-}
-
-#[test]
-fn unknown_argument_keeps_public_namespace_helper_dynamic() {
-    let root = package(
-        "root",
-        &[(
-            "helper",
-            Some("helper <- function(package) requireNamespace(package)"),
-        )],
-    );
-    let plan = analyze_images(vec![root]);
-
-    assert!(
-        plan.blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
-    );
-}
-
-#[test]
-fn bounded_string_operations_specialize_namespace_helper() {
-    let root = PackageFixture::new("root", &[
-            ("f", Some("f <- function() helper(\"foo-extra\")")),
-            (
-                "helper",
-                Some(
-                    "helper <- function(spec) { parts <- strsplit(spec, \"-\", fixed = TRUE)[[1L]]; package <- paste0(parts[[1L]], \"\"); requireNamespace(package) }",
+fn computed_namespace_names_require_declarations_instead_of_interpretation() {
+    for body in [
+        "requireNamespace(package)",
+        "requireNamespace(paste0(package, ''))",
+        "requireNamespace(strsplit(package, '-', fixed=TRUE)[[1L]][[1L]])",
+        "requireNamespace(switch(package, short='foo', long='bar'))",
+        "if (print(package)) helper(package) else requireNamespace(package)",
+    ] {
+        let root = package(
+            "root",
+            &[
+                ("f", Some("f <- function() helper('foo')")),
+                (
+                    "helper",
+                    Some(&format!("helper <- function(package) {{ {body} }}")),
                 ),
-            ),
-        ]).exports(export("f")).build();
-    let foo = package("foo", &[]);
-    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo"])
-        .analyze("root")
-        .unwrap();
-
-    assert!(
-        !plan
-            .blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
-    );
-}
-
-#[test]
-fn unknown_string_index_keeps_namespace_discovery_dynamic() {
-    let root = PackageFixture::new("root", &[
-            (
-                "f",
-                Some("f <- function(index) helper(\"foo-extra\", index)"),
-            ),
-            (
-                "helper",
-                Some(
-                    "helper <- function(spec, index) { parts <- strsplit(spec, \"-\", fixed = TRUE)[[1L]]; requireNamespace(parts[[index]]) }",
-                ),
-            ),
-        ]).exports(export("f")).build();
-    let plan = analyze_images(vec![root]);
-
-    assert!(
-        plan.blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
-    );
-}
-
-#[test]
-fn resolved_null_coalescing_helper_propagates_constant() {
-    let root = PackageFixture::new(
-        "root",
-        &[
-            ("f", Some("f <- function() helper(NULL)")),
-            (
-                "helper",
-                Some("helper <- function(package) requireNamespace(package %||% \"foo\")"),
-            ),
-            (
-                "%||%",
-                Some("`%||%` <- function(left, right) if (!is.null(left)) left else right"),
-            ),
-        ],
-    )
-    .exports(export("f"))
-    .build();
-    let foo = package("foo", &[]);
-    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo"])
-        .analyze("root")
-        .unwrap();
-
-    assert!(
-        !plan
-            .blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
-    );
-}
-
-#[test]
-fn bounded_switch_propagates_selected_package() {
-    let root = PackageFixture::new("root", &[
-            ("f", Some("f <- function() helper(\"short\")")),
-            (
-                "helper",
-                Some(
-                    "helper <- function(kind) requireNamespace(switch(kind, short = \"foo\", long = \"bar\"))",
-                ),
-            ),
-        ]).exports(export("f")).build();
-    let foo = package("foo", &[]);
-    let plan = Linker::new(FakeProvider::new(vec![root, foo]), 1)
-        .with_external_packages(["foo"])
-        .analyze("root")
-        .unwrap();
-
-    assert!(
-        !plan
-            .blockers()
-            .iter()
-            .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
-    );
-}
-
-fn root_calling_helper_with(
-    helpers: &[(&str, &str)],
-    entry: &str,
-) -> slinker_core::analysis::LinkIr {
-    let mut bindings = vec![
-        ("f", format!("f <- function() helper({entry})")),
-        (
-            "helper",
-            "helper <- function(package) requireNamespace(package)".to_owned(),
-        ),
-    ];
-    bindings.extend(
-        helpers
-            .iter()
-            .map(|(name, source)| (*name, (*source).to_owned())),
-    );
-    let bindings = bindings
-        .iter()
-        .map(|(name, source)| (*name, Some(source.as_str())))
-        .collect::<Vec<_>>();
-    let root = PackageFixture::new("root", &bindings)
-        .exports(export("f"))
-        .build();
-    Linker::new(FakeProvider::new(vec![root, package("foo", &[])]), 1)
-        .with_external_packages(["foo"])
-        .analyze("root")
-        .unwrap()
-}
-
-fn has_dynamic_discovery(plan: &slinker_core::analysis::LinkIr) -> bool {
-    plan.blockers()
-        .iter()
-        .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery)
-}
-
-#[test]
-fn recursion_starts_from_bottom_so_its_base_case_survives() {
-    let plan = root_calling_helper_with(
-        &[(
-            "pick",
-            "pick <- function(n) if (print(n)) pick(n) else \"foo\"",
-        )],
-        "pick(\"x\")",
-    );
-    assert!(!has_dynamic_discovery(&plan), "{:?}", plan.blockers());
-}
-
-#[test]
-fn mutual_recursion_converges_to_its_base_case() {
-    let plan = root_calling_helper_with(
-        &[
-            (
-                "ping",
-                "ping <- function(n) if (print(n)) pong(n) else \"foo\"",
-            ),
-            ("pong", "pong <- function(n) ping(n)"),
-        ],
-        "ping(\"x\")",
-    );
-    assert!(!has_dynamic_discovery(&plan), "{:?}", plan.blockers());
-}
-
-#[test]
-fn recursion_without_a_base_case_is_unknown_not_a_silent_constant() {
-    let plan = root_calling_helper_with(&[("spin", "spin <- function(n) spin(n)")], "spin(\"x\")");
-    assert!(has_dynamic_discovery(&plan), "{:?}", plan.blockers());
-}
-
-#[test]
-fn unknown_branch_join_keeps_agreeing_values_and_widens_disagreeing_ones() {
-    let agreeing = root_calling_helper_with(
-        &[(
-            "pick",
-            "pick <- function(n) if (print(n)) \"foo\" else \"foo\"",
-        )],
-        "pick(\"x\")",
-    );
-    assert!(
-        !has_dynamic_discovery(&agreeing),
-        "{:?}",
-        agreeing.blockers()
-    );
-
-    let disagreeing = root_calling_helper_with(
-        &[(
-            "pick",
-            "pick <- function(n) if (print(n)) \"foo\" else \"bar\"",
-        )],
-        "pick(\"x\")",
-    );
-    assert!(has_dynamic_discovery(&disagreeing));
+            ],
+        );
+        let plan = analyze_images(vec![root, package("foo", &[])]);
+        assert!(
+            plan.blockers()
+                .iter()
+                .any(|diagnostic| diagnostic.code == RejectCode::DynamicPackageDiscovery),
+            "{body}: {:?}",
+            plan.blockers()
+        );
+    }
 }
 
 #[test]
@@ -2270,14 +2069,14 @@ fn resource_reference_retains_only_required_path() {
     let plan = analyze_images(vec![root, foo]);
     assert!(plan.program().resources().iter().any(|resource| {
         plan.program().package(resource.package).identity().name == "foo"
-            && resource.path == "data/x.json"
+            && resource.path.as_str() == "data/x.json"
     }));
     assert!(
         !plan
             .program()
             .resources()
             .iter()
-            .any(|resource| resource.path == "data/y.json")
+            .any(|resource| resource.path.as_str() == "data/y.json")
     );
 }
 
@@ -2369,6 +2168,26 @@ fn do_call_with_a_literal_list_is_a_typed_invocation() {
 }
 
 #[test]
+fn linked_resource_paths_cannot_escape_the_package() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some("f <- function() system.file('..', package = 'foo')"),
+        )],
+    );
+    let foo = package("foo", &[]);
+    let plan = analyze_images(vec![root, foo]);
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("resource path")
+                && diagnostic.message.contains("package")),
+        "out-of-package resource path was accepted"
+    );
+}
+
+#[test]
 fn base_resource_lookup_is_not_a_package_resource() {
     let root = package(
         "root",
@@ -2377,6 +2196,48 @@ fn base_resource_lookup_is_not_a_package_resource() {
     let plan = analyze_images(vec![root]);
     assert!(plan.blockers().is_empty());
     assert!(plan.program().resources().is_empty());
+}
+
+#[test]
+fn linked_resource_relocation_cannot_discard_argument_evaluation() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some(
+                "f <- function() system.file('DESCRIPTION', package = 'foo', mustWork = { cat('evaluated'); FALSE })",
+            ),
+        )],
+    );
+    let foo = PackageFixture::new("foo", &[])
+        .files(vec!["DESCRIPTION".into()])
+        .build();
+    let plan = analyze_images(vec![root, foo]);
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicLookup),
+        "resource replacement discards observable argument evaluation"
+    );
+}
+
+#[test]
+fn proven_absent_linked_resource_does_not_query_the_real_installation() {
+    let root = package(
+        "root",
+        &[(
+            "f",
+            Some("f <- function() system.file('missing', package = 'foo', mustWork = FALSE)"),
+        )],
+    );
+    let foo = package("foo", &[]);
+    let plan = analyze_images(vec![root, foo]);
+    assert!(plan.blockers().is_empty(), "{:?}", plan.blockers());
+    assert_eq!(
+        plan.program().relocations().len(),
+        1,
+        "proven absence must replace the original installation query"
+    );
 }
 
 #[test]
@@ -2670,12 +2531,22 @@ fn reflective_lookups_retain_static_names_and_block_dynamic_ones() {
     );
 
     let specialized = analyze("f <- function() register('helper_method', 'cls')");
-    assert!(retained_binding(&specialized, "dep", "helper_method.cls"));
+    assert!(
+        specialized
+            .blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::DynamicLookup)
+    );
 
     let finalizer = analyze(
         "f <- function() reg.finalizer(asNamespace('dep'), function(x) x$unload(), onexit = TRUE)",
     );
-    assert!(retained_binding(&finalizer, "dep", "unload"));
+    assert!(
+        finalizer
+            .blockers()
+            .iter()
+            .any(|diagnostic| diagnostic.code == RejectCode::EnvironmentMutation)
+    );
 }
 
 #[test]
@@ -2824,7 +2695,7 @@ fn namespace_info_reads_accept_only_reproduced_fields() {
 }
 
 #[test]
-fn dynamic_namespace_is_allowed_only_without_reflection() {
+fn dynamic_namespace_needs_a_proven_consumer_and_target() {
     let blocked = |source: &str| {
         let plan = Linker::new(
             FakeProvider::new(vec![package("root", &[("f", Some(source))])]),
@@ -2840,7 +2711,7 @@ fn dynamic_namespace_is_allowed_only_without_reflection() {
         })
     };
 
-    assert!(!blocked(
+    assert!(blocked(
         "f <- function(pkg, fun) registerS3method('g', 'c', fun, envir = asNamespace(pkg))"
     ));
     assert!(blocked(
@@ -2855,7 +2726,7 @@ fn dynamic_namespace_is_allowed_only_without_reflection() {
 }
 
 #[test]
-fn construction_interpreter_does_not_reevaluate_unspecialized_calls() {
+fn repeated_static_calls_retain_the_transitive_binding() {
     let sources = (0..18)
         .map(|level| {
             let next = format!("f{}", level + 1);
@@ -2876,40 +2747,6 @@ fn construction_interpreter_does_not_reevaluate_unspecialized_calls() {
     let plan = analyze_images(vec![package("root", &bindings)]);
 
     assert!(retained_binding(&plan, "root", "f18"));
-}
-
-#[test]
-fn construction_interpreter_evaluates_each_call_signature_once_per_requester() {
-    let levels = 10;
-    let sources = (0..levels)
-        .map(|level| {
-            let next = format!("f{}", level + 1);
-            (
-                format!("f{level}"),
-                format!(
-                    "f{level} <- function(x, flag) {{ if (flag) {next}(\"a\", flag) else {next}(\"a\", flag); {next}(\"a\", flag) }}"
-                ),
-            )
-        })
-        .chain(std::iter::once((
-            format!("f{levels}"),
-            format!("f{levels} <- function(x, flag) x"),
-        )))
-        .collect::<Vec<_>>();
-    let bindings = sources
-        .iter()
-        .map(|(name, source)| (name.as_str(), Some(source.as_str())))
-        .collect::<Vec<_>>();
-    let plan = analyze_images(vec![package("root", &bindings)]);
-
-    assert!(retained_binding(&plan, "root", &format!("f{levels}")));
-    let requesters = bindings.len();
-    let signatures = bindings.len();
-    assert!(
-        plan.construction_evaluations() <= requesters * signatures,
-        "{} construction evaluations for {requesters} bindings",
-        plan.construction_evaluations()
-    );
 }
 
 #[test]
@@ -3011,7 +2848,7 @@ fn missing_packages_are_collated_instead_of_failing_fast() {
 }
 
 #[test]
-fn unused_dependency_import_does_not_pull_or_report_missing_package() {
+fn unused_dependency_import_reports_its_missing_load_requirement() {
     let root = package("root", &[("f", Some("f <- function() foo::x()"))]);
     let foo = PackageFixture::new("foo", &[("x", Some("x <- function() 1"))])
         .imports(vec![ImportSpec::From {
@@ -3026,12 +2863,14 @@ fn unused_dependency_import_does_not_pull_or_report_missing_package() {
     let plan = analyze_images(vec![root, foo]);
     assert!(retained_binding(&plan, "foo", "x"));
     assert!(
-        !plan
-            .provenance()
+        plan.provenance()
             .nodes()
             .iter()
-            .any(|node| node.package == "otelsdk")
+            .any(|node| node.package == "otelsdk" && matches!(node.kind, NodeKind::MissingPackage))
     );
+    assert!(plan.blockers().iter().any(|blocker| {
+        blocker.package == "otelsdk" && blocker.code == RejectCode::MissingDependency
+    }));
 }
 
 #[test]
@@ -3059,11 +2898,17 @@ fn reachable_dependency_import_reports_missing_package_with_provenance() {
         .shortest_path(plan.provenance().roots(), missing.id)
         .unwrap();
     assert!(path.iter().any(|edge| edge.kind == EdgeKind::Import));
-    assert!(path.iter().any(|edge| edge.reason.contains("span")));
+    assert!(
+        path.iter()
+            .any(|edge| edge.reason.contains("effective import"))
+    );
+    assert!(plan.provenance().edges().iter().any(|edge| {
+        edge.to == missing.id && edge.reason.contains("span") && edge.span.is_some()
+    }));
 }
 
 #[test]
-fn missing_unused_root_import_is_not_reported() {
+fn missing_unused_root_import_blocks_root_activation() {
     let root = PackageFixture::new("root", &[("f", Some("f <- function() 1"))])
         .imports(vec![ImportSpec::All {
             package: "required_at_root_load".into(),
@@ -3073,12 +2918,15 @@ fn missing_unused_root_import_is_not_reported() {
         .build();
     let plan = analyze_images(vec![root]);
     assert!(
-        !plan
-            .provenance()
+        plan.provenance()
             .nodes()
             .iter()
-            .any(|node| node.package == "required_at_root_load")
+            .any(|node| node.package == "required_at_root_load"
+                && matches!(node.kind, NodeKind::MissingPackage))
     );
+    assert!(plan.blockers().iter().any(|blocker| {
+        blocker.package == "required_at_root_load" && blocker.code == RejectCode::MissingDependency
+    }));
 }
 
 #[test]
@@ -4385,7 +4233,7 @@ fn repeated_predicate_refines_conditional_local_fallthrough() {
 }
 
 #[test]
-fn non_returning_package_helper_refines_exhaustive_dispatch() {
+fn helper_body_does_not_discharge_namespace_fallthrough() {
     let root = PackageFixture::new(
         "root",
         &[
@@ -4404,6 +4252,7 @@ fn non_returning_package_helper_refines_exhaustive_dispatch() {
                 ".stop_invalid_direction",
                 Some(".stop_invalid_direction <- function() { stop('invalid direction') }"),
             ),
+            ("showprob", None),
         ],
     )
     .exports(export("f"))
@@ -4411,13 +4260,14 @@ fn non_returning_package_helper_refines_exhaustive_dispatch() {
     let plan = analyze_images(vec![root]);
 
     assert!(retained_binding(&plan, "root", ".stop_invalid_direction"));
+    assert!(retained_binding(&plan, "root", "showprob"));
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("f") && diagnostic.message.contains("showprob")
     }));
 }
 
 #[test]
-fn non_returning_summary_does_not_hide_real_invalid_input_fallthrough() {
+fn conditional_dispatch_retains_real_namespace_fallthrough() {
     let root = package(
         "root",
         &[
@@ -4535,13 +4385,19 @@ fn uncaptured_superassignment_remains_environment_mutation_blocker() {
 }
 
 #[test]
-fn private_non_returning_helper_refines_enclosing_private_closure() {
-    let mut root = PackageFixture::new("root", &[(
-            "public",
-            Some(
-                "public <- function(direction) { if (direction == 'ok') value <- 1 else .die(); value }",
+fn private_helper_body_does_not_discharge_namespace_fallthrough() {
+    let mut root = PackageFixture::new(
+        "root",
+        &[
+            (
+                "public",
+                Some("public <- function(direction) { if (direction == 'ok') value <- 1 else .die(); value }"),
             ),
-        )]).exports(export("public")).build();
+            ("value", None),
+        ],
+    )
+    .exports(export("public"))
+    .build();
     Arc::make_mut(root.bindings.get_mut("public").unwrap())
         .object
         .closure
@@ -4567,6 +4423,7 @@ fn private_non_returning_helper_refines_enclosing_private_closure() {
     let plan = analyze_images(vec![root]);
 
     assert!(retained_private_binding(&plan, "root", "private:1", ".die"));
+    assert!(retained_binding(&plan, "root", "value"));
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("public") && diagnostic.message.contains("value")
     }));
@@ -5417,10 +5274,10 @@ fn one_missing_package_is_one_primary_blocker_with_every_requester_as_evidence()
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(requesters, ["dep::f1", "dep::f2", "dep::f3"]);
+    assert_eq!(requesters, ["dep::", "dep::f1", "dep::f2", "dep::f3"]);
     assert_eq!(
         primaries[0].evidence_summary().as_deref(),
-        Some("dep::f1, dep::f2, dep::f3")
+        Some("dep, dep::f1, dep::f2, dep::f3")
     );
 }
 
@@ -5447,7 +5304,7 @@ fn independent_primary_blockers_stay_independent() {
         .map(|primary| (primary.package.clone(), primary.evidence.len()))
         .collect::<Vec<_>>();
     missing.sort();
-    assert_eq!(missing, [("gone".into(), 2), ("other".into(), 2)]);
+    assert_eq!(missing, [("gone".into(), 3), ("other".into(), 2)]);
     assert!(plan.blockers().iter().any(|blocker| {
         blocker.code == RejectCode::DynamicLookup && blocker.binding.as_deref() == Some("r4")
     }));
@@ -5481,7 +5338,7 @@ fn derivative_grouping_leaves_the_graph_observational_and_the_report_determinist
         .iter()
         .filter(|edge| edge.to == missing[0])
         .count();
-    assert_eq!(derivations, 3);
+    assert_eq!(derivations, 4);
 
     let render = |plan: &slinker_core::analysis::LinkIr| {
         plan.blockers()

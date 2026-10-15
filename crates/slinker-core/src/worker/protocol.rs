@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 pub const RESPONSE_READY: u8 = 0;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -20,7 +20,7 @@ pub struct TargetSpec {
     pub libraries: Vec<PathBuf>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PackageSpec {
     pub name: PackageName,
     pub version: String,
@@ -145,6 +145,14 @@ pub enum WorkerRequest {
         protocol: u32,
         target: TargetSpec,
     },
+    ConfigureLibraries {
+        request_id: u64,
+        libraries: Vec<PathBuf>,
+    },
+    RegisterImages {
+        request_id: u64,
+        packages: Vec<PackageSpec>,
+    },
     PackageIndex {
         request_id: u64,
         package: PackageSpec,
@@ -200,6 +208,17 @@ pub enum WorkerResponse {
         harp_worker: bool,
         target: WorkerTarget,
     },
+    Configured {
+        request_id: u64,
+        target: WorkerTarget,
+    },
+    NamespaceRequired {
+        request_id: u64,
+        package: PackageName,
+    },
+    ImagesRegistered {
+        request_id: u64,
+    },
     PackageIndex {
         request_id: u64,
         index: WorkerPackageIndex,
@@ -242,7 +261,10 @@ pub enum WorkerResponse {
 impl WorkerResponse {
     pub fn request_id(&self) -> Option<u64> {
         match self {
-            Self::PackageIndex { request_id, .. }
+            Self::Configured { request_id, .. }
+            | Self::NamespaceRequired { request_id, .. }
+            | Self::ImagesRegistered { request_id }
+            | Self::PackageIndex { request_id, .. }
             | Self::Binding { request_id, .. }
             | Self::Bindings { request_id, .. }
             | Self::DispatchGenerics { request_id, .. }
@@ -251,6 +273,46 @@ impl WorkerResponse {
             | Self::SyntaxValidation { request_id, .. }
             | Self::NormalizedSyntax { request_id, .. } => Some(*request_id),
             Self::Hello { .. } | Self::Error { .. } | Self::Shutdown => None,
+        }
+    }
+}
+
+impl WorkerRequest {
+    pub(crate) fn images(&self) -> Vec<&PackageSpec> {
+        match self {
+            Self::PackageIndex { package, .. }
+            | Self::Binding { package, .. }
+            | Self::BindingBatch { package, .. }
+            | Self::DataLibrary { package, .. } => vec![package],
+            Self::DispatchGenerics { package, .. } => package.iter().collect(),
+            Self::RegisterImages { packages, .. } => packages.iter().collect(),
+            Self::SerializePayloads {
+                namespaces,
+                payloads,
+                ..
+            } => namespaces
+                .iter()
+                .map(|image| &image.package)
+                .chain(payloads.iter().map(|payload| &payload.package))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn request_id(&self) -> Option<u64> {
+        match self {
+            Self::Hello { .. } | Self::Shutdown => None,
+            Self::ConfigureLibraries { request_id, .. }
+            | Self::RegisterImages { request_id, .. }
+            | Self::PackageIndex { request_id, .. }
+            | Self::Binding { request_id, .. }
+            | Self::BindingBatch { request_id, .. }
+            | Self::DispatchGenerics { request_id, .. }
+            | Self::DataLibrary { request_id, .. }
+            | Self::SerializePayloads { request_id, .. }
+            | Self::ValidateSyntax { request_id, .. }
+            | Self::NormalizeSyntax { request_id, .. }
+            | Self::VerifyRelocation { request_id, .. } => Some(*request_id),
         }
     }
 }

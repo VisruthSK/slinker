@@ -1,19 +1,17 @@
 use super::dynamic_names::UnresolvedName;
-use super::object_world::{ClosureId, ClosureObject, ClosureOwner, Lookup, ObjectGraph, ObjectId};
 use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    BindingName, ClosureSource, ComponentName, EnvironmentKind, EnvironmentLabel, ImportSpec,
-    NativeComponent, PackageId, PackageImage, PackageName, PackageProvider,
+    BindingName, ComponentName, EnvironmentKind, EnvironmentLabel, ImportSpec, NativeComponent,
+    PackageId, PackageImage, PackageName, PackageProvider,
 };
 use crate::profile::{self, Probe};
 use crate::syntax::{
-    NamespaceImportResolution, NamespaceImports, OakParseContext, SharedNames, SourceKey, Span,
-    closure_definitely_non_returning,
+    NamespaceImportResolution, NamespaceImports, OakParseContext, SharedNames, Span,
 };
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,7 +62,6 @@ impl MetadataBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum BindingTarget {
-    Local,
     Base,
     Namespace {
         package: PackageId,
@@ -79,10 +76,6 @@ pub(super) enum BindingTarget {
         environment: EnvironmentLabel,
         binding: BindingName,
     },
-    Closure {
-        package: PackageId,
-        closure: ClosureId,
-    },
     Native {
         package: PackageId,
         component: ComponentName,
@@ -96,36 +89,6 @@ pub(super) enum BindingTarget {
         package: PackageId,
         binding: MetadataBinding,
     },
-}
-
-enum DerivedStep {
-    Resolved(Resolution),
-    Parent(EnvironmentLabel),
-}
-
-fn prove_non_returning<'a>(
-    candidates: &(impl Iterator<Item = (&'a BindingName, &'a ClosureSource)> + Clone),
-    shadowed: &BTreeSet<BindingName>,
-    imports: &NamespaceImports,
-    proven: &mut BTreeSet<BindingName>,
-) {
-    loop {
-        let context = OakParseContext::with_imports(
-            SharedNames::from(shadowed.clone()),
-            Arc::new(imports.clone()),
-            SharedNames::from(proven.clone()),
-        );
-        let before = proven.len();
-        for (name, closure) in candidates.clone() {
-            if !proven.contains(name) && closure_definitely_non_returning(&closure.source, &context)
-            {
-                proven.insert(name.clone());
-            }
-        }
-        if proven.len() == before {
-            return;
-        }
-    }
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
@@ -218,31 +181,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(base)
     }
 
-    fn inferred_non_returning_bindings(
-        &self,
-        package: PackageId,
-        image: &PackageImage,
-        imports: &NamespaceImports,
-    ) -> Result<Arc<BTreeSet<BindingName>>> {
-        let known = self.non_returning_bindings.lock().get(&package).cloned();
-        if let Some(bindings) = known {
-            return Ok(bindings);
-        }
-        let shadowed = self.namespace_shadowed_names(package, image, image.bindings.keys())?;
-        let namespace = EnvironmentLabel::namespace(&self.packages.name(package));
-        let candidates = image.bindings.iter().filter_map(|(name, binding)| {
-            let closure = binding.object.closure.as_ref()?;
-            (closure.environment == namespace).then_some((name, closure))
-        });
-        let mut proven = BTreeSet::new();
-        prove_non_returning(&candidates, &shadowed, imports, &mut proven);
-        let proven = Arc::new(proven);
-        self.non_returning_bindings
-            .lock()
-            .insert(package, Arc::clone(&proven));
-        Ok(proven)
-    }
-
     pub(super) fn oak_parse_context(
         &self,
         package: PackageId,
@@ -252,33 +190,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let _span = profile::span(Probe::OakParseContext);
         let base = self.namespace_shadow_base(package, image)?;
         let mut extra_shadowed = BTreeSet::new();
-        let mut private_shadowed = BTreeSet::new();
-        let mut visible_private = BTreeMap::new();
         let mut current = Some(lexical_environment.clone());
-        self.objects.existing(package, |graph| {
-            let Some(mut environment) = graph.environment_id(lexical_environment) else {
-                return;
-            };
-            let mut seen = BTreeSet::new();
-            while seen.insert(environment) {
-                let shape = graph.environment(environment);
-                if !shape.is_derived() {
-                    current = Some(shape.label.clone());
-                    break;
-                }
-                for name in shape.bindings.keys() {
-                    private_shadowed.insert(name.clone());
-                    extra_shadowed.insert(name.clone());
-                }
-                match shape.parent {
-                    Some(parent) => environment = parent,
-                    None => {
-                        current = None;
-                        break;
-                    }
-                }
-            }
-        });
         let mut seen = HashSet::new();
         while let Some(label) = current.take() {
             let Some(private) = image
@@ -287,35 +199,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
             else {
                 break;
             };
-            for (name, binding) in &private.bindings {
-                private_shadowed.insert(name.clone());
-                extra_shadowed.insert(name.clone());
-                visible_private.entry(name).or_insert(binding);
-            }
+            extra_shadowed.extend(private.bindings.keys().cloned());
             current = Some(private.parent.clone());
         }
 
         let imports = self.namespace_imports(package, image)?;
-        let proven = self.inferred_non_returning_bindings(package, image, &imports)?;
-        if private_shadowed.is_empty() && visible_private.is_empty() {
+        if extra_shadowed.is_empty() {
             return Ok(OakParseContext::with_imports(
                 SharedNames::from(base),
                 imports,
-                SharedNames::from(proven),
             ));
         }
         let mut shadowed = (*base).clone();
         shadowed.extend(extra_shadowed);
-        let mut non_returning = (*proven).clone();
-        non_returning.retain(|name| !private_shadowed.contains(name));
-        let candidates = visible_private
-            .iter()
-            .filter_map(|(&name, binding)| Some((name, binding.object.closure.as_ref()?)));
-        prove_non_returning(&candidates, &shadowed, &imports, &mut non_returning);
         Ok(OakParseContext::with_imports(
             SharedNames::from(shadowed),
             imports,
-            SharedNames::from(non_returning),
         ))
     }
 
@@ -340,13 +239,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 window *= 2;
                 steps = 0;
             }
-            if environment.is_derived() {
-                match self.resolve_derived(current, &environment, name) {
-                    DerivedStep::Resolved(resolution) => return Ok(resolution),
-                    DerivedStep::Parent(parent) => environment = parent,
-                }
-                continue;
-            }
             if let Some(private) = image.private_environment(&environment) {
                 if private.bindings.contains_key(name) {
                     return Ok(Resolution::Static(BindingTarget::Private {
@@ -365,42 +257,12 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 EnvironmentKind::Namespace(package) => {
                     self.resolve_foreign_namespace(package, name)
                 }
-                EnvironmentKind::Base | EnvironmentKind::Empty
-                    if self.packages.is_base_binding(name) =>
-                {
+                EnvironmentKind::Base if self.packages.is_base_binding(name) => {
                     Ok(Resolution::Static(BindingTarget::Base))
                 }
                 _ => Ok(Resolution::unresolved(name)),
             };
         }
-    }
-
-    fn resolve_derived(
-        &self,
-        current: PackageId,
-        environment: &EnvironmentLabel,
-        name: &str,
-    ) -> DerivedStep {
-        let unresolved = || DerivedStep::Resolved(Resolution::unresolved(name));
-        self.objects
-            .existing(current, |graph| {
-                let Some(id) = graph.environment_id(environment) else {
-                    return unresolved();
-                };
-                match graph.lookup_environment_binding(id, name) {
-                    Lookup::Found(object) => DerivedStep::Resolved(Resolution::Static(
-                        derived_binding_target(graph, current, object),
-                    )),
-                    Lookup::Opaque => unresolved(),
-                    Lookup::Absent => match graph.environment(id).parent {
-                        Some(parent) => {
-                            DerivedStep::Parent(graph.environment(parent).label.clone())
-                        }
-                        None => unresolved(),
-                    },
-                }
-            })
-            .unwrap_or_else(unresolved)
     }
 
     fn resolve_foreign_namespace(&self, package: &str, name: &str) -> Result<Resolution> {
@@ -419,30 +281,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         let foreign_image = self.image(foreign)?;
         self.resolve_name(foreign, &foreign_image, name)
-    }
-
-    pub(super) fn closure_execution_source(
-        &self,
-        package: PackageId,
-        closure: ClosureId,
-    ) -> Option<ClosureExecutionSource> {
-        let (closure, environment) = self.objects.existing(package, |graph| {
-            let closure = graph.closure(closure).clone();
-            let environment = graph.environment(closure.enclosure).label.clone();
-            (closure, environment)
-        })?;
-        let owner = closure.provenance.owner.source_key();
-        let key = SourceKey::Closure {
-            owner: Box::new(owner.clone()),
-            path: closure.provenance.path.clone(),
-            environment: environment.clone(),
-        };
-        Some(ClosureExecutionSource {
-            closure,
-            owner,
-            key,
-            environment,
-        })
     }
 
     pub(super) fn resolve_name(
@@ -551,17 +389,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 format!("lexical private reference `{binding}` in {environment}"),
                 Some(span),
             ),
-            Resolution::Static(BindingTarget::Closure { package, closure }) => self.require_at(
-                from,
-                Need::ClosureExecution { package, closure },
-                EdgeKind::ClosureExecution,
-                "reachable lexical reference resolves to an executable retained closure",
-                Some(span),
-            ),
             Resolution::Static(BindingTarget::Native {
                 package,
                 component,
-                binding: native_binding,
+                binding,
             }) => self.require_at(
                 from,
                 Need::Native {
@@ -569,7 +400,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     component: component.clone(),
                 },
                 EdgeKind::Native,
-                format!("registered native symbol `{native_binding}` is provided by `{component}`"),
+                format!("registered native symbol `{binding}` is provided by `{component}`"),
                 Some(span),
             ),
             Resolution::Static(BindingTarget::Imported { package, binding }) => {
@@ -652,7 +483,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Some(span),
                 );
             }
-            Resolution::Static(BindingTarget::Local | BindingTarget::Base) => {}
+            Resolution::Static(BindingTarget::Base) => {}
             Resolution::OpenDynamic(OpenReason::Unresolved(name)) => {
                 self.dynamic_names
                     .lock()
@@ -667,45 +498,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 }
 
-pub(super) struct ClosureExecutionSource {
-    pub(super) closure: ClosureObject,
-    pub(super) owner: SourceKey,
-    pub(super) key: SourceKey,
-    pub(super) environment: EnvironmentLabel,
-}
-
-fn derived_binding_target(
-    graph: &ObjectGraph,
-    current: PackageId,
-    object: ObjectId,
-) -> BindingTarget {
-    let Some(closure) = graph.closure_of(object) else {
-        return BindingTarget::Local;
-    };
-    let closure_object = graph.closure(closure);
-    let provenance = &closure_object.provenance;
-    if closure_object.derived_from.is_some() || !provenance.path.is_root() {
-        return BindingTarget::Closure {
-            package: current,
-            closure,
-        };
-    }
-    match &provenance.owner {
-        ClosureOwner::Namespace(binding) => BindingTarget::Namespace {
-            package: current,
-            binding: binding.clone(),
-        },
-        ClosureOwner::Private {
-            environment,
-            binding,
-        } => BindingTarget::Private {
-            package: current,
-            environment: environment.clone(),
-            binding: binding.clone(),
-        },
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReferenceUse {
     Recorded,
@@ -713,7 +505,7 @@ pub(super) enum ReferenceUse {
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
-    fn require_binding_at(
+    pub(super) fn require_binding_at(
         &self,
         from: NodeId,
         need: Need,

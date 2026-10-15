@@ -114,6 +114,7 @@ pub enum BindingRepresentation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObjectImage {
+    pub has_attributes: bool,
     pub representation: BindingRepresentation,
     #[serde(default)]
     pub classes: Vec<ClassName>,
@@ -163,6 +164,7 @@ impl ObjectImage {
 
     pub fn of_kind(representation: BindingRepresentation, object_kind: ObjectKind) -> Self {
         Self {
+            has_attributes: false,
             representation,
             classes: Vec::new(),
             object_kind,
@@ -220,4 +222,33 @@ impl PackageImage {
     ) -> Option<&PrivateBindingImage> {
         self.private_environment(environment)?.bindings.get(name)
     }
+}
+
+pub(crate) fn reachable_environment_labels<'a>(
+    image: &PackageImage,
+    names: impl IntoIterator<Item = &'a str>,
+) -> std::collections::BTreeSet<EnvironmentLabel> {
+    let mut labels = names
+        .into_iter()
+        .filter_map(|name| image.binding(name))
+        .flat_map(|binding| binding.object.environment_labels().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut pending = labels.iter().cloned().collect::<Vec<_>>();
+    while let Some(label) = pending.pop() {
+        let Some(private) = image.private_environment(&label) else {
+            continue;
+        };
+        let reached = std::iter::once(&private.parent).chain(
+            private
+                .bindings
+                .values()
+                .flat_map(|binding| binding.object.environment_labels()),
+        );
+        for reached in reached {
+            if labels.insert(reached.clone()) {
+                pending.push(reached.clone());
+            }
+        }
+    }
+    labels
 }

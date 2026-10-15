@@ -1484,7 +1484,7 @@ fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
     fs::write(
         &summaries,
         format!(
-            r#"{{"schema": 1, "packages": [{{"package": "tinyc", "version": "1.0.0", "image_fingerprint": "{fingerprint}", "components": [{{"component": "tinyc", "safety": "safe"}}]}}]}}"#
+            r#"{{"schema": 1, "packages": [{{"package": "tinyc", "version": "1.0.0", "origin": "installed", "image_fingerprint": "{fingerprint}", "components": [{{"component": "tinyc", "safety": "safe"}}]}}]}}"#
         ),
     )
     .expect("audited native summary: tinyc.c makes no R callbacks");
@@ -1869,6 +1869,166 @@ fn rlang_package_queries_answer_for_the_linked_copy() {
         &r_home,
         libraries(&installed),
         &format!("loadNamespace('tinyinst'); {behavior}"),
+    );
+}
+
+#[test]
+fn absent_linked_resource_stays_absent_when_the_real_installation_changes() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("resource fixture");
+    let dependency = fixture.path().join("resourceleaf");
+    write_package(&dependency, "resourceleaf", "", "", "unused <- 1\n");
+    let root = fixture.path().join("resourceprobe");
+    write_package(
+        &root,
+        "resourceprobe",
+        "Imports: resourceleaf\n",
+        "export(probe)\n",
+        "probe <- function() system.file('appears-later.txt', package = 'resourceleaf', mustWork = FALSE)\n",
+    );
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency, &original);
+    install_package(&r_home, &root, &original);
+    let behavior = "library(resourceprobe); stopifnot(identical(probe(), ''))";
+    run_r(&r_home, &original, behavior);
+
+    let output = fixture.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&original)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root)
+        .output()
+        .expect("build absent-resource package");
+    assert_success(&result, "build absent-resource package");
+
+    let absent = fixture.path().join("absent");
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&absent).expect("absent library");
+    fs::create_dir(&installed).expect("installed library");
+    install_package(&r_home, &output, &absent);
+    fs::create_dir(dependency.join("inst")).expect("installed resource directory");
+    fs::write(
+        dependency.join("inst/appears-later.txt"),
+        "different installation\n",
+    )
+    .expect("resource in a later installation");
+    install_package(&r_home, &dependency, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    let real_resource =
+        "stopifnot(nzchar(system.file('appears-later.txt', package = 'resourceleaf')))";
+    run_r(&r_home, &installed, &format!("{real_resource}; {behavior}"));
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('resourceleaf'); {real_resource}; {behavior}"),
+    );
+}
+
+#[test]
+fn repeated_null_queries_preserve_the_namespace_fallback() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("predicate fixture");
+    let dependency = fixture.path().join("predicateleaf");
+    write_package(
+        &dependency,
+        "predicateleaf",
+        "",
+        "export(compute)\n",
+        "state <- new.env(parent = emptyenv())\nstate$count <- 0L\nnext_value <- function() { state$count <- state$count + 1L; if (state$count %% 2L == 0L) 1L else NULL }\nfallback <- 42L\ncompute <- function() { if (!is.null(next_value())) fallback <- 1L; if (!is.null(next_value())) fallback }\n",
+    );
+    let root = fixture.path().join("predicateprobe");
+    write_package(
+        &root,
+        "predicateprobe",
+        "Imports: predicateleaf\n",
+        "export(probe)\n",
+        "probe <- function() predicateleaf::compute()\n",
+    );
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency, &original);
+    install_package(&r_home, &root, &original);
+    let behavior = "library(predicateprobe); stopifnot(identical(probe(), 42L))";
+    run_r(&r_home, &original, behavior);
+    let output = fixture.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&original)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root)
+        .output()
+        .expect("build predicate package");
+    assert_success(&result, "build predicate package");
+    let absent = fixture.path().join("absent");
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&absent).expect("absent library");
+    fs::create_dir(&installed).expect("installed library");
+    install_package(&r_home, &output, &absent);
+    install_package(&r_home, &dependency, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    run_r(&r_home, &installed, behavior);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('predicateleaf'); {behavior}"),
+    );
+}
+
+#[test]
+fn linked_operator_binding_preserves_r_lookup() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().expect("operator fixture");
+    let dependency = fixture.path().join("operatorleaf");
+    write_package(
+        &dependency,
+        "operatorleaf",
+        "",
+        "export(compute)\n",
+        "`+` <- function(a, b) 42L\ncompute <- function() 1L + 2L\n",
+    );
+    let root = fixture.path().join("operatorprobe");
+    write_package(
+        &root,
+        "operatorprobe",
+        "Imports: operatorleaf\n",
+        "export(probe)\n",
+        "probe <- function() operatorleaf::compute()\n",
+    );
+    let original = fixture.path().join("original");
+    fs::create_dir(&original).expect("original library");
+    install_package(&r_home, &dependency, &original);
+    install_package(&r_home, &root, &original);
+    let behavior = "library(operatorprobe); stopifnot(identical(probe(), 42L))";
+    run_r(&r_home, &original, behavior);
+    let output = fixture.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .args(["build", "--lib"])
+        .arg(&original)
+        .arg("--output")
+        .arg(&output)
+        .arg(&root)
+        .output()
+        .expect("build operator package");
+    assert_success(&result, "build operator package");
+    let absent = fixture.path().join("absent");
+    let installed = fixture.path().join("installed");
+    fs::create_dir(&absent).expect("absent library");
+    fs::create_dir(&installed).expect("installed library");
+    install_package(&r_home, &output, &absent);
+    install_package(&r_home, &dependency, &installed);
+    install_package(&r_home, &output, &installed);
+    run_r(&r_home, &absent, behavior);
+    run_r(&r_home, &installed, behavior);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('operatorleaf'); {behavior}"),
     );
 }
 

@@ -23,12 +23,7 @@ fn rendered(r_home: &Path, package: &str, threads: usize, schedule: Schedule) ->
         request.libraries = std::env::split_paths(&libraries).collect();
     }
     let target = request.capture().expect("capture the target R libraries");
-    let store = PackageStore::new(
-        r_home.to_path_buf(),
-        target.clone(),
-        CacheLocation::Disabled,
-    )
-    .expect("package store");
+    let store = PackageStore::new(target.clone(), CacheLocation::Disabled).expect("package store");
     let plan = Linker::new(store, threads)
         .with_schedule(schedule)
         .analyze(package)

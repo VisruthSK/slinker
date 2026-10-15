@@ -1,6 +1,58 @@
 use super::*;
+
+#[test]
+fn binary_constant_arguments_are_not_names() {
+    let parsed = parse_source("f <- function(x) x + TRUE");
+    let call = parsed.expressions[0]
+        .calls
+        .iter()
+        .find(|call| call.callee == "+")
+        .unwrap();
+    assert_eq!(call.static_arg(1), Some(&StaticArg::Logical(true)));
+}
+
+#[test]
+fn namespace_queries_only_guard_branches_that_require_their_truth() {
+    for condition in [
+        "!(requireNamespace('optional'))",
+        "isFALSE(requireNamespace('optional'))",
+        "requireNamespace('optional') == FALSE",
+        "identity(requireNamespace('optional'))",
+        "requireNamespace('optional') || flag",
+    ] {
+        let parsed = parse_source(&format!(
+            "f <- function(flag) if ({condition}) optional::run()"
+        ));
+        let reference = parsed.expressions[0]
+            .package_refs
+            .iter()
+            .find(|reference| reference.package == "optional")
+            .expect("namespace reference");
+        assert!(
+            reference.guards.is_empty(),
+            "{condition}: {:?}",
+            reference.guards
+        );
+    }
+}
+
+#[test]
+fn parenthesized_conjunction_preserves_required_namespace_guards() {
+    let parsed = parse_source(
+        "f <- function(flag) if ((requireNamespace('optional')) && flag) optional::run()",
+    );
+    let reference = parsed.expressions[0]
+        .package_refs
+        .iter()
+        .find(|reference| reference.package == "optional")
+        .unwrap();
+    assert_eq!(
+        reference.guards,
+        [crate::syntax::PackageGuard::Available("optional".into())]
+    );
+}
 use crate::package::{BindingName, PackageName};
-use crate::syntax::{ConstructionExprKind, ConstructionTarget, DeclaredCallable, DeclaredDomain};
+use crate::syntax::{DeclaredCallable, DeclaredDomain};
 use oak_semantic::ImportsResolver;
 
 fn parse_source(text: &str) -> ParsedRFile {
@@ -30,14 +82,7 @@ fn bquote_analyzes_holes_only() {
 }
 
 #[test]
-fn evaluated_quotation_is_live_code_in_the_calling_frame() {
-    let parsed = parse_source("f <- function(root) eval(bquote(function(...) path(.(root), ...)))");
-    let names = reference_names(&parsed);
-    assert!(names.contains(&"path"));
-    assert!(!names.contains(&"root"));
-    assert!(
-        reference_names(&parse_source("f <- function() eval(quote(helper()))")).contains(&"helper")
-    );
+fn evalq_is_live_code_in_the_calling_frame() {
     assert!(reference_names(&parse_source("f <- function() evalq(helper())")).contains(&"helper"));
 }
 
@@ -420,15 +465,15 @@ fn definite_local_assignment_never_becomes_external_reference() {
 }
 
 #[test]
-fn repeated_predicate_proves_local_binding() {
+fn repeated_predicate_keeps_the_namespace_fallback() {
     let parsed = parse_source(
         "f <- function(alternative) { if (!is.null(alternative)) { tvalue <- 1 }; if (!is.null(alternative)) tvalue }",
     );
-    assert!(!reference_names(&parsed).contains(&"tvalue"));
+    assert!(reference_names(&parsed).contains(&"tvalue"));
 }
 
 #[test]
-fn repeated_else_if_predicates_preserve_branch_specific_bindings() {
+fn repeated_comparisons_keep_all_namespace_fallbacks() {
     let parsed = parse_source(
         r#"f <- function(alternative, prob2) {
             if (alternative == "less") {
@@ -449,9 +494,9 @@ fn repeated_else_if_predicates_preserve_branch_specific_bindings() {
         }"#,
     );
     let names = reference_names(&parsed);
-    assert!(!names.contains(&"rr"));
-    assert!(!names.contains(&"lowerrr"));
-    assert!(!names.contains(&"upperrr"));
+    assert!(names.contains(&"rr"));
+    assert!(names.contains(&"lowerrr"));
+    assert!(names.contains(&"upperrr"));
 }
 
 #[test]
@@ -475,6 +520,14 @@ fn rebound_predicate_symbol_does_not_prove_local_binding() {
         .find(|reference| reference.name == "x")
         .expect("rebinding predicate input must retain fallthrough");
     assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+}
+
+#[test]
+fn rebinding_a_backticked_condition_input_preserves_fallthrough() {
+    let parsed = parse_source(
+        "f <- function(`some name`) { if (!is.null(`some name`)) x <- 1; `some name` <- 1; if (!is.null(`some name`)) x }",
+    );
+    assert!(reference_names(&parsed).contains(&"x"));
 }
 
 #[test]
@@ -513,9 +566,8 @@ fn exhaustive_dispatch_with_stop_proves_local_binding() {
 }
 
 #[test]
-fn package_local_non_returning_helper_proves_local_binding() {
-    let mut context = OakParseContext::default();
-    context.non_returning_names.insert(".die".into());
+fn helper_calls_do_not_prove_local_binding() {
+    let context = OakParseContext::default();
     let parsed = OakParser
         .parse_binding_with_context(
             SourceId(0),
@@ -528,7 +580,7 @@ fn package_local_non_returning_helper_proves_local_binding() {
             &context,
         )
         .unwrap();
-    assert!(!reference_names(&parsed).contains(&"showprob"));
+    assert!(reference_names(&parsed).contains(&"showprob"));
 }
 
 #[test]
@@ -560,9 +612,8 @@ fn zero_iteration_loop_keeps_real_fallthrough() {
 }
 
 #[test]
-fn locally_shadowed_non_returning_helper_does_not_discharge_fallthrough() {
-    let mut context = OakParseContext::default();
-    context.non_returning_names.insert(".die".into());
+fn helper_formal_does_not_discharge_fallthrough() {
+    let context = OakParseContext::default();
     let parsed = OakParser
         .parse_binding_with_context(
             SourceId(0),
@@ -579,25 +630,11 @@ fn locally_shadowed_non_returning_helper_does_not_discharge_fallthrough() {
 }
 
 #[test]
-fn locally_shadowed_stop_is_not_summarized_as_non_returning() {
-    let context = OakParseContext::default();
-    assert!(!closure_definitely_non_returning(
-        "function(stop) stop('not base stop')",
-        &context,
-    ));
-}
-
-#[test]
-fn non_returning_summary_requires_terminal_stop() {
-    let context = OakParseContext::default();
-    assert!(closure_definitely_non_returning(
-        "function(message) { stop(message) }",
-        &context,
-    ));
-    assert!(!closure_definitely_non_returning(
-        "function(flag) { if (flag) stop('bad'); 1 }",
-        &context,
-    ));
+fn locally_shadowed_stop_does_not_discharge_fallthrough() {
+    let parsed = parse_source(
+        "f <- function(flag, stop) { if (flag) x <- 1 else stop('not base stop'); x }",
+    );
+    assert!(reference_names(&parsed).contains(&"x"));
 }
 
 #[test]
@@ -764,43 +801,43 @@ fn local_recursive_closure_sees_its_completed_binding() {
 }
 
 #[test]
-fn repeated_boolean_guard_preserves_exhaustive_inner_assignment() {
+fn repeated_boolean_guards_do_not_prove_assignment() {
     let parsed = parse_source(
         "f <- function(enabled, choose_first) { if (enabled) { if (choose_first) value <- 1 else value <- 2 }; if (enabled) print(value) }",
     );
-    assert!(!reference_names(&parsed).contains(&"value"));
+    assert!(reference_names(&parsed).contains(&"value"));
 }
 
 #[test]
-fn boolean_alias_correlates_equivalent_null_guard() {
+fn boolean_alias_does_not_correlate_compound_null_guard() {
     let parsed = parse_source(
         "f <- function(obj) { present <- !is.null(obj$field); if (!is.null(obj$field)) value <- 1; if (present) print(value) }",
     );
-    assert!(!reference_names(&parsed).contains(&"value"));
+    assert!(reference_names(&parsed).contains(&"value"));
 }
 
 #[test]
-fn captured_conditional_binding_is_safe_under_same_stable_guard() {
+fn captured_condition_does_not_prove_assignment() {
     let parsed = parse_source(
         "f <- function(enabled, choose_first) { if (enabled) { if (choose_first) callback <- function() 1 else callback <- function() 2 }; invoke <- function() { if (enabled) callback() }; invoke() }",
     );
-    assert!(!reference_names(&parsed).contains(&"callback"));
+    assert!(reference_names(&parsed).contains(&"callback"));
 }
 
 #[test]
-fn captured_exhaustive_binding_is_safe_under_same_outer_guard() {
+fn captured_outer_guard_keeps_the_namespace_fallback() {
     let parsed = parse_source(
         "f <- function(deep, choose_first) { if (deep) { if (choose_first) callback <- function() 1 else callback <- function() 2 }; invoke <- function() { if (deep) callback() }; invoke() }",
     );
-    assert!(!reference_names(&parsed).contains(&"callback"));
+    assert!(reference_names(&parsed).contains(&"callback"));
 }
 
 #[test]
-fn captured_exhaustive_binding_handles_compound_inner_condition() {
+fn captured_compound_guard_keeps_the_namespace_fallback() {
     let parsed = parse_source(
         "f <- function(deep, has_private, candidate) { if (deep) { if (has_private && is.function(candidate)) callback <- candidate else callback <- function() 2 }; invoke <- function() { if (deep) mapply(callback, 1) }; invoke() }",
     );
-    assert!(!reference_names(&parsed).contains(&"callback"));
+    assert!(reference_names(&parsed).contains(&"callback"));
 }
 
 #[test]
@@ -812,15 +849,15 @@ fn mutated_guard_does_not_validate_captured_conditional_binding() {
 }
 
 #[test]
-fn descendant_local_shadow_does_not_mutate_captured_guard() {
+fn uninterpreted_calls_keep_the_captured_namespace_fallback() {
     let parsed = parse_source(
         "f <- function(enabled) { if (enabled) callback <- function() 1; shadow <- function() enabled <- FALSE; invoke <- function() { if (enabled) callback() }; invoke() }",
     );
-    assert!(!reference_names(&parsed).contains(&"callback"));
+    assert!(reference_names(&parsed).contains(&"callback"));
 }
 
 #[test]
-fn rejecting_guard_makes_following_membership_dispatch_exhaustive() {
+fn membership_guards_do_not_prove_exhaustive_dispatch() {
     let parsed = parse_source(
         r#"f <- function(which, function_value) {
             if (is.null(which) || !(which %in% c("public", "private", "active"))) stop("bad")
@@ -832,11 +869,11 @@ fn rejecting_guard_makes_following_membership_dispatch_exhaustive() {
             print(group)
         }"#,
     );
-    assert!(!reference_names(&parsed).contains(&"group"));
+    assert!(reference_names(&parsed).contains(&"group"));
 }
 
 #[test]
-fn rejecting_guard_handles_value_assignments_in_membership_dispatch() {
+fn membership_guards_do_not_prove_value_assignment() {
     let parsed = parse_source(
         r#"f <- function(which, value) {
             if (is.null(which) || !(which %in% c("public", "private", "active"))) stop("bad")
@@ -850,7 +887,7 @@ fn rejecting_guard_handles_value_assignments_in_membership_dispatch() {
             print(group)
         }"#,
     );
-    assert!(!reference_names(&parsed).contains(&"group"));
+    assert!(reference_names(&parsed).contains(&"group"));
 }
 
 #[test]
@@ -933,61 +970,7 @@ fn call_argument_records_definite_local_closure_identity() {
 }
 
 #[test]
-fn construction_facts_preserve_order_and_target_shapes() {
-    let parsed = parse_source(
-        "f <- function(template, parent) { env <- new.env(parent = parent); env$self <- env; environment(template) <- env; list2env(template, envir = env) }",
-    );
-    let construction = &parsed.expressions[0].construction;
-
-    assert_eq!(construction.len(), 4);
-    assert!(matches!(
-        &construction[0].kind,
-        ConstructionExprKind::Assign {
-            target: ConstructionTarget::Local { name },
-            value,
-        } if name == "env" && matches!(
-            &value.kind,
-            ConstructionExprKind::Call { call } if call.callee == "new.env"
-        )
-    ));
-    assert!(matches!(
-        &construction[1].kind,
-        ConstructionExprKind::Assign {
-            target: ConstructionTarget::Member { name: Some(name), .. },
-            ..
-        } if name == "self"
-    ));
-    assert!(matches!(
-        &construction[2].kind,
-        ConstructionExprKind::Assign {
-            target: ConstructionTarget::ClosureEnvironment { .. },
-            ..
-        }
-    ));
-    assert!(matches!(
-        &construction[3].kind,
-        ConstructionExprKind::Call { call } if call.callee == "list2env"
-    ));
-}
-
-#[test]
-fn reenclosure_helper_construction_shape() {
-    let parsed = parse_source(
-        "assign_func_envs <- function(objs, target_env) { if (is.null(target_env)) return(objs); lapply(objs, function(x) { if (is.function(x)) environment(x) <- target_env; x }) }",
-    );
-    assert!(matches!(
-        &parsed.expressions[0].construction[1].kind,
-        ConstructionExprKind::Call { call }
-            if call.callee == "lapply"
-                && matches!(
-                    call.arguments.get(1).and_then(|argument| argument.value.as_ref()).map(|value| &value.kind),
-                    Some(ConstructionExprKind::Function { .. })
-                )
-    ));
-}
-
-#[test]
-fn exhaustive_equality_chain_correlates_later_else_branch() {
+fn equality_chains_do_not_correlate_later_branches() {
     let parsed = parse_source(
         r#"f <- function(alternative) {
             if (alternative == "less") {
@@ -1006,36 +989,20 @@ fn exhaustive_equality_chain_correlates_later_else_branch() {
         }"#,
     );
     let names = reference_names(&parsed);
-    assert!(!names.contains(&"rr"));
-    assert!(!names.contains(&"lowerrr"));
-    assert!(!names.contains(&"upperrr"));
+    assert!(names.contains(&"rr"));
+    assert!(names.contains(&"lowerrr"));
+    assert!(names.contains(&"upperrr"));
 }
 
 #[test]
-fn non_returning_summary_handles_multi_statement_terminal_stop() {
-    let context = OakParseContext::default();
-    assert!(closure_definitely_non_returning(
-        "function(x) { message <- x; stop(message) }",
-        &context,
-    ));
-}
-
-#[test]
-fn non_returning_summary_handles_exhaustive_terminating_if() {
-    let context = OakParseContext::default();
-    assert!(closure_definitely_non_returning(
-        "function(flag) { if (flag) stop('a') else base::stop('b') }",
-        &context,
-    ));
-}
-
-#[test]
-fn explicit_return_prevents_never_returns_summary() {
-    let context = OakParseContext::default();
-    assert!(!closure_definitely_non_returning(
-        "function(flag) { if (flag) return(1); stop('otherwise') }",
-        &context,
-    ));
+fn repeated_null_queries_on_calls_do_not_prove_a_local_binding() {
+    let parsed = parse_source(
+        "f <- function() { if (!is.null(next_value())) fallback <- 1; if (!is.null(next_value())) fallback }",
+    );
+    assert!(
+        reference_names(&parsed).contains(&"fallback"),
+        "repeating a call can produce a different value and reach the namespace fallback"
+    );
 }
 
 #[test]

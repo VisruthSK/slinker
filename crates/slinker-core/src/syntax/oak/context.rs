@@ -225,11 +225,6 @@ impl SharedNames {
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.0.contains(name)
     }
-
-    #[cfg(test)]
-    pub(super) fn insert(&mut self, name: BindingName) {
-        Arc::make_mut(&mut self.0).insert(name);
-    }
 }
 
 impl From<Arc<BTreeSet<BindingName>>> for SharedNames {
@@ -248,7 +243,6 @@ impl From<BTreeSet<BindingName>> for SharedNames {
 pub struct OakParseContext {
     pub(super) shadowed_names: SharedNames,
     pub(super) imports: Arc<NamespaceImports>,
-    pub(super) non_returning_names: SharedNames,
 }
 
 impl OakParseContext {
@@ -256,19 +250,16 @@ impl OakParseContext {
         Self {
             shadowed_names: shadowed_names.into(),
             imports: Arc::default(),
-            non_returning_names: SharedNames::default(),
         }
     }
 
     pub(crate) fn with_imports(
         shadowed_names: SharedNames,
         imports: Arc<NamespaceImports>,
-        non_returning_names: SharedNames,
     ) -> Self {
         Self {
             shadowed_names,
             imports,
-            non_returning_names,
         }
     }
 

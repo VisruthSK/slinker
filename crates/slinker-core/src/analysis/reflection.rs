@@ -1,23 +1,52 @@
 use super::NodeId;
-use super::relocation::NamespaceCall;
-use crate::package::PackageId;
+use crate::package::EnvironmentLabel;
+use crate::package::{PackageId, PackageName};
+use crate::syntax::NamespaceUse;
 use crate::syntax::{CallSite, Span};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub(super) struct ReflectionFacts {
-    non_reflective_namespace_uses: HashSet<Span>,
-    contextual_namespace_calls: HashMap<Span, Option<String>>,
     computed_namespace_info_reads: Vec<ComputedNamespaceInfoRead>,
-    pending_namespace_operations: Vec<PendingNamespaceOperation>,
+    process_observations: Vec<ProcessObservation>,
+    loaded_queries: Vec<LoadedQuery>,
+    namespace_uses: Vec<NamespaceUseObservation>,
+    registry_observations: Vec<ProcessObservation>,
+    checked_registry_uses: HashSet<Span>,
+    namespace_mutations: Vec<NamespaceMutation>,
+    proved_mutations: HashSet<Span>,
+    written_callables: Vec<(PackageId, crate::package::BindingName, Span)>,
 }
 
-pub(super) struct PendingNamespaceOperation {
+pub(super) struct NamespaceMutation {
     pub(super) node: NodeId,
     pub(super) package: PackageId,
     pub(super) binding: String,
     pub(super) call: CallSite,
-    pub(super) operation: NamespaceCall,
+}
+
+pub(super) struct NamespaceUseObservation {
+    pub(super) node: NodeId,
+    pub(super) owner: PackageId,
+    pub(super) binding: String,
+    pub(super) environment: EnvironmentLabel,
+    pub(super) usage: NamespaceUse,
+    pub(super) declared_names: Option<Vec<PackageName>>,
+}
+
+pub(super) struct LoadedQuery {
+    pub(super) node: NodeId,
+    pub(super) owner: PackageId,
+    pub(super) name: PackageName,
+    pub(super) call: CallSite,
+}
+
+pub(super) struct ProcessObservation {
+    pub(super) node: NodeId,
+    pub(super) package: PackageId,
+    pub(super) binding: String,
+    pub(super) operation: String,
+    pub(super) span: Span,
 }
 
 pub(super) struct ComputedNamespaceInfoRead {
@@ -29,27 +58,63 @@ pub(super) struct ComputedNamespaceInfoRead {
 }
 
 impl ReflectionFacts {
-    pub(super) fn add_non_reflective_namespace_uses(&mut self, uses: HashSet<Span>) {
-        self.non_reflective_namespace_uses.extend(uses);
+    pub(super) fn observe_namespace_mutation(&mut self, mutation: NamespaceMutation) {
+        self.namespace_mutations.push(mutation);
+    }
+    pub(super) fn prove_mutation(&mut self, span: Span) {
+        self.proved_mutations.insert(span);
+    }
+    pub(super) fn take_unproved_mutations(&mut self) -> Vec<NamespaceMutation> {
+        std::mem::take(&mut self.namespace_mutations)
+            .into_iter()
+            .filter(|mutation| !self.proved_mutations.contains(&mutation.call.span))
+            .collect()
+    }
+    pub(super) fn record_namespace_write(
+        &mut self,
+        package: PackageId,
+        name: crate::package::BindingName,
+        span: Span,
+    ) {
+        self.written_callables.push((package, name, span));
+    }
+    pub(super) fn take_namespace_writes(
+        &mut self,
+    ) -> Vec<(PackageId, crate::package::BindingName, Span)> {
+        std::mem::take(&mut self.written_callables)
+    }
+    pub(super) fn observe_registry(&mut self, observation: ProcessObservation) {
+        self.registry_observations.push(observation);
+    }
+    pub(super) fn check_registry_use(&mut self, span: Span) {
+        self.checked_registry_uses.insert(span);
+    }
+    pub(super) fn take_raw_registry_observations(&mut self) -> Vec<ProcessObservation> {
+        std::mem::take(&mut self.registry_observations)
+            .into_iter()
+            .filter(|observation| !self.checked_registry_uses.contains(&observation.span))
+            .collect()
+    }
+    pub(super) fn observe_namespace_use(&mut self, usage: NamespaceUseObservation) {
+        self.namespace_uses.push(usage);
+    }
+    pub(super) fn take_namespace_uses(&mut self) -> Vec<NamespaceUseObservation> {
+        std::mem::take(&mut self.namespace_uses)
+    }
+    pub(super) fn defer_loaded_query(&mut self, query: LoadedQuery) {
+        self.loaded_queries.push(query);
     }
 
-    pub(super) fn is_non_reflective_namespace_use(&self, span: &Span) -> bool {
-        self.non_reflective_namespace_uses.contains(span)
+    pub(super) fn take_loaded_queries(&mut self) -> Vec<LoadedQuery> {
+        std::mem::take(&mut self.loaded_queries)
     }
 
-    pub(super) fn record_contextual_namespace_call(&mut self, span: &Span, package: &str) {
-        self.contextual_namespace_calls
-            .entry(span.clone())
-            .and_modify(|known| {
-                if known.as_deref() != Some(package) {
-                    *known = None;
-                }
-            })
-            .or_insert_with(|| Some(package.to_owned()));
+    pub(super) fn observe_process(&mut self, observation: ProcessObservation) {
+        self.process_observations.push(observation);
     }
 
-    pub(super) fn contextual_namespace(&self, span: &Span) -> Option<&str> {
-        self.contextual_namespace_calls.get(span)?.as_deref()
+    pub(super) fn take_process_observations(&mut self) -> Vec<ProcessObservation> {
+        std::mem::take(&mut self.process_observations)
     }
 
     pub(super) fn defer_computed_namespace_info_read(
@@ -68,14 +133,6 @@ impl ReflectionFacts {
                 field: field.to_owned(),
                 span,
             });
-    }
-
-    pub(super) fn defer_namespace_operation(&mut self, pending: PendingNamespaceOperation) {
-        self.pending_namespace_operations.push(pending);
-    }
-
-    pub(super) fn take_pending_namespace_operations(&mut self) -> Vec<PendingNamespaceOperation> {
-        std::mem::take(&mut self.pending_namespace_operations)
     }
 
     pub(super) fn take_computed_namespace_info_reads(&mut self) -> Vec<ComputedNamespaceInfoRead> {

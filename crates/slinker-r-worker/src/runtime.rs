@@ -27,7 +27,10 @@ pub(super) struct WorkerRuntime {
 }
 
 impl WorkerRuntime {
-    pub(super) fn start(target: &protocol::TargetSpec) -> InspectionResult<Self> {
+    pub(super) fn start(
+        target: &protocol::TargetSpec,
+        _initialization: super::serve::Initialization,
+    ) -> InspectionResult<Self> {
         if !target.r_home.is_dir() {
             return Err(format!(
                 "selected R home does not exist: {}",
@@ -93,6 +96,14 @@ impl WorkerRuntime {
         harp::parse_exprs(source)
             .map(|_| ())
             .map_err(InspectionError::from)
+    }
+
+    pub(super) fn configure(
+        &mut self,
+        libraries: &[std::path::PathBuf],
+    ) -> InspectionResult<protocol::WorkerTarget> {
+        configure_libraries(libraries)?;
+        self.target()
     }
 
     fn normalize_syntax(&self, source: &str) -> InspectionResult<String> {
@@ -416,7 +427,39 @@ impl WorkerRuntime {
     }
 
     pub(super) fn answer(&mut self, request: WorkerRequest) -> OperationResult<WorkerResponse> {
+        let request_id = request.request_id();
+        harp::RFunction::new("", ".slinker_namespace_state")
+            .add(true)
+            .call()
+            .coded(WorkerErrorCode::PackageMetadata)?;
+        let outcome = self.answer_inner(request);
+        if outcome.is_err() {
+            let missing = harp::RFunction::new("", ".slinker_namespace_state")
+                .add(false)
+                .call()
+                .coded(WorkerErrorCode::PackageMetadata)?;
+            if let (Some(request_id), Ok(package)) = (request_id, String::try_from(missing)) {
+                return Ok(WorkerResponse::NamespaceRequired {
+                    request_id,
+                    package: package.into(),
+                });
+            }
+        }
+        outcome
+    }
+
+    fn answer_inner(&mut self, request: WorkerRequest) -> OperationResult<WorkerResponse> {
         Ok(match request {
+            WorkerRequest::RegisterImages {
+                request_id,
+                packages,
+            } => {
+                for package in packages {
+                    self.context(&package)
+                        .coded(WorkerErrorCode::PackageMetadata)?;
+                }
+                WorkerResponse::ImagesRegistered { request_id }
+            }
             WorkerRequest::ValidateSyntax { request_id, source } => {
                 syntax_verdict(request_id, self.validate_syntax(&source))
             }
@@ -500,7 +543,9 @@ impl WorkerRuntime {
                 request_id,
                 serialization: self.serialize_payloads(&namespaces, &payloads)?,
             },
-            WorkerRequest::Hello { .. } | WorkerRequest::Shutdown => {
+            WorkerRequest::Hello { .. }
+            | WorkerRequest::ConfigureLibraries { .. }
+            | WorkerRequest::Shutdown => {
                 return Err(WorkerOperationError::new(
                     WorkerErrorCode::Protocol,
                     "lifecycle request received after worker startup",

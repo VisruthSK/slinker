@@ -1,5 +1,7 @@
 use crate::package::SyntaxValidation;
-use crate::package::{CanonicalSyntax, DataSetId, DatasetName, InstalledPackage, Normalization};
+use crate::package::{
+    CanonicalSyntax, DataSetId, DatasetName, FrozenPackages, InstalledPackage, Normalization,
+};
 use crate::profile::{self, Counter, Probe};
 use crate::worker::protocol::WorkerPackageIndex;
 use crate::worker::protocol::{
@@ -7,15 +9,25 @@ use crate::worker::protocol::{
     PayloadSite, PayloadSpec, RelocationSiteSpec, TargetSpec, WorkerRequest, WorkerResponse,
 };
 use crate::worker::protocol::{RESPONSE_READY, WorkerBinding};
-use crate::{Error, Result, Target, TargetEnvironment};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::{Error, Result, Target, TargetEnvironment, WorkerExecutable};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use tempfile::TempPath;
 
 #[derive(Debug)]
 pub(crate) struct WorkerClient {
+    connection: WorkerConnection,
+    packages: Arc<FrozenPackages>,
+    images: BTreeMap<crate::package::PackageName, PackageSpec>,
+    executable: WorkerExecutable,
+    lane: u64,
+}
+
+#[derive(Debug)]
+struct WorkerConnection {
     child: Child,
     input: BufWriter<ChildStdin>,
     output: BufReader<File>,
@@ -26,24 +38,32 @@ pub(crate) struct WorkerClient {
 
 impl WorkerClient {
     pub(crate) fn spawn(
-        r_home: std::path::PathBuf,
-        target: &TargetEnvironment,
+        packages: Arc<FrozenPackages>,
         lane: u64,
+        executable: &WorkerExecutable,
     ) -> Result<Self> {
-        let (client, actual) = Self::connect(r_home, target.libraries.clone(), lane)?;
+        let target = packages.target();
+        let (mut client, actual) = Self::connect(
+            target.r_home.clone(),
+            target.libraries.clone(),
+            lane,
+            executable,
+        )?;
         if actual != *target {
             return Err(Error::Analysis(
                 "Harp worker target changed between discovery and analysis".into(),
             ));
         }
+        client.packages = packages;
         Ok(client)
     }
 
     pub(crate) fn capture_target(
         r_home: std::path::PathBuf,
         libraries: Vec<std::path::PathBuf>,
+        executable: &WorkerExecutable,
     ) -> Result<(TargetEnvironment, Self)> {
-        let (client, target) = Self::connect(r_home, libraries, 0)?;
+        let (client, target) = Self::connect(r_home, libraries, 0, executable)?;
         Ok((target, client))
     }
 
@@ -51,13 +71,11 @@ impl WorkerClient {
         r_home: std::path::PathBuf,
         libraries: Vec<std::path::PathBuf>,
         lane: u64,
+        executable: &WorkerExecutable,
     ) -> Result<(Self, TargetEnvironment)> {
-        let executable = std::env::current_exe().map_err(|source| Error::Io {
-            path: "<current-executable>".into(),
-            source,
-        })?;
+        let executable_path = executable.path()?;
         let (protocol_file, protocol_path) = protocol_file()?;
-        let mut command = Command::new(&executable);
+        let mut command = Command::new(&executable_path);
         command
             .arg("__r-worker")
             .arg(&protocol_path)
@@ -80,7 +98,7 @@ impl WorkerClient {
         command.envs(target_resource_directories(&r_home)?);
         profile::count(Counter::RWorkerStartups);
         let mut child = command.spawn().map_err(|source| Error::Io {
-            path: executable,
+            path: executable_path.clone(),
             source,
         })?;
         let input = child
@@ -91,7 +109,7 @@ impl WorkerClient {
             .stdout
             .take()
             .ok_or_else(|| Error::Analysis("failed to open Harp worker readiness stream".into()))?;
-        let mut client = Self {
+        let mut client = WorkerConnection {
             child,
             input: BufWriter::new(input),
             ready: BufReader::new(ready),
@@ -113,9 +131,8 @@ impl WorkerClient {
                 protocol: PROTOCOL_VERSION,
                 harp_worker: true,
                 target,
-            } => Ok((
-                client,
-                TargetEnvironment {
+            } => {
+                let target = TargetEnvironment {
                     r_home: target.r_home,
                     target: Target {
                         r_version: target.r_version,
@@ -124,8 +141,18 @@ impl WorkerClient {
                     },
                     libraries: target.libraries,
                     base_bindings: target.base_bindings.into_iter().collect::<BTreeSet<_>>(),
-                },
-            )),
+                };
+                Ok((
+                    Self {
+                        connection: client,
+                        packages: Arc::new(FrozenPackages::new(target.clone())),
+                        images: BTreeMap::new(),
+                        executable: WorkerExecutable::Standalone(executable_path),
+                        lane,
+                    },
+                    target,
+                ))
+            }
             response => Err(worker_error("worker startup", response)),
         }
     }
@@ -136,21 +163,94 @@ impl WorkerClient {
         request: impl FnOnce(u64) -> WorkerRequest,
         pick: impl FnOnce(WorkerResponse) -> Option<T>,
     ) -> Result<T> {
-        let request_id = self.next_request;
-        self.next_request = self.next_request.wrapping_add(1);
-        let response = self.exchange(&request(request_id))?;
-        if matches!(response, WorkerResponse::Error { .. }) {
-            return Err(worker_error(operation, response));
+        let request_id = self.next_request();
+        let original = request(request_id);
+        for image in original.images() {
+            if let Some(previous) = self.images.get(&image.name)
+                && previous != image
+            {
+                return Err(Error::Analysis(format!(
+                    "inspection image changed within an epoch: {}",
+                    image.name
+                )));
+            }
+            self.images.insert(image.name.clone(), image.clone());
         }
-        match response.request_id() {
-            Some(id) if id == request_id => pick(response),
-            _ => None,
+        let mut current = original.clone();
+        let mut requested = HashSet::new();
+        loop {
+            let response = self.connection.exchange(&current)?;
+            if matches!(response, WorkerResponse::Error { .. }) {
+                return Err(worker_error(operation, response));
+            }
+            if response.request_id() != current.request_id() {
+                return Err(Error::Analysis(format!(
+                    "Harp worker returned an unexpected {operation} request id"
+                )));
+            }
+            match response {
+                WorkerResponse::NamespaceRequired { package, .. } => {
+                    if !requested.insert(package.clone()) {
+                        return Err(Error::Analysis(format!(
+                            "inspection repeatedly requested namespace `{package}` after image registration"
+                        )));
+                    }
+                    let installed = self.packages.locate(&package)?.ok_or_else(|| {
+                        Error::Analysis(format!(
+                            "inspection requires missing namespace `{package}`"
+                        ))
+                    })?;
+                    self.images.insert(package, package_spec(&installed));
+                    let target = self.packages.target();
+                    let (replacement, actual) = Self::connect(
+                        target.r_home.clone(),
+                        target.libraries.clone(),
+                        self.lane,
+                        &self.executable,
+                    )?;
+                    if actual != *target {
+                        return Err(Error::Analysis(
+                            "target changed while replacing a failed inspection epoch".into(),
+                        ));
+                    }
+                    self.connection = replacement.connection;
+                    current = WorkerRequest::RegisterImages {
+                        request_id: self.next_request(),
+                        packages: self.images.values().cloned().collect(),
+                    };
+                }
+                WorkerResponse::ImagesRegistered { .. }
+                    if matches!(current, WorkerRequest::RegisterImages { .. }) =>
+                {
+                    current = original.clone();
+                }
+                response => {
+                    return pick(response).ok_or_else(|| {
+                        Error::Analysis(format!(
+                            "Harp worker returned an unexpected {operation} response"
+                        ))
+                    });
+                }
+            }
         }
-        .ok_or_else(|| {
-            Error::Analysis(format!(
-                "Harp worker returned an unexpected {operation} response"
-            ))
-        })
+    }
+
+    fn next_request(&mut self) -> u64 {
+        let request = self.connection.next_request;
+        self.connection.next_request = request.wrapping_add(1);
+        request
+    }
+
+    pub(crate) fn packages(&self) -> Arc<FrozenPackages> {
+        Arc::clone(&self.packages)
+    }
+
+    pub(crate) fn target(&self) -> &TargetEnvironment {
+        self.packages.target()
+    }
+
+    pub(crate) fn executable(&self) -> WorkerExecutable {
+        self.executable.clone()
     }
 
     pub(crate) fn package_index(
@@ -215,6 +315,34 @@ impl WorkerClient {
                 _ => None,
             },
         )
+    }
+
+    pub(crate) fn configure_libraries(
+        &mut self,
+        libraries: Vec<std::path::PathBuf>,
+    ) -> Result<TargetEnvironment> {
+        let target = self.call(
+            "library configuration",
+            |request_id| WorkerRequest::ConfigureLibraries {
+                request_id,
+                libraries,
+            },
+            |response| match response {
+                WorkerResponse::Configured { target, .. } => Some(TargetEnvironment {
+                    r_home: target.r_home,
+                    target: Target {
+                        r_version: target.r_version,
+                        os: target.os,
+                        arch: target.arch,
+                    },
+                    libraries: target.libraries,
+                    base_bindings: target.base_bindings.into_iter().collect(),
+                }),
+                _ => None,
+            },
+        )?;
+        self.packages = Arc::new(FrozenPackages::new(target.clone()));
+        Ok(target)
     }
 
     pub(crate) fn data_library(
@@ -353,7 +481,9 @@ impl WorkerClient {
             },
         )
     }
+}
 
+impl WorkerConnection {
     fn await_response_ready(&mut self, context: &str) -> Result<()> {
         let mut console_noise = Vec::new();
         let bytes = self
@@ -440,6 +570,12 @@ fn request_opcode(payload: &[u8]) -> &str {
 fn request_context(request: &WorkerRequest) -> String {
     match request {
         WorkerRequest::Hello { .. } => "target startup".into(),
+        WorkerRequest::ConfigureLibraries { request_id, .. } => {
+            format!("request {request_id} library configuration")
+        }
+        WorkerRequest::RegisterImages { request_id, .. } => {
+            format!("request {request_id} inspection image registration")
+        }
         WorkerRequest::PackageIndex {
             request_id,
             package,
@@ -526,7 +662,7 @@ fn worker_arch() -> &'static str {
     }
 }
 
-impl Drop for WorkerClient {
+impl Drop for WorkerConnection {
     fn drop(&mut self) {
         let _ = serde_json::to_writer(&mut self.input, &WorkerRequest::Shutdown);
         let _ = self.input.write_all(b"\n");
@@ -637,45 +773,5 @@ fn worker_error(operation: &str, response: WorkerResponse) -> Error {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stale_protocol_files_do_not_block_worker_startup() {
-        let stale = (0..64)
-            .map(|index| {
-                std::env::temp_dir().join(format!(
-                    "slinker-r-worker-{}-{index}.jsonl",
-                    std::process::id()
-                ))
-            })
-            .filter(|path| std::fs::File::create_new(path).is_ok())
-            .collect::<Vec<_>>();
-        let created = (0..3).map(|_| protocol_file()).collect::<Vec<_>>();
-        for path in stale {
-            let _ = std::fs::remove_file(path);
-        }
-        for result in created {
-            result.expect("a fresh protocol file");
-        }
-    }
-
-    #[test]
-    fn worker_crash_context_identifies_exact_binding_request() {
-        let request = WorkerRequest::Binding {
-            request_id: 41,
-            package: PackageSpec {
-                name: "fixture".into(),
-                version: "1.0.0".into(),
-                image_fingerprint: "abc123".into(),
-                root: "fixture".into(),
-            },
-            name: "bad".into(),
-        };
-
-        assert_eq!(
-            request_context(&request),
-            "request 41 binding fixture::bad 1.0.0 abc123"
-        );
-    }
-}
+#[path = "../../tests/unit/worker/client.rs"]
+mod tests;

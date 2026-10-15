@@ -1,8 +1,8 @@
-use crate::analysis::object_world::ClosureId;
 use crate::package::{
-    BindingName, ClassName, ComponentName, DatasetName, EnvironmentLabel, GenericName, PackageId,
-    ResourcePath,
+    BindingName, ClassName, ComponentName, DatasetName, EnvironmentLabel, GenericName, MemberPath,
+    PackageId, ResourcePath,
 };
+use crate::syntax::SourceKey;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum LifecycleHook {
@@ -51,7 +51,9 @@ pub enum Need {
     },
     ClosureExecution {
         package: PackageId,
-        closure: ClosureId,
+        owner: SourceKey,
+        path: MemberPath,
+        enclosure: EnvironmentLabel,
     },
     Activation {
         package: PackageId,

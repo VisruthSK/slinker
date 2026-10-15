@@ -5,8 +5,8 @@ use crate::Result;
 use crate::analysis::{EdgeKind, GenericId, LifecycleHook, Need, RejectCode, S3Id};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    ComponentName, DatasetName, NativeLibrary, NativeSafety, PackageId, PackageProvider,
-    ResourcePath,
+    ComponentName, DatasetName, ImportSpec, NativeLibrary, NativeSafety, PackageId,
+    PackageProvider, ResourcePath,
 };
 use std::sync::Arc;
 
@@ -19,6 +19,28 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let image = self.image(id)?;
         let index = Arc::clone(&image.index);
         let node = self.need_node(&Need::Activation { package: id });
+
+        for import in &index.imports {
+            let name = match import {
+                ImportSpec::All { package, .. } | ImportSpec::From { package, .. } => package,
+            };
+            match self.packages.resolve(name)? {
+                Some(package) => self.require(
+                    node,
+                    Need::Activation { package },
+                    EdgeKind::Import,
+                    format!("effective import loads `{name}`"),
+                ),
+                None => self.record_missing_package(
+                    node,
+                    id,
+                    name,
+                    EdgeKind::Import,
+                    format!("effective import requires `{name}`"),
+                    None,
+                ),
+            }
+        }
 
         for registration in &index.s3 {
             if let Some(package_name) = registration.generic.package.as_deref()
@@ -277,9 +299,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
             match &native.safety {
                 NativeSafety::Unanalyzed => {
                     let identity = self.packages.identity(id);
+                    let audit = match self.packages.native_source_fingerprint(id) {
+                        Some(source) => {
+                            let target = &self.packages.target_environment().target;
+                            format!(
+                                "source_fingerprint `{source}` target R `{}` OS `{}` arch `{}`",
+                                target.r_version, target.os, target.arch
+                            )
+                        }
+                        None => format!("image `{}`", identity.image_fingerprint),
+                    };
                     let message = format!(
-                        "native component `{component}` has unanalyzed C-to-R callbacks; an audited SLINKER_NATIVE_SUMMARIES entry for package `{}` version `{}` image `{}` makes it analyzable",
-                        identity.name, identity.version, identity.image_fingerprint
+                        "native component `{component}` has unanalyzed C-to-R callbacks; an audited SLINKER_NATIVE_SUMMARIES entry for package `{}` version `{}` {audit} makes it analyzable",
+                        identity.name, identity.version
                     );
                     self.diagnostic(
                         node,

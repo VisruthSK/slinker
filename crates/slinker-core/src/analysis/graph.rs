@@ -23,7 +23,6 @@ pub enum NodeKind {
         owner: SourceKey,
         path: MemberPath,
         enclosure: EnvironmentLabel,
-        derived: bool,
     },
     Activation,
     Dataset {

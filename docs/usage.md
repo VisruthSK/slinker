@@ -10,17 +10,44 @@ slinker build
 slinker build path/to/rootpkg --lib C:/project/renv/library --external dplyr --output out/rootpkg
 ```
 
-`build` turns an R source package into another source package whose Linked dependencies are absorbed into it. The source tree is frozen, stage-installed into a private library with the selected R, analyzed, checked against the `PureRStatic` profile, and written to `target/slinker/<Package>` (or `--output`) only if every step succeeds. The result installs with `R CMD INSTALL` and needs only its External dependencies at runtime.
+`build` turns an R source package into another source package whose Linked dependencies are absorbed into it. The source tree is frozen, stage-installed into a private library with the selected R, analyzed, checked against the `PureRStatic` profile, and written to `<Package>-slinked` beside the source directory (or `--output`) only if every step succeeds. The result installs with `R CMD INSTALL` and needs only its External dependencies at runtime.
 
-Rebuilds are incremental. A successful build records its inputs (the frozen source tree, the target R, the `--link`/`--external` selection, the analyzer version, and the exact identity of every installed package analysis consulted, including packages found absent) together with a digest of the generated tree. The next `build` to the same output stops after capturing the target when all of that still matches and the output is untouched, prints the path, and says `up to date` on stderr (`"status": "up_to_date"` in JSON). Otherwise it rebuilds, and an existing output that slinker generated earlier is replaced atomically with unchanged files keeping their modification times; a directory that is not a generated package is never replaced. `slinker cache` lists the recorded builds and `slinker cache clear` forgets them.
+Every build stage-installs the Root again, so changed installation dependencies cannot reuse stale captured values. Typed inspection artifacts remain cached. An existing generated output is replaced atomically, with unchanged files keeping their modification times; a foreign directory is never replaced. Concurrent builds to the same output are rejected. A failed build preserves the previous complete output. Outputs inside the source must be excluded by `.Rbuildignore`; the default sibling directory avoids including generated output in later source snapshots.
 
 Third-party dependencies are Linked by default; base-priority packages and every `--external` package stay External. The generated `DESCRIPTION` drops Linked packages and declares the intersection of every retained requirement on each External package. A build that the profile cannot realize exactly fails with one report listing every blocker. Diagnostics that exist only because analysis continued past one failed prerequisite are grouped under it: a missing package reached from many sites, or one run-time name creator that could bind many free names, is one primary blocker followed by `reached from` the distinct sites, while independent blockers stay separate lines. Grouping changes only the report; the graph still records every reaching edge. See [semantics](semantics.md) for what a build preserves and what blocks it.
 
 The report groups blockers by rejection code. Each blocker names its package and owning binding, the line and column inside that binding's source when analysis has one, and the sites it was reached from. See [JSON output](#json-output) for the machine-readable form.
 
-Snapshotting the source tree skips `.git`, `target`, and `renv` at the package root and every entry matched by a `.Rbuildignore` regular expression (case-insensitive, matched against the path relative to the root, as `R CMD build` does). A pattern the regex engine cannot parse, such as lookaround, fails the build. Symlinks and other non-regular entries fail the build.
+The selected R's `R CMD build` chooses snapshot contents, using its own default exclusions and `.Rbuildignore` PCRE rules. Vignette building, data resaving, and native cleanup are disabled during capture. Symlinks and other non-regular entries fail the build. Staging runs the original installation and configure steps on a disposable copy, preserving the captured snapshot. Preflight freezes staged native libraries and installed `inst` resources, including those created by configure; generated packages omit consumed configure/cleanup scripts and build/install exclusion files. Nonempty `inst/slinker` and `inst` paths that overlap generated code or package metadata block before publication.
 
 `--lib`, `--external`, `--link`, and `--threads` are accepted by every command and mean the same thing in each. `--threads` sets the number of analysis threads and defaults to 4.
+
+## Library
+
+The CLI uses `slinker_core::session`. Library consumers choose an R installation and a worker executable explicitly:
+
+```rust,no_run
+use std::num::NonZeroUsize;
+use std::path::Path;
+use slinker_core::WorkerExecutable;
+use slinker_core::cache::CacheLocation;
+use slinker_core::session::{SessionOptions, SourceSession};
+
+let options = SessionOptions {
+    native_summaries: None,
+    libraries: vec!["/project/library".into()],
+    external: vec!["dplyr".into()],
+    linked: Vec::new(),
+    threads: NonZeroUsize::new(4).unwrap(),
+    cache: CacheLocation::Default,
+    worker_executable: WorkerExecutable::Standalone("/path/to/slinker".into()),
+};
+let source = SourceSession::prepare(Path::new("/project/rootpkg"), &options, "/path/to/R".into())?;
+source.build(Path::new("/project/out/rootpkg"))?;
+# Ok::<(), slinker_core::session::SessionError>(())
+```
+
+`Session::open` also accepts installed roots through `RootSpec`. Session options are copied at capture; later edits to the caller's options cannot change that invocation. `Session::analyze` returns the semantic plan and diagnostics, while `SourceSession::check` runs build preflight without publishing. Build errors use `SessionError`; a successful build returns `Ok(())`.
 
 ## Check
 
@@ -87,7 +114,7 @@ Provenance explains a result and never decides one: finalization reads typed req
 
 ## Cache
 
-Slinker keeps a persistent cache of installed-package inspection results (package indexes, binding images, private environments, syntax normalizations, dispatch queries). Entries are content-addressed by the exact installed image, the target R, and the analyzer schema, so a stale entry is never read. Each run adds one packed file.
+Slinker keeps a persistent cache of installed-package inspection results (package indexes, binding images, private environments, syntax normalizations, dispatch queries). Entries are keyed by the exact installed image, target R, and analyzer schema, and stored in a SQLite database per schema.
 
 ```text
 slinker cache                  location and total size per analyzer schema
@@ -105,7 +132,7 @@ slinker cache clear --obsolete delete caches written by older analyzer versions
 ```text
 R_HOME                    fallback R installation when `R RHOME` is unavailable
 SLINKER_CACHE_DIR         persistent installed-image analysis cache
-SLINKER_NATIVE_SUMMARIES  audited native-effect manifest for exact installed images
+SLINKER_NATIVE_SUMMARIES  audited native-effect manifest for installed images or Root source
 ```
 
 The native summary manifest format is described in [semantics](semantics.md#native-packages).

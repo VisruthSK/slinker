@@ -19,29 +19,58 @@ fn registered_name(program: &ProgramIr, namespace: NamespaceId) -> &str {
         .as_str()
 }
 
+#[cfg(test)]
+#[path = "../../tests/unit/build/payload.rs"]
+mod tests;
+
 pub(super) fn check_payload_bundles(
     program: &ProgramIr,
     serialization: PayloadSerialization,
 ) -> Result<Vec<CheckedPayloadBundle>, BuildReport> {
     let bundles = program.payload_bundles();
+    let namespace_name = |name: &str| {
+        program
+            .packages()
+            .find_map(|(_, package)| {
+                (package.registered_namespace().as_str() == name)
+                    .then_some(package.identity().name.as_str())
+            })
+            .unwrap_or(name)
+            .to_owned()
+    };
     let package_name = |bundle: &PayloadBundleIr| {
         &program
             .package(program.namespace(bundle.namespace()).package)
             .identity()
             .name
     };
-    let site =
-        |site: &PayloadSite| format!("{}::{}", package_name(&bundles[site.payload]), site.binding);
+    let site = |site: &PayloadSite| {
+        bundles
+            .get(site.payload)
+            .map(|bundle| format!("{}::{}", package_name(bundle), site.binding))
+            .ok_or_else(|| {
+                BuildReport::preflight(vec![
+                    "worker returned an invalid payload identity index".into(),
+                ])
+            })
+    };
     let serialized = match serialization {
         PayloadSerialization::SharedIdentity { first, second } => {
             return Err(BuildReport::preflight(vec![format!(
                 "payload `{}` and payload `{}` reach one environment or reference object, which separate namespace bundles would split into two",
-                site(&first),
-                site(&second)
+                site(&first)?,
+                site(&second)?
             )]));
         }
         PayloadSerialization::Serialized { bundles } => bundles,
     };
+    if serialized.len() != bundles.len() {
+        return Err(BuildReport::preflight(vec![format!(
+            "worker returned {} payload bundles, expected {}",
+            serialized.len(),
+            bundles.len()
+        )]));
+    }
     let mut blockers = Vec::new();
     let mut checked = Vec::new();
     for ((id, bundle), SerializedPayload { bytes, namespaces }) in
@@ -60,11 +89,13 @@ pub(super) fn check_payload_bundles(
             .filter(|namespace| *namespace != owner)
             .collect::<BTreeSet<_>>();
         blockers.extend(observed.difference(&established).map(|namespace| {
+            let namespace = namespace_name(namespace);
             format!(
                 "payload bundle of `{package}` refers to namespace `{namespace}`, which analysis did not establish as a dependency"
             )
         }));
         blockers.extend(established.difference(&observed).map(|namespace| {
+            let namespace = namespace_name(namespace);
             format!(
                 "payload bundle of `{package}` does not refer to namespace `{namespace}`, which analysis established as a dependency"
             )

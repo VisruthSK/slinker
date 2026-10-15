@@ -1,15 +1,16 @@
 use super::invocation::PinnedUse;
-use super::relocation::PendingRelocation;
+use super::relocation::{DefaultedResource, PendingRelocation};
+use super::resolution::ReferenceUse;
 use super::s3::CallableId;
 use super::state::{AnalyzerState, Caller, ParsedSite};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
-use crate::ir::ExternalBindingAccess;
+use crate::ir::{BindingLookup, ExternalBindingAccess};
 use crate::package::PackageRole;
-use crate::package::{PackageId, PackageProvider};
+use crate::package::{PackageId, PackageProvider, ResourcePath};
 use crate::syntax::PackageRef;
 use crate::syntax::ResourceRef;
-use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, ResourcePackage};
+use crate::syntax::{CallSite, ParsedExpression, ParsedRFile, ResourceArguments, ResourcePackage};
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn namespace_access(
@@ -17,6 +18,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         from: NodeId,
         current: PackageId,
         reference: &PackageRef,
+        use_kind: ReferenceUse,
     ) -> Result<()> {
         if reference.package == "base" {
             return Ok(());
@@ -53,7 +55,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .cloned()
                     .unwrap_or_else(|| reference.symbol.clone())
             };
-            self.require_at(
+            self.require_binding_at(
                 from,
                 Need::Binding {
                     package: current,
@@ -67,6 +69,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     reference.symbol
                 ),
                 Some(reference.span.clone()),
+                use_kind,
             );
             return Ok(());
         }
@@ -105,11 +108,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let binding = if reference.internal {
             reference.symbol.clone()
         } else {
-            index
-                .exports
-                .get(reference.symbol.as_str())
-                .cloned()
-                .unwrap_or_else(|| reference.symbol.clone())
+            let Some(binding) = index.exports.get(reference.symbol.as_str()) else {
+                self.diagnostic(
+                    from,
+                    current,
+                    None,
+                    RejectCode::DynamicLookup,
+                    format!(
+                        "`{}::{}` is not exported; its lookup error cannot be relocated",
+                        reference.package, reference.symbol
+                    ),
+                    Some(reference.span.clone()),
+                );
+                return Ok(());
+            };
+            binding.clone()
         };
         self.require_at(
             from,
@@ -118,7 +131,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             "qualified namespace access requires activation",
             Some(reference.span.clone()),
         );
-        self.require_at(
+        self.require_binding_at(
             from,
             Need::Binding {
                 package: foreign,
@@ -132,6 +145,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 reference.symbol
             ),
             Some(reference.span.clone()),
+            use_kind,
         );
         self.relocations
             .lock()
@@ -139,7 +153,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 source: reference.span.clone(),
                 package: foreign,
                 binding,
-                internal: reference.internal,
+                lookup: if reference.internal {
+                    BindingLookup::Internal
+                } else {
+                    BindingLookup::Exported {
+                        name: reference.symbol.clone(),
+                    }
+                },
             });
         Ok(())
     }
@@ -189,13 +209,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         value: pinned.value.as_str().to_owned(),
                         span: resource.span.clone(),
                     });
-                    let names_linked = self
-                        .known_package(&pinned.value)
-                        .is_some_and(|package| self.packages.role(package) == PackageRole::Linked);
-                    if !names_linked {
-                        return Ok(());
-                    }
-                    return self.literal_resource_access(from, current, resource, &pinned.value);
+                    self.relocations.lock().defer_resource(DefaultedResource {
+                        node: from,
+                        owner: current,
+                        package: pinned.value.as_str().into(),
+                        reference: resource.clone(),
+                    });
+                    return Ok(());
                 };
                 for name in names {
                     let linked = self
@@ -220,7 +240,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         self.literal_resource_access(from, current, resource, &package_name)
     }
 
-    fn literal_resource_access(
+    pub(super) fn literal_resource_access(
         &self,
         from: NodeId,
         current: PackageId,
@@ -230,22 +250,34 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(foreign) = self.resource_package(from, current, resource, package_name)? else {
             return Ok(());
         };
-        let Some(path) = &resource.path else {
+        let ResourceArguments::Static { path, must_work } = &resource.arguments else {
             self.diagnostic(
                 from,
                 current,
                 None,
                 RejectCode::DynamicLookup,
-                format!("dynamic system.file() path for package {package_name}"),
+                format!("system.file() arguments for Linked {package_name} cannot be relocated without changing their evaluation or library lookup"),
                 Some(resource.span.clone()),
             );
             return Ok(());
         };
-        if !self.packages.resource_exists(foreign, path)? {
-            match resource.must_work {
-                Some(false) => return Ok(()),
-                Some(true) => {
-                    self.diagnostic(
+        let path = match path.parse::<ResourcePath>() {
+            Ok(path) => path,
+            Err(error) => {
+                self.diagnostic(
+                    from,
+                    current,
+                    None,
+                    RejectCode::UnsupportedResourcePath,
+                    format!("{error}: {package_name}"),
+                    Some(resource.span.clone()),
+                );
+                return Ok(());
+            }
+        };
+        if !self.packages.resource_exists(foreign, &path)? {
+            if *must_work {
+                self.diagnostic(
                         from,
                         current,
                         None,
@@ -253,26 +285,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         format!("system.file(..., mustWork = TRUE) requires absent path {package_name}/{path}"),
                         Some(resource.span.clone()),
                     );
-                    return Ok(());
-                }
-                None => {
-                    self.diagnostic(
-                        from,
-                        current,
-                        None,
-                        RejectCode::DynamicLookup,
-                        format!("dynamic mustWork controls absent system.file path {package_name}/{path}"),
-                        Some(resource.span.clone()),
-                    );
-                    return Ok(());
-                }
+            } else {
+                self.relocations
+                    .lock()
+                    .push(PendingRelocation::AbsentResource {
+                        source: resource.span.clone(),
+                    });
             }
+            return Ok(());
         }
         self.require_at(
             from,
             Need::Resource {
                 package: foreign,
-                resource: path.clone().into(),
+                resource: path.clone(),
             },
             EdgeKind::Resource,
             format!("system.file requires {package_name}/{path}"),
@@ -283,7 +309,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .push(PendingRelocation::ResourceAccess {
                 source: resource.span.clone(),
                 package: foreign,
-                resource: path.into(),
+                resource: path,
             });
         Ok(())
     }

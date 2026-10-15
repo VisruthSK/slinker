@@ -10,9 +10,12 @@ use crate::package::{Atom, EnvironmentLabel};
 use crate::package::{
     BindingName, ClassName, DispatchCallee, GenericName, ImportSpec, PackageId, PackageProvider,
 };
-use crate::syntax::CalleeKind;
 use crate::syntax::{CallSite, ParsedRFile, Span, StaticArg};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+#[cfg(test)]
+#[path = "../../tests/unit/analysis/s3.rs"]
+mod tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct S3GenericKey {
@@ -29,12 +32,11 @@ pub(super) struct CallableId {
 #[derive(Clone, Debug, Default)]
 struct S3Generic {
     sites: Vec<(NodeId, PackageId, Span)>,
-    callable: Option<CallableId>,
-    selector: Option<String>,
-    formals: Vec<String>,
+    definition: Option<GenericDefinition>,
     dispatch: S3Dispatch,
 }
 
+#[derive(Clone, Debug)]
 pub(super) struct GenericDefinition {
     pub(super) callable: CallableId,
     pub(super) selector: String,
@@ -58,6 +60,9 @@ pub(super) struct S3Model {
 }
 
 impl S3Model {
+    pub(super) fn requires_stability(&self, callable: &CallableId) -> bool {
+        self.callable_generics.contains_key(callable)
+    }
     fn observe_use_method(
         &mut self,
         key: &S3GenericKey,
@@ -67,17 +72,15 @@ impl S3Model {
         let entry = self.generics.entry(key.clone()).or_default();
         entry.sites.push(site);
         match definition {
-            Some(definition) if entry.callable.is_none() => {
-                entry.callable = Some(definition.callable.clone());
-                entry.selector = Some(definition.selector);
-                entry.formals = definition.formals;
+            Some(definition) if entry.definition.is_none() => {
                 self.callable_generics
-                    .entry(definition.callable)
+                    .entry(definition.callable.clone())
                     .or_default()
                     .insert(key.clone());
+                entry.definition = Some(definition);
             }
             Some(_) => {}
-            None => entry.callable = None,
+            None => entry.definition = None,
         }
     }
 
@@ -90,10 +93,12 @@ impl S3Model {
 
     fn callable_to_check(&self, key: &S3GenericKey) -> Option<&CallableId> {
         let generic = self.generics.get(key)?;
-        match (&generic.dispatch, &generic.callable, &generic.selector) {
-            (S3Dispatch::Open, _, _) => None,
-            (_, Some(callable), Some(_)) => Some(callable),
-            _ => None,
+        match &generic.dispatch {
+            S3Dispatch::Open => None,
+            _ => generic
+                .definition
+                .as_ref()
+                .map(|definition| &definition.callable),
         }
     }
 
@@ -109,16 +114,22 @@ impl S3Model {
         if generic.dispatch == S3Dispatch::Open {
             return DispatchChange::Unchanged;
         }
-        let classes = match (&generic.callable, &generic.selector) {
-            (Some(callable), Some(selector)) if !callable_is_external => invocations
-                .uses(callable)
-                .iter()
-                .map(|invocation| {
-                    invocation
-                        .as_ref()
-                        .and_then(|invocation| selector_domain(invocation, selector, generic))
-                })
-                .collect::<Option<Vec<_>>>(),
+        if let Some(definition) = &generic.definition
+            && !callable_is_external
+            && invocations.coverage(&definition.callable).pending()
+        {
+            return DispatchChange::Unchanged;
+        }
+        let classes = match &generic.definition {
+            Some(definition)
+                if !callable_is_external && !invocations.coverage(&definition.callable).open() =>
+            {
+                invocations
+                    .coverage(&definition.callable)
+                    .invocations()
+                    .map(|invocation| selector_domain(invocation, definition))
+                    .collect::<Option<Vec<_>>>()
+            }
             _ => None,
         };
         let Some(classes) = classes else {
@@ -219,6 +230,24 @@ impl S3Dispatch {
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {
+    pub(super) fn settle_caller_coverage(&self) -> Result<bool> {
+        let (keys, callables) = {
+            let model = self.s3.lock();
+            (
+                model.generics.keys().cloned().collect(),
+                model.callable_generics.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        for callable in callables {
+            let mut invocations = self.invocations.lock();
+            if invocations.coverage(&callable).pending() {
+                invocations.record_unclassified(callable);
+            }
+        }
+        self.refresh_generics(keys)?;
+        Ok(self.work.pending() != 0)
+    }
+
     pub(super) fn s3_dispatch(
         &self,
         site: ParsedSite<'_>,
@@ -496,30 +525,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
     }
 }
 
-fn selector_domain(invocation: &Invocation, selector: &str, generic: &S3Generic) -> ClassDomain {
-    if let Some(argument) = invocation
-        .arguments
-        .iter()
-        .find(|argument| argument.name.as_deref() == Some(selector))
-    {
-        return argument.classes.clone();
-    }
-    let named = invocation
-        .arguments
-        .iter()
-        .filter_map(|argument| argument.name.as_deref())
-        .collect::<BTreeSet<_>>();
-    let position = generic
-        .formals
-        .iter()
-        .filter(|formal| !named.contains(formal.as_str()))
-        .position(|formal| formal == selector)?;
+fn selector_domain(invocation: &Invocation, definition: &GenericDefinition) -> ClassDomain {
     invocation
-        .arguments
-        .iter()
-        .filter(|argument| argument.name.is_none())
-        .nth(position)
-        .and_then(|argument| argument.classes.clone())
+        .argument_for(&definition.formals, &definition.selector)?
+        .classes
+        .clone()
 }
 
 pub(super) fn callable_target(resolved: &Resolution) -> Option<CallableId> {
@@ -543,20 +553,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         lexical_environment: &EnvironmentLabel,
         call: &CallSite,
     ) -> Result<Option<CallableId>> {
-        match call.qualified_package.as_deref() {
-            Some("base") => Ok(None),
-            Some(package) => Ok(self.known_package(package).map(|package| CallableId {
-                package,
-                binding: call.callee.clone().into(),
-            })),
-            None if call.callee_kind == CalleeKind::DefinitelyLexical => Ok(None),
-            None => Ok(callable_target(&self.resolve_lexical_name(
-                current,
-                image,
-                lexical_environment,
-                &call.callee,
-            )?)),
-        }
+        let fact = self.resolved_call(current, image, lexical_environment, call)?;
+        Ok(fact.target().and_then(callable_target))
     }
 }
 
@@ -589,33 +587,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         site: ParsedSite<'_>,
         call: &CallSite,
     ) -> Result<Option<DispatchOwner>> {
-        let target = match call.qualified_package.as_deref() {
-            Some("base") => Resolution::Static(BindingTarget::Base),
-            Some(package) => match self.known_package(package) {
-                Some(package) => Resolution::Static(BindingTarget::External {
-                    package,
-                    binding: call.callee.clone().into(),
-                }),
-                None => return Ok(None),
-            },
-            None if call.callee_kind == CalleeKind::DefinitelyLexical => {
-                return Ok(None);
-            }
-            None => self.resolve_lexical_name(
-                site.package,
-                site.image,
-                site.lexical_environment,
-                &call.callee,
-            )?,
+        let fact = self.resolved_call(site.package, site.image, site.lexical_environment, call)?;
+        let super::call::ResolvedCallee::Established { target, name } = fact.callee() else {
+            return Ok(None);
         };
         match target {
-            Resolution::Static(BindingTarget::Base) => {
-                Ok(Some(DispatchOwner::Base(call.callee.clone().into())))
-            }
+            Resolution::Static(BindingTarget::Base) => Ok(Some(DispatchOwner::Base(name.clone()))),
             Resolution::Static(BindingTarget::External { package, binding })
-                if self.packages.is_external(package) =>
+                if self.packages.is_external(*package) =>
             {
-                self.defining_namespace(package, binding)
+                self.defining_namespace(*package, binding.clone())
             }
             _ => Ok(None),
         }

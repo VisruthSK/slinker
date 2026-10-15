@@ -1,20 +1,21 @@
 mod copy;
 mod emit;
-pub mod incremental;
 mod payload;
 mod relocated;
 mod report;
 
 pub use report::{Blocker, BlockerGroup, BuildReport};
 
-use crate::TargetEnvironment;
 use crate::analysis::LinkIr;
+use crate::filesystem::copy_entry;
 use crate::ir::{ProgramIr, ResourceId};
-use crate::package::{CanonicalSyntax, PackageId};
-use crate::source::{FrozenSourceFiles, SourcePackageSnapshot, StagedRoot};
-use crate::worker::client::WorkerClient;
+use crate::package::{PackageId, SyntaxValidation};
+use crate::source::StagedRoot;
 use crate::worker::protocol::{DataLibraryFiles, NamespaceImageSpec, PackageSpec, PayloadSpec};
-use copy::{copy_dataset_libraries, copy_entry, copy_linked_resources, copy_root_resources};
+use crate::worker::service::WorkerService;
+use copy::{
+    copy_dataset_libraries, copy_linked_resources, copy_root_resources, freeze_inst_resources,
+};
 use emit::{generate_r_source, render_namespace};
 use payload::{CheckedPayloadBundle, check_payload_bundles, closure_patches};
 use relocated::RelocatedCode;
@@ -22,86 +23,15 @@ use std::collections::BTreeMap;
 
 use crate::ir::PackageRole;
 use std::fs;
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
 use tempfile::TempDir;
 use thiserror::Error;
 
 #[derive(Debug)]
-pub struct TargetRuntimeHandle {
-    r_home: PathBuf,
-    target: TargetEnvironment,
-    spare: Mutex<Option<WorkerClient>>,
-}
-
-pub(crate) struct BorrowedWorker<'a> {
-    client: Option<WorkerClient>,
-    spare: &'a Mutex<Option<WorkerClient>>,
-}
-
-impl Deref for BorrowedWorker<'_> {
-    type Target = WorkerClient;
-
-    fn deref(&self) -> &WorkerClient {
-        self.client
-            .as_ref()
-            .expect("a borrowed worker holds its client until it is dropped")
-    }
-}
-
-impl DerefMut for BorrowedWorker<'_> {
-    fn deref_mut(&mut self) -> &mut WorkerClient {
-        self.client
-            .as_mut()
-            .expect("a borrowed worker holds its client until it is dropped")
-    }
-}
-
-impl Drop for BorrowedWorker<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut spare) = self.spare.lock() {
-            *spare = self.client.take();
-        }
-    }
-}
-
-impl TargetRuntimeHandle {
-    pub fn new(r_home: PathBuf, target: TargetEnvironment) -> Self {
-        Self {
-            r_home,
-            target,
-            spare: Mutex::new(None),
-        }
-    }
-
-    pub fn r_home(&self) -> &Path {
-        &self.r_home
-    }
-
-    pub fn target(&self) -> &TargetEnvironment {
-        &self.target
-    }
-
-    pub(crate) fn worker(&self) -> crate::Result<BorrowedWorker<'_>> {
-        let reused = self.spare.lock().ok().and_then(|mut spare| spare.take());
-        let client = match reused {
-            Some(client) => client,
-            None => WorkerClient::spawn(self.r_home.clone(), &self.target, 0)?,
-        };
-        Ok(BorrowedWorker {
-            client: Some(client),
-            spare: &self.spare,
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct BuildContext {
-    source: SourcePackageSnapshot,
-    _staged_root: StagedRoot,
-    target_runtime: TargetRuntimeHandle,
+pub(crate) struct BuildContext {
+    staged_root: StagedRoot,
+    workers: Arc<WorkerService>,
 }
 
 #[derive(Debug)]
@@ -109,21 +39,17 @@ struct FrozenInputs {
     bundles: Vec<CheckedPayloadBundle>,
     resources: BTreeMap<ResourceId, PathBuf>,
     datasets: BTreeMap<PackageId, DataLibraryFiles>,
-    code: RelocatedCode,
+    root_resources: PathBuf,
+    generated_r: String,
+    namespace: String,
     _directory: TempDir,
 }
 
 impl BuildContext {
-    pub fn new(
-        source: SourcePackageSnapshot,
-        staged_root: StagedRoot,
-        r_home: PathBuf,
-        target: TargetEnvironment,
-    ) -> Self {
+    pub(crate) fn new(staged_root: StagedRoot, workers: Arc<WorkerService>) -> Self {
         Self {
-            source,
-            _staged_root: staged_root,
-            target_runtime: TargetRuntimeHandle::new(r_home, target),
+            staged_root,
+            workers,
         }
     }
 
@@ -147,7 +73,7 @@ impl BuildContext {
                 root: location(package).clone(),
             }
         };
-        let mut worker = self.target_runtime.worker()?;
+        let mut worker = self.workers.preparation()?;
         let code = RelocatedCode::verify(program, &mut worker)?;
         let mut bundles = Vec::new();
         if !program.payload_bundles().is_empty() {
@@ -190,6 +116,25 @@ impl BuildContext {
         let directory = tempfile::Builder::new()
             .prefix("slinker-frozen-")
             .tempdir()?;
+        let root_resources = directory.path().join("root-resources");
+        fs::create_dir(&root_resources)?;
+        copy_root_resources(self.staged_root.source_root(), &root_resources)?;
+        let native = if program.root_artifact().native_components.is_empty() {
+            None
+        } else {
+            let native = dunce::canonicalize(self.staged_root.package_root().join("libs"))?;
+            copy_entry(&native, &root_resources.join("inst/libs"))?;
+            Some(native)
+        };
+        let inst = self.staged_root.source_root().join("inst");
+        if inst.is_dir() {
+            freeze_inst_resources(
+                &inst,
+                self.staged_root.package_root(),
+                &root_resources.join("inst"),
+                native.as_deref(),
+            )?;
+        }
         let mut resources = BTreeMap::new();
         for (ordinal, (id, resource)) in program.indexed_resources().enumerate() {
             let frozen = directory.path().join(ordinal.to_string());
@@ -203,25 +148,23 @@ impl BuildContext {
         if let Some(changed) = sources.changed()? {
             return Err(BuildContextError::TargetUniverseChanged(changed.name.to_string()).into());
         }
+        let generated_r = generate_r_source(program, &code)?;
+        let namespace = render_namespace(program);
+        for source in [&generated_r, &namespace] {
+            if let SyntaxValidation::Rejected(message) = worker.validate_syntax(source)? {
+                return Err(BuildContextError::InvalidCode(message).into());
+            }
+        }
+        self.workers.check()?;
         Ok(FrozenInputs {
             bundles,
-            code,
             resources,
             datasets,
+            root_resources,
+            generated_r,
+            namespace,
             _directory: directory,
         })
-    }
-
-    pub fn source(&self) -> &SourcePackageSnapshot {
-        &self.source
-    }
-
-    fn materialization<'a>(&'a self, frozen: &'a FrozenInputs) -> MaterializationContext<'a> {
-        MaterializationContext {
-            source_files: self.source.files(),
-            target_runtime: &self.target_runtime,
-            frozen,
-        }
     }
 }
 
@@ -237,54 +180,19 @@ pub enum BuildContextError {
     InvalidCode(String),
 }
 
-#[derive(Clone, Copy)]
-pub struct MaterializationContext<'a> {
-    source_files: &'a FrozenSourceFiles,
-    target_runtime: &'a TargetRuntimeHandle,
-    frozen: &'a FrozenInputs,
-}
+pub(crate) enum PureRStatic {}
 
-impl MaterializationContext<'_> {
-    fn source_files(&self) -> &FrozenSourceFiles {
-        self.source_files
-    }
-
-    fn target_runtime(&self) -> &TargetRuntimeHandle {
-        self.target_runtime
-    }
-
-    fn bundles(&self) -> &[CheckedPayloadBundle] {
-        &self.frozen.bundles
-    }
-
-    fn resource(&self, resource: ResourceId) -> &Path {
-        &self.frozen.resources[&resource]
-    }
-
-    fn dataset_library(&self, package: PackageId) -> &DataLibraryFiles {
-        &self.frozen.datasets[&package]
-    }
-
-    fn code(&self) -> &RelocatedCode {
-        &self.frozen.code
-    }
-}
-
-pub enum PureRStatic {}
-
-pub struct BuildableProgram<'a, Profile> {
+pub(crate) struct BuildableProgram<'a> {
     program: &'a ProgramIr,
     description: &'a str,
-    context: &'a BuildContext,
     frozen: FrozenInputs,
-    _profile: PhantomData<Profile>,
 }
 
 impl PureRStatic {
-    pub fn check<'a>(
+    pub(crate) fn check<'a>(
         ir: &'a LinkIr,
-        context: &'a BuildContext,
-    ) -> Result<BuildableProgram<'a, PureRStatic>, PreflightError> {
+        context: &BuildContext,
+    ) -> Result<BuildableProgram<'a>, PreflightError> {
         let mut blockers = BuildReport::analysis_blockers(ir);
         let description = ir.program().root_artifact().description.as_deref();
         if description.is_none() {
@@ -293,6 +201,27 @@ impl PureRStatic {
             ));
         }
         let program = ir.program();
+        let reserved = context.staged_root.source_root().join("inst/slinker");
+        if reserved.exists()
+            && (!reserved.is_dir() || fs::read_dir(&reserved)?.next().transpose()?.is_some())
+        {
+            blockers.push(Blocker::preflight(
+                "Root resources occupy reserved generated path inst/slinker".into(),
+            ));
+        }
+        for path in ["R", "Meta", "DESCRIPTION", "NAMESPACE"] {
+            if context
+                .staged_root
+                .source_root()
+                .join("inst")
+                .join(path)
+                .exists()
+            {
+                blockers.push(Blocker::preflight(format!(
+                    "Root inst/{path} overlaps package metadata or generated code"
+                )));
+            }
+        }
         for import in program.root_artifact().load.before_bootstrap().imports() {
             let target = program.binding(import.target);
             if target.name != import.local {
@@ -309,9 +238,7 @@ impl PureRStatic {
         Ok(BuildableProgram {
             program: ir.program(),
             description,
-            context,
             frozen,
-            _profile: PhantomData,
         })
     }
 }
@@ -337,13 +264,16 @@ impl From<std::io::Error> for PreflightError {
 }
 
 #[derive(Debug)]
-pub struct GeneratedPackage {
-    path: PathBuf,
+pub(crate) struct PendingPackage {
+    root: PathBuf,
+    output: OutputLease,
+    _directory: TempDir,
 }
 
-impl GeneratedPackage {
-    pub fn path(&self) -> &Path {
-        &self.path
+impl PendingPackage {
+    pub(crate) fn publish(self) -> Result<(), MaterializeError> {
+        publish(&self.root, &self.output.path)?;
+        Ok(())
     }
 }
 
@@ -351,10 +281,11 @@ impl GeneratedPackage {
     clippy::needless_pass_by_value,
     reason = "consuming the preflight capability makes each approved program materialize once"
 )]
-pub fn materialize(
-    buildable: BuildableProgram<'_, PureRStatic>,
-    output: &Path,
-) -> Result<GeneratedPackage, MaterializeError> {
+pub(crate) fn materialize(
+    buildable: BuildableProgram<'_>,
+    lease: OutputLease,
+) -> Result<PendingPackage, MaterializeError> {
+    let output = &lease.path;
     if output.exists() && !is_generated_package(output) {
         return Err(MaterializeError::OutputExists(output.into()));
     }
@@ -362,7 +293,6 @@ pub fn materialize(
         .parent()
         .ok_or_else(|| MaterializeError::InvalidOutput(output.into()))?;
     fs::create_dir_all(parent)?;
-    let materialization = buildable.context.materialization(&buildable.frozen);
     let temporary = tempfile::Builder::new()
         .prefix(".slinker-materialize-")
         .tempdir_in(parent)?;
@@ -378,14 +308,11 @@ pub fn materialize(
         package_root.join("DESCRIPTION"),
         buildable.description.as_bytes(),
     )?;
-    fs::write(
-        package_root.join("NAMESPACE"),
-        render_namespace(buildable.program),
-    )?;
-    copy_root_resources(materialization.source_files().root(), &package_root)?;
+    fs::write(package_root.join("NAMESPACE"), &buildable.frozen.namespace)?;
+    copy_entry(&buildable.frozen.root_resources, &package_root)?;
     let payload_directory = package_root.join("inst/slinker/payload");
     fs::create_dir_all(&payload_directory)?;
-    for checked in materialization.bundles() {
+    for checked in &buildable.frozen.bundles {
         let bundle = buildable.program.payload_bundle(checked.bundle);
         let package = buildable.program.namespace(bundle.namespace()).package;
         fs::write(
@@ -396,16 +323,62 @@ pub fn materialize(
             &checked.bytes,
         )?;
     }
-    let generated = generate_r_source(buildable.program, materialization.code())?;
-    let mut worker = materialization.target_runtime().worker()?;
-    validate_r_source(&mut worker, &generated)?;
-    fs::write(package_root.join("R/zzz-slinker-generated.R"), generated)?;
-    copy_linked_resources(buildable.program, materialization, &package_root)?;
-    copy_dataset_libraries(buildable.program, materialization, &package_root)?;
-    publish(&package_root, output)?;
-    Ok(GeneratedPackage {
-        path: output.to_path_buf(),
+    fs::write(
+        package_root.join("R/zzz-slinker-generated.R"),
+        &buildable.frozen.generated_r,
+    )?;
+    copy_linked_resources(buildable.program, &buildable.frozen, &package_root)?;
+    copy_dataset_libraries(buildable.program, &buildable.frozen, &package_root)?;
+    Ok(PendingPackage {
+        root: package_root,
+        output: lease,
+        _directory: temporary,
     })
+}
+
+#[derive(Debug)]
+pub(crate) struct OutputLease {
+    path: PathBuf,
+    _lock: fs::File,
+}
+
+impl OutputLease {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(crate) fn acquire(output: &Path) -> std::io::Result<Self> {
+        let absolute = std::path::absolute(output)?;
+        let parent = absolute
+            .parent()
+            .ok_or_else(|| std::io::Error::other("output has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let name = absolute
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("output has no filename"))?;
+        let parent = dunce::canonicalize(parent)?;
+        let path = parent.join(name);
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(std::io::Error::other(
+                "generated output cannot be a symlink",
+            ));
+        }
+        let mut lock_name = std::ffi::OsString::from(".#");
+        lock_name.push(name);
+        lock_name.push(".slinker-lock");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(parent.join(lock_name))?;
+        lock.try_lock().map_err(|error| {
+            std::io::Error::other(format!(
+                "output {} is already owned by another build: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { path, _lock: lock })
+    }
 }
 
 fn is_generated_package(directory: &Path) -> bool {
@@ -427,7 +400,13 @@ fn publish(package_root: &Path, output: &Path) -> std::io::Result<()> {
     let backup = retired.path().join("previous");
     fs::rename(output, &backup)?;
     if let Err(error) = fs::rename(package_root, output) {
-        fs::rename(&backup, output)?;
+        if let Err(restore) = fs::rename(&backup, output) {
+            let retained = retired.keep();
+            return Err(std::io::Error::other(format!(
+                "publication failed: {error}; restore failed: {restore}; previous package preserved at {}",
+                retained.join("previous").display()
+            )));
+        }
         return Err(error);
     }
     Ok(())
@@ -465,18 +444,6 @@ pub enum MaterializeError {
     OutputExists(PathBuf),
     #[error("invalid generated output path: {0}")]
     InvalidOutput(PathBuf),
-    #[error("generated R source failed target-R validation: {0}")]
-    InvalidR(String),
-    #[error("target-R worker failed during materialization: {0}")]
-    Worker(#[from] crate::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-fn validate_r_source(worker: &mut WorkerClient, source: &str) -> Result<(), MaterializeError> {
-    match worker.canonical_syntax(source)? {
-        CanonicalSyntax::Stable(_) => Ok(()),
-        CanonicalSyntax::Unstable => Err(MaterializeError::InvalidR(
-            "target-R parse/deparse normalization is not stable".into(),
-        )),
-    }
 }

@@ -1,8 +1,8 @@
+use crate::package::FrozenPackages;
 use crate::worker::client::WorkerClient;
-use crate::{Error, Result, TargetEnvironment};
+use crate::{Error, Result, WorkerExecutable};
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -46,15 +46,17 @@ impl<V: Clone> Slot<V> {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct Lane {
     client: Mutex<Option<WorkerClient>>,
     id: u64,
 }
 
-pub(super) struct Lanes {
+#[derive(Debug)]
+pub(crate) struct Lanes {
     lanes: Vec<Lane>,
-    r_home: PathBuf,
-    target: TargetEnvironment,
+    packages: Arc<FrozenPackages>,
+    executable: WorkerExecutable,
 }
 
 pub(super) struct LaneGuard<'a> {
@@ -67,9 +69,9 @@ impl LaneGuard<'_> {
     pub(super) fn client(&mut self) -> Result<&mut WorkerClient> {
         if self.guard.is_none() {
             *self.guard = Some(WorkerClient::spawn(
-                self.lanes.r_home.clone(),
-                &self.lanes.target,
+                Arc::clone(&self.lanes.packages),
                 self.id,
+                &self.lanes.executable,
             )?);
         }
         Ok(self.guard.as_mut().expect("lane client was just spawned"))
@@ -77,7 +79,11 @@ impl LaneGuard<'_> {
 }
 
 impl Lanes {
-    pub(super) fn new(r_home: PathBuf, target: TargetEnvironment, count: usize) -> Self {
+    pub(crate) fn new(
+        packages: Arc<FrozenPackages>,
+        executable: WorkerExecutable,
+        count: usize,
+    ) -> Self {
         Self {
             lanes: (0..count.max(1))
                 .map(|index| Lane {
@@ -85,12 +91,12 @@ impl Lanes {
                     id: index as u64 + 1,
                 })
                 .collect(),
-            r_home,
-            target,
+            packages,
+            executable,
         }
     }
 
-    pub(super) fn prime(&self, client: WorkerClient) {
+    pub(crate) fn prime(&self, client: WorkerClient) {
         *self.lanes[0].client.lock().expect("lane lock") = Some(client);
     }
 
@@ -240,11 +246,5 @@ impl<Q: Eq + Hash + Clone, V: Clone> Batcher<Q, V> {
                 }
             }
         }
-    }
-}
-
-impl Lanes {
-    pub(super) fn r_home(&self) -> &std::path::Path {
-        &self.r_home
     }
 }

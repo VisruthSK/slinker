@@ -16,12 +16,13 @@ slinker-r-worker = { path = "crates/slinker-r-worker" }
 sha2 = "0.11"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
 dunce = "1.0"
 tempfile = "3.23"
 thiserror = "2.0"
 rayon = "1.12"
-r-description-parser = "0.3.0"
-r-metadata = "0.3.0"
+r-description-parser = "0.4.0"
+r-metadata = "0.4.0"
 regex = "1.13.1"
 which = "8.0.6"
 anstream = "1.0.0"

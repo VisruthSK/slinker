@@ -1,4 +1,3 @@
-use crate::build::incremental::BuildState;
 use crate::cache::{
     Cache, CacheLocation, SchemaDirectory, cache_root, clear_schemas, schema_directories,
 };
@@ -31,8 +30,8 @@ pub struct SchemaCacheReport {
     pub schema: String,
     pub current: bool,
     pub directory: PathBuf,
-    pub packs: usize,
-    pub pack_bytes: u64,
+    pub files: usize,
+    pub bytes: u64,
     pub entries: usize,
     pub by_kind: BTreeMap<EntryKind, KindTotals>,
     pub unrecognized_entries: usize,
@@ -40,20 +39,10 @@ pub struct SchemaCacheReport {
 }
 
 #[derive(Debug, Serialize)]
-pub struct BuildCacheReport {
-    pub package: String,
-    pub output: PathBuf,
-    pub inputs: String,
-    pub output_digest: String,
-    pub consulted_packages: usize,
-}
-
-#[derive(Debug, Serialize)]
 pub struct CacheReport {
     pub location: Option<PathBuf>,
     pub current_schema: &'static str,
     pub schemas: Vec<SchemaCacheReport>,
-    pub builds: Vec<BuildCacheReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,8 +116,8 @@ fn schema_report(location: &CacheLocation, schema: SchemaDirectory) -> Result<Sc
         current: schema.schema == ANALYSIS_SCHEMA,
         schema: schema.schema,
         directory: schema.directory,
-        packs: schema.packs,
-        pack_bytes: schema.bytes,
+        files: schema.files,
+        bytes: schema.bytes,
         entries: entries.len(),
         by_kind,
         unrecognized_entries: unrecognized,
@@ -141,22 +130,10 @@ pub fn inspect_cache(location: &CacheLocation) -> Result<CacheReport> {
         .into_iter()
         .map(|schema| schema_report(location, schema))
         .collect::<Result<Vec<_>>>()?;
-    let builds = BuildState::new(location)
-        .records()
-        .into_iter()
-        .map(|record| BuildCacheReport {
-            consulted_packages: record.consulted.len(),
-            package: record.package,
-            output: record.output,
-            inputs: record.inputs,
-            output_digest: record.output_digest,
-        })
-        .collect();
     Ok(CacheReport {
         location: cache_root(location),
         current_schema: ANALYSIS_SCHEMA,
         schemas,
-        builds,
     })
 }
 
@@ -182,12 +159,8 @@ pub fn clear_cache(location: &CacheLocation, scope: &ClearScope) -> Result<Clear
             }
             outcome.bytes_removed =
                 clear_schemas(location, |schema| keep_current && schema == ANALYSIS_SCHEMA)?;
-            if !keep_current {
-                outcome.entries_removed += BuildState::new(location).clear()?;
-            }
         }
         ClearScope::Packages(names) => {
-            outcome.entries_removed += BuildState::new(location).remove_packages(names);
             let root = cache_root(location)
                 .ok_or_else(|| Error::Analysis("the cache is disabled".into()))?;
             for schema in schema_directories(location) {
