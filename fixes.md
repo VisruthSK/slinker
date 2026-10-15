@@ -929,6 +929,22 @@ Linked lexical methods. Do not add a string evaluator just to prove this example
 Use the same generic-dispatch fact model for the worker and analyzer; currently
 the worker's syntax walker supplies weaker facts without marking the difference.
 
+Follow-up reproduced on `track-f-dispatch` on 2026-10-15: the typed observation
+representation does not close this finding. An External dependency can export:
+
+```r
+g <- function(x) { use <- get("UseMethod"); use("g") }
+```
+
+With the same Linked lexical `g.foo` method, original R returns `"expected"`.
+The build succeeds with the dispatcher package External, but the generated call
+fails because `reviewdispatchcaller::g.foo` was removed. The current
+`.slinker_callable_dispatch` walk does not establish the reflected dispatcher's
+identity; it nevertheless returns `known = TRUE` with no generic names, which
+becomes `NoDispatch`. This remains an open Track F blocker. The repair must
+require an established classification or fail closed for unproved aliases;
+recognizing only this particular `get()` spelling would not establish that rule.
+
 ### Lower priority boundary case: External caller reflection
 
 The ordinary External-call path records the installed dependency without

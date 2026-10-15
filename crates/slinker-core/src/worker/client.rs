@@ -1,7 +1,7 @@
-use crate::package::SyntaxValidation;
 use crate::package::{
     CanonicalSyntax, DataSetId, DatasetName, FrozenPackages, InstalledPackage, Normalization,
 };
+use crate::package::{DispatchObservation, SyntaxValidation};
 use crate::profile::{self, Counter, Probe};
 use crate::worker::protocol::WorkerPackageIndex;
 use crate::worker::protocol::{
@@ -302,7 +302,7 @@ impl WorkerClient {
         &mut self,
         package: Option<&InstalledPackage>,
         name: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<DispatchObservation> {
         self.call(
             "dispatch generics",
             |request_id| WorkerRequest::DispatchGenerics {
@@ -311,7 +311,7 @@ impl WorkerClient {
                 name: name.into(),
             },
             |response| match response {
-                WorkerResponse::DispatchGenerics { generics, .. } => Some(generics),
+                WorkerResponse::DispatchGenerics { observation, .. } => Some(observation),
                 _ => None,
             },
         )

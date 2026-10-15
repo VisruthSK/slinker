@@ -1,12 +1,12 @@
 use crate::metadata::Priority;
 use crate::package::{
-    CanonicalSyntax, DispatchSubject, GenericName, InstalledPackage, PackageId, PackageIdentity,
-    PackageImage, PackageIndex, PackageLocation, PackageName, PackageProvider, PackageResolver,
-    PackageRole, SyntaxValidation, fingerprint_image,
+    CanonicalSyntax, DispatchObservation, DispatchSubject, InstalledPackage, PackageId,
+    PackageIdentity, PackageImage, PackageIndex, PackageLocation, PackageName, PackageProvider,
+    PackageResolver, PackageRole, SyntaxValidation, fingerprint_image,
 };
 use crate::{Error, Result, TargetEnvironment};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,7 +206,7 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.store.binding_image(&self.entry(id).package, name)
     }
 
-    pub fn dispatch_generics(&self, callee: DispatchCallee<'_>) -> Result<BTreeSet<GenericName>> {
+    pub fn dispatch_generics(&self, callee: DispatchCallee<'_>) -> Result<DispatchObservation> {
         match callee {
             DispatchCallee::Base { binding } => self
                 .store

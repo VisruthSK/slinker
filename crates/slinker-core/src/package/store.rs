@@ -3,8 +3,8 @@ use crate::package::cache_names::EntryKind;
 use crate::package::inspection::{Batcher, Lanes, Slot};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, ComponentName, Digest, EnvironmentKind, EnvironmentLabel, FrozenPackages,
-    GenericName, InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary,
+    BindingName, ComponentName, Digest, DispatchObservation, EnvironmentKind, EnvironmentLabel,
+    FrozenPackages, InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary,
     NativeSafety, ObjectImage, PackageData, PackageIdentity, PackageImage, PackageIndex,
     PackageName, PrivateEnvironmentImage, ResourcePath,
 };
@@ -29,7 +29,7 @@ fn identifiers(source: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v1";
+pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v2";
 
 #[must_use]
 pub fn analysis_schema() -> &'static str {
@@ -49,7 +49,7 @@ struct CachedPackage<T> {
 #[serde(deny_unknown_fields)]
 struct CachedDispatch {
     target: Digest,
-    generics: BTreeSet<String>,
+    observation: DispatchObservation,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -346,7 +346,7 @@ pub trait PackageProvider: PackageResolver {
             .iter()
             .any(|candidate| candidate == path.as_str()))
     }
-    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>>;
+    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<DispatchObservation>;
     fn validate_syntax(&self, source: &str) -> Result<SyntaxValidation>;
     fn canonical_syntax(&self, source: &str) -> Result<CanonicalSyntax>;
     fn prefetch_canonical_syntax(&self, _sources: &[&str]) -> Result<()> {
@@ -398,7 +398,7 @@ pub struct PackageStore {
         Mutex<HashMap<PackageIdentity, HashMap<EnvironmentLabel, Arc<PrivateEnvironmentImage>>>>,
     published_environments: Mutex<HashSet<(PackageIdentity, EnvironmentLabel)>>,
     demanded: Mutex<HashSet<(PackageIdentity, String)>>,
-    dispatch: Memo<(Option<PackageIdentity>, String), BTreeSet<GenericName>>,
+    dispatch: Memo<(Option<PackageIdentity>, String), DispatchObservation>,
     normalizer: Batcher<String, Normalization>,
     cache: Cache,
     target_fingerprint: Digest,
@@ -956,7 +956,7 @@ impl PackageProvider for PackageStore {
         Ok(package.location.root.join(path.as_str()).exists())
     }
 
-    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
+    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<DispatchObservation> {
         let (package, binding) = match subject {
             DispatchSubject::Base { binding } => (None, binding),
             DispatchSubject::Installed { package, binding } => (Some(package), binding),
@@ -972,24 +972,22 @@ impl PackageProvider for PackageStore {
                 .read::<CachedDispatch>(&name)
                 .filter(|entry| entry.target == self.target_fingerprint)
             {
-                return Ok(cached.generics.into_iter().map(GenericName::from).collect());
+                return Ok(cached.observation);
             }
             let lane = package.map_or(0, |package| self.affine_lane(&package.identity));
-            let generics = self
+            let observation = self
                 .lanes
                 .lane(lane)
                 .client()?
-                .dispatch_generics(package, binding)?
-                .into_iter()
-                .collect::<BTreeSet<String>>();
+                .dispatch_generics(package, binding)?;
             self.cache.publish(
                 &name,
                 &CachedDispatch {
                     target: self.target_fingerprint.clone(),
-                    generics: generics.clone(),
+                    observation: observation.clone(),
                 },
             );
-            Ok(generics.into_iter().map(GenericName::from).collect())
+            Ok(observation)
         })
     }
 

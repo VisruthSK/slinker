@@ -1,5 +1,6 @@
 mod cache_names;
 mod cache_report;
+mod dispatch;
 mod identity;
 mod image;
 mod index;
@@ -16,6 +17,7 @@ pub use cache_report::{
     CacheReport, ClearOutcome, ClearScope, KindTotals, PackageCacheReport, SchemaCacheReport,
     clear_cache, inspect_cache,
 };
+pub use dispatch::DispatchObservation;
 pub use identity::{
     Digest, InstalledPackage, PackageId, PackageIdentity, PackageLocation, PackageRole,
 };

@@ -5,12 +5,13 @@ use slinker_core::analysis::{
 };
 use slinker_core::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, CanonicalSyntax,
-    ClosureSource, DatasetName, Digest, DispatchSubject, EmbeddedClosureSource, ExportMap,
-    GenericName, ImportBinding, ImportSpec, InstalledPackage, LifecycleMetadata, NativeComponent,
-    NativeFacts, NativeLibrary, NativeRegistration, NativeRoutineSummary, NativeSafety,
-    NativeSymbolBinding, ObjectImage, ObjectIssue, ObjectKind, PackageData, PackageIdentity,
-    PackageImage, PackageIndex, PackageLocation, PackageProvider, PackageResolver,
-    PrivateBindingImage, PrivateEnvironmentImage, S3Registration, SyntaxValidation,
+    ClosureSource, DatasetName, Digest, DispatchObservation, DispatchSubject,
+    EmbeddedClosureSource, ExportMap, GenericName, ImportBinding, ImportSpec, InstalledPackage,
+    LifecycleMetadata, NativeComponent, NativeFacts, NativeLibrary, NativeRegistration,
+    NativeRoutineSummary, NativeSafety, NativeSymbolBinding, ObjectImage, ObjectIssue, ObjectKind,
+    PackageData, PackageIdentity, PackageImage, PackageIndex, PackageLocation, PackageProvider,
+    PackageResolver, PrivateBindingImage, PrivateEnvironmentImage, S3Registration,
+    SyntaxValidation,
 };
 use slinker_core::package::{EnvironmentLabel, MemberPath, ObjectIssueKind, UnsupportedObject};
 use slinker_core::{Description, Error, Result, Target, TargetEnvironment};
@@ -200,14 +201,16 @@ impl PackageProvider for FakeProvider {
             .ok_or_else(|| Error::Analysis(format!("missing fake image {}", package.identity.name)))
     }
 
-    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<BTreeSet<GenericName>> {
+    fn dispatch_generics(&self, subject: DispatchSubject<'_>) -> Result<DispatchObservation> {
         let key = match subject {
             DispatchSubject::Base { binding } => (None, binding.to_owned()),
             DispatchSubject::Installed { package, binding } => {
                 (Some(package.identity.name.to_string()), binding.to_owned())
             }
         };
-        Ok(self.dispatch.get(&key).cloned().unwrap_or_default())
+        Ok(DispatchObservation::from_generics(
+            self.dispatch.get(&key).cloned().unwrap_or_default(),
+        ))
     }
 
     fn validate_syntax(&self, _source: &str) -> Result<SyntaxValidation> {
@@ -470,18 +473,11 @@ fn private_closure(name: &str, environment: &str, source: &str) -> PrivateBindin
     PrivateBindingImage {
         name: name.into(),
         object: ObjectImage {
-            has_attributes: false,
-            representation: slinker_core::package::BindingRepresentation::Value,
-            classes: Vec::new(),
-            object_kind: ObjectKind::Closure,
             closure: Some(ClosureSource {
                 environment: environment.into(),
                 source: Arc::from(source),
             }),
-            environment: None,
-            embedded_closures: Vec::new(),
-            embedded_environments: Vec::new(),
-            issues: Vec::new(),
+            ..ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Closure)
         },
     }
 }
@@ -559,18 +555,11 @@ fn runtime_reenclosure_blocks_without_inventing_an_environment() {
                 name: format!("{name}_dependency").into(),
                 origin: BindingOrigin::Code,
                 object: ObjectImage {
-                    has_attributes: false,
-                    representation: slinker_core::package::BindingRepresentation::Value,
-                    classes: Vec::new(),
-                    object_kind: ObjectKind::Closure,
                     closure: Some(ClosureSource {
                         source: Arc::from(format!("{name}_dependency <- function() 1")),
                         environment: "namespace:root".into(),
                     }),
-                    environment: None,
-                    embedded_closures: Vec::new(),
-                    embedded_environments: Vec::new(),
-                    issues: Vec::new(),
+                    ..ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Closure)
                 },
             }),
         );
@@ -807,19 +796,15 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
                 PrivateBindingImage {
                     name: "bad".into(),
                     object: ObjectImage {
-                        has_attributes: false,
-                        representation: slinker_core::package::BindingRepresentation::Value,
-                        classes: Vec::new(),
-                        object_kind: ObjectKind::Unsupported(UnsupportedObject::SexpType(22)),
-                        closure: None,
-                        environment: None,
-                        embedded_closures: Vec::new(),
-                        embedded_environments: Vec::new(),
                         issues: vec![ObjectIssue {
                             path: "$".into(),
                             kind: ObjectIssueKind::ExternalPointer,
                             detail: "external pointer".into(),
                         }],
+                        ..ObjectImage::of_kind(
+                            BindingRepresentation::Value,
+                            ObjectKind::Unsupported(UnsupportedObject::SexpType(22)),
+                        )
                     },
                 },
             )]),

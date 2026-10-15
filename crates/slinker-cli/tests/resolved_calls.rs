@@ -117,7 +117,7 @@ fn reflective_generic_callers_remain_open() {
         "reflectdep",
         "",
         "export(runner)\n",
-        "g <- function(x) UseMethod('g')\ng.default <- function(x) 'default'\ng.foo <- function(x) 'foo'\nrunner <- function(x) { f <- get('g'); f(x) }\n",
+        "g <- function(x) UseMethod('g')\ng.default <- function(x) 'default'\ng.foo <- function(x) 'foo'\nrunner <- function(x) { declare(slinker(x=s3('foo'))); direct <- g(x); f <- get('g'); c(direct, f(structure(1, class='bar'))) }\ng.bar <- function(x) 'bar'\n",
     );
     package(
         &source,
@@ -129,7 +129,7 @@ fn reflective_generic_callers_remain_open() {
     let r_home = discover_r_home();
     install_package(&r_home, &dependency, &original);
     install_package_using(&r_home, &source, &original, &original);
-    let oracle = "stopifnot(identical(reflectroot::run(), 'foo'))";
+    let oracle = "stopifnot(identical(reflectroot::run(), c('foo', 'bar')))";
     run_r(&r_home, &original, oracle);
     let output = work.path().join("output");
     let result = build(&source, &output, &original, &work.path().join("cache"), "1");
@@ -143,6 +143,111 @@ fn reflective_generic_callers_remain_open() {
         &installed,
         &format!("loadNamespace('reflectdep'); {oracle}"),
     );
+}
+
+#[test]
+fn retained_primitive_callables_keep_group_methods() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("primitivedep");
+    let source = work.path().join("primitiveroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "primitivedep",
+        "",
+        "export(run)\n",
+        "operations <- list(sum)\nSummary.foo <- function(..., na.rm=FALSE) { NextMethod(); 42L }\nrun <- function(x) operations[[1L]](x)\n",
+    );
+    package(
+        &source,
+        "primitiveroot",
+        "Imports: primitivedep\n",
+        "export(run)\n",
+        "run <- function() primitivedep::run(structure(1, class='foo'))\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(primitiveroot::run(), 42L))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert_success(&result, "primitive callable build");
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('primitivedep'); {oracle}"),
+    );
+}
+
+#[test]
+fn unknown_external_dispatch_blocks_before_publication() {
+    for generic_call in ["UseMethod(nm)", "UseMethod(object='x', gen=nm)"] {
+        let work = tempfile::tempdir().unwrap();
+        let dependency = work.path().join("computeddep");
+        let caller = work.path().join("computedcaller");
+        let source = work.path().join("computedroot");
+        let original = work.path().join("original");
+        fs::create_dir(&original).unwrap();
+        package(
+            &dependency,
+            "computeddep",
+            "",
+            "export(g)\n",
+            &format!("g <- function(x) {{ nm <- 'g'; {generic_call} }}\n"),
+        );
+        package(
+            &caller,
+            "computedcaller",
+            "Imports: computeddep\n",
+            "export(run)\n",
+            "g.foo <- function(x) 'expected'\ng.character <- function(x) 'expected'\nrun <- function(x) computeddep::g(x)\n",
+        );
+        package(
+            &source,
+            "computedroot",
+            "Imports: computedcaller\n",
+            "export(run)\n",
+            "run <- function() computedcaller::run(structure(1, class='foo'))\n",
+        );
+        let r_home = discover_r_home();
+        install_package(&r_home, &dependency, &original);
+        install_package_using(&r_home, &caller, &original, &original);
+        install_package_using(&r_home, &source, &original, &original);
+        run_r(
+            &r_home,
+            &original,
+            "stopifnot(identical(computedroot::run(), 'expected'))",
+        );
+        let output = work.path().join("output");
+        let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+            .arg("build")
+            .arg(&source)
+            .arg("--output")
+            .arg(&output)
+            .arg("--lib")
+            .arg(&original)
+            .args(["--external", "computeddep"])
+            .env("SLINKER_CACHE_DIR", work.path().join("cache"))
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "unknown External dispatch was accepted"
+        );
+        assert!(!output.exists());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("could not establish the callee's S3 dispatch generics")
+        );
+    }
 }
 
 #[test]
@@ -465,7 +570,7 @@ fn partial_matching_selects_the_same_s3_method_as_r() {
         "matchingdep",
         "",
         "export(run)\nS3method(gen, a)\nS3method(gen, b)\n",
-        "gen <- function(object, other) UseMethod('gen', object)\ngen.a <- function(object, other) 'a'\ngen.b <- function(object, other) 'b'\nrun <- function(x, y) { declare(slinker(x=s3('a'), y=s3('b'))); gen(ob=y, x) }\n",
+        "gen <- function(object, other) UseMethod(obj=object, gen='gen')\ngen.a <- function(object, other) 'a'\ngen.b <- function(object, other) 'b'\nrun <- function(x, y) { declare(slinker(x=s3('a'), y=s3('b'))); gen(ob=y, x) }\n",
     );
     package(
         &source,

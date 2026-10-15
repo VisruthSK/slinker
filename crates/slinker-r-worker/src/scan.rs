@@ -168,6 +168,11 @@ impl<'a> ObjectScanner<'a> {
         }
         match kind {
             libr::CLOSXP => self.scan_closure(&mut image, value, path, site)?,
+            libr::BUILTINSXP | libr::SPECIALSXP => {
+                image
+                    .primitive_dispatch
+                    .push(crate::dispatch::primitive(value)?);
+            }
             libr::ENVSXP => self.scan_environment(&mut image, value, path, site, true)?,
             libr::VECSXP => self.scan_members(&mut image, value, path, depth)?,
             libr::LISTSXP => {

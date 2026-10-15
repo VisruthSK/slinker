@@ -558,46 +558,79 @@ invisible(loadNamespace("tools", lib.loc = R.home("library")))
 
 .slinker_s3_aliases <- list(as.numeric = "as.double", seq.int = "seq")
 
-.slinker_use_method_generics <- function(expression) {
+.slinker_primitive_bindings <- Filter(
+  is.primitive,
+  mget(ls(baseenv(), all.names = TRUE), envir = baseenv())
+)
+
+.slinker_callable_dispatch <- function(value, name = NULL) {
+  if (!is.function(value)) {
+    return(list(known = TRUE, generics = character()))
+  }
+  if (is.primitive(value)) {
+    identities <- names(Filter(
+      function(candidate) identical(value, candidate),
+      .slinker_primitive_bindings
+    ))
+    if (!length(identities) || any(identities %in% c("UseMethod", "NextMethod"))) {
+      return(list(known = FALSE, generics = character()))
+    }
+    identities <- intersect(identities, tools:::.get_internal_S3_generics())
+    groups <- names(Filter(
+      function(members) any(identities %in% members),
+      .slinker_s3_groups
+    ))
+    return(list(known = TRUE, generics = unique(c(
+      identities,
+      groups,
+      unlist(.slinker_s3_aliases[intersect(identities, names(.slinker_s3_aliases))])
+    ))))
+  }
   generics <- character()
-  visit <- function(call) {
-    head <- call[[1L]]
-    is_use_method <- identical(head, quote(UseMethod)) ||
-      identical(head, quote(base::UseMethod))
-    if (
-      is_use_method &&
-        length(call) >= 2L &&
-        is.character(call[[2L]]) &&
-        length(call[[2L]]) == 1L
-    ) {
-      generics <<- c(generics, call[[2L]])
+  known <- TRUE
+  visit <- function(expression) {
+    if (is.symbol(expression) &&
+        as.character(expression) %in% c("UseMethod", "NextMethod")) {
+      known <<- FALSE
     }
-    for (index in seq_along(call)) {
-      if (is.call(call[[index]])) visit(call[[index]])
+    if (!is.call(expression) && !is.pairlist(expression) && !is.expression(expression)) {
+      return(invisible(NULL))
+    }
+    indices <- seq_along(expression)
+    if (is.call(expression)) {
+      head <- expression[[1L]]
+      if (identical(head, quote(UseMethod)) ||
+          identical(head, quote(base::UseMethod))) {
+        matched <- tryCatch(
+          match.call(args(base::UseMethod), expression),
+          error = function(error) NULL
+        )
+        generic <- if (!is.null(matched) && "generic" %in% names(matched) &&
+                       !identical(matched[["generic"]], quote(expr = ))) {
+          matched[["generic"]]
+        }
+        if (is.character(generic) && length(generic) == 1L && !is.na(generic)) {
+          generics <<- c(generics, generic)
+        } else {
+          known <<- FALSE
+        }
+        indices <- indices[-1L]
+      }
+    }
+    for (index in indices) {
+      if (!identical(expression[[index]], quote(expr = ))) visit(expression[[index]])
     }
   }
-  if (is.call(expression)) {
-    visit(expression)
-  }
-  unique(generics)
+  visit(body(value))
+  visit(formals(value))
+  list(known = known, generics = unique(c(
+    generics,
+    if (name %in% .internalGenerics) name
+  )))
 }
 
 .slinker_dispatch_generics <- function(environment, name) {
-  value <- get(name, envir = environment, inherits = FALSE)
-  if (!is.function(value)) {
-    return(character())
-  }
-  if (is.primitive(value)) {
-    groups <- names(Filter(
-      function(members) name %in% members,
-      .slinker_s3_groups
-    ))
-    return(unique(c(name, groups, .slinker_s3_aliases[[name]])))
-  }
-  unique(c(
-    .slinker_use_method_generics(body(value)),
-    if (name %in% .internalGenerics) name
-  ))
+  .slinker_callable_dispatch(get(name, envir = environment, inherits = FALSE), name)
 }
 
 .slinker_data_library <- function(

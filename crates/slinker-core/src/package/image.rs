@@ -1,4 +1,6 @@
-use crate::package::{BindingName, ClassName, EnvironmentLabel, MemberPath, PackageIndex};
+use crate::package::{
+    BindingName, ClassName, DispatchObservation, EnvironmentLabel, MemberPath, PackageIndex,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -123,6 +125,7 @@ pub struct ObjectImage {
     pub environment: Option<EnvironmentLabel>,
     pub embedded_closures: Vec<EmbeddedClosureSource>,
     pub embedded_environments: Vec<EmbeddedEnvironmentRef>,
+    pub primitive_dispatch: Vec<DispatchObservation>,
     pub issues: Vec<ObjectIssue>,
 }
 
@@ -143,6 +146,7 @@ impl ObjectImage {
         self.embedded_environments
             .extend(member.embedded_environments);
         self.issues.extend(member.issues);
+        self.primitive_dispatch.extend(member.primitive_dispatch);
     }
 
     pub fn environment_labels(&self) -> impl Iterator<Item = &EnvironmentLabel> {
@@ -172,6 +176,7 @@ impl ObjectImage {
             environment: None,
             embedded_closures: Vec::new(),
             embedded_environments: Vec::new(),
+            primitive_dispatch: Vec::new(),
             issues: Vec::new(),
         }
     }

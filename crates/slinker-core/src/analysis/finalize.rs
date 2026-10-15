@@ -1137,7 +1137,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     None,
                     RejectCode::ObjectSystem,
                     message.clone(),
-                    Some(span),
+                    span,
                 );
             }
         }

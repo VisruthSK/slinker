@@ -117,6 +117,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             },
             &binding_image.object,
         );
+        self.retain_primitive_dispatch(node, id, binding, &binding_image.object)?;
         self.require_member_closures(
             node,
             id,
@@ -482,6 +483,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             },
             &binding_image.object,
         );
+        self.retain_primitive_dispatch(node, id, binding, &binding_image.object)?;
         self.require_member_closures(
             node,
             id,

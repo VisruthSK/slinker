@@ -1,7 +1,8 @@
 use crate::ir::ObjectStep;
 use crate::package::{
-    BindingImage, BindingName, DataSetId, DataStorage, DatasetName, Digest, EnvironmentLabel,
-    ExportMap, ImportSpec, NativeComponent, PackageName, PrivateEnvironmentImage, S3Registration,
+    BindingImage, BindingName, DataSetId, DataStorage, DatasetName, Digest, DispatchObservation,
+    EnvironmentLabel, ExportMap, ImportSpec, NativeComponent, PackageName, PrivateEnvironmentImage,
+    S3Registration,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 
 pub const RESPONSE_READY: u8 = 0;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -233,7 +234,7 @@ pub enum WorkerResponse {
     },
     DispatchGenerics {
         request_id: u64,
-        generics: Vec<String>,
+        observation: DispatchObservation,
     },
     DataLibrary {
         request_id: u64,

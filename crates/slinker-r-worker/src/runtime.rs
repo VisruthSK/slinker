@@ -290,7 +290,7 @@ impl WorkerRuntime {
         &mut self,
         package: Option<&protocol::PackageSpec>,
         name: &str,
-    ) -> OperationResult<Vec<String>> {
+    ) -> OperationResult<slinker_core::package::DispatchObservation> {
         let environment = match package {
             Some(package) => {
                 let context = self
@@ -308,12 +308,12 @@ impl WorkerRuntime {
                 format!("installed image has no binding {name}"),
             ));
         }
-        harp::RFunction::new("", ".slinker_dispatch_generics")
+        let result = harp::RFunction::new("", ".slinker_dispatch_generics")
             .add(environment)
             .add(name)
             .call()
-            .and_then(Vec::<String>::try_from)
-            .coded(WorkerErrorCode::BindingForce)
+            .coded(WorkerErrorCode::BindingForce)?;
+        crate::dispatch::observation(&result).coded(WorkerErrorCode::BindingForce)
     }
 
     fn binding_value(
@@ -533,7 +533,7 @@ impl WorkerRuntime {
                 name,
             } => WorkerResponse::DispatchGenerics {
                 request_id,
-                generics: self.dispatch_generics(package.as_ref(), name.as_str())?,
+                observation: self.dispatch_generics(package.as_ref(), name.as_str())?,
             },
             WorkerRequest::SerializePayloads {
                 request_id,

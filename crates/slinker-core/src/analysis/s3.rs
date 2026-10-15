@@ -1,4 +1,4 @@
-use super::arguments::declared_strings;
+use super::arguments::{declared_strings, matched_arg_index, matched_static_arg};
 use super::invocation::{ClassDomain, Invocation, InvocationModel};
 use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParsedSite};
@@ -8,7 +8,8 @@ use crate::package::PackageAvailability;
 use crate::package::PackageImage;
 use crate::package::{Atom, EnvironmentLabel};
 use crate::package::{
-    BindingName, ClassName, DispatchCallee, GenericName, ImportSpec, PackageId, PackageProvider,
+    BindingName, ClassName, DispatchCallee, DispatchObservation, GenericName, ImportSpec,
+    ObjectImage, PackageId, PackageProvider,
 };
 use crate::syntax::{CallSite, ParsedRFile, Span, StaticArg};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -31,7 +32,7 @@ pub(super) struct CallableId {
 
 #[derive(Clone, Debug, Default)]
 struct S3Generic {
-    sites: Vec<(NodeId, PackageId, Span)>,
+    sites: Vec<(NodeId, PackageId, Option<Span>)>,
     definition: Option<GenericDefinition>,
     dispatch: S3Dispatch,
 }
@@ -66,7 +67,7 @@ impl S3Model {
     fn observe_use_method(
         &mut self,
         key: &S3GenericKey,
-        site: (NodeId, PackageId, Span),
+        site: (NodeId, PackageId, Option<Span>),
         definition: Option<GenericDefinition>,
     ) {
         let entry = self.generics.entry(key.clone()).or_default();
@@ -195,7 +196,7 @@ impl S3Model {
             .map(|(key, _)| key)
     }
 
-    pub(super) fn sites(&self, key: &S3GenericKey) -> &[(NodeId, PackageId, Span)] {
+    pub(super) fn sites(&self, key: &S3GenericKey) -> &[(NodeId, PackageId, Option<Span>)] {
         self.generics
             .get(key)
             .map_or(&[], |generic| generic.sites.as_slice())
@@ -265,7 +266,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             ));
             return Ok(());
         }
-        let generics = match call.static_arg(0) {
+        let generics = match matched_static_arg(call, &["generic", "object"], "generic") {
             Some(StaticArg::String(generic)) => BTreeSet::from([generic.as_str().to_owned()]),
             Some(StaticArg::Symbol(_)) => {
                 declared_strings(parsed, call, &["generic", "object"], "generic")
@@ -303,7 +304,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             .is_namespace_of(&self.packages.name(current));
         let selector = match (
             parameters,
-            call.arguments.get(1).map(|argument| &argument.value),
+            matched_arg_index(call, &["generic", "object"], "object")
+                .and_then(|index| call.arguments.get(index))
+                .map(|argument| &argument.value),
         ) {
             (Some(parameters), None) => parameters.first().cloned(),
             (Some(parameters), Some(Some(StaticArg::Symbol(object))))
@@ -333,9 +336,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                         .collect()
                 }),
             });
-        self.s3
-            .lock()
-            .observe_use_method(&key, (from, current, call.span.clone()), definition);
+        self.s3.lock().observe_use_method(
+            &key,
+            (from, current, Some(call.span.clone())),
+            definition,
+        );
         self.connect_generic_site(from, generic);
         self.refresh_s3_generic(&key)
     }
@@ -567,8 +572,28 @@ impl<P: PackageProvider> AnalyzerState<P> {
         let Some(owner) = self.dispatching_callee(site, call)? else {
             return Ok(());
         };
-        let generics = self.packages.dispatch_generics(owner.as_callee())?;
-        for generic in generics {
+        // These operations are handled by s3_dispatch, including declared names.
+        if matches!(&owner, DispatchOwner::Base(name) if matches!(name.as_str(), "UseMethod" | "NextMethod"))
+        {
+            return Ok(());
+        }
+        let observation = self.packages.dispatch_generics(owner.as_callee())?;
+        let (first, rest) = match observation {
+            DispatchObservation::NoDispatch => return Ok(()),
+            DispatchObservation::UnknownDispatch => {
+                self.diagnostic(
+                    site.node,
+                    site.package,
+                    Some(site.binding),
+                    RejectCode::ObjectSystem,
+                    "target R could not establish the callee's S3 dispatch generics",
+                    Some(call.span.clone()),
+                );
+                return Ok(());
+            }
+            DispatchObservation::Generics { first, rest } => (first, rest),
+        };
+        for generic in std::iter::once(first).chain(rest) {
             let key = (site.package, generic.clone());
             if !self.s3.lock().lexical_methods.contains_key(&key) {
                 let methods = self.s3_method_candidates(site.package, &generic, None)?;
@@ -577,6 +602,44 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let methods = self.s3.lock().lexical_methods[&key].clone();
             for (method, kind) in methods {
                 self.demand_s3_method(site.node, site.package, &generic, &method, kind);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn retain_primitive_dispatch(
+        &self,
+        node: NodeId,
+        package: PackageId,
+        binding: &str,
+        object: &ObjectImage,
+    ) -> Result<()> {
+        for observation in &object.primitive_dispatch {
+            let (first, rest) = match observation {
+                DispatchObservation::NoDispatch => continue,
+                DispatchObservation::UnknownDispatch => {
+                    self.diagnostic(
+                        node,
+                        package,
+                        Some(binding),
+                        RejectCode::ObjectSystem,
+                        "target R could not establish a retained primitive's S3 dispatch generics",
+                        None,
+                    );
+                    continue;
+                }
+                DispatchObservation::Generics { first, rest } => (first, rest),
+            };
+            for generic in std::iter::once(first).chain(rest) {
+                let key = S3GenericKey {
+                    package,
+                    name: generic.clone(),
+                };
+                self.s3
+                    .lock()
+                    .observe_use_method(&key, (node, package, None), None);
+                self.connect_generic_site(node, generic);
+                self.refresh_s3_generic(&key)?;
             }
         }
         Ok(())
