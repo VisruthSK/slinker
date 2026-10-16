@@ -5,7 +5,7 @@ use super::state::{AnalyzerState, ParsedSite};
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::package::PackageAvailability;
 use crate::package::PackageImage;
-use crate::package::{Atom, EnvironmentKind, EnvironmentLabel};
+use crate::package::{Atom, EnvironmentLabel};
 use crate::package::{
     BindingName, ClassName, DispatchCallee, DispatchObservation, GenericName, ImportSpec,
     ObjectImage, PackageId, PackageProvider,
@@ -798,8 +798,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             environment = private.parent.clone();
         }
-        match environment.kind() {
-            EnvironmentKind::Namespace(name) if name != "base" => {
+        match &environment {
+            EnvironmentLabel::Namespace(name) if name != "base" => {
                 let package = self.packages.resolve(name)?.ok_or_else(|| {
                     Error::Analysis(format!("missing lexical method namespace `{name}`"))
                 })?;
@@ -810,10 +810,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     Ok(Some(package))
                 }
             }
-            EnvironmentKind::Namespace(_) | EnvironmentKind::Base | EnvironmentKind::Empty => {
+            EnvironmentLabel::Namespace(_) | EnvironmentLabel::Base | EnvironmentLabel::Empty => {
                 Ok(None)
             }
-            EnvironmentKind::Private | EnvironmentKind::Unsupported(_) | EnvironmentKind::Other => {
+            EnvironmentLabel::InstalledPrivate(_) | EnvironmentLabel::Unsupported(_) => {
                 Err(Error::Analysis(format!(
                     "cannot establish lexical S3 methods in `{environment}`"
                 )))

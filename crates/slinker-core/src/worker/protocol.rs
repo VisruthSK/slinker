@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 pub const RESPONSE_READY: u8 = 0;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {

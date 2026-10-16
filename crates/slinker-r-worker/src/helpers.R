@@ -183,6 +183,13 @@ invisible(loadNamespace("tools", lib.loc = R.home("library")))
   paste0(lhs, " <- ", rhs)
 }
 
+.slinker_defaults_match <- function(value, source) {
+  tryCatch({
+    definition <- parse(text = source, keep.source = FALSE)[[1L]][[3L]]
+    identical(formals(value), definition[[2L]])
+  }, error = function(e) FALSE)
+}
+
 .slinker_normalize_source <- function(source) {
   expressions <- parse(text = source, keep.source = FALSE)
   paste(

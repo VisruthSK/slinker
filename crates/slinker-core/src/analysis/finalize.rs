@@ -27,8 +27,8 @@ use crate::package::PackageImage;
 use crate::package::PackageSources;
 use crate::package::reachable_environment_labels;
 use crate::package::{
-    EnvironmentKind, EnvironmentLabel, ImportSpec, NativeComponent, PackageAvailability, PackageId,
-    PackageName, PackageProvider,
+    EnvironmentLabel, ImportSpec, NativeComponent, PackageAvailability, PackageId, PackageName,
+    PackageProvider,
 };
 use crate::profile::{self, Probe};
 use crate::source::generated_description;
@@ -843,17 +843,22 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 .iter()
                 .filter(|&(_, &binding)| builder.binding_is_payload(binding))
                 .map(|(binding, _)| binding.as_str());
-            for label in reachable_environment_labels(&image, payloads) {
-                let EnvironmentKind::Namespace(target) = label.kind() else {
+            for label in reachable_environment_labels(
+                &image,
+                payloads
+                    .filter_map(|name| image.binding(name))
+                    .map(|binding| &binding.object),
+            ) {
+                let EnvironmentLabel::Namespace(target) = label else {
                     continue;
                 };
                 if target == "base" {
                     continue;
                 }
-                let Some(dependency) = namespace_ids.get(target) else {
+                let Some(dependency) = namespace_ids.get(target.as_str()) else {
                     issues.push(FinalizationIssue::PayloadOutsideProgram {
                         package: name.clone(),
-                        namespace: target.to_owned(),
+                        namespace: target.to_string(),
                     });
                     continue;
                 };

@@ -3,10 +3,10 @@ use crate::package::cache_names::EntryKind;
 use crate::package::inspection::{Batcher, Lanes, Slot};
 use crate::package::locator::fingerprint_strings;
 use crate::package::{
-    BindingName, ComponentName, Digest, DispatchObservation, EnvironmentKind, EnvironmentLabel,
-    FrozenPackages, InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary,
-    NativeSafety, ObjectImage, PackageData, PackageIdentity, PackageImage, PackageIndex,
-    PackageName, PrivateEnvironmentImage, ResourcePath,
+    BindingName, ComponentName, Digest, DispatchObservation, EnvironmentLabel, FrozenPackages,
+    InstalledPackage, LifecycleMetadata, NativeFacts, NativeRoutineSummary, NativeSafety,
+    ObjectImage, PackageData, PackageIdentity, PackageImage, PackageIndex, PackageName,
+    PrivateEnvironmentImage, ResourcePath,
 };
 use crate::worker::client::WorkerClient;
 use crate::worker::protocol::{
@@ -29,7 +29,7 @@ fn identifiers(source: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v4";
+pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v5";
 
 #[must_use]
 pub fn analysis_schema() -> &'static str {
@@ -507,6 +507,42 @@ impl PackageStore {
                 identity.name, worker.binding.name
             )));
         }
+        let invalid = |detail| {
+            Error::Analysis(format!(
+                "invalid installed object observation for {}::{}: {detail}",
+                identity.name, worker.binding.name
+            ))
+        };
+        worker.binding.object.validate().map_err(invalid)?;
+        for (label, environment) in &private_environments {
+            if !matches!(label, EnvironmentLabel::InstalledPrivate(_)) || label != &environment.id {
+                return Err(invalid(
+                    "private environment key does not match its identity",
+                ));
+            }
+            for (name, binding) in &environment.bindings {
+                if name != &binding.name {
+                    return Err(invalid("private binding name does not match its key"));
+                }
+                binding.object.validate().map_err(invalid)?;
+            }
+        }
+        for label in worker.binding.object.environment_labels().chain(
+            private_environments.values().flat_map(|environment| {
+                std::iter::once(&environment.parent).chain(
+                    environment
+                        .bindings
+                        .values()
+                        .flat_map(|binding| binding.object.environment_labels()),
+                )
+            }),
+        ) {
+            if matches!(label, EnvironmentLabel::InstalledPrivate(_))
+                && !private_environments.contains_key(label)
+            {
+                return Err(invalid("reachable private environment is missing"));
+            }
+        }
         Ok(Arc::new(PackageImage {
             index,
             bindings: HashMap::from([(worker.binding.name.clone(), Arc::new(worker.binding))]),
@@ -580,7 +616,7 @@ impl PackageStore {
         identity: &PackageIdentity,
         label: &EnvironmentLabel,
     ) -> String {
-        let label = fingerprint_strings([label.as_str()]).to_string();
+        let label = fingerprint_strings([label.to_string().as_str()]).to_string();
         EntryKind::Environment.member_name(
             identity.name.as_str(),
             &self.cache_key(identity),
@@ -626,7 +662,9 @@ impl PackageStore {
         let mut environments = HashMap::new();
         let mut pending = roots;
         while let Some(label) = pending.pop() {
-            if label.kind() != EnvironmentKind::Private || environments.contains_key(&label) {
+            if !matches!(label, EnvironmentLabel::InstalledPrivate(_))
+                || environments.contains_key(&label)
+            {
                 continue;
             }
             let environment: PrivateEnvironmentImage = self.load_cached_package(
@@ -831,7 +869,9 @@ impl PackageStore {
             .cloned()
             .collect::<Vec<_>>();
         while let Some(label) = pending.pop() {
-            if label.kind() != EnvironmentKind::Private || reachable.contains_key(&label) {
+            if !matches!(label, EnvironmentLabel::InstalledPrivate(_))
+                || reachable.contains_key(&label)
+            {
                 continue;
             }
             let Some(environment) = known.get(&label) else {

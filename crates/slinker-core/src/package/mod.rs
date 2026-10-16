@@ -44,8 +44,8 @@ pub use store::{
 pub use universe::{DispatchCallee, PackageAvailability, PackageSources, TargetUniverse};
 
 pub use names::{
-    Atom, BindingName, ClassName, ComponentName, DataSetId, DatasetName, EnvironmentKind,
-    EnvironmentLabel, ExportName, GenericLabel, GenericName, MemberPath, PackageName, SymbolName,
+    Atom, BindingName, ClassName, ComponentName, DataSetId, DatasetName, EnvironmentLabel,
+    ExportName, GenericLabel, GenericName, MemberPath, MemberStep, PackageName, SymbolName,
 };
 
 pub(crate) use image::reachable_environment_labels;

@@ -1,13 +1,12 @@
-use super::sexp::names;
 use super::{InspectionError, InspectionResult};
 use harp::RFunctionExt;
 use harp::environment_iter::BindingValue;
 use harp::object::RObject;
 use slinker_core::package::{
     BindingImage, BindingName, BindingOrigin, BindingRepresentation, ClassName, ClosureSource,
-    EmbeddedClosureSource, EmbeddedEnvironmentRef, EnvironmentKind, EnvironmentLabel, MemberPath,
-    ObjectImage, ObjectIssue, ObjectIssueKind, ObjectKind, PrivateBindingImage,
-    PrivateEnvironmentImage, UnsupportedObject,
+    EmbeddedClosureSource, EmbeddedEnvironmentRef, EnvironmentLabel, MemberPath, ObjectImage,
+    ObjectIssue, ObjectIssueKind, ObjectKind, PrivateBindingImage, PrivateEnvironmentImage,
+    UnsupportedObject,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -102,9 +101,12 @@ impl<'a> ObjectScanner<'a> {
                     ObjectKind::ActiveBinding,
                 ));
             }
-            BindingValue::Altrep { object, .. } => {
-                return Ok(altrep_image(&harp::utils::r_altrep_class(object.sexp)));
-            }
+            BindingValue::Altrep { object, .. } => (
+                BindingRepresentation::Altrep {
+                    class: harp::utils::r_altrep_class(object.sexp),
+                },
+                object,
+            ),
             BindingValue::Promise { promise } => match policy {
                 PromisePolicy::Force => (
                     BindingRepresentation::LazyLoadPromise,
@@ -149,22 +151,17 @@ impl<'a> ObjectScanner<'a> {
                 "object graph exceeds 128 levels",
             ));
         }
-        if harp::utils::r_is_altrep(value) {
-            let mut image = ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Altrep);
-            image.issues = altrep_issues(path, &harp::utils::r_altrep_class(value));
-            return Ok(image);
-        }
         let kind = harp::utils::r_typeof(value);
-        let recursive = matches!(
-            kind,
-            libr::CLOSXP | libr::ENVSXP | libr::VECSXP | libr::LISTSXP
-        );
         let mut image = ObjectImage::of_kind(BindingRepresentation::Value, object_kind(value));
-        if recursive && !self.walking.insert(value) {
+        if !self.walking.insert(value) {
             if kind == libr::ENVSXP {
                 self.scan_environment(&mut image, value, path, site, false)?;
             }
             return Ok(image);
+        }
+        if harp::utils::r_is_altrep(value) {
+            image.object_kind = ObjectKind::Altrep;
+            image.issues = altrep_issues(path, &harp::utils::r_altrep_class(value));
         }
         match kind {
             libr::CLOSXP => self.scan_closure(&mut image, value, path, site)?,
@@ -174,13 +171,6 @@ impl<'a> ObjectScanner<'a> {
                     .push(crate::dispatch::primitive(value)?);
             }
             libr::ENVSXP => self.scan_environment(&mut image, value, path, site, true)?,
-            libr::VECSXP => self.scan_members(&mut image, value, path, depth)?,
-            libr::LISTSXP => {
-                let members = harp::RFunction::new("base", "as.list")
-                    .add(RObject::view(value))
-                    .call()?;
-                self.scan_members(&mut image, members.sexp, path, depth)?;
-            }
             libr::EXTPTRSXP => image.issues.push(member_issue(
                 path,
                 ObjectIssueKind::ExternalPointer,
@@ -191,26 +181,27 @@ impl<'a> ObjectScanner<'a> {
                 ObjectIssueKind::WeakReference,
                 "weak reference",
             )),
+            libr::PROMSXP => image.issues.push(member_issue(
+                path,
+                ObjectIssueKind::UnforcedPromise,
+                "nested promise is preserved without forcing",
+            )),
             _ => {}
         }
-        if !matches!(kind, libr::LANGSXP | libr::EXPRSXP) {
-            let mut attributes = Vec::new();
-            harp::r::attrib_for_each(value, |tag, attribute| attributes.push((tag, attribute)));
-            image.has_attributes = !attributes.is_empty();
-            for (tag, attribute) in attributes {
-                let name = String::from(harp::symbol::RSymbol::new(tag)?);
-                let member = self.scan_value(
-                    attribute,
-                    &MemberPath::new(format!("{path}.attr[{name}]")),
-                    Site::Member,
-                    depth + 1,
-                )?;
-                image.absorb_members(member);
-            }
+        if let ObjectKind::Unsupported(kind) = image.object_kind {
+            image.issues.push(member_issue(
+                path,
+                ObjectIssueKind::UnsupportedKind,
+                &kind.to_string(),
+            ));
         }
-        if recursive {
-            self.walking.remove(&value);
+        for (step, child) in super::walk::children(value)? {
+            image.has_attributes |=
+                matches!(step, slinker_core::package::MemberStep::Attribute { .. });
+            let member = self.scan_value(child, &path.child(step), Site::Member, depth + 1)?;
+            image.absorb_members(member);
         }
+        self.walking.remove(&value);
         Ok(image)
     }
 
@@ -222,7 +213,20 @@ impl<'a> ObjectScanner<'a> {
         site: Site<'_>,
     ) -> InspectionResult<()> {
         let environment = self.environment_ref(harp::r::fn_env(value))?;
-        let source = self.deparse(site, value)?.into();
+        let source = self.deparse(site, value)?;
+        let source_matches = harp::RFunction::new("", ".slinker_defaults_match")
+            .add(value)
+            .add(source.clone())
+            .call()
+            .and_then(bool::try_from)?;
+        if !source_matches {
+            image.issues.push(member_issue(
+                path,
+                ObjectIssueKind::SourceMismatch,
+                "deparsed function does not preserve installed defaults",
+            ));
+        }
+        let source = source.into();
         match site {
             Site::Binding(_) => {
                 image.closure = Some(ClosureSource {
@@ -255,39 +259,14 @@ impl<'a> ObjectScanner<'a> {
                 environment: environment.clone(),
             });
         }
-        if report_identity && let EnvironmentKind::Unsupported(detail) = environment.kind() {
+        if report_identity && let EnvironmentLabel::Unsupported(detail) = &environment {
             image.issues.push(ObjectIssue {
                 path: path.clone(),
                 kind: ObjectIssueKind::EnvironmentIdentity,
-                detail: detail.into(),
+                detail: detail.to_string(),
             });
         }
         image.environment = Some(environment);
-        Ok(())
-    }
-
-    fn scan_members(
-        &mut self,
-        image: &mut ObjectImage,
-        list: libr::SEXP,
-        path: &MemberPath,
-        depth: usize,
-    ) -> InspectionResult<()> {
-        let names = names(list);
-        for index in 0..harp::object::r_length(list) {
-            let position = usize::try_from(index).unwrap_or(usize::MAX);
-            let member = match names.get(position).filter(|name| !name.is_empty()) {
-                Some(name) => path.field(name),
-                None => path.element(position + 1),
-            };
-            let scanned = self.scan_value(
-                harp::object::list_get(list, index),
-                &member,
-                Site::Member,
-                depth + 1,
-            )?;
-            image.absorb_members(scanned);
-        }
         Ok(())
     }
 
@@ -392,17 +371,6 @@ fn altrep_issues(path: &MemberPath, class: &str) -> Vec<ObjectIssue> {
         return Vec::new();
     }
     vec![member_issue(path, ObjectIssueKind::Altrep, class)]
-}
-
-fn altrep_image(class: &str) -> ObjectImage {
-    let mut image = ObjectImage::of_kind(
-        BindingRepresentation::Altrep {
-            class: class.to_owned(),
-        },
-        ObjectKind::Altrep,
-    );
-    image.issues = altrep_issues(&MemberPath::root(), class);
-    image
 }
 
 fn unforced_promise_image() -> ObjectImage {

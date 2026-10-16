@@ -6,6 +6,7 @@ mod runtime;
 mod scan;
 mod serve;
 mod sexp;
+mod walk;
 
 pub use serve::run;
 
