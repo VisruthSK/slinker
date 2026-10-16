@@ -5,8 +5,8 @@ use harp::object::RObject;
 use harp::{RFunctionExt, RObjectExt};
 use slinker_core::package::{
     BindingName, DataSetId, DataStorage, DatasetName, Digest, ExportMap, ExportName, ImportBinding,
-    ImportSpec, NameLookup, NativeComponent, NativeLibrary, NativeRegistration, NativeRoutines,
-    NativeSafety, NativeSymbolBinding, PackageName, S3Registration,
+    ImportSpec, NameLookup, NativeComponent, NativeLibrary, NativeRegistration, NativeRoutine,
+    NativeRoutines, NativeSafety, NativeSymbolBinding, PackageName, S3Registration,
 };
 use std::collections::BTreeMap;
 
@@ -234,10 +234,10 @@ fn native_library(compiled: &RObject) -> InspectionResult<NativeLibrary> {
     Ok(NativeLibrary::Loaded {
         library,
         routines: NativeRoutines {
-            c: typed_strings(&routines, "c")?,
-            call: typed_strings(&routines, "call")?,
-            fortran: typed_strings(&routines, "fortran")?,
-            external: typed_strings(&routines, "external")?,
+            c: registered_routines(&routines, "c")?,
+            call: registered_routines(&routines, "call")?,
+            fortran: registered_routines(&routines, "fortran")?,
+            external: registered_routines(&routines, "external")?,
         },
         name_lookup: if bool::try_from(field(compiled, "force_symbols")?)? {
             NameLookup::Forced
@@ -245,4 +245,26 @@ fn native_library(compiled: &RObject) -> InspectionResult<NativeLibrary> {
             NameLookup::Allowed
         },
     })
+}
+
+fn registered_routines(
+    routines: &RObject,
+    interface: &str,
+) -> InspectionResult<Vec<NativeRoutine>> {
+    list_field(routines, interface)?
+        .into_iter()
+        .map(|routine| {
+            let parameters = i32::try_from(field(&routine, "parameters")?)?;
+            let parameters = match parameters {
+                -1 => None,
+                value => Some(u32::try_from(value).map_err(|_| {
+                    InspectionError::from("invalid registered native argument count".to_owned())
+                })?),
+            };
+            Ok(NativeRoutine {
+                name: string_field(&routine, "name")?.into(),
+                parameters,
+            })
+        })
+        .collect()
 }

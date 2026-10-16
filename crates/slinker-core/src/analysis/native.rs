@@ -288,21 +288,23 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         });
         let registered = NativeInterface::of_callee(&call.callee)
             .zip(native.library.routines())
-            .is_some_and(|(interface, routines)| {
+            .filter(|(interface, routines)| {
                 routines
-                    .of(interface)
+                    .of(*interface)
                     .iter()
-                    .any(|routine| routine == symbol)
-            });
+                    .any(|routine| routine.name == *symbol)
+            })
+            .map(|(interface, _)| interface);
         let source = call.arg_span(index).cloned();
-        match (native.library.name_lookup(), source) {
-            (Some(NameLookup::Forced), _) if !names_other_library => {}
-            (Some(NameLookup::Allowed), Some(source)) if registered && !names_other_library => {
+        match (native.library.name_lookup(), source, registered) {
+            (Some(NameLookup::Forced), _, _) if !names_other_library => {}
+            (Some(NameLookup::Allowed), Some(source), Some(interface)) if !names_other_library => {
                 self.relocations.lock().push(PendingRelocation::NativeSymbol {
                     source,
                     package: current,
                     component: component.into(),
                     symbol: symbol.into(),
+                    interface,
                 });
             }
             _ => self.diagnostic(
@@ -311,7 +313,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 None,
                 RejectCode::UnknownNativeLookup,
                 format!(
-                    "{} selector \"{symbol}\" of Linked `{component}` cannot be resolved through its own DLL copy",
+                    "{} selector \"{symbol}\" of Linked `{component}` cannot preserve registered lookup and argument validation through its own DLL copy",
                     call.callee
                 ),
                 Some(call.span.clone()),
@@ -434,7 +436,51 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             return Ok(None);
         };
         match self.resolve_lexical_name(current, image, lexical_environment, name)? {
-            Resolution::Static(BindingTarget::Native { component, .. }) => Ok(Some(component)),
+            Resolution::Static(BindingTarget::Native {
+                component, binding, ..
+            }) => {
+                let routine = image
+                    .index
+                    .dynlibs
+                    .iter()
+                    .find(|native| native.name == component)
+                    .and_then(|native| {
+                        let symbol = native
+                            .bindings()
+                            .find(|symbol| symbol.binding == binding)?
+                            .symbol;
+                        let interface = NativeInterface::of_callee(&call.callee)?;
+                        native
+                            .library
+                            .routines()?
+                            .of(interface)
+                            .iter()
+                            .find(|routine| routine.name == symbol)
+                    });
+                if !self.is_root(current)
+                    && let Some(parameters) = routine.and_then(|routine| routine.parameters)
+                {
+                    let arguments = call
+                        .arguments
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, argument)| {
+                            *index != selector_index
+                                && argument.name.as_deref() != Some("PACKAGE")
+                                && !(matches!(call.callee.as_str(), ".C" | ".Fortran")
+                                    && matches!(
+                                        argument.name.as_deref(),
+                                        Some("NAOK" | "DUP" | "ENCODING")
+                                    ))
+                        })
+                        .count();
+                    let dots = call.arguments.iter().any(|argument| matches!(&argument.value, Some(StaticArg::Symbol(name)) if name == "..."));
+                    if dots || usize::try_from(parameters).ok() != Some(arguments) {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(component))
+            }
             Resolution::Static(
                 BindingTarget::Namespace { .. }
                 | BindingTarget::Private { .. }

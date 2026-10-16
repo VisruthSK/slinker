@@ -62,6 +62,118 @@ fn blocked_observation(name: &str, code: &str, oracle: &str, dependency_code: &s
 }
 
 #[test]
+fn ordinary_external_base_alias_does_not_require_a_base_package_image() {
+    let r = discover_r_home();
+    let work = tempfile::tempdir().unwrap();
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    let external = work.path().join("aliasexternal");
+    package(
+        &external,
+        "aliasexternal",
+        "",
+        "export(invoke)\n",
+        "invoke <- base::identity\n",
+    );
+    install_package(&r, &external, &original);
+    let dep = work.path().join("aliasdep");
+    package(
+        &dep,
+        "aliasdep",
+        "Imports: aliasexternal\n",
+        "export(run)\n",
+        "run <- function() aliasexternal::invoke(42L)\n",
+    );
+    install_package_using(&r, &dep, &original, &original);
+    let root = work.path().join("aliasroot");
+    package(
+        &root,
+        "aliasroot",
+        "Imports: aliasdep\n",
+        "export(run)\n",
+        "run <- function() aliasdep::run()\n",
+    );
+    install_package_using(&r, &root, &original, &original);
+    let oracle = "stopifnot(identical(aliasroot::run(), 42L))";
+    run_r(&r, &original, oracle);
+    let output = work.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(&root)
+        .arg("--lib")
+        .arg(&original)
+        .args(["--external", "aliasexternal"])
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_success(&result, "build ordinary External base alias");
+    let generated = work.path().join("generated-library");
+    fs::create_dir(&generated).unwrap();
+    install_package_using(&r, &output, &generated, &original);
+    let libraries = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r, &libraries, oracle);
+}
+
+#[test]
+fn external_caller_frame_reflection_blocks_before_removing_its_target() {
+    let r = discover_r_home();
+    let work = tempfile::tempdir().unwrap();
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    let external = work.path().join("callerexternal");
+    package(
+        &external,
+        "callerexternal",
+        "",
+        "export(invoke)\n",
+        "invoke <- function(name) get(name, envir=parent.frame())()\n",
+    );
+    install_package(&r, &external, &original);
+    let dep = work.path().join("callerdep");
+    package(
+        &dep,
+        "callerdep",
+        "Imports: callerexternal\n",
+        "export(run)\n",
+        "hidden <- function() 'expected'\nrun <- function() callerexternal::invoke('hidden')\n",
+    );
+    install_package_using(&r, &dep, &original, &original);
+    let root = work.path().join("callerroot");
+    package(
+        &root,
+        "callerroot",
+        "Imports: callerdep\n",
+        "export(run)\n",
+        "run <- function() callerdep::run()\n",
+    );
+    install_package_using(&r, &root, &original, &original);
+    run_r(
+        &r,
+        &original,
+        "stopifnot(identical(callerroot::run(), 'expected'))",
+    );
+    let output = work.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(&root)
+        .arg("--lib")
+        .arg(&original)
+        .args(["--external", "callerexternal"])
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "External caller reflection removed a required binding"
+    );
+    assert!(stderr.contains("caller frame"), "{stderr}");
+    assert!(!output.exists());
+}
+
+#[test]
 fn namespace_members_and_reflective_generics_keep_their_obligations() {
     let work = tempfile::tempdir().unwrap();
     let dependency = work.path().join("memberdep");

@@ -5,8 +5,8 @@ pub use crate::package::{
     PackageName, PackageRole, ResourcePath,
 };
 
-use crate::package::NativeComponent;
 use crate::package::{DataSetId, Digest, SymbolName};
+use crate::package::{NativeComponent, NativeInterface};
 use crate::syntax::TextRange;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -389,6 +389,7 @@ pub enum RelocationTarget {
         package: PackageId,
         component: ComponentName,
         symbol: SymbolName,
+        interface: NativeInterface,
     },
     NativeLibrary {
         package: PackageId,

@@ -130,14 +130,21 @@ impl NativeLibrary {
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct NativeRoutines {
-    pub c: Vec<SymbolName>,
-    pub call: Vec<SymbolName>,
-    pub fortran: Vec<SymbolName>,
-    pub external: Vec<SymbolName>,
+    pub c: Vec<NativeRoutine>,
+    pub call: Vec<NativeRoutine>,
+    pub fortran: Vec<NativeRoutine>,
+    pub external: Vec<NativeRoutine>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct NativeRoutine {
+    pub name: SymbolName,
+    /// None denotes R's variable-arity registration (-1).
+    pub parameters: Option<u32>,
 }
 
 impl NativeRoutines {
-    pub fn of(&self, interface: NativeInterface) -> &[SymbolName] {
+    pub fn of(&self, interface: NativeInterface) -> &[NativeRoutine] {
         match interface {
             NativeInterface::C => &self.c,
             NativeInterface::Call => &self.call,
@@ -150,7 +157,7 @@ impl NativeRoutines {
         [&self.c, &self.call, &self.fortran, &self.external]
             .into_iter()
             .flatten()
-            .map(SymbolName::as_str)
+            .map(|routine| routine.name.as_str())
             .collect()
     }
 }
@@ -169,8 +176,17 @@ impl NativeInterface {
             ".C" => Some(Self::C),
             ".Call" => Some(Self::Call),
             ".Fortran" => Some(Self::Fortran),
-            ".External" => Some(Self::External),
+            ".External" | ".External2" => Some(Self::External),
             _ => None,
+        }
+    }
+
+    pub fn registration_table(self) -> &'static str {
+        match self {
+            Self::C => ".C",
+            Self::Call => ".Call",
+            Self::Fortran => ".Fortran",
+            Self::External => ".External",
         }
     }
 }

@@ -27,6 +27,8 @@ The plan may deliberately replace an existing invariant. In that case, implement
 
 Breaking changes are allowed. When replacing an API, representation, flag, format, or mechanism, remove the obsolete one in the same change unless coexistence is explicitly required.
 
+Until the first release, all schemas, protocols, and fingerprint formats stay at v1. Changes are breaking; do not bump versions or add compatibility layers.
+
 Delete completed plan items rather than turning the plan into a status log.
 
 ## Priorities

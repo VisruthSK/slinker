@@ -69,10 +69,10 @@ pub(super) fn generate_r_source(
         ".slinker_root_package <- {}",
         r_string(&program.package(program.root_package()).identity().name)
     );
-    emit_bootstrap(&mut out, program, code);
+    emit_bootstrap(&mut out, program, code)?;
     out.push_str("})\n");
     out.push_str(&root_closures_source(program, code)?);
-    out.push_str(&format!(".onLoad <- function(libname, pkgname) {{\n  {ROOT_RUNTIME_BINDING}[[\"bootstrap\"]](base::asNamespace(pkgname), libname, pkgname)\n}}\n"));
+    out.push_str(&format!("base::assign(\".onLoad\", function(libname, pkgname) {{\n  {ROOT_RUNTIME_BINDING}[[\"bootstrap\"]](base::asNamespace(pkgname), libname, pkgname)\n}})\n"));
     Ok(out)
 }
 
@@ -82,28 +82,44 @@ fn root_closures_source(
 ) -> Result<String, BuildContextError> {
     let root_on_load = program.root_artifact().on_load;
     let mut source = String::new();
-    for closure in namespace_closures(program, program.root_namespace()) {
-        let code_id = program.closure(closure).code;
-        let text = code.source(code_id);
-        if Some(closure) == root_on_load {
-            let value_start = program
-                .code(code_id)
-                .assigned_value_start()
-                .ok_or_else(|| {
-                    BuildContextError::InvalidCode("Root .onLoad code is not an assignment".into())
-                })?;
-            source.push_str(ROOT_ON_LOAD_BINDING);
-            source.push_str(" <- ");
-            source.push_str(&text[value_start..]);
+    for (name, closure) in namespace_closures(program, program.root_namespace()) {
+        let name = if Some(closure) == root_on_load {
+            ROOT_ON_LOAD_BINDING
         } else {
-            source.push_str(text);
-        }
-        source.push('\n');
+            name.as_str()
+        };
+        emit!(
+            source,
+            "{}",
+            closure_assignment(program, code, closure, name)?
+        );
     }
     Ok(source)
 }
 
-fn emit_bootstrap(out: &mut String, program: &ProgramIr, code: &RelocatedCode) {
+fn closure_assignment(
+    program: &ProgramIr,
+    code: &RelocatedCode,
+    closure: ClosureId,
+    name: &str,
+) -> Result<String, BuildContextError> {
+    let code_id = program.closure(closure).code;
+    let text = code.source(code_id);
+    let value = program
+        .code(code_id)
+        .assigned_value_start()
+        .and_then(|start| text.get(start..))
+        .ok_or_else(|| {
+            BuildContextError::InvalidCode(format!("closure `{name}` code is not an assignment"))
+        })?;
+    Ok(format!("base::assign({}, {value})", r_string(name)))
+}
+
+fn emit_bootstrap(
+    out: &mut String,
+    program: &ProgramIr,
+    code: &RelocatedCode,
+) -> Result<(), BuildContextError> {
     let root = program.root_namespace();
     out.push_str("bootstrap <- function(root, libname, pkgname) {\n  .slinker_check_target()\n");
     out.push_str("  on.exit(.slinker_unregister(), add = TRUE)\n");
@@ -126,7 +142,7 @@ fn emit_bootstrap(out: &mut String, program: &ProgramIr, code: &RelocatedCode) {
         );
     }
     for activation in program.activations() {
-        emit_activation(out, program, code, activation);
+        emit_activation(out, program, code, activation)?;
     }
     let after_activation = program.root_artifact().load.after_activation();
     for import in after_activation.imports() {
@@ -164,6 +180,7 @@ fn emit_bootstrap(out: &mut String, program: &ProgramIr, code: &RelocatedCode) {
         out.push_str("  get(\".onLoad\", envir = root, inherits = FALSE)(libname, pkgname)\n");
     }
     out.push_str("}\n");
+    Ok(())
 }
 
 fn emit_activation(
@@ -171,7 +188,7 @@ fn emit_activation(
     program: &ProgramIr,
     code: &RelocatedCode,
     activation: &NamespaceActivationIr,
-) {
+) -> Result<(), BuildContextError> {
     let namespace = program.namespace(activation.namespace);
     let package = program.package(namespace.package);
     let name = &package.identity().name;
@@ -230,12 +247,12 @@ fn emit_activation(
             ),
         }
     }
-    for closure in namespace_closures(program, namespace) {
-        let source = code.source(program.closure(closure).code);
+    for (name, closure) in namespace_closures(program, namespace) {
+        let source = closure_assignment(program, code, closure, name)?;
         emit!(
             out,
             "    eval(parse(text = {}), envir = ns)",
-            r_string(source)
+            r_string(&source)
         );
     }
     if let Some(bundle) = payload_bundle(program, namespace) {
@@ -259,15 +276,16 @@ fn emit_activation(
             "FALSE"
         }
     );
+    Ok(())
 }
 
-fn namespace_closures(
-    program: &ProgramIr,
-    namespace: &Namespace,
-) -> impl Iterator<Item = ClosureId> {
-    namespace.bindings.values().filter_map(|binding| {
+fn namespace_closures<'a>(
+    program: &'a ProgramIr,
+    namespace: &'a Namespace,
+) -> impl Iterator<Item = (&'a BindingName, ClosureId)> {
+    namespace.bindings.iter().filter_map(|(name, binding)| {
         match initial_value(program, *binding).map(|value| program.value(value)) {
-            Some(Value::Closure(closure)) => Some(*closure),
+            Some(Value::Closure(closure)) => Some((name, *closure)),
             _ => None,
         }
     })
@@ -443,14 +461,14 @@ pub(super) fn render_namespace(program: &ProgramIr) -> String {
         let symbols = native.symbols.iter().map(|symbol| {
             format!(
                 "{} = {}",
-                r_binding_name(&symbol.binding),
+                r_string(&symbol.binding),
                 r_string(&symbol.symbol)
             )
         });
         emit!(
             out,
             "useDynLib({})",
-            std::iter::once(r_binding_name(&native.name).into_source())
+            std::iter::once(r_string(&native.name).into_source())
                 .chain(registration)
                 .chain(symbols)
                 .collect::<Vec<_>>()
@@ -462,13 +480,13 @@ pub(super) fn render_namespace(program: &ProgramIr) -> String {
         let generic = match &registration.generic.home {
             GenericHome::Program(package) => format!(
                 "{}::{}",
-                r_binding_name(&program.package(*package).identity().name),
-                r_binding_name(&registration.generic.name)
+                r_string(&program.package(*package).identity().name),
+                r_string(&registration.generic.name)
             ),
             GenericHome::Optional(package) => format!(
                 "{}::{}",
-                r_binding_name(package),
-                r_binding_name(&registration.generic.name)
+                r_string(package),
+                r_string(&registration.generic.name)
             ),
             GenericHome::Lexical => r_string(&registration.generic.name).into_source(),
         };
@@ -508,21 +526,4 @@ pub(super) fn r_string(value: &str) -> RExpr {
             .replace('\n', "\\n")
             .replace('\r', "\\r")
     ))
-}
-
-fn r_binding_name(value: &str) -> RExpr {
-    let simple = !value.is_empty()
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if index == 0 {
-                byte.is_ascii_alphabetic() || byte == b'.'
-            } else {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_')
-            }
-        })
-        && !(value.starts_with('.') && value.as_bytes().get(1).is_some_and(u8::is_ascii_digit));
-    RExpr::new(if simple {
-        value.into()
-    } else {
-        format!("`{}`", value.replace('`', "\\`"))
-    })
 }

@@ -93,7 +93,7 @@ namespaces <- new.env(hash = TRUE, parent = emptyenv())
   for (binding in names(symbols)) {
     assign(
       binding,
-      getNativeSymbolInfo(symbols[[binding]], dll),
+      getNativeSymbolInfo(symbols[[binding]], dll, withRegistrationInfo = TRUE),
       envir = namespace
     )
   }

@@ -22,6 +22,10 @@ impl ResourcePath {
         Self("Meta/package.rds".into())
     }
 
+    pub(crate) fn native_libraries() -> Self {
+        Self("libs".into())
+    }
+
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }

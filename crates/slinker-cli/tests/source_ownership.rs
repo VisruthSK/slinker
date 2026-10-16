@@ -40,6 +40,134 @@ fn install_built_tarball(r_home: &Path, source: &Path, library: &Path, archive: 
 }
 
 #[test]
+fn generated_linked_assignments_do_not_call_the_package_assignment_operator() {
+    let r = discover_r_home();
+    let work = tempfile::tempdir().unwrap();
+    let dep = work.path().join("assignmentdep");
+    package(
+        &dep,
+        "assignmentdep",
+        "",
+        "run <- function() 1L\n`<-` <- function(...) stop('package assignment operator was called')\n",
+    );
+    fs::write(dep.join("NAMESPACE"), "export(run, '<-')\n").unwrap();
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    install_package(&r, &dep, &original);
+    let source = work.path().join("assignmentroot");
+    package(
+        &source,
+        "assignmentroot",
+        "Imports: assignmentdep\n",
+        "run <- function() list(assignmentdep::run(), is.function(assignmentdep::`<-`))\n",
+    );
+    common::install_package_using(&r, &source, &original, &original);
+    let oracle = "stopifnot(identical(assignmentroot::run(), list(1L, TRUE)))";
+    run_r(&r, &original, oracle);
+    let output = work.path().join("generated");
+    assert_success(
+        &build(&source, &output, &original, &work.path().join("cache")),
+        "build Linked assignment operator",
+    );
+    let generated = work.path().join("generated-library");
+    fs::create_dir(&generated).unwrap();
+    install_package(&r, &output, &generated);
+    let libraries = std::env::join_paths([&generated, &original]).unwrap();
+    let check = || {
+        run_r(&r, &generated, oracle);
+        run_r(&r, &libraries, oracle);
+        run_r(
+            &r,
+            &libraries,
+            &format!("loadNamespace('assignmentdep'); {oracle}"),
+        );
+    };
+    check();
+    install_built_tarball(&r, &output, &generated, "assignmentroot_1.0.0.tar.gz");
+    check();
+}
+
+#[test]
+fn generated_root_assignments_do_not_call_the_package_assignment_operator() {
+    let r = discover_r_home();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("assignmentroot");
+    package(
+        &source,
+        "assignmentroot",
+        "",
+        "run <- function() 1L\n`<-` <- function(...) stop('package assignment operator was called')\n",
+    );
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    install_package(&r, &source, &original);
+    let oracle = "stopifnot(identical(assignmentroot::run(), 1L))";
+    run_r(&r, &original, oracle);
+    let output = work.path().join("generated");
+    assert_success(
+        &build(&source, &output, &original, &work.path().join("cache")),
+        "build root with assignment operator",
+    );
+    let generated = work.path().join("generated-library");
+    fs::create_dir(&generated).unwrap();
+    install_package(&r, &output, &generated);
+    run_r(&r, &generated, oracle);
+    install_built_tarball(&r, &output, &generated, "assignmentroot_1.0.0.tar.gz");
+    run_r(&r, &generated, oracle);
+}
+
+#[test]
+fn reserved_external_generic_names_survive_generated_namespace_and_tarball() {
+    let r = discover_r_home();
+    let work = tempfile::tempdir().unwrap();
+    let dep = work.path().join("keyworddep");
+    package(
+        &dep,
+        "keyworddep",
+        "",
+        "`if` <- function(x) UseMethod('if')\n",
+    );
+    fs::write(dep.join("NAMESPACE"), "export(`if`)\n").unwrap();
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    install_package(&r, &dep, &original);
+    let source = work.path().join("keywordroot");
+    package(
+        &source,
+        "keywordroot",
+        "Imports: keyworddep\n",
+        "method <- function(x) 42L\nrun <- function() keyworddep::`if`(structure(1L, class='foo'))\n",
+    );
+    fs::write(
+        source.join("NAMESPACE"),
+        "export(run)\nS3method(keyworddep::`if`, foo, method)\n",
+    )
+    .unwrap();
+    common::install_package_using(&r, &source, &original, &original);
+    let oracle = "stopifnot(identical(keywordroot::run(), 42L))";
+    run_r(&r, &original, oracle);
+    let output = work.path().join("generated");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(&source)
+        .arg("--lib")
+        .arg(&original)
+        .args(["--external", "keyworddep"])
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_success(&result, "build reserved external generic");
+    let generated = work.path().join("generated-library");
+    fs::create_dir(&generated).unwrap();
+    install_package(&r, &dep, &generated);
+    common::install_package_using(&r, &output, &generated, &generated);
+    run_r(&r, &generated, oracle);
+    install_built_tarball(&r, &output, &generated, "keywordroot_1.0.0.tar.gz");
+    run_r(&r, &generated, oracle);
+}
+
+#[test]
 fn source_installation_inputs_are_reobserved_on_every_build() {
     let work = tempfile::tempdir().unwrap();
     let dependency = work.path().join("capturedep");

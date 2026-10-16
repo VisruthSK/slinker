@@ -66,11 +66,11 @@ The generated Root `.onLoad` activates Linked namespaces in an order finalizatio
 
 ## Native packages
 
-Native opacity widens the demanded native component, not the package's R namespace. A Linked package's compiled library is copied into the generated package and loaded by its bootstrap, while unrelated R wrappers remain eligible for elimination. A Root keeps and compiles its own native code.
+Native opacity widens the demanded native component, not the package's R namespace. A Linked package's installed `libs` directory is copied into the generated package and its library is loaded by the bootstrap, preserving companion files while unrelated R wrappers remain eligible for elimination. A Root keeps its staged native artifacts.
 
 The worker loads each installed library to read its registered routines, so `useDynLib(pkg, .registration = TRUE)` names resolve; a library that fails to load there, for example because its `R_init` asks a package the worker has not loaded for a C callable, blocks with `NativeLoadFailure` rather than leaving its routines unknown.
 
-A Linked DLL is a separate copy that loads next to any real one, and its namespace records it under `DLLs`. String selectors (`.Call("routine", PACKAGE = "pkg")`) and `getNativeSymbolInfo(name, "pkg")` in Linked code resolve through that copy's `DllInfo`, never by name; when the DLL forces symbols they fail in every copy, as in the original, and stay as written. A string selector that is not a registered routine of its interface, or `getNativeSymbolInfo` without `PACKAGE` on a Linked routine, blocks. Computed selectors block unless they resolve to an established installed native symbol binding; having only one DLL does not establish a selector's identity. Unanalyzed native code blocks.
+A Linked DLL is a separate copy that loads next to any real one, and its namespace records it under `DLLs`. String selectors select the corresponding interface in that copy's registered routine table, preserving R's argument validation. `.External2` uses the `.External` registration table and keeps its own calling convention. `getNativeSymbolInfo(name, "pkg")` resolves through the private copy's `DllInfo`; when the DLL forces symbols, name-based operations fail as in the original and stay as written. A string selector that is not a registered routine of its interface, or `getNativeSymbolInfo` without `PACKAGE` on a Linked routine, blocks. Computed selectors block unless they resolve to an established installed native symbol binding; having only one DLL does not establish a selector's identity. A Linked symbol call whose argument count cannot preserve the installed byte-compiled call's behavior blocks. Unanalyzed native code blocks.
 
 ### Native effect summaries
 

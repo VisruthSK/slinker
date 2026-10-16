@@ -155,7 +155,9 @@ invisible(loadNamespace("tools", lib.loc = R.home("library")))
       list(
         library = library,
         routines = lapply(interfaces, function(interface) {
-          sort(unique(as.character(names(registered[[interface]]))))
+          lapply(registered[[interface]], function(routine) {
+            list(name = routine$name, parameters = routine$numParameters)
+          })
         }),
         force_symbols = isTRUE(unclass(dll)$forceSymbols)
       )

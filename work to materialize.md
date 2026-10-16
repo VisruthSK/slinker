@@ -88,14 +88,13 @@ exact unproven behavior until a sound rule covers it); `crates/slinker-cli/tests
 replacements and rejects parseable unplanned changes and malformed rewrites). Each item adds its own
 acceptance cases here.
 
-`crates/slinker-cli/tests/source_ownership.rs` covers installation inputs, R exclusions, configure outputs, source-native audits, hook-free inspection, generated paths, and publication failures. `crates/slinker-core/tests/image_identity.rs` guards fingerprint framing. Preserve repeated-startup and thread/cache determinism regressions alongside these cases.
+`crates/slinker-cli/tests/source_ownership.rs` covers installation inputs, R exclusions, configure outputs, source-native audits, hook-free inspection, generated paths, publication failures, shadow-proof Root/Linked assignments, and reserved NAMESPACE names through source and tarball installation. `crates/slinker-cli/tests/native_soundness.rs` compares native argument validation, interface identity, registration classes, `.External2` isolation, and companion files against original R; unpreserved compiled pointer arity blocks before publication. `crates/slinker-cli/tests/resolved_calls.rs` also covers the direct External caller-frame reflection blocker. `crates/slinker-core/tests/image_identity.rs` guards fingerprint framing. Preserve repeated-startup and thread/cache determinism regressions alongside these cases.
 
 ## Next up
 
-1. Capture the remaining independent failures in `fixes.md` as regressions under `crates/*/tests/`; retain original R as the oracle.
-2. Track I: finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
-3. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
-4. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
+1. Track I: finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
+2. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
+3. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
 
 ---
 
@@ -156,7 +155,7 @@ Done when:
 
 ## Deferred
 
-- General External caller-effect analysis. The caller-reflection reproduction in `fixes.md` remains an unresolved soundness failure: preserve or explicitly block that use before claiming the supported profile is sound. Keep the repair focused; a blanket declaration requirement for External calls is not authorized by this finding.
+- General External caller-effect analysis. Direct External caller-frame access is blocked; this does not establish general effects through indirect calls or native code. A blanket declaration requirement for External calls is not authorized by the recorded caller-reflection finding.
 - Broader S3 precision: pruning installed registrations, exact `NextMethod` vectors, and inferred constructor classes. Require complete caller knowledge and independent dispatch oracles first.
 - Resource/call coverage: explicit `system.file` `lib.loc` and computed arguments/paths, Linked `.onLoad` `libname` lowering, and dynamic-key private-environment operations. Do not widen the profile to repair an existing soundness failure.
 - A richer realistic CRAN-like fixture and additional S4/S7/introspection/evaluation coverage. Preserve the existing corpus and fail-closed boundaries; any future construction profile must establish lexical sharing, laziness, and identity independently.

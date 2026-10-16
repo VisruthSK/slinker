@@ -127,10 +127,12 @@ impl Replacement {
                 package,
                 component,
                 symbol,
+                interface,
             } => Self::expression(RExpr::new(format!(
-                "base::getNativeSymbolInfo({}, {})",
-                r_string(symbol),
-                native_library(program, *package, component)
+                "base::getDLLRegisteredRoutines({})[[{}]][[{}]]",
+                native_library(program, *package, component),
+                r_string(interface.registration_table()),
+                r_string(symbol)
             ))),
             RelocationTarget::NativeLibrary { package, component } => {
                 Self::expression(native_library(program, *package, component))

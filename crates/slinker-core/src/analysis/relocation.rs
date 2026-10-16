@@ -2,8 +2,8 @@ use super::NodeId;
 use crate::Version;
 use crate::ir::{BindingLookup, NamespaceOperation};
 use crate::package::{
-    BindingName, ComponentName, DataSetId, DatasetName, PackageId, PackageName, ResourcePath,
-    SymbolName,
+    BindingName, ComponentName, DataSetId, DatasetName, NativeInterface, PackageId, PackageName,
+    ResourcePath, SymbolName,
 };
 use crate::syntax::{ResourceRef, Span};
 
@@ -90,6 +90,7 @@ pub(super) enum PendingRelocation {
         package: PackageId,
         component: ComponentName,
         symbol: SymbolName,
+        interface: NativeInterface,
     },
     NativeLibrary {
         source: Span,

@@ -290,14 +290,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             }
             if !self.is_root(id) {
                 match native.library.path() {
-                    Some(library) => self.require(
+                    Some(_) => self.require(
                         node,
                         Need::Resource {
                             package: id,
-                            resource: library.to_owned(),
+                            resource: crate::package::ResourcePath::native_libraries(),
                         },
                         EdgeKind::Native,
-                        format!("native component `{component}` ships its compiled library"),
+                        format!("native component `{component}` ships its installed native directory"),
                     ),
                     None => self.diagnostic(
                         node,

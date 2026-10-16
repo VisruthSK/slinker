@@ -475,10 +475,10 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 }
             }
             for native in &image.index.dynlibs {
-                if let (LinkedPackageRole::Linked, Some(library)) = (role, native.library.path()) {
+                if let (LinkedPackageRole::Linked, Some(_)) = (role, native.library.path()) {
                     builder.add_resource(ResourceIr {
                         package,
-                        path: library.clone(),
+                        path: crate::package::ResourcePath::native_libraries(),
                     });
                 }
             }
@@ -706,11 +706,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     package,
                     component,
                     symbol,
+                    interface,
                     ..
                 } => RelocationTarget::NativeSymbol {
                     package: *package,
                     component: component.clone(),
                     symbol: symbol.clone(),
+                    interface: *interface,
                 },
                 PendingRelocation::NativeLibrary {
                     package, component, ..

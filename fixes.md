@@ -1,5 +1,7 @@
 # Repository review
 
+Until the first release, schemas, protocols, and fingerprint formats remain v1. Changes are breaking; replace obsolete representations without version bumps or compatibility layers.
+
 Reviewed 2026-10-06 through 2026-10-08 at `tightening` / `5e02b976737596753e8d249cdc57955dafc774e5`.
 This is a review with reproduced failures and proposed fixes. The independent
 architecture pass on 2026-10-08 added the reflective-S3, default-resource-order,
@@ -113,6 +115,25 @@ This decision concerns shared S3 registrations; it does not broaden the other
 documented exceptions.
 
 ## Findings with reproduced failures
+
+The regression audit maps these findings to executable cases under `crates/*/tests/`. Historical descriptions below record the failures at the reviewed revision; they are not a list of current failures.
+
+| Findings | Regression coverage |
+| --- | --- |
+| Export checks, namespace values/observations, Root support, loaded queries | `resolved_calls.rs`: unexported lookup, namespace members/enumeration, support reads, and loaded observations; `soundness.rs`: retained namespace objects and support collisions |
+| Default fidelity, datasets, structural members, ALTREP attributes, primitive dispatch | `soundness.rs`: lossy defaults, executable datasets, structural payload member cases; `resolved_calls.rs`: primitive callable methods |
+| Package-defined assignment and reserved NAMESPACE names | `source_ownership.rs`: shadow-proof Root/Linked assignment cases and `reserved_external_generic_names_survive_generated_namespace_and_tarball` |
+| Load boundaries, hook recursion, inspection without hooks | `resolved_calls.rs`: delayed/shared load effects and effective imports; `soundness.rs`: recursive Root hook; `source_ownership.rs`: foreign closure inspection |
+| Visibility/argument errors, guards, callee mutation, helper replacement, quote/eval | `resolved_calls.rs`: namespace replacement, control forms, platform replacement, installed stop helper, local/base eval cases |
+| S3 argument matching, reflective callers, unknown External dispatch | `resolved_calls.rs`: partial matching, reflective callers, and indirect dispatch cases |
+| Discovery order | `resolved_calls.rs`: defaulted resource lookup across helper names and thread counts; schedule/cache determinism suites |
+| Direct External caller reflection | `resolved_calls.rs`: `external_caller_frame_reflection_blocks_before_removing_its_target`; general External effects remain deferred |
+| Native argument validation, interfaces, registration classes, `.External2`, companion files | `native_soundness.rs`: original/generated oracles across absent/installed/loaded dependencies; unpreserved compiled pointer arity blocks before publication |
+| Unresolved native selectors | `build_materializer.rs`: `computed_native_selector_blocks_even_with_one_audited_dll`; exact/literal private-DLL positive oracle |
+| Source installation inputs, configure replay, native audits, R exclusions, generated paths/publication | `source_ownership.rs`: original source/generated source/tarball cases |
+| External Depends requirements, image identity, repeated worker startup | `resolved_calls.rs`: Depends constraints; `image_identity.rs`: file-tree framing; `harp_runtime.rs`: repeated worker startup |
+
+Build-record reuse/concurrent-record findings lost their mechanism when build records were removed. They do not justify preserving that mechanism solely to test it.
 
 Each item states whether slinker publishes behavior that differs from the
 original or rejects an otherwise valid program. Simplification proposals later

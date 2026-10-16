@@ -52,7 +52,7 @@ Branch conditions stay as Air expressions in the syntax census. Namespace availa
 
 ## Cache
 
-Disposable typed artifacts use schema `slinker-analysis-v4` and a SQLite database per schema directory. Keys include the installed image and target R. Reads verify the serialized bytes against their SHA-256 digest before decoding them. Corrupt entries or an unavailable database are cache misses. SQLite owns indexing and atomic publication; each invocation commits its artifact transaction when the cache closes. WAL permits readers alongside a writer. Serialization and deserialization run outside the connection lock. Installed-package fingerprints frame entry kinds, relative paths, and content digests, including empty directories; unsupported filesystem entries are rejected. `slinker cache` inspects and clears these artifacts.
+Disposable typed artifacts use schema `slinker-analysis-v1` and a SQLite database per schema directory. Keys include the installed image and target R. Reads verify the serialized bytes against their SHA-256 digest before decoding them. Corrupt entries or an unavailable database are cache misses. SQLite owns indexing and atomic publication; each invocation commits its artifact transaction when the cache closes. WAL permits readers alongside a writer. Serialization and deserialization run outside the connection lock. Installed-package fingerprints frame entry kinds, relative paths, and content digests, including empty directories; unsupported filesystem entries are rejected. `slinker cache` inspects and clears these artifacts.
 
 ## Benchmarks
 

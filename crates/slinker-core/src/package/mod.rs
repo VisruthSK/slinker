@@ -29,8 +29,8 @@ pub use image::{
 pub use index::{
     BindingNames, DataStorage, ExportMap, GenericSpec, ImportBinding, ImportSpec,
     LifecycleMetadata, NameLookup, NativeComponent, NativeFacts, NativeInterface, NativeLibrary,
-    NativeRegistration, NativeRoutineSummary, NativeRoutines, NativeSafety, NativeSymbolBinding,
-    PackageData, PackageIndex, S3Registration,
+    NativeRegistration, NativeRoutine, NativeRoutineSummary, NativeRoutines, NativeSafety,
+    NativeSymbolBinding, PackageData, PackageIndex, S3Registration,
 };
 pub(crate) use locator::FrozenPackages;
 pub use locator::PackageLocator;

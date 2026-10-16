@@ -562,6 +562,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 | "getNamespaceInfo"
                 | ".Call"
                 | ".External"
+                | ".External2"
                 | ".C"
                 | ".Fortran"
                 | "deparse"
@@ -615,10 +616,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         if !fact.base() {
             if let super::call::ResolvedCallee::Established {
-                target: Resolution::Static(BindingTarget::External { package, .. }),
+                target:
+                    Resolution::Static(BindingTarget::External {
+                        package,
+                        binding: external_binding,
+                    }),
                 ..
             } = fact.callee()
             {
+                self.reject_external_caller_reflection(site, *package, external_binding, call)?;
                 match self.packages.name(*package).as_str() {
                     "utils" => self.utils_call(caller, call)?,
                     "rlang" => self.rlang_call(caller, call)?,
@@ -770,7 +776,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             "UseMethod" | "NextMethod" => {
                 self.s3_dispatch(site, parsed, None, call)?;
             }
-            ".Call" | ".External" | ".C" | ".Fortran" => {
+            ".Call" | ".External" | ".External2" | ".C" | ".Fortran" => {
                 self.native_call(site, parsed, call)?;
             }
             "getNativeSymbolInfo" if !self.is_root(current) => {
@@ -785,6 +791,52 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 });
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn reject_external_caller_reflection(
+        &self,
+        site: ParsedSite<'_>,
+        external: PackageId,
+        binding: &str,
+        call: &CallSite,
+    ) -> Result<()> {
+        if self.is_root(site.package) || self.packages.is_platform(external) {
+            return Ok(());
+        }
+        let image = self.packages.binding_image(external, binding)?;
+        let Some(closure) = image
+            .binding(binding)
+            .and_then(|binding| binding.object.closure.as_ref())
+        else {
+            return Ok(());
+        };
+        let mut sources = crate::syntax::Sources::default();
+        let source = sources.add(
+            self.packages.name(external),
+            crate::syntax::SourceKey::Binding(binding.into()),
+            closure.source.clone(),
+        );
+        let Ok(parsed) = crate::syntax::OakParser.parse_binding(source, &closure.source) else {
+            return Ok(());
+        };
+        let observes_caller = parsed
+            .expressions
+            .iter()
+            .flat_map(|expression| &expression.calls)
+            .any(|call| {
+                matches!(
+                    call.callee.as_str(),
+                    "parent.frame" | "sys.frame" | "sys.frames" | "sys.function"
+                ) && call.callee_kind != crate::syntax::CalleeKind::DefinitelyLexical
+                    && call
+                        .qualified_package()
+                        .is_none_or(|package| package == "base")
+            });
+        if observes_caller {
+            self.diagnostic(site.node, site.package, Some(site.binding), RejectCode::DynamicLookup,
+                format!("External `{}::{binding}` observes its caller frame, whose Linked bindings are not preserved by this call contract", self.packages.name(external)), Some(call.span.clone()));
         }
         Ok(())
     }

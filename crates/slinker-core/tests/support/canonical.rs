@@ -113,8 +113,9 @@ impl<'a> Canonical<'a> {
                 package,
                 component,
                 symbol,
+                interface,
             } => format!(
-                "native-symbol {} {component} {symbol}",
+                "native-symbol {} {component} {interface:?} {symbol}",
                 self.package(*package)
             ),
             RelocationTarget::NativeLibrary { package, component } => {
