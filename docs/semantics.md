@@ -70,7 +70,7 @@ Native opacity widens the demanded native component, not the package's R namespa
 
 The worker loads each installed library to read its registered routines, so `useDynLib(pkg, .registration = TRUE)` names resolve; a library that fails to load there, for example because its `R_init` asks a package the worker has not loaded for a C callable, blocks with `NativeLoadFailure` rather than leaving its routines unknown.
 
-A Linked DLL is a separate copy that loads next to any real one, and its namespace records it under `DLLs`. String selectors (`.Call("routine", PACKAGE = "pkg")`) and `getNativeSymbolInfo(name, "pkg")` in Linked code resolve through that copy's `DllInfo`, never by name; when the DLL forces symbols they fail in every copy, as in the original, and stay as written. A string selector that is not a registered routine of its interface, or `getNativeSymbolInfo` without `PACKAGE` on a Linked routine, blocks. Unanalyzed native code blocks.
+A Linked DLL is a separate copy that loads next to any real one, and its namespace records it under `DLLs`. String selectors (`.Call("routine", PACKAGE = "pkg")`) and `getNativeSymbolInfo(name, "pkg")` in Linked code resolve through that copy's `DllInfo`, never by name; when the DLL forces symbols they fail in every copy, as in the original, and stay as written. A string selector that is not a registered routine of its interface, or `getNativeSymbolInfo` without `PACKAGE` on a Linked routine, blocks. Computed selectors block unless they resolve to an established installed native symbol binding; having only one DLL does not establish a selector's identity. Unanalyzed native code blocks.
 
 ### Native effect summaries
 

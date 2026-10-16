@@ -1426,6 +1426,76 @@ fn linked_native_library_whose_init_fails_in_the_worker_blocks() {
 }
 
 #[test]
+fn computed_native_selector_blocks_even_with_one_audited_dll() {
+    let r_home = discover_r_home();
+    let fixture = tempfile::tempdir().unwrap();
+    let dep = fixture.path().join("counterdep");
+    write_package(
+        &dep,
+        "counterdep",
+        "",
+        "useDynLib(counterdep, .registration=TRUE)\nexport(computed, literal)\n",
+        "computed <- function(nm='counter_tick') .Call(nm, PACKAGE='counterdep')\nliteral <- function() .Call('counter_tick', PACKAGE='counterdep')\n",
+    );
+    fs::create_dir(dep.join("src")).unwrap();
+    fs::write(dep.join("src/counter.c"), "#include <R.h>\n#include <Rinternals.h>\n#include <R_ext/Rdynload.h>\nstatic int count = 0;\nSEXP counter_tick(void) { return Rf_ScalarInteger(++count); }\nstatic const R_CallMethodDef calls[] = {{\"counter_tick\", (DL_FUNC)&counter_tick, 0}, {NULL, NULL, 0}};\nvoid R_init_counterdep(DllInfo *dll) { R_registerRoutines(dll, NULL, calls, NULL, NULL); R_useDynamicSymbols(dll, FALSE); }\n").unwrap();
+    let library = fixture.path().join("library");
+    fs::create_dir(&library).unwrap();
+    install_package(&r_home, &dep, &library);
+    let root = fixture.path().join("counterroot");
+    write_package(
+        &root,
+        "counterroot",
+        "Imports: counterdep\n",
+        "export(run)\n",
+        "run <- function() c(counterdep::computed(), counterdep::literal())\n",
+    );
+    install_package(&r_home, &root, &library);
+    run_r(
+        &r_home,
+        &library,
+        "stopifnot(identical(counterroot::run(), 1:2)); for (i in 1:5) counterdep::literal(); stopifnot(identical(counterroot::run(), 8:9))",
+    );
+
+    let output = fixture.path().join("generated");
+    let build = |summaries: Option<&Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_slinker"));
+        command
+            .arg("build")
+            .arg(&root)
+            .arg("--lib")
+            .arg(&library)
+            .arg("--output")
+            .arg(&output)
+            .env_remove("SLINKER_NATIVE_SUMMARIES");
+        if let Some(summaries) = summaries {
+            command.env("SLINKER_NATIVE_SUMMARIES", summaries);
+        }
+        command.output().unwrap()
+    };
+    let unaudited = build(None);
+    assert!(!unaudited.status.success());
+    let stderr = String::from_utf8_lossy(&unaudited.stderr);
+    let key = "package `counterdep` version `1.0.0` image `";
+    let fingerprint = stderr
+        .find(key)
+        .map(|start| &stderr[start + key.len()..])
+        .and_then(|rest| rest.split('`').next())
+        .unwrap_or_else(|| panic!("native audit key missing: {stderr}"));
+    let summaries = fixture.path().join("summaries.json");
+    fs::write(&summaries, format!(r#"{{"schema":1,"packages":[{{"package":"counterdep","version":"1.0.0","origin":"installed","image_fingerprint":"{fingerprint}","components":[{{"component":"counterdep","safety":"safe"}}]}}]}}"#)).unwrap();
+    let result = build(Some(&summaries));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "computed native selector was accepted"
+    );
+    assert!(stderr.contains("UnknownNativeLookup"), "{stderr}");
+    assert!(!stderr.contains("UnknownNativeEffects"), "{stderr}");
+    assert!(!output.exists(), "blocked build published output");
+}
+
+#[test]
 fn linked_native_lookups_by_name_reach_their_own_dll_copy() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");

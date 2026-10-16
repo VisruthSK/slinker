@@ -826,10 +826,9 @@ impl<P: PackageProvider> AnalyzerState<P> {
             binding,
             lexical_environment,
         } = site;
-        if let Some(target) =
+        if let Some(component) =
             self.native_component_for_call(current, image, lexical_environment, call)?
         {
-            let component = target.component;
             self.require_at(
                 from,
                 Need::Native {

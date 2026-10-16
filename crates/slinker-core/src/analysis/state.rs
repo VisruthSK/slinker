@@ -15,8 +15,8 @@ use crate::analysis::{Diagnostic, EdgeKind, GenericId, Graph, Need, NodeId, Node
 use crate::ir::ExternalBindingAccess;
 use crate::package::ObjectImage;
 use crate::package::{
-    BindingName, ComponentName, EnvironmentLabel, GenericLabel, PackageId, PackageImage,
-    PackageName, PackageProvider, TargetUniverse,
+    BindingName, EnvironmentLabel, GenericLabel, PackageId, PackageImage, PackageName,
+    PackageProvider, TargetUniverse,
 };
 use crate::profile::{self, Counter, Probe};
 use crate::syntax::{CallSite, NamespaceImports, ParsedRFile, SourceKey, Span};
@@ -118,11 +118,6 @@ pub(super) struct LoadedPackage {
     pub(super) namespace: Guarded<NamespaceBuilder>,
     pub(super) native_bindings: NativeBindingIndex,
     sealed: AtomicBool,
-}
-
-pub(super) struct NativeCallTarget {
-    pub(super) component: ComponentName,
-    pub(super) consumes_selector: bool,
 }
 
 impl<P: PackageProvider> AnalyzerState<P> {

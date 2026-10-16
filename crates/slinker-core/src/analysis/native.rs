@@ -4,7 +4,7 @@ use super::arguments::{
 };
 use super::relocation::PendingRelocation;
 use super::resolution::{BindingTarget, OpenReason, Resolution};
-use super::state::{AnalyzerState, NativeCallTarget, NativeCallbackContext};
+use super::state::{AnalyzerState, NativeCallbackContext};
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, RejectCode};
 use crate::ir::ExternalBindingAccess;
@@ -408,7 +408,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
         image: &PackageImage,
         lexical_environment: &EnvironmentLabel,
         call: &CallSite,
-    ) -> Result<Option<NativeCallTarget>> {
+    ) -> Result<Option<ComponentName>> {
         let Some(selector_index) = matched_arg_index(call, &[".NAME"], ".NAME") else {
             return Ok(None);
         };
@@ -427,23 +427,14 @@ OpenReason::Unresolved(_)) => self.diagnostic(
             if components.next().is_some() {
                 return Ok(None);
             }
-            return Ok(Some(NativeCallTarget {
-                component: component.name.as_str().into(),
-                consumes_selector: false,
-            }));
+            return Ok(Some(component.name.clone()));
         }
 
         let StaticArg::Symbol(name) = selector else {
             return Ok(None);
         };
         match self.resolve_lexical_name(current, image, lexical_environment, name)? {
-            Resolution::Static(BindingTarget::Native { component, .. }) => {
-                return Ok(Some(NativeCallTarget {
-                    component,
-                    consumes_selector: false,
-                }));
-            }
-            Resolution::OpenDynamic(OpenReason::Unresolved(_)) => {}
+            Resolution::Static(BindingTarget::Native { component, .. }) => Ok(Some(component)),
             Resolution::Static(
                 BindingTarget::Namespace { .. }
                 | BindingTarget::Private { .. }
@@ -452,34 +443,7 @@ OpenReason::Unresolved(_)) => self.diagnostic(
                 | BindingTarget::Metadata { .. }
                 | BindingTarget::Base,
             )
-            | Resolution::OpenDynamic(OpenReason::MissingPackage { .. }) => return Ok(None),
-        }
-
-        let mut registered = image.index.dynlibs.iter().filter(|native| {
-            native.registration.is_some() && !matches!(native.safety, NativeSafety::Unsupported(_))
-        });
-        let Some(first) = registered.next() else {
-            return Ok(None);
-        };
-        if registered.next().is_some() {
-            Ok(None)
-        } else {
-            Ok(Some(NativeCallTarget {
-                component: first.name.clone(),
-                consumes_selector: true,
-            }))
-        }
-    }
-
-    pub(super) fn sole_opaque_registered_native_component(index: &PackageIndex) -> Option<&str> {
-        let mut registered = index.dynlibs.iter().filter(|native| {
-            native.registration.is_some() && matches!(native.safety, NativeSafety::Unanalyzed)
-        });
-        let first = registered.next()?;
-        if registered.next().is_some() {
-            None
-        } else {
-            Some(first.name.as_str())
+            | Resolution::OpenDynamic(_) => Ok(None),
         }
     }
 }

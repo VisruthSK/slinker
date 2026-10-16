@@ -1,7 +1,7 @@
 use super::relocation::NamespaceCall;
 pub(super) use crate::arguments::{MatchScope, match_arguments};
 use crate::ir::NamespaceOperation;
-use crate::syntax::{CallSite, DeclaredCallable, ParsedRFile, Span, StaticArg};
+use crate::syntax::{CallSite, DeclaredCallable, ParsedRFile, StaticArg};
 use std::collections::BTreeSet;
 
 #[cfg(test)]
@@ -58,11 +58,6 @@ pub(super) fn declared_callables(
 ) -> Option<BTreeSet<DeclaredCallable>> {
     let binding = call.arg_binding(index)?;
     parsed.callable_domain_for(binding, call.scope)
-}
-
-pub(super) fn native_selector_span(call: &CallSite) -> Option<&Span> {
-    let index = matched_arg_index(call, &[".NAME"], ".NAME")?;
-    call.arg_span(index)
 }
 
 pub(super) fn static_string_arg(call: &CallSite) -> Option<&str> {

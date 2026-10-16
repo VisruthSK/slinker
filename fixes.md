@@ -1040,6 +1040,8 @@ copy/load simplification should remove reconstruction of these objects.
 
 ### P1: The sole-DLL fallback admits unrewritten dynamic selectors
 
+Resolved by removing both sole-component guesses and selector-reference suppression. `computed_native_selector_blocks_even_with_one_audited_dll` preserves the original R counter oracle and checks rejection before publication; `linked_native_lookups_by_name_reach_their_own_dll_copy` retains the supported private-DLL oracle across dependency installation and load states.
+
 `analysis/native.rs::native_component_for_call` treats an unresolved selector
 symbol as belonging to the only registered component. This does not establish
 whether the symbol is an installed native binding or a function parameter holding

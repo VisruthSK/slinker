@@ -1,4 +1,3 @@
-use super::arguments::native_selector_span;
 use super::dynamic_names::{CreatedName, CreatorOperation, NameCreator};
 use super::need::WorkKey;
 use super::parse_cache::ParseState;
@@ -571,8 +570,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     self.resolved_call(site.package, site.image, site.lexical_environment, call)?;
                 }
             }
-            let consumed_native_selectors = self.consumed_native_selectors(site, expression)?;
-            self.process_references(site, parsed, expression, &consumed_native_selectors)?;
+            self.process_references(site, parsed, expression)?;
             for resource in &expression.resource_refs {
                 if !self.guards_active(site, &resource.guards, &resource.span)? {
                     continue;
@@ -636,59 +634,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
         Ok(())
     }
 
-    fn consumed_native_selectors(
-        &self,
-        site: ParsedSite<'_>,
-        expression: &ParsedExpression,
-    ) -> Result<Vec<Span>> {
-        let mut consumed_native_selectors = Vec::new();
-        for call in &expression.calls {
-            if !self.guards_active(site, &call.guards, &call.span)?
-                || !matches!(
-                    call.callee.as_str(),
-                    ".Call" | ".External" | ".C" | ".Fortran"
-                )
-                || !self.call_resolves_definitely_to_base(
-                    site.package,
-                    site.image,
-                    site.lexical_environment,
-                    call,
-                )?
-            {
-                continue;
-            }
-            let Some(target) = self.native_component_for_call(
-                site.package,
-                site.image,
-                site.lexical_environment,
-                call,
-            )?
-            else {
-                continue;
-            };
-            if target.consumes_selector
-                && let Some(span) = native_selector_span(call)
-            {
-                consumed_native_selectors.push(span.clone());
-            }
-        }
-        Ok(consumed_native_selectors)
-    }
-
     fn process_references(
         &self,
         site: ParsedSite<'_>,
         parsed: &ParsedRFile,
         expression: &ParsedExpression,
-        consumed_native_selectors: &[Span],
     ) -> Result<()> {
         let _span = profile::span(Probe::ProcessReferences);
         let enclosure_known = !site.lexical_environment.is_unsupported();
         for reference in &expression.references {
             if !self.guards_active(site, &reference.guards, &reference.span)? {
-                continue;
-            }
-            if consumed_native_selectors.contains(&reference.span) {
                 continue;
             }
             if expression.namespace_info_reads.iter().any(|read| {
@@ -1146,32 +1101,14 @@ impl<P: PackageProvider> AnalyzerState<P> {
             && !is_r_constant(value)
         {
             let resolved = self.resolve_lexical_name(package, image, lexical_environment, value)?;
-            let opaque_native = (binding == ".onLoad"
-                && matches!(resolved, Resolution::OpenDynamic(OpenReason::Unresolved(_))))
-            .then(|| Self::sole_opaque_registered_native_component(&image.index))
-            .flatten();
-            match opaque_native {
-                Some(component) => self.require_at(
-                    from,
-                    Need::Native {
-                        package,
-                        component: component.to_owned().into(),
-                    },
-                    EdgeKind::Native,
-                    format!(
-                        ".onLoad may receive registered native symbol `{value}` from `{component}`"
-                    ),
-                    Some(effect.span.clone()),
-                ),
-                None => self.require_resolved(
-                    from,
-                    package,
-                    Some(binding),
-                    resolved,
-                    effect.span.clone(),
-                    ReferenceUse::Unrecorded,
-                ),
-            }
+            self.require_resolved(
+                from,
+                package,
+                Some(binding),
+                resolved,
+                effect.span.clone(),
+                ReferenceUse::Unrecorded,
+            );
         }
 
         if effect.target_enclosing_local {

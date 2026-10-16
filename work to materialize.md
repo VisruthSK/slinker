@@ -92,7 +92,7 @@ acceptance cases here.
 
 ## Next up
 
-1. Capture the remaining independent failures in `fixes.md` as regressions under `crates/*/tests/`; retain original R as the oracle. Delete unresolved-selector/sole-DLL guesses.
+1. Capture the remaining independent failures in `fixes.md` as regressions under `crates/*/tests/`; retain original R as the oracle.
 2. Track I: finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
 3. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
 4. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.

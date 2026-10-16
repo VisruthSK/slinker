@@ -1370,7 +1370,31 @@ fn opaque_registered_component() -> NativeComponent {
 }
 
 #[test]
-fn opaque_registered_selector_is_consumed_by_native_call() {
+fn computed_native_selector_is_not_proven_by_a_sole_audited_dll() {
+    let mut component = opaque_registered_component();
+    component.safety = NativeSafety::Safe(NativeFacts {
+        callbacks: Vec::new(),
+    });
+    let root = PackageFixture::new(
+        "root",
+        &[(
+            "f",
+            Some("f <- function(nm = 'tick') .Call(nm, PACKAGE = 'root')"),
+        )],
+    )
+    .exports(export("f"))
+    .dynlibs(vec![component])
+    .build();
+    let plan = analyze_images(vec![root]);
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| { diagnostic.code == RejectCode::UnknownNativeLookup })
+    );
+}
+
+#[test]
+fn unresolved_native_selector_blocks_despite_opaque_registration() {
     let root = PackageFixture::new("root", &[("f", Some("f <- function(x) .Call(croot_f, x)"))])
         .exports(export("f"))
         .dynlibs(vec![opaque_registered_component()])
@@ -1386,15 +1410,16 @@ fn opaque_registered_selector_is_consumed_by_native_call() {
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeEffects)
     );
-    assert!(!plan.blockers().iter().any(|diagnostic| {
-        diagnostic.code == RejectCode::UnknownNativeLookup
-            || (diagnostic.code == RejectCode::UnresolvedBinding
-                && diagnostic.message.contains("croot_f"))
-    }));
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| { diagnostic.code == RejectCode::UnknownNativeLookup })
+    );
+    assert_eq!(unresolved_name_evidence(&plan, "croot_f").count(), 1);
 }
 
 #[test]
-fn opaque_native_selector_consumption_is_occurrence_specific() {
+fn native_selector_does_not_hide_unresolved_reference_occurrences() {
     let root = PackageFixture::new(
         "root",
         &[(
@@ -1407,17 +1432,16 @@ fn opaque_native_selector_consumption_is_occurrence_specific() {
     .build();
     let plan = analyze_images(vec![root]);
 
-    assert_eq!(unresolved_name_evidence(&plan, "croot_f").count(), 1);
+    assert_eq!(unresolved_name_evidence(&plan, "croot_f").count(), 2);
     assert!(
-        !plan
-            .blockers()
+        plan.blockers()
             .iter()
             .any(|diagnostic| diagnostic.code == RejectCode::UnknownNativeLookup)
     );
 }
 
 #[test]
-fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
+fn ordinary_r_binding_is_retained_but_not_assumed_to_be_a_native_selector() {
     let root = PackageFixture::new(
         "root",
         &[("f", Some("f <- function(x) .Call(foo, x)")), ("foo", None)],
@@ -1436,7 +1460,7 @@ fn ordinary_r_binding_beats_opaque_native_selector_fallback() {
 }
 
 #[test]
-fn shadowed_native_primitive_does_not_consume_selector() {
+fn shadowed_native_primitive_does_not_require_native_component() {
     let root = PackageFixture::new(
         "root",
         &[("f", Some("f <- function(.Call, x) .Call(croot_f, x)"))],
@@ -1462,7 +1486,7 @@ fn shadowed_native_primitive_does_not_consume_selector() {
 }
 
 #[test]
-fn named_opaque_native_selector_is_matched_by_formal_name() {
+fn named_unresolved_native_selector_blocks_despite_opaque_registration() {
     let root = PackageFixture::new(
         "root",
         &[("f", Some("f <- function(x) .Call(x, .NAME = croot_f)"))],
@@ -1478,11 +1502,12 @@ fn named_opaque_native_selector_is_matched_by_formal_name() {
             .iter()
             .any(|node| matches!(node.kind, NodeKind::NativeComponent { .. }))
     );
-    assert!(!plan.blockers().iter().any(|diagnostic| {
-        diagnostic.code == RejectCode::UnknownNativeLookup
-            || (diagnostic.code == RejectCode::UnresolvedBinding
-                && diagnostic.message.contains("croot_f"))
-    }));
+    assert!(
+        plan.blockers()
+            .iter()
+            .any(|diagnostic| { diagnostic.code == RejectCode::UnknownNativeLookup })
+    );
+    assert_eq!(unresolved_name_evidence(&plan, "croot_f").count(), 1);
 }
 
 #[test]
@@ -1597,7 +1622,7 @@ fn registered_native_symbol_can_be_assigned_into_namespace_state() {
 }
 
 #[test]
-fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
+fn opaque_registration_without_symbol_facts_still_blocks_onload() {
     let mut root = PackageFixture::new(
         "root",
         &[
@@ -1622,10 +1647,6 @@ fn opaque_registered_native_rhs_in_onload_is_not_misreported_as_r_binding() {
     .build();
     Arc::make_mut(&mut root.index).lifecycle.on_load = true;
     let plan = analyze_images(vec![root]);
-    assert!(!plan.blockers().iter().any(|diagnostic| {
-        diagnostic.code == RejectCode::UnresolvedBinding
-            && diagnostic.message.contains("croot_tick")
-    }));
     assert!(
         plan.blockers()
             .iter()
