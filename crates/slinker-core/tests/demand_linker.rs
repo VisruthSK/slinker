@@ -181,6 +181,14 @@ impl PackageResolver for FakeProvider {
 }
 
 impl PackageProvider for FakeProvider {
+    fn inspect_dataset(
+        &self,
+        _package: &InstalledPackage,
+        _name: &DatasetName,
+    ) -> Result<Vec<slinker_core::package::ObjectIssue>> {
+        // These fixtures model passive datasets without invoking an R worker.
+        Ok(Vec::new())
+    }
     fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         self.packages
             .get(package.identity.name.as_str())
@@ -429,7 +437,7 @@ fn retained_binding(plan: &slinker_core::analysis::LinkIr, package: &str, bindin
 fn retained_private_binding(
     plan: &slinker_core::analysis::LinkIr,
     package: &str,
-    environment: &str,
+    environment: &EnvironmentLabel,
     binding: &str,
 ) -> bool {
     plan.provenance().nodes().iter().any(|node| {
@@ -469,12 +477,12 @@ fn program_has_s3_registration(
         })
 }
 
-fn private_closure(name: &str, environment: &str, source: &str) -> PrivateBindingImage {
+fn private_closure(name: &str, environment: EnvironmentLabel, source: &str) -> PrivateBindingImage {
     PrivateBindingImage {
         name: name.into(),
         object: ObjectImage {
             closure: Some(ClosureSource {
-                environment: environment.into(),
+                environment,
                 source: Arc::from(source),
             }),
             ..ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Closure)
@@ -502,9 +510,11 @@ fn retaining_structured_object_executes_nested_closures() {
         .object
         .embedded_closures
         .push(EmbeddedClosureSource {
-            path: "$[[1]]".into(),
+            path: MemberPath::root().child(slinker_core::package::MemberStep::Element(
+                1.try_into().unwrap(),
+            )),
             source: Arc::from(".slinker_embedded <- function() nested_dependency()"),
-            environment: "namespace:root".into(),
+            environment: EnvironmentLabel::namespace("root"),
         });
 
     let plan = analyze_images(vec![root]);
@@ -528,23 +538,25 @@ fn runtime_reenclosure_blocks_without_inventing_an_environment() {
         .closure
         .as_mut()
         .unwrap()
-        .environment = "private:1".into();
+        .environment = EnvironmentLabel::private("1");
     let capsule = Arc::make_mut(root.bindings.get_mut("capsule").unwrap());
     capsule.object.object_kind = ObjectKind::Environment;
-    capsule.object.environment = Some("private:1".into());
+    capsule.object.environment = Some(EnvironmentLabel::private("1"));
     {
         let templates = Arc::make_mut(root.bindings.get_mut("templates").unwrap());
         templates.object.object_kind = ObjectKind::List;
-        for name in ["first", "second"] {
+        for (index, name) in ["first", "second"].into_iter().enumerate() {
             templates
                 .object
                 .embedded_closures
                 .push(EmbeddedClosureSource {
-                    path: MemberPath::root().field(name),
+                    path: MemberPath::root().child(slinker_core::package::MemberStep::Element(
+                        (index + 1).try_into().unwrap(),
+                    )),
                     source: Arc::from(format!(
                         ".slinker_embedded <- function() {{ self; {name}_dependency() }}"
                     )),
-                    environment: "namespace:root".into(),
+                    environment: EnvironmentLabel::namespace("root"),
                 });
         }
     }
@@ -557,7 +569,7 @@ fn runtime_reenclosure_blocks_without_inventing_an_environment() {
                 object: ObjectImage {
                     closure: Some(ClosureSource {
                         source: Arc::from(format!("{name}_dependency <- function() 1")),
-                        environment: "namespace:root".into(),
+                        environment: EnvironmentLabel::namespace("root"),
                     }),
                     ..ObjectImage::of_kind(BindingRepresentation::Value, ObjectKind::Closure)
                 },
@@ -565,16 +577,16 @@ fn runtime_reenclosure_blocks_without_inventing_an_environment() {
         );
     }
     root.private_environments.insert(
-        "private:1".into(),
+        EnvironmentLabel::private("1"),
         Arc::new(PrivateEnvironmentImage {
-            id: "private:1".into(),
-            parent: "namespace:root".into(),
+            id: EnvironmentLabel::private("1"),
+            parent: EnvironmentLabel::namespace("root"),
             bindings: HashMap::from([
                 (
                     "assign_func_envs".into(),
                     private_closure(
                         "assign_func_envs",
-                        "private:1",
+                        EnvironmentLabel::private("1"),
                         "assign_func_envs <- function(objs, target_env) { if (is.null(target_env)) return(objs); lapply(objs, function(x) { if (is.function(x)) environment(x) <- target_env; x }) }",
                     ),
                 ),
@@ -582,7 +594,7 @@ fn runtime_reenclosure_blocks_without_inventing_an_environment() {
                     "list2env2".into(),
                     private_closure(
                         "list2env2",
-                        "private:1",
+                        EnvironmentLabel::private("1"),
                         "list2env2 <- function(x, envir = NULL) { if (is.null(envir)) envir <- new.env(); if (length(x) == 0L) return(NULL); list2env(x, envir) }",
                     ),
                 ),
@@ -616,7 +628,7 @@ fn unknown_closure_enclosure_reports_root_cause_without_lexical_cascade() {
         .closure
         .as_mut()
         .unwrap()
-        .environment = "unsupported:dynamic".into();
+        .environment = EnvironmentLabel::unsupported("dynamic");
     let plan = analyze_images(vec![root]);
 
     assert!(plan.blockers().iter().any(|diagnostic| {
@@ -693,15 +705,19 @@ fn closure_private_environment_is_inventory_not_a_root_set() {
         .closure
         .as_mut()
         .unwrap()
-        .environment = "private:1".into();
+        .environment = EnvironmentLabel::private("1");
     root.private_environments.insert(
-        "private:1".into(),
+        EnvironmentLabel::private("1"),
         Arc::new(PrivateEnvironmentImage {
-            id: "private:1".into(),
-            parent: "namespace:root".into(),
+            id: EnvironmentLabel::private("1"),
+            parent: EnvironmentLabel::namespace("root"),
             bindings: HashMap::from([(
                 "unused".into(),
-                private_closure("unused", "private:1", "unused <- function() foo::bar()"),
+                private_closure(
+                    "unused",
+                    EnvironmentLabel::private("1"),
+                    "unused <- function() foo::bar()",
+                ),
             )]),
         }),
     );
@@ -710,7 +726,7 @@ fn closure_private_environment_is_inventory_not_a_root_set() {
     assert!(!retained_private_binding(
         &plan,
         "root",
-        "private:1",
+        &EnvironmentLabel::private("1"),
         "unused"
     ));
     assert!(
@@ -734,20 +750,28 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
         .closure
         .as_mut()
         .unwrap()
-        .environment = "private:1".into();
+        .environment = EnvironmentLabel::private("1");
     root.private_environments.insert(
-        "private:1".into(),
+        EnvironmentLabel::private("1"),
         Arc::new(PrivateEnvironmentImage {
-            id: "private:1".into(),
-            parent: "namespace:root".into(),
+            id: EnvironmentLabel::private("1"),
+            parent: EnvironmentLabel::namespace("root"),
             bindings: HashMap::from([
                 (
                     "helper".into(),
-                    private_closure("helper", "private:1", "helper <- function() 1"),
+                    private_closure(
+                        "helper",
+                        EnvironmentLabel::private("1"),
+                        "helper <- function() 1",
+                    ),
                 ),
                 (
                     "unused".into(),
-                    private_closure("unused", "private:1", "unused <- function() foo::bar()"),
+                    private_closure(
+                        "unused",
+                        EnvironmentLabel::private("1"),
+                        "unused <- function() foo::bar()",
+                    ),
                 ),
             ]),
         }),
@@ -757,13 +781,13 @@ fn lexical_lookup_demands_only_the_referenced_private_binding() {
     assert!(retained_private_binding(
         &plan,
         "root",
-        "private:1",
+        &EnvironmentLabel::private("1"),
         "helper"
     ));
     assert!(!retained_private_binding(
         &plan,
         "root",
-        "private:1",
+        &EnvironmentLabel::private("1"),
         "unused"
     ));
     assert!(
@@ -785,19 +809,19 @@ fn unused_private_binding_issue_does_not_block_owner_closure() {
         .closure
         .as_mut()
         .unwrap()
-        .environment = "private:1".into();
+        .environment = EnvironmentLabel::private("1");
     root.private_environments.insert(
-        "private:1".into(),
+        EnvironmentLabel::private("1"),
         Arc::new(PrivateEnvironmentImage {
-            id: "private:1".into(),
-            parent: "namespace:root".into(),
+            id: EnvironmentLabel::private("1"),
+            parent: EnvironmentLabel::namespace("root"),
             bindings: HashMap::from([(
                 "bad".into(),
                 PrivateBindingImage {
                     name: "bad".into(),
                     object: ObjectImage {
                         issues: vec![ObjectIssue {
-                            path: "$".into(),
+                            path: MemberPath::root(),
                             kind: ObjectIssueKind::ExternalPointer,
                             detail: "external pointer".into(),
                         }],
@@ -4388,17 +4412,17 @@ fn private_helper_body_does_not_discharge_namespace_fallthrough() {
         .closure
         .as_mut()
         .unwrap()
-        .environment = "private:1".into();
+        .environment = EnvironmentLabel::private("1");
     root.private_environments.insert(
-        "private:1".into(),
+        EnvironmentLabel::private("1"),
         Arc::new(PrivateEnvironmentImage {
-            id: "private:1".into(),
-            parent: "namespace:root".into(),
+            id: EnvironmentLabel::private("1"),
+            parent: EnvironmentLabel::namespace("root"),
             bindings: HashMap::from([(
                 ".die".into(),
                 private_closure(
                     ".die",
-                    "private:1",
+                    EnvironmentLabel::private("1"),
                     ".die <- function() { stop('invalid') }",
                 ),
             )]),
@@ -4407,7 +4431,12 @@ fn private_helper_body_does_not_discharge_namespace_fallthrough() {
 
     let plan = analyze_images(vec![root]);
 
-    assert!(retained_private_binding(&plan, "root", "private:1", ".die"));
+    assert!(retained_private_binding(
+        &plan,
+        "root",
+        &EnvironmentLabel::private("1"),
+        ".die"
+    ));
     assert!(retained_binding(&plan, "root", "value"));
     assert!(!plan.blockers().iter().any(|diagnostic| {
         diagnostic.binding.as_deref() == Some("public") && diagnostic.message.contains("value")
@@ -5454,9 +5483,9 @@ mod schedule_equivalence {
     };
     use slinker_core::analysis::{ExplanationDag, LinkIr, Linker, Schedule};
     use slinker_core::package::{
-        EmbeddedClosureSource, ImportBinding, ImportSpec, MemberPath, NativeComponent, NativeFacts,
-        NativeLibrary, NativeRegistration, NativeSafety, NativeSymbolBinding, ObjectKind,
-        PackageImage, PrivateEnvironmentImage, S3Registration,
+        EmbeddedClosureSource, EnvironmentLabel, ImportBinding, ImportSpec, MemberPath,
+        NativeComponent, NativeFacts, NativeLibrary, NativeRegistration, NativeSafety,
+        NativeSymbolBinding, ObjectKind, PackageImage, PrivateEnvironmentImage, S3Registration,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -5625,35 +5654,37 @@ mod schedule_equivalence {
             .closure
             .as_mut()
             .unwrap()
-            .environment = "private:1".into();
+            .environment = EnvironmentLabel::private("1");
         let capsule = Arc::make_mut(root.bindings.get_mut("capsule").unwrap());
         capsule.object.object_kind = ObjectKind::Environment;
-        capsule.object.environment = Some("private:1".into());
+        capsule.object.environment = Some(EnvironmentLabel::private("1"));
         let templates = Arc::make_mut(root.bindings.get_mut("templates").unwrap());
         templates.object.object_kind = ObjectKind::List;
-        for name in ["first", "second"] {
+        for (index, name) in ["first", "second"].into_iter().enumerate() {
             templates
                 .object
                 .embedded_closures
                 .push(EmbeddedClosureSource {
-                    path: MemberPath::root().field(name),
+                    path: MemberPath::root().child(slinker_core::package::MemberStep::Element(
+                        (index + 1).try_into().unwrap(),
+                    )),
                     source: Arc::from(format!(
                         ".slinker_embedded <- function() {{ self; {name}_dependency() }}"
                     )),
-                    environment: "namespace:root".into(),
+                    environment: EnvironmentLabel::namespace("root"),
                 });
         }
         root.private_environments.insert(
-            "private:1".into(),
+            EnvironmentLabel::private("1"),
             Arc::new(PrivateEnvironmentImage {
-                id: "private:1".into(),
-                parent: "namespace:root".into(),
+                id: EnvironmentLabel::private("1"),
+                parent: EnvironmentLabel::namespace("root"),
                 bindings: HashMap::from([
                     (
                         "assign_func_envs".into(),
                         private_closure(
                             "assign_func_envs",
-                            "private:1",
+                            EnvironmentLabel::private("1"),
                             "assign_func_envs <- function(objs, target_env) { if (is.null(target_env)) return(objs); lapply(objs, function(x) { if (is.function(x)) environment(x) <- target_env; x }) }",
                         ),
                     ),
@@ -5661,7 +5692,7 @@ mod schedule_equivalence {
                         "list2env2".into(),
                         private_closure(
                             "list2env2",
-                            "private:1",
+                            EnvironmentLabel::private("1"),
                             "list2env2 <- function(x, envir = NULL) { if (is.null(envir)) envir <- new.env(); if (length(x) == 0L) return(NULL); list2env(x, envir) }",
                         ),
                     ),
@@ -5716,25 +5747,37 @@ mod schedule_equivalence {
                 .closure
                 .as_mut()
                 .unwrap()
-                .environment = "private:1".into();
+                .environment = EnvironmentLabel::private("1");
         }
         root.private_environments.insert(
-            "private:1".into(),
+            EnvironmentLabel::private("1"),
             Arc::new(PrivateEnvironmentImage {
-                id: "private:1".into(),
-                parent: "namespace:root".into(),
+                id: EnvironmentLabel::private("1"),
+                parent: EnvironmentLabel::namespace("root"),
                 bindings: HashMap::from([
                     (
                         "used".into(),
-                        private_closure("used", "private:1", "used <- function() deeper()"),
+                        private_closure(
+                            "used",
+                            EnvironmentLabel::private("1"),
+                            "used <- function() deeper()",
+                        ),
                     ),
                     (
                         "deeper".into(),
-                        private_closure("deeper", "private:1", "deeper <- function() 1"),
+                        private_closure(
+                            "deeper",
+                            EnvironmentLabel::private("1"),
+                            "deeper <- function() 1",
+                        ),
                     ),
                     (
                         "unused".into(),
-                        private_closure("unused", "private:1", "unused <- function() 2"),
+                        private_closure(
+                            "unused",
+                            EnvironmentLabel::private("1"),
+                            "unused <- function() 2",
+                        ),
                     ),
                 ]),
             }),

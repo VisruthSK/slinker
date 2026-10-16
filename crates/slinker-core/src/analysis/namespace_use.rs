@@ -4,7 +4,7 @@ use super::resolution::{BindingTarget, ReferenceUse, Resolution};
 use super::state::AnalyzerState;
 use crate::Result;
 use crate::analysis::{EdgeKind, Need, RejectCode};
-use crate::package::{EnvironmentKind, PackageId, PackageProvider, PackageRole};
+use crate::package::{EnvironmentLabel, PackageId, PackageProvider, PackageRole};
 use crate::syntax::{CallSite, NamespaceUseKind, StaticArg, StaticEnvironment};
 
 enum NamespaceTarget {
@@ -217,7 +217,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                             .environment
                             .as_ref()
                             .is_some_and(|environment| {
-                                environment.kind() == EnvironmentKind::Private
+                                matches!(environment, EnvironmentLabel::InstalledPrivate(_))
                             });
                     }
                 } else if matches!(call.callee.as_str(), "assign" | "delayedAssign") {
@@ -302,13 +302,13 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     _ => None,
                 };
                 match closure.map(|closure| closure.environment) {
-                    Some(environment) => match environment.kind() {
-                        EnvironmentKind::Namespace(name) => self
-                            .known_package(name)
+                    Some(environment) => match environment {
+                        EnvironmentLabel::Namespace(name) => self
+                            .known_package(&name)
                             .map_or(NamespaceTarget::Unproved, NamespaceTarget::Package),
-                        EnvironmentKind::Private
-                        | EnvironmentKind::Base
-                        | EnvironmentKind::Empty => NamespaceTarget::Complete,
+                        EnvironmentLabel::InstalledPrivate(_)
+                        | EnvironmentLabel::Base
+                        | EnvironmentLabel::Empty => NamespaceTarget::Complete,
                         _ => NamespaceTarget::Unproved,
                     },
                     None => NamespaceTarget::Unproved,
@@ -387,8 +387,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                                         if !seen.insert(environment.clone()) {
                                             break None;
                                         }
-                                        if let EnvironmentKind::Namespace(name) = environment.kind()
-                                        {
+                                        if let EnvironmentLabel::Namespace(name) = &environment {
                                             break self.known_package(name);
                                         }
                                         let Some(private) = image.private_environment(&environment)

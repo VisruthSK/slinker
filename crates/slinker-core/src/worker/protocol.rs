@@ -1,8 +1,8 @@
 use crate::ir::ObjectStep;
 use crate::package::{
     BindingImage, BindingName, DataSetId, DataStorage, DatasetName, Digest, DispatchObservation,
-    EnvironmentLabel, ExportMap, ImportSpec, NativeComponent, PackageName, PrivateEnvironmentImage,
-    S3Registration,
+    EnvironmentLabel, ExportMap, ImportSpec, NativeComponent, ObjectIssue, PackageName,
+    PrivateEnvironmentImage, S3Registration,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 pub const RESPONSE_READY: u8 = 0;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetSpec {
@@ -179,6 +179,11 @@ pub enum WorkerRequest {
         objects: Vec<DatasetName>,
         sets: BTreeMap<DataSetId, Vec<DatasetName>>,
     },
+    InspectDataset {
+        request_id: u64,
+        package: PackageSpec,
+        name: DatasetName,
+    },
     SerializePayloads {
         request_id: u64,
         namespaces: Vec<NamespaceImageSpec>,
@@ -240,6 +245,10 @@ pub enum WorkerResponse {
         request_id: u64,
         library: DataLibraryFiles,
     },
+    DatasetInspection {
+        request_id: u64,
+        issues: Vec<ObjectIssue>,
+    },
     Payloads {
         request_id: u64,
         serialization: PayloadSerialization,
@@ -270,6 +279,7 @@ impl WorkerResponse {
             | Self::Bindings { request_id, .. }
             | Self::DispatchGenerics { request_id, .. }
             | Self::DataLibrary { request_id, .. }
+            | Self::DatasetInspection { request_id, .. }
             | Self::Payloads { request_id, .. }
             | Self::SyntaxValidation { request_id, .. }
             | Self::NormalizedSyntax { request_id, .. } => Some(*request_id),
@@ -284,6 +294,7 @@ impl WorkerRequest {
             Self::PackageIndex { package, .. }
             | Self::Binding { package, .. }
             | Self::BindingBatch { package, .. }
+            | Self::InspectDataset { package, .. }
             | Self::DataLibrary { package, .. } => vec![package],
             Self::DispatchGenerics { package, .. } => package.iter().collect(),
             Self::RegisterImages { packages, .. } => packages.iter().collect(),
@@ -308,6 +319,7 @@ impl WorkerRequest {
             | Self::PackageIndex { request_id, .. }
             | Self::Binding { request_id, .. }
             | Self::BindingBatch { request_id, .. }
+            | Self::InspectDataset { request_id, .. }
             | Self::DispatchGenerics { request_id, .. }
             | Self::DataLibrary { request_id, .. }
             | Self::SerializePayloads { request_id, .. }

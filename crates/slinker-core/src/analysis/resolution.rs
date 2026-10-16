@@ -4,8 +4,8 @@ use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, NodeKind, RejectCode};
 use crate::ir::ExternalBindingAccess;
 use crate::package::{
-    BindingName, ComponentName, EnvironmentKind, EnvironmentLabel, ImportSpec, NativeComponent,
-    PackageId, PackageImage, PackageName, PackageProvider,
+    BindingName, ComponentName, EnvironmentLabel, ImportSpec, NativeComponent, PackageId,
+    PackageImage, PackageName, PackageProvider,
 };
 use crate::profile::{self, Probe};
 use crate::syntax::{
@@ -250,14 +250,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 environment = private.parent.clone();
                 continue;
             }
-            return match environment.kind() {
-                EnvironmentKind::Namespace(package) if package == self.packages.name(current) => {
+            return match &environment {
+                EnvironmentLabel::Namespace(package)
+                    if package.as_str() == self.packages.name(current).as_str() =>
+                {
                     self.resolve_name(current, image, name)
                 }
-                EnvironmentKind::Namespace(package) => {
+                EnvironmentLabel::Namespace(package) => {
                     self.resolve_foreign_namespace(package, name)
                 }
-                EnvironmentKind::Base if self.packages.is_base_binding(name) => {
+                EnvironmentLabel::Base if self.packages.is_base_binding(name) => {
                     Ok(Resolution::Static(BindingTarget::Base))
                 }
                 _ => Ok(Resolution::unresolved(name)),

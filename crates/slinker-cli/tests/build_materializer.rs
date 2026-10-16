@@ -1241,7 +1241,7 @@ probe <- function() c(
 }
 
 #[test]
-fn payload_namespace_reference_hidden_from_analysis_blocks() {
+fn payload_namespace_reference_without_a_proven_consumer_blocks_during_analysis() {
     let r_home = discover_r_home();
     let fixture = tempfile::tempdir().expect("fixture tempdir");
     let hidden_source = fixture.path().join("hiddenbase");
@@ -1295,7 +1295,7 @@ fn payload_namespace_reference_hidden_from_analysis_blocks() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(!result.status.success(), "{stderr}");
     assert!(
-        stderr.contains("payload bundle of `hiddenref` refers to namespace `hiddenbase`"),
+        stderr.contains("retained namespace object `hiddenbase` has no established consumer"),
         "{stderr}"
     );
     assert!(!output.exists());

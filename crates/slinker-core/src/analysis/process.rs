@@ -124,7 +124,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             &image,
             &SourceKey::Binding(binding.clone()),
             &binding_image.object,
-        );
+        )?;
         if let Some(closure) = &binding_image.object.closure {
             let key = SourceKey::Binding(binding.clone());
             let site = ClosureSite {
@@ -402,7 +402,32 @@ impl<P: PackageProvider> AnalyzerState<P> {
         image: &PackageImage,
         owner: &SourceKey,
         object: &ObjectImage,
-    ) {
+    ) -> Result<()> {
+        for environment in crate::package::reachable_environment_labels(image, [object]) {
+            let EnvironmentLabel::Namespace(name) = environment else {
+                continue;
+            };
+            if name == "base" || name == self.packages.name(id) {
+                continue;
+            }
+            let Some(package) = self.packages.resolve(&name)? else {
+                self.record_missing_package(
+                    node,
+                    id,
+                    &name,
+                    EdgeKind::ClosureExecution,
+                    "retained object refers to this namespace",
+                    None,
+                );
+                continue;
+            };
+            self.require(
+                node,
+                Need::Activation { package },
+                EdgeKind::ClosureExecution,
+                "retained object refers to this namespace",
+            );
+        }
         let environments = object
             .environment
             .iter()
@@ -414,6 +439,21 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     .map(|reference| &reference.environment),
             );
         for environment in environments {
+            if let EnvironmentLabel::Namespace(name) = environment
+                && name != "base"
+                && self
+                    .known_package(name)
+                    .is_some_and(|package| !self.packages.is_external(package))
+            {
+                self.diagnostic(
+                    node,
+                    id,
+                    Some(&owner.to_string()),
+                    RejectCode::UnsupportedObject,
+                    format!("retained namespace object `{name}` has no established consumer"),
+                    None,
+                );
+            }
             if let Some(private) = image.private_environment(environment) {
                 for binding in private.bindings.keys() {
                     self.require(
@@ -445,6 +485,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 "a retained value holds an executable closure",
             );
         }
+        Ok(())
     }
 
     pub(super) fn process_private_binding(
@@ -490,7 +531,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
             &image,
             &SourceKey::private(environment.clone(), binding.clone()),
             &binding_image.object,
-        );
+        )?;
         if let Some(closure) = &binding_image.object.closure {
             let key = SourceKey::private(environment.clone(), binding.clone());
             self.analyze_closure(&ClosureSite {

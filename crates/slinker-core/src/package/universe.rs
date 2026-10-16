@@ -224,6 +224,14 @@ impl<P: PackageProvider> TargetUniverse<P> {
         self.store.resource_exists(&self.entry(id).package, path)
     }
 
+    pub(crate) fn inspect_dataset(
+        &self,
+        id: PackageId,
+        name: &super::DatasetName,
+    ) -> Result<Vec<super::ObjectIssue>> {
+        self.store.inspect_dataset(&self.entry(id).package, name)
+    }
+
     pub fn validate_syntax(&self, source: &str) -> Result<SyntaxValidation> {
         self.store.validate_syntax(source)
     }

@@ -70,6 +70,9 @@ pub enum ObjectIssueKind {
     ObjectDepth,
     UnforcedPromise,
     WeakReference,
+    SourceMismatch,
+    NonData,
+    UnsupportedKind,
 }
 
 impl fmt::Display for ObjectIssueKind {
@@ -81,6 +84,9 @@ impl fmt::Display for ObjectIssueKind {
             Self::ObjectDepth => "object_depth",
             Self::UnforcedPromise => "unforced_promise",
             Self::WeakReference => "weak_reference",
+            Self::SourceMismatch => "source_mismatch",
+            Self::NonData => "non_data",
+            Self::UnsupportedKind => "unsupported_kind",
         })
     }
 }
@@ -130,6 +136,51 @@ pub struct ObjectImage {
 }
 
 impl ObjectImage {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        match (&self.object_kind, &self.closure, &self.environment) {
+            (ObjectKind::Closure, Some(closure), Some(environment))
+                if &closure.environment == environment => {}
+            (ObjectKind::Environment, None, Some(_)) => {}
+            (ObjectKind::Closure | ObjectKind::Environment, _, _) => {
+                return Err("missing or contradictory object enclosure");
+            }
+            (_, None, None) => {}
+            _ => return Err("non-enclosed object carries a closure or environment"),
+        }
+        match &self.representation {
+            BindingRepresentation::ActiveBinding
+                if self.object_kind != ObjectKind::ActiveBinding =>
+            {
+                return Err("active binding representation has a different object kind");
+            }
+            BindingRepresentation::Altrep { .. } if self.object_kind != ObjectKind::Altrep => {
+                return Err("ALTREP representation has a different object kind");
+            }
+            BindingRepresentation::Promise { forced: false }
+                if self.object_kind != ObjectKind::Promise =>
+            {
+                return Err("unforced promise representation has a different object kind");
+            }
+            _ => {}
+        }
+        let mut paths = std::collections::HashSet::new();
+        for path in self
+            .embedded_closures
+            .iter()
+            .map(|closure| &closure.path)
+            .chain(
+                self.embedded_environments
+                    .iter()
+                    .map(|environment| &environment.path),
+            )
+        {
+            if path.is_root() || !paths.insert(path) {
+                return Err("embedded object locations are empty or duplicated");
+            }
+        }
+        Ok(())
+    }
+
     pub fn closure_sources(&self) -> impl Iterator<Item = &str> {
         self.closure
             .iter()
@@ -231,12 +282,11 @@ impl PackageImage {
 
 pub(crate) fn reachable_environment_labels<'a>(
     image: &PackageImage,
-    names: impl IntoIterator<Item = &'a str>,
+    objects: impl IntoIterator<Item = &'a ObjectImage>,
 ) -> std::collections::BTreeSet<EnvironmentLabel> {
-    let mut labels = names
+    let mut labels = objects
         .into_iter()
-        .filter_map(|name| image.binding(name))
-        .flat_map(|binding| binding.object.environment_labels().cloned())
+        .flat_map(|object| object.environment_labels().cloned())
         .collect::<std::collections::BTreeSet<_>>();
     let mut pending = labels.iter().cloned().collect::<Vec<_>>();
     while let Some(label) = pending.pop() {

@@ -81,7 +81,7 @@ missing fact.
 ## Regression corpus
 
 Keep passing: `crates/slinker-cli/tests/build_materializer.rs` (synthetic fixtures, vendored `praise`/`pkgconfig`);
-`crates/slinker-cli/tests/soundness.rs` (computed call blockers, operator lookup, closure attributes, and runtime-support collisions);
+`crates/slinker-cli/tests/soundness.rs` (computed call blockers, operator lookup, structural payload members, passive datasets, default fidelity, foreign enclosures, closure attributes, and runtime-support collisions);
 `crates/slinker-cli/tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, and `here` verify their original suites and block on unproven `do.call` targets; restore their generated-package installation-independence checks only after a sound callable proof or declaration covers those targets; `pkgcond`, `doubt`,
 `config`, `qrcode` (unselected optional packages), and `voucher` with cli and fs Linked block with their
 exact unproven behavior until a sound rule covers it); `crates/slinker-cli/tests/harp_runtime.rs` (target-R relocation verification accepts exactly the planned
@@ -93,25 +93,11 @@ acceptance cases here.
 ## Next up
 
 1. Capture the remaining independent failures in `fixes.md` as regressions under `crates/*/tests/`; retain original R as the oracle. Delete unresolved-selector/sole-DLL guesses.
-2. Tracks G/I: share object traversal with structural identities and finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
+2. Track I: finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
 3. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
 4. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
 
 ---
-
-## Track G: Structural object observation
-
-- Share traversal mechanics for binding inspection, passive-dataset validation, and alias/reference checks. Keep explicit policies and non-execution of nested promises/active bindings.
-- Use structural member steps, including list position and attributes, with display labels separate from identity. Distinguish duplicate and delimiter-containing names.
-- Inspect or block executable/unsupported objects throughout lists, pairlists, expressions, language objects, defaults, attributes, and private environments. Demanded datasets admit ordinary data only.
-- Validate wire/cache observations before trusted semantic construction. Distinguish durable installed lazy-load environment keys from worker-local labels and namespace references.
-- Foreign namespace references in retained payloads create explicit retention/role obligations. Preserve existing private-state and foreign-enclosure regressions, including `httr` -> R6 where provisioned.
-
-Done when:
-- duplicate-member, expression-vector, ALTREP-attribute, primitive-callable, dataset, default-attribute, alias, and foreign-namespace regressions are covered by original-R oracles;
-- no object kind accepted for serialization bypasses the applicable structural policy;
-- the shared walker replaces duplicate traversal/type dispatch without introducing an abstract R heap or construction interpreter.
-
 
 ## Track H: Static analysis performance
 

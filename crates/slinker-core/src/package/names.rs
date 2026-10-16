@@ -119,96 +119,128 @@ name_type!(SymbolName);
 name_type!(DataSetId);
 name_type!(ExportName);
 name_type!(GenericLabel);
-name_type!(EnvironmentLabel);
 name_type!(Atom);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EnvironmentKind<'a> {
-    Namespace(&'a str),
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EnvironmentLabel {
+    Namespace(PackageName),
     Base,
     Empty,
-    Private,
-    Unsupported(&'a str),
-    Other,
+    InstalledPrivate(Atom),
+    Unsupported(Atom),
+}
+
+impl Serialize for EnvironmentLabel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvironmentLabel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let label = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        match label.as_ref() {
+            "base:base" => Ok(Self::Base),
+            "base:empty" => Ok(Self::Empty),
+            text => match text.split_once(':') {
+                Some(("namespace", name)) if !name.is_empty() => Ok(Self::namespace(name)),
+                Some(("private", key)) if !key.is_empty() => Ok(Self::private(key)),
+                Some(("unsupported", detail)) => Ok(Self::unsupported(detail)),
+                _ => Err(serde::de::Error::custom(
+                    "invalid installed environment identity",
+                )),
+            },
+        }
+    }
+}
+
+impl fmt::Display for EnvironmentLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Namespace(package) => write!(f, "namespace:{package}"),
+            Self::Base => f.write_str("base:base"),
+            Self::Empty => f.write_str("base:empty"),
+            Self::InstalledPrivate(key) => write!(f, "private:{key}"),
+            Self::Unsupported(detail) => write!(f, "unsupported:{detail}"),
+        }
+    }
 }
 
 impl EnvironmentLabel {
     pub fn namespace(package: &str) -> Self {
-        Self(intern(&format!("namespace:{package}")))
+        Self::Namespace(package.into())
     }
 
     pub fn base() -> Self {
-        Self("base:base".into())
+        Self::Base
     }
 
     pub fn empty() -> Self {
-        Self("base:empty".into())
+        Self::Empty
     }
 
     pub fn private(key: impl fmt::Display) -> Self {
-        Self(intern(&format!("private:{key}")))
+        Self::InstalledPrivate(key.to_string().into())
     }
 
     pub fn unsupported(detail: &str) -> Self {
-        Self(intern(&format!("unsupported:{detail}")))
-    }
-
-    pub fn kind(&self) -> EnvironmentKind<'_> {
-        let label = &*self.0;
-        if let Some(package) = label.strip_prefix("namespace:") {
-            EnvironmentKind::Namespace(package)
-        } else if let Some(detail) = label.strip_prefix("unsupported:") {
-            EnvironmentKind::Unsupported(detail)
-        } else if label.starts_with("private:") {
-            EnvironmentKind::Private
-        } else if label == "base:base" {
-            EnvironmentKind::Base
-        } else if label == "base:empty" {
-            EnvironmentKind::Empty
-        } else {
-            EnvironmentKind::Other
-        }
+        Self::Unsupported(detail.into())
     }
 
     pub fn is_unsupported(&self) -> bool {
-        matches!(self.kind(), EnvironmentKind::Unsupported(_))
+        matches!(self, Self::Unsupported(_))
     }
 
     pub fn is_namespace_of(&self, package: &str) -> bool {
-        self.kind() == EnvironmentKind::Namespace(package)
+        matches!(self, Self::Namespace(name) if name == package)
     }
 }
-name_type!(MemberPath);
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum MemberStep {
+    Element(std::num::NonZeroUsize),
+    Attribute {
+        position: std::num::NonZeroUsize,
+        name: BindingName,
+    },
+    Formals,
+    Body,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MemberPath(Vec<MemberStep>);
 
 impl MemberPath {
     pub fn root() -> Self {
-        Self("$".into())
+        Self::default()
     }
 
     #[must_use]
-    pub fn field(&self, name: &str) -> Self {
-        Self(intern(&format!("{}${name}", self.0)))
-    }
-
-    #[must_use]
-    pub fn element(&self, position: usize) -> Self {
-        Self(intern(&format!("{}[[{position}]]", self.0)))
+    pub fn child(&self, step: MemberStep) -> Self {
+        let mut path = self.clone();
+        path.0.push(step);
+        path
     }
 
     pub fn is_root(&self) -> bool {
-        &*self.0 == "$"
+        self.0.is_empty()
     }
+}
 
-    pub fn direct_field(&self) -> Option<&str> {
-        let name = self.0.strip_prefix("$$")?;
-        (!name.is_empty() && !name.contains(['$', '[', ']'])).then_some(name)
-    }
-
-    pub fn direct_element(&self) -> Option<usize> {
-        let digits = self.0.strip_prefix("$[[")?.strip_suffix("]]")?;
-        (!digits.contains(['[', '$', '.']))
-            .then(|| digits.parse().ok())
-            .flatten()
+impl fmt::Display for MemberPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("$")?;
+        for step in &self.0 {
+            match step {
+                MemberStep::Element(position) => write!(f, "[[{position}]]")?,
+                MemberStep::Attribute { position, name } => {
+                    write!(f, ".attr[[{position}, {:?}]]", name.as_str())?;
+                }
+                MemberStep::Formals => f.write_str(".formals")?,
+                MemberStep::Body => f.write_str(".body")?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -259,5 +291,4 @@ from_atom!(
     DataSetId,
     ExportName,
     GenericLabel,
-    EnvironmentLabel,
 );

@@ -12,6 +12,301 @@ fn package(path: &Path, name: &str, imports: &str, code: &str) {
 }
 
 #[test]
+fn structural_payload_members_retain_each_callable_as_in_original_r() {
+    let r = discover_r_home();
+    for (label, members, call) in [
+        (
+            "duplicates",
+            "list(same=function() 1L, same=function() hidden())",
+            "bundle[[2L]]()",
+        ),
+        (
+            "delimiters",
+            "list('a$b'=function() 1L, a=list(b=function() hidden()))",
+            "bundle$a$b()",
+        ),
+        (
+            "expression",
+            "as.expression(list(function() hidden()))",
+            "bundle[[1L]]()",
+        ),
+        (
+            "pairlist",
+            "pairlist(same=function() 1L, same=function() hidden())",
+            "bundle[[2L]]()",
+        ),
+        (
+            "primitive",
+            "list(sum)",
+            "bundle[[1L]](structure(1L, class='foo'))",
+        ),
+        (
+            "language",
+            "as.call(list(quote(identity), function() hidden()))",
+            "bundle[[2L]]()",
+        ),
+        (
+            "altrep",
+            "structure(1:1000000, callback=function() hidden())",
+            "attr(bundle, 'callback')()",
+        ),
+        (
+            "expressionattribute",
+            "structure(expression(1L), callback=function() hidden())",
+            "attr(bundle, 'callback')()",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        fs::create_dir(&original).unwrap();
+        let dep = temp.path().join("dep");
+        package(
+            &dep,
+            "sounddep",
+            "",
+            &format!(
+                "hidden <- function() 'expected'\nSummary.foo <- function(..., na.rm=FALSE) 'expected'\nbundle <- {members}\nrun <- function() {call}\n"
+            ),
+        );
+        install_package(&r, &dep, &original);
+        let root = temp.path().join("root");
+        package(
+            &root,
+            "soundroot",
+            "Imports: sounddep\n",
+            "run <- function() sounddep::run()",
+        );
+        install_package(&r, &root, &original);
+        let oracle = "stopifnot(identical(soundroot::run(), 'expected'))";
+        run_r(&r, &original, oracle);
+        let output = temp.path().join("generated");
+        let result = slinker(&[
+            "build".as_ref(),
+            root.as_os_str(),
+            "--lib".as_ref(),
+            original.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+        ]);
+        assert_success(&result, &format!("build {label} payload"));
+        let generated = temp.path().join("generated-library");
+        fs::create_dir(&generated).unwrap();
+        install_package(&r, &output, &generated);
+        for mode in ["absent", "installed", "loaded"] {
+            let libraries = if mode == "absent" {
+                generated.clone().into_os_string()
+            } else {
+                std::env::join_paths([&generated, &original]).unwrap()
+            };
+            let preload = if mode == "loaded" {
+                "loadNamespace('sounddep');"
+            } else {
+                ""
+            };
+            run_r(&r, libraries, &format!("{preload} {oracle}"));
+        }
+    }
+}
+
+#[test]
+fn foreign_closure_enclosures_retain_their_namespace_without_lexical_references() {
+    let r = discover_r_home();
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original");
+    fs::create_dir(&original).unwrap();
+    let foreign = temp.path().join("foreign");
+    package(&foreign, "soundforeign", "", "run <- function() 42L");
+    install_package(&r, &foreign, &original);
+    let dep = temp.path().join("dep");
+    package(
+        &dep,
+        "sounddep",
+        "Imports: soundforeign\n",
+        "run <- soundforeign::run",
+    );
+    common::install_package_using(&r, &dep, &original, &original);
+    let root = temp.path().join("root");
+    package(
+        &root,
+        "soundroot",
+        "Imports: sounddep\n",
+        "run <- function() sounddep::run()",
+    );
+    common::install_package_using(&r, &root, &original, &original);
+    let oracle = "stopifnot(identical(soundroot::run(), 42L))";
+    run_r(&r, &original, oracle);
+    let output = temp.path().join("generated");
+    assert_success(
+        &slinker(&[
+            "build".as_ref(),
+            root.as_os_str(),
+            "--lib".as_ref(),
+            original.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+        ]),
+        "build foreign closure enclosure",
+    );
+    let generated = temp.path().join("generated-library");
+    fs::create_dir(&generated).unwrap();
+    install_package(&r, &output, &generated);
+    for mode in ["absent", "installed", "loaded"] {
+        let libraries = if mode == "absent" {
+            generated.clone().into_os_string()
+        } else {
+            std::env::join_paths([&generated, &original]).unwrap()
+        };
+        let preload = if mode == "loaded" {
+            "loadNamespace('sounddep'); loadNamespace('soundforeign');"
+        } else {
+            ""
+        };
+        run_r(&r, libraries, &format!("{preload} {oracle}"));
+    }
+}
+
+#[test]
+fn namespace_objects_in_payloads_cannot_expose_removed_bindings() {
+    let r = discover_r_home();
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original");
+    fs::create_dir(&original).unwrap();
+    let dep = temp.path().join("dep");
+    package(
+        &dep,
+        "sounddep",
+        "",
+        "hidden <- 42L\nrun <- function() NULL",
+    );
+    install_package(&r, &dep, &original);
+    let root = temp.path().join("root");
+    package(
+        &root,
+        "soundroot",
+        "Imports: sounddep\n",
+        "box <- list(asNamespace('sounddep'))\nrun <- function() box[[1L]]$hidden",
+    );
+    common::install_package_using(&r, &root, &original, &original);
+    run_r(&r, &original, "stopifnot(identical(soundroot::run(),42L))");
+    let output = temp.path().join("generated");
+    let result = slinker(&[
+        "build".as_ref(),
+        root.as_os_str(),
+        "--lib".as_ref(),
+        original.as_os_str(),
+        "--output".as_ref(),
+        output.as_os_str(),
+    ]);
+    assert!(
+        !result.status.success(),
+        "unproven payload namespace built successfully"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("UnsupportedObject"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn lossy_function_defaults_block_before_publication() {
+    let r = discover_r_home();
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original");
+    fs::create_dir(&original).unwrap();
+    let root = temp.path().join("root");
+    package(
+        &root,
+        "soundroot",
+        "",
+        "run <- function(x) class(x)\nformals(run)$x <- structure(1, class='special')",
+    );
+    install_package(&r, &root, &original);
+    run_r(
+        &r,
+        &original,
+        "stopifnot(identical(soundroot::run(), 'special'))",
+    );
+    let output = temp.path().join("generated");
+    let result = slinker(&[
+        "build".as_ref(),
+        root.as_os_str(),
+        "--output".as_ref(),
+        output.as_os_str(),
+    ]);
+    assert!(!result.status.success(), "lossy default built successfully");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("source_mismatch"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn executable_dataset_members_block_before_publication() {
+    let r = discover_r_home();
+    for (label, value) in [
+        ("list", "list(identity)"),
+        ("attribute", "structure(1:1000000, callback=identity)"),
+        ("expression", "as.expression(list(identity))"),
+        ("environment", "new.env(parent=emptyenv())"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        fs::create_dir(&original).unwrap();
+        let dep = temp.path().join("dep");
+        package(
+            &dep,
+            "sounddep",
+            "LazyData: true\n",
+            "run <- function() NULL",
+        );
+        let data = dep.join("data");
+        fs::create_dir(&data).unwrap();
+        let file = data
+            .join("bundle.rda")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        run_r(
+            &r,
+            "",
+            &format!("bundle <- {value}; save(bundle, file='{file}')"),
+        );
+        install_package(&r, &dep, &original);
+        run_r(&r, &original, "stopifnot(!is.null(sounddep::bundle))");
+        let root = temp.path().join("root");
+        package(
+            &root,
+            "soundroot",
+            "Imports: sounddep\n",
+            "run <- function() sounddep::bundle",
+        );
+        let output = temp.path().join("generated");
+        let result = slinker(&[
+            "build".as_ref(),
+            root.as_os_str(),
+            "--lib".as_ref(),
+            original.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+        ]);
+        assert!(
+            !result.status.success(),
+            "{label}: executable dataset built successfully"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("UnsupportedObject"),
+            "{label}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output.exists());
+    }
+}
+
+#[test]
 fn unproven_string_calls_block_instead_of_removing_the_runtime_target() {
     let r = discover_r_home();
     let cases = [

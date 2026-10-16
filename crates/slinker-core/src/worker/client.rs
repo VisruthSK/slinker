@@ -366,6 +366,25 @@ impl WorkerClient {
         )
     }
 
+    pub(crate) fn inspect_dataset(
+        &mut self,
+        package: &InstalledPackage,
+        name: &crate::package::DatasetName,
+    ) -> Result<Vec<crate::package::ObjectIssue>> {
+        self.call(
+            "dataset inspection",
+            |request_id| WorkerRequest::InspectDataset {
+                request_id,
+                package: package_spec(package),
+                name: name.clone(),
+            },
+            |response| match response {
+                WorkerResponse::DatasetInspection { issues, .. } => Some(issues),
+                _ => None,
+            },
+        )
+    }
+
     pub(crate) fn serialize_payloads(
         &mut self,
         namespaces: Vec<NamespaceImageSpec>,
@@ -621,6 +640,14 @@ fn request_context(request: &WorkerRequest) -> String {
             "request {request_id} data library of {} ({} objects)",
             package.name,
             objects.len()
+        ),
+        WorkerRequest::InspectDataset {
+            request_id,
+            package,
+            name,
+        } => format!(
+            "request {request_id} inspect dataset {}::{name}",
+            package.name
         ),
         WorkerRequest::SerializePayloads {
             request_id,

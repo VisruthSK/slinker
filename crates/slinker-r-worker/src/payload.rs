@@ -48,7 +48,10 @@ impl WorkerRuntime {
                 .iter()
                 .map(|closure| closure.sexp)
                 .collect::<HashSet<_>>();
-            if ReferenceWalk::default().reaches(&roots, &replaced) {
+            if ReferenceWalk::default()
+                .reaches(&roots, &replaced)
+                .coded(WorkerErrorCode::BindingForce)?
+            {
                 return Err(WorkerOperationError::new(
                     WorkerErrorCode::BindingForce,
                     "a rewritten payload closure is still referenced from another payload location",
@@ -228,22 +231,26 @@ struct ReferenceWalk {
 }
 
 impl ReferenceWalk {
-    fn reaches(&mut self, roots: &[harp::object::RObject], targets: &HashSet<libr::SEXP>) -> bool {
+    fn reaches(
+        &mut self,
+        roots: &[harp::object::RObject],
+        targets: &HashSet<libr::SEXP>,
+    ) -> InspectionResult<bool> {
         let mut stack = roots.iter().map(|root| root.sexp).collect::<Vec<_>>();
         while let Some(value) = stack.pop() {
             if targets.contains(&value) {
-                return true;
+                return Ok(true);
             }
             if !self.visited.insert(value) {
                 continue;
             }
-            harp::r::attrib_for_each(value, |_, attribute| stack.push(attribute));
+            stack.extend(
+                super::walk::children(value)?
+                    .into_iter()
+                    .map(|(_, child)| child),
+            );
             match harp::utils::r_typeof(value) {
-                libr::CLOSXP => stack.extend([
-                    harp::r::fn_formals(value),
-                    harp::r::fn_body(value),
-                    harp::r::fn_env(value),
-                ]),
+                libr::CLOSXP => stack.push(harp::r::fn_env(value)),
                 libr::ENVSXP => {
                     let envs = &*harp::environment::R_ENVS;
                     if [envs.global, envs.base, envs.empty, envs.base_ns].contains(&value)
@@ -253,8 +260,8 @@ impl ReferenceWalk {
                         continue;
                     }
                     stack.push(harp::r::env_parent(value));
-                    for binding in harp::environment::Environment::view(value).iter().flatten() {
-                        match binding.value {
+                    for binding in harp::environment::Environment::view(value).iter() {
+                        match binding?.value {
                             harp::environment_iter::BindingValue::Standard { object }
                             | harp::environment_iter::BindingValue::Altrep { object, .. } => {
                                 stack.push(object.sexp);
@@ -268,22 +275,9 @@ impl ReferenceWalk {
                         }
                     }
                 }
-                libr::VECSXP | libr::EXPRSXP => {
-                    for index in 0..harp::object::r_length(value) {
-                        stack.push(harp::object::list_get(value, index));
-                    }
-                }
-                libr::LISTSXP | libr::LANGSXP => {
-                    let elements = std::cell::RefCell::new(Vec::new());
-                    harp::utils::r_pairlist_any(value, |element| {
-                        elements.borrow_mut().push(element);
-                        false
-                    });
-                    stack.extend(elements.into_inner());
-                }
                 _ => {}
             }
         }
-        false
+        Ok(false)
     }
 }

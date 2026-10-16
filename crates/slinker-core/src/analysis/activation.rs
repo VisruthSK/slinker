@@ -174,6 +174,20 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 format!("dataset `{dataset}` is absent from installed image"),
                 None,
             );
+            return Ok(());
+        }
+        for issue in self.packages.inspect_dataset(id, dataset)? {
+            self.diagnostic(
+                node,
+                id,
+                None,
+                RejectCode::UnsupportedObject,
+                format!(
+                    "dataset `{dataset}` {}: {} ({})",
+                    issue.path, issue.kind, issue.detail
+                ),
+                None,
+            );
         }
         Ok(())
     }

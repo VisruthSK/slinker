@@ -214,8 +214,8 @@ fn harp_inspection_preserves_lazy_active_altrep_and_private_state() {
         BindingRepresentation::Promise { forced: false }
     );
     assert_eq!(
-        private.bindings["self"].object.environment.as_deref(),
-        Some(private.id.as_str())
+        private.bindings["self"].object.environment.as_ref(),
+        Some(&private.id)
     );
     assert!(
         private.bindings["handler"]
