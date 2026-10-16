@@ -600,6 +600,17 @@ invisible(loadNamespace("tools", lib.loc = R.home("library")))
   .slinker_callable_dispatch(get(name, envir = environment, inherits = FALSE))
 }
 
+.slinker_data_objects <- function(root, objects) {
+  environment <- new.env(hash = TRUE, parent = emptyenv())
+  base::lazyLoad(file.path(root, "data", "Rdata"), envir = environment,
+    filter = function(name) name %in% objects)
+  absent <- setdiff(objects, ls(environment, all.names = TRUE))
+  if (length(absent)) {
+    stop(sprintf("installed lazy-load data lacks: %s", toString(absent)), call. = FALSE)
+  }
+  environment
+}
+
 .slinker_data_library <- function(
   root,
   objects,
@@ -607,18 +618,7 @@ invisible(loadNamespace("tools", lib.loc = R.home("library")))
   set_lengths,
   set_members
 ) {
-  database <- file.path(root, "data", "Rdata")
-  environment <- new.env(hash = TRUE, parent = emptyenv())
-  base::lazyLoad(database, envir = environment, filter = function(name) {
-    name %in% objects
-  })
-  absent <- setdiff(objects, ls(environment, all.names = TRUE))
-  if (length(absent)) {
-    stop(
-      sprintf("installed lazy-load data lacks: %s", toString(absent)),
-      call. = FALSE
-    )
-  }
+  environment <- .slinker_data_objects(root, objects)
   directory <- tempfile("slinker-data-library")
   dir.create(directory)
   on.exit(unlink(directory, recursive = TRUE), add = TRUE)

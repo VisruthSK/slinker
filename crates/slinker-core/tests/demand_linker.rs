@@ -181,6 +181,14 @@ impl PackageResolver for FakeProvider {
 }
 
 impl PackageProvider for FakeProvider {
+    fn inspect_dataset(
+        &self,
+        _package: &InstalledPackage,
+        _name: &DatasetName,
+    ) -> Result<Vec<slinker_core::package::ObjectIssue>> {
+        // These fixtures model passive datasets without invoking an R worker.
+        Ok(Vec::new())
+    }
     fn index(&self, package: &InstalledPackage) -> Result<Arc<PackageIndex>> {
         self.packages
             .get(package.identity.name.as_str())

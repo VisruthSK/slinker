@@ -71,6 +71,7 @@ pub enum ObjectIssueKind {
     UnforcedPromise,
     WeakReference,
     SourceMismatch,
+    NonData,
     UnsupportedKind,
 }
 
@@ -84,6 +85,7 @@ impl fmt::Display for ObjectIssueKind {
             Self::UnforcedPromise => "unforced_promise",
             Self::WeakReference => "weak_reference",
             Self::SourceMismatch => "source_mismatch",
+            Self::NonData => "non_data",
             Self::UnsupportedKind => "unsupported_kind",
         })
     }

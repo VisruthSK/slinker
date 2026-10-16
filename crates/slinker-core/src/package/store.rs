@@ -334,6 +334,11 @@ pub trait PackageResolver: Send + Sync {
 }
 
 pub trait PackageProvider: PackageResolver {
+    fn inspect_dataset(
+        &self,
+        package: &InstalledPackage,
+        name: &super::DatasetName,
+    ) -> Result<Vec<super::ObjectIssue>>;
     fn native_source_fingerprint(&self, _package: &InstalledPackage) -> Option<Digest> {
         None
     }
@@ -940,6 +945,16 @@ impl PackageResolver for PackageStore {
 }
 
 impl PackageProvider for PackageStore {
+    fn inspect_dataset(
+        &self,
+        package: &InstalledPackage,
+        name: &super::DatasetName,
+    ) -> Result<Vec<super::ObjectIssue>> {
+        self.lanes
+            .lane(self.affine_lane(&package.identity))
+            .client()?
+            .inspect_dataset(package, name)
+    }
     fn native_source_fingerprint(&self, package: &InstalledPackage) -> Option<Digest> {
         self.native_summaries
             .root

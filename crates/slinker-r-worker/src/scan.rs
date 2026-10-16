@@ -12,6 +12,54 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_DEPTH: usize = 128;
 
+pub(super) fn passive_dataset(value: libr::SEXP) -> InspectionResult<Vec<ObjectIssue>> {
+    let mut pending = vec![(MemberPath::root(), value, 0)];
+    let mut visited = HashSet::new();
+    let mut issues = Vec::new();
+    while let Some((path, value, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
+            issues.push(member_issue(
+                &path,
+                ObjectIssueKind::ObjectDepth,
+                "object graph exceeds 128 levels",
+            ));
+            continue;
+        }
+        if !visited.insert(value) {
+            continue;
+        }
+        let kind = object_kind(value);
+        if !matches!(
+            kind,
+            ObjectKind::Null
+                | ObjectKind::Logical
+                | ObjectKind::Integer
+                | ObjectKind::Double
+                | ObjectKind::Complex
+                | ObjectKind::Character
+                | ObjectKind::Raw
+                | ObjectKind::List
+                | ObjectKind::Pairlist
+        ) {
+            issues.push(member_issue(
+                &path,
+                ObjectIssueKind::NonData,
+                &format!("dataset contains {kind:?}"),
+            ));
+            continue;
+        }
+        if harp::utils::r_is_altrep(value) {
+            issues.extend(altrep_issues(&path, &harp::utils::r_altrep_class(value)));
+        }
+        pending.extend(
+            super::walk::children(value)?
+                .into_iter()
+                .map(|(step, child)| (path.child(step), child, depth + 1)),
+        );
+    }
+    Ok(issues)
+}
+
 #[derive(Clone, Copy)]
 enum PromisePolicy {
     Force,

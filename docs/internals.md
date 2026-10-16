@@ -24,6 +24,10 @@ Target capture and installed-image work run in isolated Rust worker processes. E
 
 For an encountered package, slinker first reads cheap installed metadata such as `DESCRIPTION`, `Meta/package.rds`, `Meta/nsInfo.rds`, and lazy-load binding names. Full lazy-load object inspection happens only when a binding, dataset, or other semantic need requires it.
 
+Binding inspection, passive-dataset validation, and payload alias checks share structural child enumeration. It visits attributes, list and pairlist positions, expression and language members, and function formals and bodies without evaluating them. ALTREP traversal visits attributes without invoking element accessors. Private-environment inspection preserves nested promises and active bindings without executing them.
+
+Member identities are typed steps with nonzero positions; names are diagnostic labels rather than list identities. Environment identities distinguish namespaces, base/empty environments, durable installed lazy-load keys, and unsupported environments. Worker addresses remain local. Protocol and cache decoding reject malformed identities; package-image construction checks enclosure consistency, unique member locations, and reachable private-environment completeness. Foreign namespace enclosures create explicit activation obligations during analysis.
+
 Effective installed namespace metadata is the authority for imports, exports, S3 registrations, and DLL declarations. `DESCRIPTION Imports`, `Depends`, and `Suggests` are not recursively converted into a package closure. `Depends` attachment semantics remain an explicit unsupported case unless satisfied by the target policy.
 
 Target capture does not enumerate the installed package universe. Package discovery stays demand-driven: each package name is located and fingerprinted once, the first time retained code needs it, and that answer, including absence, is frozen for the invocation.

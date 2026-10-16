@@ -286,6 +286,31 @@ impl WorkerRuntime {
         })
     }
 
+    fn inspect_dataset(
+        &mut self,
+        package: &protocol::PackageSpec,
+        name: &DatasetName,
+    ) -> OperationResult<Vec<slinker_core::package::ObjectIssue>> {
+        let root = self
+            .context(package)
+            .coded(WorkerErrorCode::PackageMetadata)?
+            .image
+            .elt("root")
+            .coded(WorkerErrorCode::BindingForce)?;
+        let objects = harp::RFunction::new("", ".slinker_data_objects")
+            .add(root)
+            .add(vec![name.to_string()])
+            .call()
+            .coded(WorkerErrorCode::BindingForce)?;
+        let value = harp::RFunction::new("base", "get")
+            .add(name.as_str())
+            .param("envir", objects)
+            .param("inherits", false)
+            .call()
+            .coded(WorkerErrorCode::BindingForce)?;
+        super::scan::passive_dataset(value.sexp).coded(WorkerErrorCode::BindingForce)
+    }
+
     pub(super) fn dispatch_generics(
         &mut self,
         package: Option<&protocol::PackageSpec>,
@@ -526,6 +551,14 @@ impl WorkerRuntime {
             } => WorkerResponse::DataLibrary {
                 request_id,
                 library: self.data_library(&package, &objects, &sets)?,
+            },
+            WorkerRequest::InspectDataset {
+                request_id,
+                package,
+                name,
+            } => WorkerResponse::DatasetInspection {
+                request_id,
+                issues: self.inspect_dataset(&package, &name)?,
             },
             WorkerRequest::DispatchGenerics {
                 request_id,

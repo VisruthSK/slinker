@@ -245,6 +245,68 @@ fn lossy_function_defaults_block_before_publication() {
 }
 
 #[test]
+fn executable_dataset_members_block_before_publication() {
+    let r = discover_r_home();
+    for (label, value) in [
+        ("list", "list(identity)"),
+        ("attribute", "structure(1:1000000, callback=identity)"),
+        ("expression", "as.expression(list(identity))"),
+        ("environment", "new.env(parent=emptyenv())"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        fs::create_dir(&original).unwrap();
+        let dep = temp.path().join("dep");
+        package(
+            &dep,
+            "sounddep",
+            "LazyData: true\n",
+            "run <- function() NULL",
+        );
+        let data = dep.join("data");
+        fs::create_dir(&data).unwrap();
+        let file = data
+            .join("bundle.rda")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        run_r(
+            &r,
+            "",
+            &format!("bundle <- {value}; save(bundle, file='{file}')"),
+        );
+        install_package(&r, &dep, &original);
+        run_r(&r, &original, "stopifnot(!is.null(sounddep::bundle))");
+        let root = temp.path().join("root");
+        package(
+            &root,
+            "soundroot",
+            "Imports: sounddep\n",
+            "run <- function() sounddep::bundle",
+        );
+        let output = temp.path().join("generated");
+        let result = slinker(&[
+            "build".as_ref(),
+            root.as_os_str(),
+            "--lib".as_ref(),
+            original.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+        ]);
+        assert!(
+            !result.status.success(),
+            "{label}: executable dataset built successfully"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("UnsupportedObject"),
+            "{label}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output.exists());
+    }
+}
+
+#[test]
 fn unproven_string_calls_block_instead_of_removing_the_runtime_target() {
     let r = discover_r_home();
     let cases = [
