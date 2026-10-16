@@ -563,7 +563,7 @@ invisible(loadNamespace("tools", lib.loc = R.home("library")))
   mget(ls(baseenv(), all.names = TRUE), envir = baseenv())
 )
 
-.slinker_callable_dispatch <- function(value, name = NULL) {
+.slinker_callable_dispatch <- function(value) {
   if (!is.function(value)) {
     return(list(known = TRUE, generics = character()))
   }
@@ -586,51 +586,11 @@ invisible(loadNamespace("tools", lib.loc = R.home("library")))
       unlist(.slinker_s3_aliases[intersect(identities, names(.slinker_s3_aliases))])
     ))))
   }
-  generics <- character()
-  known <- TRUE
-  visit <- function(expression) {
-    if (is.symbol(expression) &&
-        as.character(expression) %in% c("UseMethod", "NextMethod")) {
-      known <<- FALSE
-    }
-    if (!is.call(expression) && !is.pairlist(expression) && !is.expression(expression)) {
-      return(invisible(NULL))
-    }
-    indices <- seq_along(expression)
-    if (is.call(expression)) {
-      head <- expression[[1L]]
-      if (identical(head, quote(UseMethod)) ||
-          identical(head, quote(base::UseMethod))) {
-        matched <- tryCatch(
-          match.call(args(base::UseMethod), expression),
-          error = function(error) NULL
-        )
-        generic <- if (!is.null(matched) && "generic" %in% names(matched) &&
-                       !identical(matched[["generic"]], quote(expr = ))) {
-          matched[["generic"]]
-        }
-        if (is.character(generic) && length(generic) == 1L && !is.na(generic)) {
-          generics <<- c(generics, generic)
-        } else {
-          known <<- FALSE
-        }
-        indices <- indices[-1L]
-      }
-    }
-    for (index in indices) {
-      if (!identical(expression[[index]], quote(expr = ))) visit(expression[[index]])
-    }
-  }
-  visit(body(value))
-  visit(formals(value))
-  list(known = known, generics = unique(c(
-    generics,
-    if (name %in% .internalGenerics) name
-  )))
+  list(known = FALSE, generics = character())
 }
 
 .slinker_dispatch_generics <- function(environment, name) {
-  .slinker_callable_dispatch(get(name, envir = environment, inherits = FALSE), name)
+  .slinker_callable_dispatch(get(name, envir = environment, inherits = FALSE))
 }
 
 .slinker_data_library <- function(

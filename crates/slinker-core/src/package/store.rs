@@ -29,7 +29,7 @@ fn identifiers(source: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v2";
+pub(super) const ANALYSIS_SCHEMA: &str = "slinker-analysis-v4";
 
 #[must_use]
 pub fn analysis_schema() -> &'static str {

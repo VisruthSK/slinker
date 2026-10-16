@@ -2,16 +2,16 @@ use super::arguments::{declared_strings, matched_arg_index, matched_static_arg};
 use super::invocation::{ClassDomain, Invocation, InvocationModel};
 use super::resolution::{BindingTarget, Resolution};
 use super::state::{AnalyzerState, ParsedSite};
-use crate::Result;
 use crate::analysis::{EdgeKind, Need, NodeId, RejectCode};
 use crate::package::PackageAvailability;
 use crate::package::PackageImage;
-use crate::package::{Atom, EnvironmentLabel};
+use crate::package::{Atom, EnvironmentKind, EnvironmentLabel};
 use crate::package::{
     BindingName, ClassName, DispatchCallee, DispatchObservation, GenericName, ImportSpec,
     ObjectImage, PackageId, PackageProvider,
 };
 use crate::syntax::{CallSite, ParsedRFile, Span, StaticArg};
+use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[cfg(test)]
@@ -51,13 +51,48 @@ pub(super) enum DispatchChange {
 }
 
 #[derive(Default)]
+enum DispatchUniverse {
+    #[default]
+    Classified,
+    Unbounded {
+        expanded: HashSet<PackageId>,
+    },
+}
+
+impl DispatchUniverse {
+    fn open(&mut self) {
+        if matches!(self, Self::Classified) {
+            *self = Self::Unbounded {
+                expanded: HashSet::new(),
+            };
+        }
+    }
+
+    fn expand(&mut self, package: PackageId) -> bool {
+        match self {
+            Self::Classified => false,
+            Self::Unbounded { expanded } => expanded.insert(package),
+        }
+    }
+}
+
+struct LexicalDispatchUse {
+    node: NodeId,
+    owner: PackageId,
+    environment: EnvironmentLabel,
+    first: GenericName,
+    rest: Vec<GenericName>,
+}
+
+#[derive(Default)]
 pub(super) struct S3Model {
     generics: BTreeMap<S3GenericKey, S3Generic>,
     callable_generics: HashMap<CallableId, BTreeSet<S3GenericKey>>,
     closed_methods: HashSet<(PackageId, BindingName)>,
     retained: BTreeMap<GenericName, BTreeMap<(PackageId, BindingName), EdgeKind>>,
-    lexical_methods: HashMap<(PackageId, GenericName), BTreeMap<BindingName, EdgeKind>>,
     next_method_calls: Vec<(NodeId, PackageId, String, Span)>,
+    universe: DispatchUniverse,
+    lexical_uses: Vec<LexicalDispatchUse>,
 }
 
 impl S3Model {
@@ -116,6 +151,7 @@ impl S3Model {
             return DispatchChange::Unchanged;
         }
         if let Some(definition) = &generic.definition
+            && matches!(self.universe, DispatchUniverse::Classified)
             && !callable_is_external
             && invocations.coverage(&definition.callable).pending()
         {
@@ -123,7 +159,9 @@ impl S3Model {
         }
         let classes = match &generic.definition {
             Some(definition)
-                if !callable_is_external && !invocations.coverage(&definition.callable).open() =>
+                if matches!(self.universe, DispatchUniverse::Classified)
+                    && !callable_is_external
+                    && !invocations.coverage(&definition.callable).open() =>
             {
                 invocations
                     .coverage(&definition.callable)
@@ -232,6 +270,8 @@ impl S3Dispatch {
 
 impl<P: PackageProvider> AnalyzerState<P> {
     pub(super) fn settle_caller_coverage(&self) -> Result<bool> {
+        self.settle_lexical_dispatch()?;
+        self.expand_unclassified_dispatch()?;
         let (keys, callables) = {
             let model = self.s3.lock();
             (
@@ -247,6 +287,107 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
         self.refresh_generics(keys)?;
         Ok(self.work.pending() != 0)
+    }
+
+    fn expand_unclassified_dispatch(&self) -> Result<()> {
+        loop {
+            let mut expanded = false;
+            for package in self.retained_namespaces() {
+                if !self.s3.lock().universe.expand(package) {
+                    continue;
+                }
+                expanded = true;
+                for (package, binding) in
+                    self.selected_method_bindings(package, |name| name.contains('.'))?
+                {
+                    self.s3
+                        .lock()
+                        .closed_methods
+                        .insert((package, binding.clone()));
+                    if !self.is_root(package) {
+                        self.require_root(Need::Binding { package, binding });
+                    }
+                }
+            }
+            if !expanded {
+                return Ok(());
+            }
+        }
+    }
+
+    fn selected_method_bindings(
+        &self,
+        package: PackageId,
+        selected: impl Fn(&str) -> bool,
+    ) -> Result<BTreeSet<(PackageId, BindingName)>> {
+        let image = self.image(package)?;
+        let mut methods = image
+            .index
+            .binding_names
+            .iter()
+            .filter(|name| selected(name))
+            .map(|name| (package, name.clone()))
+            .collect::<BTreeSet<_>>();
+        let imports = self.namespace_imports(package, &image)?;
+        for (name, imported) in imports.names().map_err(|missing| {
+            Error::Analysis(format!(
+                "cannot establish S3 method names imported from `{missing}`"
+            ))
+        })? {
+            if selected(&name) {
+                let source = self.packages.resolve(&imported.package)?.ok_or_else(|| {
+                    Error::Analysis(format!("missing S3 method provider `{}`", imported.package))
+                })?;
+                if let Some(method) = self.imported_method_binding(source, imported.binding)? {
+                    methods.insert(method);
+                }
+            }
+        }
+        Ok(methods)
+    }
+
+    fn imported_method_binding(
+        &self,
+        mut package: PackageId,
+        mut binding: BindingName,
+    ) -> Result<Option<(PackageId, BindingName)>> {
+        let mut seen = HashSet::new();
+        while seen.insert((package, binding.clone())) {
+            if self.packages.is_external(package) {
+                self.external.lock().insert(package);
+                return Ok(None);
+            }
+            let image = self.image(package)?;
+            match self.resolve_name(package, &image, &binding)? {
+                Resolution::Static(BindingTarget::Namespace { package, binding }) => {
+                    return Ok(Some((package, binding)));
+                }
+                Resolution::Static(BindingTarget::Imported {
+                    package: next,
+                    binding: remote,
+                }) => {
+                    package = next;
+                    binding = remote;
+                }
+                Resolution::Static(BindingTarget::External { package, .. }) => {
+                    self.external.lock().insert(package);
+                    return Ok(None);
+                }
+                Resolution::Static(
+                    BindingTarget::Base
+                    | BindingTarget::Native { .. }
+                    | BindingTarget::Metadata { .. },
+                ) => return Ok(None),
+                Resolution::Static(BindingTarget::Private { .. }) | Resolution::OpenDynamic(_) => {
+                    return Err(Error::Analysis(format!(
+                        "cannot establish imported S3 method `{binding}`"
+                    )));
+                }
+            }
+        }
+        Err(Error::Analysis(format!(
+            "cyclic imported S3 method `{binding}`"
+        )))
     }
 
     pub(super) fn s3_dispatch(
@@ -434,9 +575,8 @@ impl<P: PackageProvider> AnalyzerState<P> {
         package: PackageId,
         generic: &str,
         classes: Option<&BTreeSet<ClassName>>,
-    ) -> Result<BTreeMap<BindingName, EdgeKind>> {
+    ) -> Result<BTreeMap<(PackageId, BindingName), EdgeKind>> {
         let image = self.image(package)?;
-        let prefix = format!("{generic}.");
         let wanted = |class: &str| classes.is_none_or(|classes| classes.contains(class));
         let registered = self
             .loaded(package)?
@@ -465,16 +605,24 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 EdgeKind::Lexical
             }
         };
-        Ok(image
-            .index
-            .binding_names
-            .iter()
-            .filter(|name| name.strip_prefix(&prefix).is_some_and(wanted))
-            .cloned()
-            .chain(registered)
-            .map(|method| (kind(&method), method))
-            .map(|(kind, method)| (method, kind))
-            .collect())
+        let mut methods = self
+            .selected_method_bindings(package, |name| {
+                method_class(name, generic).is_some_and(wanted)
+            })?
+            .into_iter()
+            .map(|(owner, method)| {
+                let edge = if owner == package {
+                    kind(&method)
+                } else {
+                    EdgeKind::Lexical
+                };
+                ((owner, method), edge)
+            })
+            .collect::<BTreeMap<_, _>>();
+        for method in registered {
+            methods.insert((package, method.clone()), kind(&method));
+        }
+        Ok(methods)
     }
 
     fn demand_s3_method(
@@ -508,15 +656,15 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<()> {
         let methods = self.s3_method_candidates(package, generic, classes)?;
         let sites = self.s3.lock().sites_named(generic);
-        for (method, kind) in methods {
+        for ((owner, method), kind) in methods {
             self.s3
                 .lock()
                 .retained
                 .entry(generic.into())
                 .or_default()
-                .insert((package, method.clone()), kind);
+                .insert((owner, method.clone()), kind);
             for from in &sites {
-                self.demand_s3_method(*from, package, generic, &method, kind);
+                self.demand_s3_method(*from, owner, generic, &method, kind);
             }
         }
         Ok(())
@@ -535,6 +683,10 @@ fn selector_domain(invocation: &Invocation, definition: &GenericDefinition) -> C
         .argument_for(&definition.formals, &definition.selector)?
         .classes
         .clone()
+}
+
+fn method_class<'a>(binding: &'a str, generic: &str) -> Option<&'a str> {
+    binding.strip_prefix(generic)?.strip_prefix('.')
 }
 
 pub(super) fn callable_target(resolved: &Resolution) -> Option<CallableId> {
@@ -578,33 +730,95 @@ impl<P: PackageProvider> AnalyzerState<P> {
             return Ok(());
         }
         let observation = self.packages.dispatch_generics(owner.as_callee())?;
-        let (first, rest) = match observation {
-            DispatchObservation::NoDispatch => return Ok(()),
-            DispatchObservation::UnknownDispatch => {
-                self.diagnostic(
-                    site.node,
-                    site.package,
-                    Some(site.binding),
-                    RejectCode::ObjectSystem,
-                    "target R could not establish the callee's S3 dispatch generics",
-                    Some(call.span.clone()),
-                );
-                return Ok(());
-            }
-            DispatchObservation::Generics { first, rest } => (first, rest),
-        };
-        for generic in std::iter::once(first).chain(rest) {
-            let key = (site.package, generic.clone());
-            if !self.s3.lock().lexical_methods.contains_key(&key) {
-                let methods = self.s3_method_candidates(site.package, &generic, None)?;
-                self.s3.lock().lexical_methods.insert(key.clone(), methods);
-            }
-            let methods = self.s3.lock().lexical_methods[&key].clone();
-            for (method, kind) in methods {
-                self.demand_s3_method(site.node, site.package, &generic, &method, kind);
+        match observation {
+            DispatchObservation::NoDispatch => {}
+            DispatchObservation::UnknownDispatch => self.s3.lock().universe.open(),
+            DispatchObservation::Generics { first, rest } => {
+                self.s3.lock().lexical_uses.push(LexicalDispatchUse {
+                    node: site.node,
+                    owner: site.package,
+                    environment: site.lexical_environment.clone(),
+                    first,
+                    rest,
+                });
             }
         }
         Ok(())
+    }
+
+    fn settle_lexical_dispatch(&self) -> Result<()> {
+        let uses = {
+            let mut model = self.s3.lock();
+            let uses = std::mem::take(&mut model.lexical_uses);
+            if matches!(model.universe, DispatchUniverse::Unbounded { .. }) {
+                return Ok(());
+            }
+            uses
+        };
+        let mut candidates = HashMap::new();
+        for usage in uses {
+            let Some(package) = self.lexical_method_namespace(usage.owner, &usage.environment)?
+            else {
+                continue;
+            };
+            for generic in std::iter::once(usage.first).chain(usage.rest) {
+                let key = (package, generic.clone());
+                let methods = match candidates.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(self.s3_method_candidates(package, &generic, None)?)
+                    }
+                };
+                for (&(owner, ref method), &kind) in methods.iter() {
+                    if self.is_root(owner) {
+                        self.s3
+                            .lock()
+                            .closed_methods
+                            .insert((owner, method.clone()));
+                    } else {
+                        self.demand_s3_method(usage.node, owner, &generic, method, kind);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lexical_method_namespace(
+        &self,
+        owner: PackageId,
+        environment: &EnvironmentLabel,
+    ) -> Result<Option<PackageId>> {
+        let image = self.image(owner)?;
+        let mut environment = environment.clone();
+        let mut seen = HashSet::new();
+        while let Some(private) = image.private_environment(&environment) {
+            if !seen.insert(environment.clone()) {
+                return Err(Error::Analysis("cyclic lexical method environment".into()));
+            }
+            environment = private.parent.clone();
+        }
+        match environment.kind() {
+            EnvironmentKind::Namespace(name) if name != "base" => {
+                let package = self.packages.resolve(name)?.ok_or_else(|| {
+                    Error::Analysis(format!("missing lexical method namespace `{name}`"))
+                })?;
+                if self.packages.is_external(package) {
+                    self.external.lock().insert(package);
+                    Ok(None)
+                } else {
+                    Ok(Some(package))
+                }
+            }
+            EnvironmentKind::Namespace(_) | EnvironmentKind::Base | EnvironmentKind::Empty => {
+                Ok(None)
+            }
+            EnvironmentKind::Private | EnvironmentKind::Unsupported(_) | EnvironmentKind::Other => {
+                Err(Error::Analysis(format!(
+                    "cannot establish lexical S3 methods in `{environment}`"
+                )))
+            }
+        }
     }
 
     pub(super) fn retain_primitive_dispatch(
@@ -652,10 +866,19 @@ impl<P: PackageProvider> AnalyzerState<P> {
     ) -> Result<Option<DispatchOwner>> {
         let fact = self.resolved_call(site.package, site.image, site.lexical_environment, call)?;
         let super::call::ResolvedCallee::Established { target, name } = fact.callee() else {
+            self.s3.lock().universe.open();
             return Ok(None);
         };
         match target {
-            Resolution::Static(BindingTarget::Base) => Ok(Some(DispatchOwner::Base(name.clone()))),
+            Resolution::OpenDynamic(_) => {
+                self.s3.lock().universe.open();
+                Ok(None)
+            }
+            // A missing compatibility binding cannot dispatch on this target.
+            Resolution::Static(BindingTarget::Base) => Ok(self
+                .packages
+                .is_base_binding(name)
+                .then(|| DispatchOwner::Base(name.clone()))),
             Resolution::Static(BindingTarget::External { package, binding })
                 if self.packages.is_external(*package) =>
             {

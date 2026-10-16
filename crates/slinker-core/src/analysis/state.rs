@@ -439,7 +439,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
         }
     }
 
-    fn require_root(&self, need: Need) {
+    pub(super) fn require_root(&self, need: Need) {
         self.record_unclassified(&need);
         self.require_internal_root(need);
     }

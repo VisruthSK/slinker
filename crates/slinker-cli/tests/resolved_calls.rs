@@ -188,14 +188,37 @@ fn retained_primitive_callables_keep_group_methods() {
 }
 
 #[test]
-fn unknown_external_dispatch_blocks_before_publication() {
-    for generic_call in ["UseMethod(nm)", "UseMethod(object='x', gen=nm)"] {
+fn indirect_dispatch_preserves_methods_or_blocks_before_publication() {
+    for (generic_call, imported_method, external) in [
+        ("UseMethod(nm)", false, true),
+        ("UseMethod(object='x', gen=nm)", false, true),
+        ("use <- get('UseMethod'); use(nm)", false, true),
+        ("use <- get('UseMethod'); use(nm)", true, true),
+        ("use <- get(paste0('Use', 'Method')); use(nm)", false, true),
+        ("use <- match.fun('UseMethod'); use(nm)", false, true),
+        ("use <- base::UseMethod; use(nm)", false, true),
+        (
+            "dispatchers <- list(base::UseMethod); dispatchers[[1L]](nm)",
+            false,
+            true,
+        ),
+        ("use <- get('UseMethod'); use(nm)", false, false),
+        (
+            "dispatchers <- list(base::UseMethod); dispatchers[[1L]](nm)",
+            false,
+            false,
+        ),
+        ("use <- .Primitive('UseMethod'); use(nm)", false, false),
+    ] {
         let work = tempfile::tempdir().unwrap();
         let dependency = work.path().join("computeddep");
         let caller = work.path().join("computedcaller");
+        let methods = work.path().join("computedmethods");
         let source = work.path().join("computedroot");
         let original = work.path().join("original");
+        let generated = work.path().join("generated");
         fs::create_dir(&original).unwrap();
+        fs::create_dir(&generated).unwrap();
         package(
             &dependency,
             "computeddep",
@@ -204,11 +227,33 @@ fn unknown_external_dispatch_blocks_before_publication() {
             &format!("g <- function(x) {{ nm <- 'g'; {generic_call} }}\n"),
         );
         package(
+            &methods,
+            "computedmethods",
+            "",
+            "export(g.foo)\n",
+            "g.foo <- function(x) 'expected'\n",
+        );
+        package(
             &caller,
             "computedcaller",
-            "Imports: computeddep\n",
-            "export(run)\n",
-            "g.foo <- function(x) 'expected'\ng.character <- function(x) 'expected'\nrun <- function(x) computeddep::g(x)\n",
+            if imported_method {
+                "Imports: computeddep, computedmethods\n"
+            } else {
+                "Imports: computeddep\n"
+            },
+            if imported_method {
+                "importFrom(computedmethods,g.foo)\nexport(run)\n"
+            } else {
+                "export(run)\n"
+            },
+            &format!(
+                "{}g.character <- function(x) 'expected'\nrun <- function(x) computeddep::g(x)\n",
+                if imported_method {
+                    ""
+                } else {
+                    "g.foo <- function(x) 'expected'\n"
+                }
+            ),
         );
         package(
             &source,
@@ -219,6 +264,9 @@ fn unknown_external_dispatch_blocks_before_publication() {
         );
         let r_home = discover_r_home();
         install_package(&r_home, &dependency, &original);
+        if imported_method {
+            install_package(&r_home, &methods, &original);
+        }
         install_package_using(&r_home, &caller, &original, &original);
         install_package_using(&r_home, &source, &original, &original);
         run_r(
@@ -227,25 +275,39 @@ fn unknown_external_dispatch_blocks_before_publication() {
             "stopifnot(identical(computedroot::run(), 'expected'))",
         );
         let output = work.path().join("output");
-        let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_slinker"));
+        command
             .arg("build")
             .arg(&source)
             .arg("--output")
             .arg(&output)
             .arg("--lib")
             .arg(&original)
-            .args(["--external", "computeddep"])
-            .env("SLINKER_CACHE_DIR", work.path().join("cache"))
-            .output()
-            .unwrap();
-        assert!(
-            !result.status.success(),
-            "unknown External dispatch was accepted"
-        );
-        assert!(!output.exists());
-        assert!(
-            String::from_utf8_lossy(&result.stderr)
-                .contains("could not establish the callee's S3 dispatch generics")
+            .env("SLINKER_CACHE_DIR", work.path().join("cache"));
+        if external {
+            command.args(["--external", "computeddep"]);
+        }
+        let result = command.output().unwrap();
+        if !result.status.success() {
+            assert!(!output.exists());
+            assert!(
+                String::from_utf8_lossy(&result.stderr)
+                    .contains("could not establish the callee's S3 dispatch generics")
+            );
+            continue;
+        }
+        if external {
+            install_package(&r_home, &dependency, &generated);
+        }
+        install_package(&r_home, &output, &generated);
+        let oracle = "stopifnot(identical(computedroot::run(), 'expected'))";
+        run_r(&r_home, &generated, oracle);
+        let installed = std::env::join_paths([&generated, &original]).unwrap();
+        run_r(&r_home, &installed, oracle);
+        run_r(
+            &r_home,
+            &installed,
+            &format!("loadNamespace('computedcaller'); {oracle}"),
         );
     }
 }

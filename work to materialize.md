@@ -93,23 +93,11 @@ acceptance cases here.
 ## Next up
 
 1. Capture the remaining independent failures in `fixes.md` as regressions under `crates/*/tests/`; retain original R as the oracle. Delete unresolved-selector/sole-DLL guesses.
-2. Track F: close the reproduced reflective-dispatch gap. `get("UseMethod")` must not be reported as `NoDispatch`; Track F remains unfinished.
-3. Tracks G/I: share object traversal with structural identities and finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
-4. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
-5. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
+2. Tracks G/I: share object traversal with structural identities and finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
+3. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
+4. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
 
 ---
-
-## Track F: S3 caller completeness
-
-- Establish sound dispatch observations for reflective and indirect dispatcher calls. Absence of a literal `UseMethod` call is not evidence of `NoDispatch`.
-- Preserve the reproduced External `g <- function(x) { use <- get("UseMethod"); use("g") }` case from `fixes.md` as an original-R regression. Retain the Linked caller's methods or block before publication when dispatch cannot be established.
-- Fix the observation rule at its owner; do not add a special case for one literal lookup or a string evaluator that leaves other unproved aliases accepted.
-
-Done when:
-- the reflective-dispatch reproducer preserves original behavior with the Linked caller absent, installed, and loaded, or explicitly blocks before publishing an output;
-- unproved dispatcher aliases cannot silently become `NoDispatch`;
-- existing direct/computed/named `UseMethod`, mixed direct/reflective caller, primitive/group, registered/lexical method, and `NextMethod` regressions remain green.
 
 ## Track G: Structural object observation
 

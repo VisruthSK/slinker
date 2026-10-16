@@ -179,7 +179,7 @@ fn unregistered_lexical_methods_dispatch_from_linked_code_as_in_the_original() {
     fs::create_dir(&installed).expect("library with the real Linked package");
     install_package(&r_home, &dependency_source, &installed);
     install_package(&r_home, &output, &installed);
-    let demand_driven = "imports <- parent.env(asNamespace('lexroot')); linked <- environment(get('show_format', envir = imports)); stopifnot(is.function(get('format.lexical', envir = linked)), is.function(get('print.lexical', envir = linked))); message <- tryCatch(get('summary.lexical', envir = linked), error = conditionMessage); stopifnot(grepl('`lexlinked::summary.lexical` was removed by slinker', message, fixed = TRUE))";
+    let demand_driven = "imports <- parent.env(asNamespace('lexroot')); linked <- environment(get('show_format', envir = imports)); stopifnot(is.function(get('format.lexical', envir = linked)), is.function(get('print.lexical', envir = linked)), is.function(get('summary.lexical', envir = linked))); message <- tryCatch(get('show_summary_name', envir = linked), error = conditionMessage); stopifnot(grepl('`lexlinked::show_summary_name` was removed by slinker', message, fixed = TRUE))";
     for library in [&validation, &installed] {
         run_r(&r_home, library, &format!("{behavior}; {demand_driven}"));
     }
@@ -2255,7 +2255,7 @@ fn syntax_forms_dispatch_to_unregistered_lexical_methods_as_in_the_original() {
         &r_home,
         &validation,
         &format!(
-            "{behavior}; linked <- environment(get('sub', envir = parent.env(asNamespace('synroot')))); message <- tryCatch(get('[[<-.syn', envir = linked), error = conditionMessage); stopifnot(grepl('was removed by slinker', message, fixed = TRUE))"
+            "{behavior}; linked <- environment(get('sub', envir = parent.env(asNamespace('synroot')))); stopifnot(identical(get('[[<-.syn', envir = linked)(NULL), 'never'))"
         ),
     );
 }

@@ -941,9 +941,21 @@ The build succeeds with the dispatcher package External, but the generated call
 fails because `reviewdispatchcaller::g.foo` was removed. The current
 `.slinker_callable_dispatch` walk does not establish the reflected dispatcher's
 identity; it nevertheless returns `known = TRUE` with no generic names, which
-becomes `NoDispatch`. This remains an open Track F blocker. The repair must
+became `NoDispatch`. This exposed the remaining Track F blocker. The repair must
 require an established classification or fail closed for unproved aliases;
 recognizing only this particular `get()` spelling would not establish that rule.
+
+The correction removes the closure-body scanner. Opaque closures remain
+`UnknownDispatch`. The same alias in Linked source also needs the methods of
+its caller, so an unclassified call cannot restrict retention to its immediate
+namespace. Analysis opens the S3 method universe and retains all possible
+lexical method names across retained namespaces and effective imports at
+quiescence, including namespaces discovered later. Registered methods remain
+unconditional activation obligations. The original-R regression
+in `crates/slinker-cli/tests/resolved_calls.rs` covers literal and computed
+lookups, `match.fun`, namespace aliases, dispatcher tables, imported methods,
+and Linked dispatchers with the Linked packages absent, installed, and loaded.
+Cache schema v4 prevents reuse of the earlier unsound `NoDispatch` observations.
 
 ### Lower priority boundary case: External caller reflection
 
