@@ -1572,6 +1572,8 @@ Current upstream Ark/Oak was also inspected at `d5e185b279fa136eff3cad3db967e41a
 - Generic assignment provenance must preserve aliases, reassignment alternatives and producer identity; slinker then attaches namespace obligations to those producers.
 - The scanner and walker bind a for-variable before visiting its sequence. R evaluates the sequence first: with enclosing `x <- 1:3`, `function() { for (x in x) {}; x }` returns `3`. A direct parser probe currently loses the sequence-side outer reference. Fix this order in Oak's scan and walk passes; do not recreate the flow engine in slinker.
 
+The proposed owner fix is preserved in `docs/upstream/oak-for-sequence.patch`; its consumer regressions are in `docs/upstream/slinker-for-sequence-regression.patch`. These are review artifacts, not applied dependency overrides. Both reaching-definition cases failed before the upstream fix. With the fix, Oak's 7 unit and 378 integration tests pass (one existing ignored test), its crate Clippy and nightly formatting checks pass, and an isolated slinker consumer passes 140 core tests plus the original/generated package oracle in all three dependency states. The consumer oracle checks both empty-loop `NULL` initialization and the enclosing value read by `for (values in values)`. Luna reviewed the owner fix without findings. Slinker's portable dependency pin remains unchanged; adopting the unpublished fix is still outstanding.
+
 The substantial reduction is to remove the local generic language layer once these contracts have an upstream owner. Moving files, dropping proof obligations or adding an Oak-named wrapper around the same local engine does not achieve that. No thousands-line deletion has been established yet.
 
 ### Flatten the remaining construction IR
