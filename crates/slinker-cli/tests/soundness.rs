@@ -16,6 +16,16 @@ fn structural_payload_members_retain_each_callable_as_in_original_r() {
     let r = discover_r_home();
     for (label, members, call) in [
         (
+            "intrinsic",
+            "list(function() if (is.function(.Generic)) hidden() else 'wrong')",
+            "bundle[[1L]]()",
+        ),
+        (
+            "keyword",
+            "list(function() if (is.function(`TRUE`)) hidden() else 'wrong')",
+            "bundle[[1L]]()",
+        ),
+        (
             "duplicates",
             "list(same=function() 1L, same=function() hidden())",
             "bundle[[2L]]()",
@@ -65,7 +75,7 @@ fn structural_payload_members_retain_each_callable_as_in_original_r() {
             "sounddep",
             "",
             &format!(
-                "hidden <- function() 'expected'\nSummary.foo <- function(..., na.rm=FALSE) 'expected'\nbundle <- {members}\nrun <- function() {call}\n"
+                "hidden <- function() 'expected'\n`TRUE` <- hidden\n.Generic <- hidden\nSummary.foo <- function(..., na.rm=FALSE) 'expected'\nbundle <- {members}\nrun <- function() {call}\n"
             ),
         );
         install_package(&r, &dep, &original);

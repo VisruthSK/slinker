@@ -1,7 +1,7 @@
 use super::census::{Census, node_range};
 use super::context::OakParseContext;
 use super::proofs::is_base_call;
-use super::{LiveCall, static_first_string};
+use super::{CallSite, static_first_string};
 use crate::syntax::facts::{NameRef, PackageGuard, PackageRef, StaticArg, SyntaxEffect};
 use crate::syntax::source::TextRange;
 use air_r_syntax::AnyRExpression;
@@ -36,12 +36,12 @@ pub(super) fn apply_guard_regions_to_package_refs(
 
 pub(super) fn apply_guard_regions_to_calls(
     regions: &[(TextRange, PackageGuard)],
-    calls: &mut [LiveCall],
+    calls: &mut [CallSite],
 ) {
     for (range, guard) in regions {
         for call in calls.iter_mut() {
-            if range.contains_range(call.site.span.range()) {
-                push_guard(&mut call.site.guards, guard.clone());
+            if range.contains_range(call.span.range()) {
+                push_guard(&mut call.guards, guard.clone());
             }
         }
     }
@@ -64,7 +64,7 @@ pub(super) fn if_guard_regions(
     context: &OakParseContext,
     index: &SemanticIndex,
     census: &Census,
-    calls: &[LiveCall],
+    calls: &[CallSite],
 ) -> Vec<(TextRange, PackageGuard)> {
     let mut guards = Vec::new();
     for region in &census.ifs {
@@ -77,17 +77,18 @@ pub(super) fn if_guard_regions(
         for range in required {
             let Some(call) = calls
                 .iter()
-                .find(|call| call.site.span.range() == range && is_base_call(context, &call.site))
+                .find(|call| call.span.range() == range && is_base_call(context, call))
             else {
                 continue;
             };
-            let guard = match call.site.callee.as_str() {
-                "requireNamespace" => static_first_string(&call.site)
-                    .map(|package| PackageGuard::Available(package.into())),
-                "isNamespaceLoaded" => static_first_string(&call.site)
-                    .map(|package| PackageGuard::Loaded(package.into())),
-                _ => None,
-            };
+            let guard =
+                match call.callee.as_str() {
+                    "requireNamespace" => static_first_string(call)
+                        .map(|package| PackageGuard::Available(package.into())),
+                    "isNamespaceLoaded" => static_first_string(call)
+                        .map(|package| PackageGuard::Loaded(package.into())),
+                    _ => None,
+                };
             if let Some(guard) = guard {
                 guards.push((region.then_branch, guard));
             }
@@ -98,43 +99,42 @@ pub(super) fn if_guard_regions(
 
 pub(super) fn hook_guard_regions(
     context: &OakParseContext,
-    calls: &[LiveCall],
+    calls: &[CallSite],
 ) -> Vec<(TextRange, PackageGuard)> {
     let mut guards = Vec::new();
     for call in calls {
-        if call.site.callee != "setHook" || !is_base_call(context, &call.site) {
+        if call.callee != "setHook" || !is_base_call(context, call) {
             continue;
         }
-        let Some(event_argument) = call.raw.args.first() else {
+        let Some(event_argument) = call.arguments.first() else {
             continue;
         };
-        let Some(callback_argument) = call.raw.args.get(1) else {
+        let Some(callback_argument) = call.arguments.get(1) else {
             continue;
         };
         let Some(event_call) = calls.iter().find(|nested| {
-            nested.site.callee == "packageEvent"
-                && is_base_call(context, &nested.site)
+            nested.callee == "packageEvent"
+                && is_base_call(context, nested)
                 && event_argument
-                    .value
-                    .contains_range(nested.site.span.range())
+                    .span
+                    .as_ref()
+                    .is_some_and(|span| span.range().contains_range(nested.span.range()))
         }) else {
             continue;
         };
-        let Some(package) = static_first_string(&event_call.site) else {
+        let Some(package) = static_first_string(event_call) else {
             continue;
         };
         let event = event_call
-            .site
             .static_arg(1)
             .and_then(|argument| match argument {
                 StaticArg::String(value) => Some(value.as_str()),
                 StaticArg::Symbol(_) | StaticArg::Logical(_) => None,
             });
-        if event == Some("onLoad") {
-            guards.push((
-                callback_argument.value,
-                PackageGuard::Selected(package.into()),
-            ));
+        if event == Some("onLoad")
+            && let Some(span) = &callback_argument.span
+        {
+            guards.push((span.range(), PackageGuard::Selected(package.into())));
         }
     }
     guards

@@ -1,22 +1,40 @@
-use super::scan::{ForRegion, FunctionRegion, RawArgument, RawCall, static_string, static_symbol};
 use super::text_offset;
 use crate::package::Atom;
 use crate::syntax::facts::StaticArg;
 use crate::syntax::source::TextRange;
 use air_r_syntax::{
-    AnyRArgumentName, AnyRExpression, AnyRParameterName, AnyRValue, RArgument, RBinaryExpression,
-    RCall, RForStatement, RFunctionDefinition, RIfStatement, RLanguage, RRoot, RSyntaxKind,
+    AnyRArgumentName, AnyRExpression, AnyRParameterName, AnyRValue, RBinaryExpression, RCall,
+    RForStatement, RFunctionDefinition, RIdentifier, RIfStatement, RLanguage, RNamespaceExpression,
+    RRoot, RStringValue, RSyntaxKind,
 };
 use biome_rowan::{AstNode, AstSeparatedList};
+use oak_core::syntax_ext::{RIdentifierExt, RStringValueExt};
 use oak_semantic::semantic_index::DefinitionKind;
 use std::collections::{BTreeSet, HashMap};
 
 pub(super) struct Census {
-    calls: Vec<RCall>,
+    pub(super) calls: Vec<RCall>,
+    pub(super) expressions: Vec<AnyRExpression>,
+    pub(super) namespaces: HashMap<usize, RNamespaceExpression>,
     by_callee: HashMap<(usize, usize), usize>,
     pub(super) functions: Vec<FunctionRegion>,
     pub(super) fors: Vec<ForRegion>,
     pub(super) ifs: Vec<IfRegion>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct FunctionRegion {
+    pub(super) function_start: usize,
+    pub(super) formals: TextRange,
+    pub(super) body: TextRange,
+    pub(super) parameters: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ForRegion {
+    pub(super) variable: String,
+    pub(super) variable_start: usize,
+    pub(super) body: TextRange,
 }
 
 #[derive(Debug, Clone)]
@@ -28,19 +46,39 @@ pub(super) struct IfRegion {
 }
 
 impl Census {
-    pub(super) fn of(root: &RRoot) -> Self {
+    pub(super) fn of(root: &RRoot) -> Result<Self, String> {
         let mut census = Self {
             calls: Vec::new(),
+            expressions: Vec::new(),
+            namespaces: HashMap::new(),
             by_callee: HashMap::new(),
             functions: Vec::new(),
             fors: Vec::new(),
             ifs: Vec::new(),
         };
         for node in root.syntax().descendants() {
+            if let Some(expression) = AnyRExpression::cast(node.clone()) {
+                census.expressions.push(expression);
+            }
             match node.kind() {
+                RSyntaxKind::R_IDENTIFIER => {
+                    if RIdentifier::cast(node).is_some_and(|name| identifier_name(&name).is_none())
+                    {
+                        return Err(
+                            "escaped identifiers have no established Oak binding identity".into(),
+                        );
+                    }
+                }
+                RSyntaxKind::R_NAMESPACE_EXPRESSION => {
+                    if let Some(namespace) = RNamespaceExpression::cast(node) {
+                        census
+                            .namespaces
+                            .insert(node_range(&namespace).start, namespace);
+                    }
+                }
                 RSyntaxKind::R_CALL => {
                     if let Some(call) = RCall::cast(node) {
-                        census.add_call(call);
+                        census.add_call(call)?;
                     }
                 }
                 RSyntaxKind::R_FUNCTION_DEFINITION => {
@@ -61,10 +99,20 @@ impl Census {
                 _ => {}
             }
         }
-        census
+        Ok(census)
     }
 
-    fn add_call(&mut self, call: RCall) {
+    fn add_call(&mut self, call: RCall) -> Result<(), String> {
+        let arguments = call.arguments().map_err(|error| error.to_string())?;
+        for argument in arguments.items().iter() {
+            let argument = argument.map_err(|error| error.to_string())?;
+            if let Some(clause) = argument.name_clause() {
+                let name = clause.name().map_err(|error| error.to_string())?;
+                if argument_name(&name).is_none() {
+                    return Err("argument name has no established literal value".into());
+                }
+            }
+        }
         if let Ok(function) = call.function() {
             let range = node_range(&function);
             self.by_callee
@@ -72,13 +120,18 @@ impl Census {
                 .or_insert(self.calls.len());
         }
         self.calls.push(call);
+        Ok(())
     }
 
-    pub(super) fn call_of(&self, callee_start: usize, callee_end: usize) -> Option<RawCall> {
+    pub(super) fn call_of(&self, callee_start: usize, callee_end: usize) -> Option<&RCall> {
         let call = self
             .calls
             .get(*self.by_callee.get(&(callee_start, callee_end))?)?;
-        raw_call(call)
+        Some(call)
+    }
+
+    pub(super) fn is_callee(&self, start: usize, end: usize) -> bool {
+        self.by_callee.contains_key(&(start, end))
     }
 
     pub(super) fn is_replacement_target(&self, callee_start: usize, callee_end: usize) -> bool {
@@ -132,56 +185,13 @@ pub(super) fn node_range(node: &impl AstNode<Language = RLanguage>) -> TextRange
     TextRange::new(text_offset(range.start()), text_offset(range.end()))
 }
 
-pub(super) fn raw_call(call: &RCall) -> Option<RawCall> {
-    let range = node_range(call);
-    let mut args = call
-        .arguments()
-        .ok()?
-        .items()
-        .iter()
-        .filter_map(std::result::Result::ok)
-        .map(|argument| raw_argument(&argument))
-        .collect::<Vec<_>>();
-    if args.last().is_some_and(RawArgument::is_hole) {
-        args.pop();
-    }
-    Some(RawCall {
-        start: range.start,
-        end: range.end,
-        args,
-    })
-}
-
-fn raw_argument(argument: &RArgument) -> RawArgument {
-    let name = argument
-        .name_clause()
-        .and_then(|clause| clause.name().ok())
-        .and_then(|name| argument_name(&name));
-    let value = argument.value();
-    RawArgument {
-        name,
-        value: value.as_ref().map_or_else(
-            || {
-                let end = node_range(argument).end;
-                TextRange::new(end, end)
-            },
-            node_range,
-        ),
-        static_arg: value.as_ref().and_then(static_arg_of),
-    }
-}
-
-fn argument_name(name: &AnyRArgumentName) -> Option<String> {
+pub(super) fn argument_name(name: &AnyRArgumentName) -> Option<String> {
     match name {
-        AnyRArgumentName::RIdentifier(identifier) => {
-            static_symbol(identifier.syntax().text_trimmed().to_string().as_str())
-        }
+        AnyRArgumentName::RIdentifier(identifier) => identifier_name(identifier),
         AnyRArgumentName::RDots(_) => Some("...".to_owned()),
         AnyRArgumentName::RDotDotI(index) => Some(index.syntax().text_trimmed().to_string()),
-        AnyRArgumentName::RStringValue(value) => {
-            static_string(&value.syntax().text_trimmed().to_string())
-        }
-        AnyRArgumentName::RNullExpression(_) => None,
+        AnyRArgumentName::RStringValue(value) => string_value(value),
+        AnyRArgumentName::RNullExpression(_) => Some("NULL".into()),
     }
 }
 
@@ -190,18 +200,66 @@ pub(super) fn static_arg_of(expression: &AnyRExpression) -> Option<StaticArg> {
         AnyRExpression::RTrueExpression(_) => Some(StaticArg::Logical(true)),
         AnyRExpression::RFalseExpression(_) => Some(StaticArg::Logical(false)),
         AnyRExpression::AnyRValue(AnyRValue::RStringValue(value)) => {
-            static_string(&value.syntax().text_trimmed().to_string())
-                .map(|string| StaticArg::String(Atom::from(string)))
+            string_value(value).map(|string| StaticArg::String(Atom::from(string)))
         }
-        AnyRExpression::RIdentifier(node) => symbol_arg(&node.syntax().text_trimmed().to_string()),
-        AnyRExpression::RDots(node) => symbol_arg(&node.syntax().text_trimmed().to_string()),
-        AnyRExpression::RDotDotI(node) => symbol_arg(&node.syntax().text_trimmed().to_string()),
+        AnyRExpression::RIdentifier(node) => {
+            identifier_name(node).map(|name| StaticArg::Symbol(name.into()))
+        }
+        AnyRExpression::RDots(_) => Some(StaticArg::Symbol("...".into())),
+        AnyRExpression::RDotDotI(node) => Some(StaticArg::Symbol(
+            node.syntax().text_trimmed().to_string().into(),
+        )),
         _ => None,
     }
 }
 
-fn symbol_arg(text: &str) -> Option<StaticArg> {
-    static_symbol(text).map(|symbol| StaticArg::Symbol(Atom::from(symbol)))
+pub(super) fn identifier_name(identifier: &RIdentifier) -> Option<String> {
+    let name = identifier.name_text();
+    (!name.contains(['\\', '`'])).then_some(name)
+}
+
+// Air has already lexed and validated this entire token. Only literal value
+// decoding belongs here; expression boundaries and names come from AST nodes.
+fn string_value(value: &RStringValue) -> Option<String> {
+    let token = value.value_token().ok()?;
+    let text = token.text_trimmed();
+    if text.starts_with(['r', 'R']) {
+        let open = text.find(['(', '[', '{'])?;
+        return text
+            .get(open + 1..text.len().checked_sub(open)?)
+            .map(str::to_owned);
+    }
+    let content = value.string_text()?;
+    let mut characters = content.chars();
+    let mut decoded = String::new();
+    while let Some(character) = characters.next() {
+        decoded.push(if character == '\\' {
+            match characters.next()? {
+                '\\' => '\\',
+                '\'' => '\'',
+                '"' => '"',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'b' => '\u{0008}',
+                'f' => '\u{000c}',
+                'a' => '\u{0007}',
+                'v' => '\u{000b}',
+                _ => return None,
+            }
+        } else {
+            character
+        });
+    }
+    Some(decoded)
+}
+
+pub(super) fn node_name(node: &impl AstNode<Language = RLanguage>) -> Option<String> {
+    match AnyRExpression::cast(node.syntax().clone())? {
+        AnyRExpression::RIdentifier(identifier) => identifier_name(&identifier),
+        AnyRExpression::AnyRValue(AnyRValue::RStringValue(value)) => string_value(&value),
+        _ => None,
+    }
 }
 
 fn function_region(function: &RFunctionDefinition) -> Option<FunctionRegion> {
@@ -214,13 +272,7 @@ fn function_region(function: &RFunctionDefinition) -> Option<FunctionRegion> {
         .iter()
         .filter_map(std::result::Result::ok)
         .filter_map(|parameter| parameter.name().ok())
-        .filter_map(|name| match name {
-            AnyRParameterName::RIdentifier(node) => {
-                static_symbol(&node.syntax().text_trimmed().to_string())
-            }
-            AnyRParameterName::RDots(_) => Some("...".to_owned()),
-            AnyRParameterName::RDotDotI(node) => Some(node.syntax().text_trimmed().to_string()),
-        })
+        .filter_map(|name| parameter_name(&name))
         .collect::<BTreeSet<_>>();
     Some(FunctionRegion {
         function_start: node_range(function).start,
@@ -230,11 +282,19 @@ fn function_region(function: &RFunctionDefinition) -> Option<FunctionRegion> {
     })
 }
 
+pub(super) fn parameter_name(name: &AnyRParameterName) -> Option<String> {
+    match name {
+        AnyRParameterName::RIdentifier(identifier) => identifier_name(identifier),
+        AnyRParameterName::RDots(_) => Some("...".to_owned()),
+        AnyRParameterName::RDotDotI(node) => Some(node.syntax().text_trimmed().to_string()),
+    }
+}
+
 fn for_region(statement: &RForStatement) -> Option<ForRegion> {
     let variable = statement.variable().ok()?;
     let body = statement.body().ok()?;
     Some(ForRegion {
-        variable: static_symbol(&variable.syntax().text_trimmed().to_string())?,
+        variable: identifier_name(&variable)?,
         variable_start: node_range(&variable).start,
         body: node_range(&body),
     })

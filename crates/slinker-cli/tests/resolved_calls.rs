@@ -62,6 +62,48 @@ fn blocked_observation(name: &str, code: &str, oracle: &str, dependency_code: &s
 }
 
 #[test]
+fn base_closure_environments_use_the_runtime_namespace_and_reject_writes() {
+    let r = discover_r_home();
+    for (name, code, expected, blocked) in [
+        (
+            "baseread",
+            "run <- function() environmentName(environment(identity))\nenvironment(run) <- asNamespace('base')\n",
+            "'base'",
+            false,
+        ),
+        (
+            "basewrite",
+            "run <- function() tryCatch(assign('identity', function(x) 7L, envir=environment(identity)), error=function(e) 'protected')\nenvironment(run) <- asNamespace('base')\n",
+            "'protected'",
+            true,
+        ),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join(name);
+        package(&root, name, "", "export(run)\n", code);
+        let library = work.path().join("original");
+        fs::create_dir(&library).unwrap();
+        install_package(&r, &root, &library);
+        let oracle = format!("stopifnot(identical({name}::run(), {expected}))");
+        run_r(&r, &library, &oracle);
+        let output = work.path().join("output");
+        let result = build(&root, &output, &library, &work.path().join("cache"), "1");
+        if blocked {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(!result.status.success());
+            assert!(stderr.contains("writes a platform namespace"), "{stderr}");
+            assert!(!output.exists());
+        } else {
+            assert_success(&result, "base closure environment");
+            let generated = work.path().join("generated-library");
+            fs::create_dir(&generated).unwrap();
+            install_package(&r, &output, &generated);
+            run_r(&r, &generated, &oracle);
+        }
+    }
+}
+
+#[test]
 fn ordinary_external_base_alias_does_not_require_a_base_package_image() {
     let r = discover_r_home();
     let work = tempfile::tempdir().unwrap();
@@ -187,19 +229,19 @@ fn namespace_members_and_reflective_generics_keep_their_obligations() {
         "memberdep",
         "",
         "export(entry)\nS3method(gen,a)\nS3method(gen,b)\n",
-        "hidden <- 42L\nentry <- function() 1L\ngen <- function(x) UseMethod('gen')\ngen.a <- function(x) 'a'\ngen.b <- function(x) 'b'\n",
+        "hidden <- 42L\nalias_hidden <- 43L\nchain_hidden <- 44L\nentry <- function() 1L\ngen <- function(x) UseMethod('gen')\ngen.a <- function(x) 'a'\ngen.b <- function(x) 'b'\n",
     );
     package(
         &source,
         "memberroot",
         "Imports: memberdep\n",
         "export(run)\n",
-        "run <- function() { ns <- asNamespace('memberdep'); g <- get('gen', envir=ns, inherits=FALSE); c(as.character(ns$hidden), as.character(getNamespace('memberdep')[['hidden']]), g(structure(1, class='a')), g(structure(1, class='b'))) }\n",
+        "run <- function() { ns <- asNamespace('memberdep'); `ns alias` <- ns; a <- b <- asNamespace('memberdep'); g <- get('gen', envir=ns, inherits=FALSE); c(as.character(ns$hidden), as.character(getNamespace('memberdep')[['hidden']]), g(structure(1, class='a')), g(structure(1, class='b')), as.character(`ns alias`$alias_hidden), as.character(a$chain_hidden)) }\n",
     );
     let r_home = discover_r_home();
     install_package(&r_home, &dependency, &original);
     install_package_using(&r_home, &source, &original, &original);
-    let oracle = "stopifnot(identical(memberroot::run(), c('42','42','a','b')))";
+    let oracle = "stopifnot(identical(memberroot::run(), c('42','42','a','b','43','44')))";
     run_r(&r_home, &original, oracle);
     let output = work.path().join("output");
     let result = build(&source, &output, &original, &work.path().join("cache"), "1");

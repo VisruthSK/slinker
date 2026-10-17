@@ -1,13 +1,13 @@
+use super::census::{Census, argument_name, node_name, static_arg_of};
 use super::context::OakParseContext;
-use super::scan::static_arg;
-use super::{LexicalScopes, ast_span, ast_str, ast_text, identifier_callee, text_offset};
+use super::{LexicalScopes, ast_span, identifier_callee, text_offset};
 use crate::package::{BindingName, PackageName};
 use crate::syntax::facts::{
     BindingDeclaration, DeclaredCallable, DeclaredDomain, LexicalScopeId, SemanticIssue,
     SemanticIssueKind, StaticArg,
 };
 use crate::syntax::source::SourceId;
-use air_r_syntax::{AnyRExpression, RCall, RRoot};
+use air_r_syntax::{AnyRExpression, RCall};
 use biome_rowan::{AstNode, AstSeparatedList};
 use oak_semantic::semantic_index::{ScopeId, SemanticIndex};
 use std::collections::BTreeSet;
@@ -26,8 +26,7 @@ impl Declarations {
 
 pub(super) fn collect_declarations(
     source: &SourceId,
-    text: &str,
-    root: &RRoot,
+    census: &Census,
     context: &OakParseContext,
     index: &SemanticIndex,
     scopes: &LexicalScopes,
@@ -37,22 +36,33 @@ pub(super) fn collect_declarations(
         inert: Vec::new(),
         issues: Vec::new(),
     };
-    if !text.contains("declare") {
-        return collected;
-    }
-    for call in root.syntax().descendants().filter_map(RCall::cast) {
+    for call in &census.calls {
         let start = text_offset(call.syntax().text_trimmed_range().start());
         let (scope, lexical) = scopes.at(index, start);
         let Ok(function) = call.function() else {
             continue;
         };
         let is_declare = match &function {
-            AnyRExpression::RIdentifier(_) => identifier_callee(&call).is_some_and(|callee| {
-                callee.name() == "declare"
-                    && context.resolves_to_base(callee.name())
-                    && index.resolve(callee.name(), scope).is_none()
+            AnyRExpression::RIdentifier(_) => identifier_callee(call).is_some_and(|callee| {
+                callee.as_str() == "declare"
+                    && context.resolves_to_base(callee.as_str())
+                    && index.resolve(callee.as_str(), scope).is_none()
             }),
-            _ => ast_str(text, &function) == "base::declare",
+            AnyRExpression::RNamespaceExpression(namespace) => {
+                namespace
+                    .left()
+                    .ok()
+                    .and_then(|name| node_name(&name))
+                    .as_deref()
+                    == Some("base")
+                    && namespace
+                        .right()
+                        .ok()
+                        .and_then(|name| node_name(&name))
+                        .as_deref()
+                        == Some("declare")
+            }
+            _ => false,
         };
         let Ok(arguments) = call.arguments() else {
             continue;
@@ -71,12 +81,11 @@ pub(super) fn collect_declarations(
             let AnyRExpression::RCall(language) = value else {
                 continue;
             };
-            if identifier_callee(&language).is_none_or(|callee| callee.name() != "slinker") {
+            if identifier_callee(&language).is_none_or(|callee| callee.as_str() != "slinker") {
                 continue;
             }
             collect_slinker_declaration(
                 source,
-                text,
                 index,
                 scopes,
                 (scope, lexical),
@@ -90,7 +99,6 @@ pub(super) fn collect_declarations(
 
 pub(super) fn collect_slinker_declaration(
     source: &SourceId,
-    text: &str,
     index: &SemanticIndex,
     scopes: &LexicalScopes,
     (scope, lexical): (ScopeId, LexicalScopeId),
@@ -105,10 +113,8 @@ pub(super) fn collect_slinker_declaration(
         let name = argument
             .name_clause()
             .and_then(|clause| clause.name().ok())
-            .map(|name| ast_text(text, &name));
-        let domain = argument
-            .value()
-            .and_then(|value| declared_domain(text, &value));
+            .and_then(|name| argument_name(&name));
+        let domain = argument.value().and_then(|value| declared_domain(&value));
         let issue = match (name, domain) {
             (Some(name), Some(domain)) => match scopes.binding(index, &name, scope) {
                 Some(binding)
@@ -144,40 +150,43 @@ pub(super) fn collect_slinker_declaration(
     }
 }
 
-pub(super) fn declared_domain(text: &str, value: &AnyRExpression) -> Option<DeclaredDomain> {
+pub(super) fn declared_domain(value: &AnyRExpression) -> Option<DeclaredDomain> {
     let (callee, arguments) = declaration_call(value)?;
     match callee.as_str() {
-        "strings" => literal_strings(text, &arguments)
+        "strings" => literal_strings(&arguments)
             .map(|strings| DeclaredDomain::Strings(strings.into_iter().collect())),
-        "s3" | "one_of" => declared_classes(text, value).map(DeclaredDomain::Classes),
+        "s3" | "one_of" => declared_classes(value).map(DeclaredDomain::Classes),
         "callables" if !arguments.is_empty() => arguments
             .iter()
-            .map(|argument| declared_callable(ast_text(text, argument).trim()))
+            .map(declared_callable)
             .collect::<Option<BTreeSet<_>>>()
             .map(DeclaredDomain::Callables),
         _ => None,
     }
 }
 
-pub(super) fn declared_callable(text: &str) -> Option<DeclaredCallable> {
-    let (package, name) = match text.split_once(":::").or_else(|| text.split_once("::")) {
-        Some((package, name)) => (Some(package), name),
-        None => (None, text),
+pub(super) fn declared_callable(value: &AnyRExpression) -> Option<DeclaredCallable> {
+    let (package, name) = match value {
+        AnyRExpression::RNamespaceExpression(namespace) => (
+            Some(node_name(&namespace.left().ok()?)?),
+            node_name(&namespace.right().ok()?)?,
+        ),
+        AnyRExpression::RIdentifier(identifier) => (None, node_name(identifier)?),
+        _ => return None,
     };
-    let symbol = |candidate: &str| matches!(static_arg(candidate), Some(StaticArg::Symbol(symbol)) if symbol == candidate);
-    (package.is_none_or(symbol) && symbol(name)).then(|| DeclaredCallable {
+    Some(DeclaredCallable {
         package: package.map(PackageName::from),
         name: BindingName::from(name),
     })
 }
 
-pub(super) fn declared_classes(text: &str, value: &AnyRExpression) -> Option<Vec<Vec<String>>> {
+pub(super) fn declared_classes(value: &AnyRExpression) -> Option<Vec<Vec<String>>> {
     let (callee, arguments) = declaration_call(value)?;
     match callee.as_str() {
-        "s3" => literal_strings(text, &arguments).map(|classes| vec![classes]),
+        "s3" => literal_strings(&arguments).map(|classes| vec![classes]),
         "one_of" if !arguments.is_empty() => arguments
             .iter()
-            .map(|alternative| declared_classes(text, alternative))
+            .map(declared_classes)
             .collect::<Option<Vec<_>>>()
             .map(|alternatives| alternatives.into_iter().flatten().collect()),
         _ => None,
@@ -188,7 +197,7 @@ pub(super) fn declaration_call(value: &AnyRExpression) -> Option<(String, Vec<An
     let AnyRExpression::RCall(call) = value else {
         return None;
     };
-    let callee = identifier_callee(call)?.name().to_owned();
+    let callee = identifier_callee(call)?;
     let arguments = call
         .arguments()
         .ok()?
@@ -203,18 +212,16 @@ pub(super) fn declaration_call(value: &AnyRExpression) -> Option<(String, Vec<An
     Some((callee, arguments))
 }
 
-pub(super) fn literal_strings(text: &str, arguments: &[AnyRExpression]) -> Option<Vec<String>> {
+pub(super) fn literal_strings(arguments: &[AnyRExpression]) -> Option<Vec<String>> {
     if arguments.is_empty() {
         return None;
     }
     arguments
         .iter()
-        .map(
-            |argument| match static_arg(ast_text(text, argument).trim()) {
-                Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
-                Some(StaticArg::Symbol(_) | StaticArg::Logical(_)) | None => None,
-            },
-        )
+        .map(|argument| match static_arg_of(argument) {
+            Some(StaticArg::String(value)) => Some(value.as_str().to_owned()),
+            Some(StaticArg::Symbol(_) | StaticArg::Logical(_)) | None => None,
+        })
         .collect()
 }
 

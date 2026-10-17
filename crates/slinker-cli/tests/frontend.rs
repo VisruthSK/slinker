@@ -5,6 +5,52 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[test]
+fn literal_values_from_air_nodes_match_target_r() {
+    use slinker_core::syntax::{OakParser, SourceKey, Sources, StaticArg};
+    let source = r###"run <- function() list(r"(plain)", r"---(pkg::fake() # text \ "quoted")---", "line\nbreak", 'tab\tvalue')"###;
+    let r = discover_r_home();
+    let oracle = common::run_r_output(
+        &r,
+        "",
+        &format!(
+            "{source}\ncat(vapply(run(), function(value) paste(utf8ToInt(value), collapse=','), ''), sep='\\n')"
+        ),
+    );
+    assert_success(&oracle, "target R literal oracle");
+    let mut sources = Sources::default();
+    let id = sources.add("literalprobe", SourceKey::Binding("run".into()), source);
+    let parsed = OakParser.parse_binding(id, source).unwrap();
+    let call = parsed.expressions[0]
+        .calls
+        .iter()
+        .find(|call| call.callee == "list")
+        .unwrap();
+    let observed = call
+        .arguments
+        .iter()
+        .map(|argument| {
+            let Some(StaticArg::String(value)) = &argument.value else {
+                panic!("literal not established: {argument:?}");
+            };
+            value
+                .chars()
+                .map(|character| u32::from(character).to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        observed,
+        String::from_utf8(oracle.stdout)
+            .unwrap()
+            .replace("\r\n", "\n")
+            .trim_end()
+    );
+    assert!(parsed.expressions[0].package_refs.is_empty());
+}
+
 fn slinker(args: &[&str], paths: &[&Path]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_slinker"))
         .args(args)

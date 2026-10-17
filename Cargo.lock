@@ -1519,6 +1519,7 @@ dependencies = [
  "air_r_syntax",
  "biome_rowan",
  "dunce",
+ "oak_core",
  "oak_semantic",
  "r-description-parser",
  "r-metadata",

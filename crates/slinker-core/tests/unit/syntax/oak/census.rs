@@ -1,44 +1,47 @@
 use super::*;
 use air_r_parser::{RParserOptions, parse};
 
-fn raw_calls(text: &str) -> Vec<RawCall> {
-    let parsed = parse(text, RParserOptions::default());
-    parsed
-        .tree()
-        .syntax()
-        .descendants()
-        .filter_map(RCall::cast)
-        .filter_map(|call| raw_call(&call))
-        .collect()
+fn calls(text: &str) -> Vec<crate::syntax::CallSite> {
+    super::super::OakParser
+        .parse_binding(crate::syntax::SourceId(0), text)
+        .unwrap()
+        .expressions
+        .into_iter()
+        .next()
+        .unwrap()
+        .calls
 }
 
 #[test]
 fn trailing_comma_adds_no_argument_but_leading_hole_does() {
-    assert_eq!(raw_calls("f(x,)")[0].args.len(), 1);
-    assert_eq!(raw_calls("f(,)")[0].args.len(), 1);
-    assert_eq!(raw_calls("f(,x)")[0].args.len(), 2);
-    assert_eq!(raw_calls("f(x,,y)")[0].args.len(), 3);
-    assert!(raw_calls("f()")[0].args.is_empty());
+    assert_eq!(calls("f(x,)")[0].arguments.len(), 1);
+    assert_eq!(calls("f(,)")[0].arguments.len(), 1);
+    assert_eq!(calls("f(,x)")[0].arguments.len(), 2);
+    assert_eq!(calls("f(x,,y)")[0].arguments.len(), 3);
+    assert!(calls("f()")[0].arguments.is_empty());
 }
 
 #[test]
 fn argument_names_come_from_name_clauses() {
-    let call = &raw_calls("f(a = 1, \"b c\" = 2, `d` = 3, x == y)")[0];
+    let call = &calls("f(a = 1, \"b c\" = 2, `d` = 3, NULL = 4, x == y)")[0];
     let names = call
-        .args
+        .arguments
         .iter()
         .map(|argument| argument.name.as_deref())
         .collect::<Vec<_>>();
-    assert_eq!(names, [Some("a"), Some("b c"), Some("d"), None]);
+    assert_eq!(
+        names,
+        [Some("a"), Some("b c"), Some("d"), Some("NULL"), None]
+    );
 }
 
 #[test]
 fn language_constants_are_not_symbol_arguments() {
-    let call = &raw_calls("f(TRUE, NULL, T, ..., \"s\")")[0];
+    let call = &calls("f(TRUE, NULL, T, ..., \"s\")")[0];
     let values = call
-        .args
+        .arguments
         .iter()
-        .map(|argument| argument.static_arg.clone())
+        .map(|argument| argument.value.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         values,
@@ -56,7 +59,7 @@ fn language_constants_are_not_symbol_arguments() {
 fn regions_are_the_syntax_nodes_not_scanned_text() {
     let text = "f <- function(a, b = 2) {\n  if (a) 1 else 2\n  for (i in b) i\n  \\(z) z\n}\n";
     let parsed = parse(text, RParserOptions::default());
-    let census = Census::of(&parsed.tree());
+    let census = Census::of(&parsed.tree()).unwrap();
     let slice = |range: TextRange| &text[range.start..range.end];
 
     assert_eq!(census.functions.len(), 2);
@@ -84,7 +87,7 @@ fn regions_are_the_syntax_nodes_not_scanned_text() {
 fn replacement_targets_are_calls_on_the_left_of_an_assignment() {
     let text = "names(x) <- v\ny <- names(x)\n";
     let parsed = parse(text, RParserOptions::default());
-    let census = Census::of(&parsed.tree());
+    let census = Census::of(&parsed.tree()).unwrap();
     assert!(census.is_replacement_target(0, 5));
     let second = text.rfind("names").unwrap();
     assert!(!census.is_replacement_target(second, second + 5));

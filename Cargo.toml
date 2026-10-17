@@ -37,6 +37,7 @@ biome_rowan = { git = "https://github.com/lionel-/biome", rev = "a1296ea6ba363d8
 
 # Oak semantic analysis only. Do not pull Ark runtime/LSP/Jupyter crates.
 oak_semantic = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a" }
+oak_core = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a" }
 harp = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a" }
 libr = { git = "https://github.com/posit-dev/ark", rev = "37fe33a19c4fc678da32c5c23111306b52019f4a" }
 

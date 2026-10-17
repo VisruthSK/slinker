@@ -92,9 +92,8 @@ acceptance cases here.
 
 ## Next up
 
-1. Track I: finish Air/Oak ownership. Then Track J can flatten construction and replace duplicate function restoration paths coherently.
-2. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
-3. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
+1. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
+2. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
 
 ---
 
@@ -112,26 +111,6 @@ Done when:
 - the soundness and installation-independence corpus passes unchanged;
 - any coordination replacement removes its superseded scheduler/locking mechanism, and reports measured tradeoffs without restoring query/allocation interpretation.
 - after sessions and their returned objects are dropped, no process-global interner retains their unique text; repeated-session measurements report both retained memory and runtime cost.
-
----
-
-## Track I: Parse on the syntax tree
-
-Air parses every binding and Oak indexes it, yet slinker still re-derives some structure by scanning source text with its own lexer. The remaining scanners do not understand raw strings, can end an expression at a newline after a trailing operator or `%>%`, and detect `=` by character rules. Replace them; do not add scanners.
-
-Still to do:
-- `syntax/oak/scan.rs`, `proofs.rs`, `declarations.rs` and `mod.rs` still scan/redecode source: `static_arg`/`static_string`/`static_symbol` on re-sliced text, `expression_end`, `skip_trivia`, `matching_delimiter`, `CodeScanner`, and `contains_call_named`. Delete helper-body exit inference rather than migrating its unsound scanner.
-- Resolve the remaining Oak `DefinitionKind` pointers (`Parameter`, `ForVariable`, `Assign`) to Air nodes instead of scanning around the target; assignments and super-assignments already resolve through `assignment_of`.
-- Collect every node class the translation needs in the single `Census` pass (data-mask ranges, declarations, dispatching syntax, namespace-info reads, operators) instead of one tree walk per fact; keep reusing Oak where it already answers (`use_is_bound`, `reaching_definitions`, scope kinds and ranges, `enclosing_bindings`, eager and lazy scopes).
-- Audit `slinker-r-worker` against harp (Ark's Rust wrappers for R objects) and delete hand-rolled R object inspection that harp already provides; keep only slinker-specific protocol and policy.
-
-Done when:
-
-- no byte-offset scanning of R source remains under `syntax/oak` and `scan.rs` is deleted;
-- `analyze --json` is byte-identical before and after on R6, jsonlite, rlang, cli, callr, testthat (`--threads 1`), compiler, and grid, or each difference is explained as a soundness fix with its own regression test;
-- raw strings, code-like text in comments and strings, and multi-line continuations (`x <-\n f()`, a trailing `%>%`) each have a regression case that failed under scanning.
-
-Record allocation measurements separately; a correctness and ownership improvement does not require an allocation reduction.
 
 ---
 

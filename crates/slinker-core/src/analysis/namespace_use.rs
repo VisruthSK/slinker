@@ -9,6 +9,7 @@ use crate::syntax::{CallSite, NamespaceUseKind, StaticArg, StaticEnvironment};
 
 enum NamespaceTarget {
     Package(PackageId),
+    Base,
     Complete,
     Unproved,
 }
@@ -271,7 +272,7 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     NamespaceTarget::Unproved
                 }
             }
-            StaticEnvironment::Namespace(name) if name == "base" => NamespaceTarget::Complete,
+            StaticEnvironment::Namespace(name) if name == "base" => NamespaceTarget::Base,
             StaticEnvironment::Namespace(name) => self
                 .known_package(name)
                 .map_or(NamespaceTarget::Unproved, NamespaceTarget::Package),
@@ -279,6 +280,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 let image = self.image(owner)?;
                 let resolved =
                     self.resolve_lexical_name(owner, &image, &observation.environment, binding)?;
+                if matches!(&resolved, Resolution::Static(BindingTarget::Base))
+                    || matches!(&resolved, Resolution::Static(BindingTarget::External { package, .. }) if self.packages.name(*package) == "base")
+                {
+                    return Ok(NamespaceTarget::Base);
+                }
                 let closure = match resolved {
                     Resolution::Static(
                         BindingTarget::Namespace { package, binding }
@@ -303,12 +309,16 @@ impl<P: PackageProvider> AnalyzerState<P> {
                 };
                 match closure.map(|closure| closure.environment) {
                     Some(environment) => match environment {
+                        EnvironmentLabel::Namespace(name) if name == "base" => {
+                            NamespaceTarget::Base
+                        }
                         EnvironmentLabel::Namespace(name) => self
                             .known_package(&name)
                             .map_or(NamespaceTarget::Unproved, NamespaceTarget::Package),
-                        EnvironmentLabel::InstalledPrivate(_)
-                        | EnvironmentLabel::Base
-                        | EnvironmentLabel::Empty => NamespaceTarget::Complete,
+                        EnvironmentLabel::Base => NamespaceTarget::Base,
+                        EnvironmentLabel::InstalledPrivate(_) | EnvironmentLabel::Empty => {
+                            NamespaceTarget::Complete
+                        }
                         _ => NamespaceTarget::Unproved,
                     },
                     None => NamespaceTarget::Unproved,
@@ -419,8 +429,6 @@ impl<P: PackageProvider> AnalyzerState<P> {
                     }
                 }
             };
-            let base =
-                matches!(&usage.target, StaticEnvironment::Namespace(name) if name == "base");
             if matches!(&action, NamespaceAction::Write(_))
                 && let NamespaceUseKind::Argument { call, .. } = &usage.operation
             {
@@ -429,11 +437,11 @@ impl<P: PackageProvider> AnalyzerState<P> {
             let target = self.namespace_target(observation)?;
             let mut problem: Option<String> = None;
             match (target, action) {
-                (_, NamespaceAction::Write(_)) if base => {
+                (NamespaceTarget::Base, NamespaceAction::Write(_)) => {
                     problem =
                         Some("writes a platform namespace; semantic callees are not stable".into());
                 }
-                (NamespaceTarget::Complete, _) => {}
+                (NamespaceTarget::Base | NamespaceTarget::Complete, _) => {}
                 (NamespaceTarget::Package(package), NamespaceAction::Write(name)) => {
                     if self.packages.is_external(package) {
                         problem = Some(

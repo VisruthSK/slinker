@@ -1,6 +1,6 @@
-use super::census::{Census, IfRegion, assignment_of, node_range, static_arg_of};
+use super::census::{Census, IfRegion, assignment_of, node_name, node_range, static_arg_of};
+use super::census::{ForRegion, FunctionRegion};
 use super::context::OakParseContext;
-use super::scan::{ForRegion, FunctionRegion, static_symbol};
 use super::{LiveUse, innermost_function_region, text_offset};
 use crate::syntax::facts::{CallSite, CalleeKind, StaticArg};
 use crate::syntax::source::TextRange;
@@ -82,7 +82,6 @@ pub(super) fn recursive_closure_binding_is_initialized(
 }
 
 pub(super) fn post_for_use_may_fall_through(
-    text: &str,
     index: &SemanticIndex,
     regions: &[ForRegion],
     if_regions: &[IfRegion],
@@ -109,7 +108,6 @@ pub(super) fn post_for_use_may_fall_through(
         }
 
         if scope_has_definite_binding_before(
-            text,
             index,
             live_use.scope,
             &live_use.name,
@@ -130,7 +128,6 @@ pub(super) fn post_for_use_may_fall_through(
 }
 
 pub(super) fn scope_has_definite_binding_before(
-    text: &str,
     index: &SemanticIndex,
     scope: ScopeId,
     name: &str,
@@ -155,7 +152,6 @@ pub(super) fn scope_has_definite_binding_before(
                     let definition_start = text_offset(definition.range().start());
                     definition_start < before
                         && definition_must_execute_before_position(
-                            text,
                             definition_start,
                             use_position,
                             regions.for_regions,
@@ -170,7 +166,6 @@ pub(super) fn scope_has_definite_binding_before(
 }
 
 pub(super) fn definition_must_execute_before_position(
-    _text: &str,
     definition_start: usize,
     position: usize,
     for_regions: &[ForRegion],
@@ -211,7 +206,6 @@ pub(super) fn definition_must_execute_before_position(
 }
 
 pub(super) fn conditional_fallthrough_proven_bound(
-    text: &str,
     context: &OakParseContext,
     index: &SemanticIndex,
     census: &Census,
@@ -227,13 +221,7 @@ pub(super) fn conditional_fallthrough_proven_bound(
         .filter(|start| *start < live_use.start)
         .collect::<Vec<_>>();
     if definitions.iter().any(|start| {
-        definition_must_execute_before_position(
-            text,
-            *start,
-            live_use.start,
-            &census.fors,
-            &census.ifs,
-        )
+        definition_must_execute_before_position(*start, live_use.start, &census.fors, &census.ifs)
     }) {
         return true;
     }
@@ -242,25 +230,16 @@ pub(super) fn conditional_fallthrough_proven_bound(
             .else_branch
             .is_some_and(|branch| branch.end <= live_use.start)
             && definition_must_execute_before_position(
-                text,
                 region.if_start,
                 live_use.start,
                 &census.fors,
                 &census.ifs,
             )
-            && if_chain_all_returning_paths_bind(
-                text,
-                context,
-                index,
-                &census.ifs,
-                region,
-                &definitions,
-            )
+            && if_chain_all_returning_paths_bind(context, index, &census.ifs, region, &definitions)
     })
 }
 
 pub(super) fn if_chain_all_returning_paths_bind(
-    text: &str,
     context: &OakParseContext,
     index: &SemanticIndex,
     regions: &[IfRegion],
@@ -273,7 +252,6 @@ pub(super) fn if_chain_all_returning_paths_bind(
         region.then_branch.end,
         definition_starts,
     ) && !branch_exits_current_function(
-        text,
         context,
         index,
         regions,
@@ -296,7 +274,6 @@ pub(super) fn if_chain_all_returning_paths_bind(
         .find(|candidate| candidate.if_start == else_start)
     {
         return if_chain_all_returning_paths_bind(
-            text,
             context,
             index,
             regions,
@@ -306,7 +283,7 @@ pub(super) fn if_chain_all_returning_paths_bind(
     }
 
     branch_binds_reaching_definition(regions, else_start, else_end, definition_starts)
-        || branch_exits_current_function(text, context, index, regions, else_start, else_end)
+        || branch_exits_current_function(context, index, regions, else_start, else_end)
 }
 
 pub(super) fn branch_binds_reaching_definition(
@@ -362,7 +339,6 @@ fn branch_expression(regions: &[IfRegion], start: usize, end: usize) -> Option<A
 }
 
 pub(super) fn branch_exits_current_function(
-    text: &str,
     context: &OakParseContext,
     index: &SemanticIndex,
     regions: &[IfRegion],
@@ -380,7 +356,7 @@ pub(super) fn branch_exits_current_function(
                 .else_branch
                 .is_some_and(|branch| branch.end <= range.end)
     }) {
-        return if_chain_all_paths_exit(text, context, index, regions, region);
+        return if_chain_all_paths_exit(context, index, regions, region);
     }
 
     let Some((package, callee, callee_start)) = ast_direct_call(&expression) else {
@@ -412,8 +388,8 @@ fn ast_direct_call(expression: &AnyRExpression) -> Option<(Option<String>, Strin
         AnyRExpression::RNamespaceExpression(namespace) => {
             let (package, callee) = (namespace.left().ok()?, namespace.right().ok()?);
             Some((
-                Some(static_symbol(&package.syntax().text_trimmed().to_string())?),
-                static_symbol(&callee.syntax().text_trimmed().to_string())?,
+                Some(node_name(&package)?),
+                node_name(&callee)?,
                 node_range(&callee).start,
             ))
         }
@@ -422,14 +398,12 @@ fn ast_direct_call(expression: &AnyRExpression) -> Option<(Option<String>, Strin
 }
 
 pub(super) fn if_chain_all_paths_exit(
-    text: &str,
     context: &OakParseContext,
     index: &SemanticIndex,
     regions: &[IfRegion],
     region: &IfRegion,
 ) -> bool {
     if !branch_exits_current_function(
-        text,
         context,
         index,
         regions,
@@ -449,9 +423,9 @@ pub(super) fn if_chain_all_paths_exit(
         .iter()
         .find(|candidate| candidate.if_start == else_start)
     {
-        if_chain_all_paths_exit(text, context, index, regions, nested)
+        if_chain_all_paths_exit(context, index, regions, nested)
     } else {
-        branch_exits_current_function(text, context, index, regions, else_start, else_end)
+        branch_exits_current_function(context, index, regions, else_start, else_end)
     }
 }
 

@@ -121,6 +121,7 @@ The regression audit maps these findings to executable cases under `crates/*/tes
 | Findings | Regression coverage |
 | --- | --- |
 | Export checks, namespace values/observations, Root support, loaded queries | `resolved_calls.rs`: unexported lookup, namespace members/enumeration, support reads, and loaded observations; `soundness.rs`: retained namespace objects and support collisions |
+| AST literal/name ownership, namespace aliases, platform closure enclosures | `frontend.rs`: target-R literal oracle; core syntax cases: raw namespace selectors, declarations, continuations, escaped identifier blocker; `resolved_calls.rs`: quoted namespace aliases and base closure environments; `soundness.rs`: ordinary `.Generic` and backticked `TRUE` namespace bindings |
 | Default fidelity, datasets, structural members, ALTREP attributes, primitive dispatch | `soundness.rs`: lossy defaults, executable datasets, structural payload member cases; `resolved_calls.rs`: primitive callable methods |
 | Package-defined assignment and reserved NAMESPACE names | `source_ownership.rs`: shadow-proof Root/Linked assignment cases and `reserved_external_generic_names_survive_generated_namespace_and_tarball` |
 | Load boundaries, hook recursion, inspection without hooks | `resolved_calls.rs`: delayed/shared load effects and effective imports; `soundness.rs`: recursive Root hook; `source_ownership.rs`: foreign closure inspection |
@@ -134,6 +135,8 @@ The regression audit maps these findings to executable cases under `crates/*/tes
 | External Depends requirements, image identity, repeated worker startup | `resolved_calls.rs`: Depends constraints; `image_identity.rs`: file-tree framing; `harp_runtime.rs`: repeated worker startup |
 
 Build-record reuse/concurrent-record findings lost their mechanism when build records were removed. They do not justify preserving that mechanism solely to test it.
+
+The Air/Oak ownership refactor removes `syntax/oak/scan.rs` and the duplicate raw-call records. One checked census supplies syntax nodes to the translation passes. Raw strings and namespace names have failing-before regressions; continuation cases retain their existing behavior. Cold single-thread JSON comparisons match for R6, jsonlite, rlang, callr, testthat, compiler, and grid. The old cli analysis failed while requesting installed metadata for base; the corrected runtime-owned base enclosure has its own original/generated regression. Harp already owns generic R object access in the worker; its remaining member traversal expresses slinker's payload and executable-member policy.
 
 Each item states whether slinker publishes behavior that differs from the
 original or rejects an otherwise valid program. Simplification proposals later

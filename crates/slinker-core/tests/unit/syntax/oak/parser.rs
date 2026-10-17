@@ -1,4 +1,90 @@
 use super::*;
+use std::collections::BTreeMap;
+
+#[test]
+fn undecoded_argument_names_block_instead_of_becoming_positional() {
+    let result = OakParser.parse_binding(
+        SourceId(0),
+        r#"f <- function() system.file("pack\x61ge"='dep')"#,
+    );
+    assert!(result.unwrap_err().contains("argument name"));
+}
+
+#[test]
+fn escaped_identifiers_block_instead_of_losing_binding_obligations() {
+    let result = OakParser.parse_binding(
+        SourceId(0),
+        r"f <- function() { `ns\x20alias` <- asNamespace('dep'); `ns alias`$hidden }",
+    );
+    assert!(result.unwrap_err().contains("escaped identifiers"));
+}
+
+#[test]
+fn raw_namespace_selectors_keep_decoded_names_and_the_full_call() {
+    let source = r#"f <- function() r"(stats)"::filter()"#;
+    let parsed = parse_source(source);
+    let reference = &parsed.expressions[0].package_refs[0];
+    assert_eq!(reference.package, "stats");
+    let call = parsed.expressions[0]
+        .calls
+        .iter()
+        .find(|call| call.callee == "filter")
+        .unwrap();
+    assert_eq!(call.qualified_package(), Some("stats"));
+    assert_eq!(
+        &source[call.span.start..call.span.end],
+        r#"r"(stats)"::filter()"#
+    );
+}
+
+#[test]
+fn raw_strings_are_literal_values_even_with_code_like_contents() {
+    for (source, expected) in [
+        (r#"f <- function() get(r"(target)")"#, "target"),
+        (
+            r###"f <- function() get(r"---(pkg::fake() # not code \\ "quoted")---")"###,
+            r#"pkg::fake() # not code \\ "quoted""#,
+        ),
+    ] {
+        let parsed = parse_source(source);
+        let calls = &parsed.expressions[0].calls;
+        let call = calls.iter().find(|call| call.callee == "get").unwrap();
+        assert_eq!(
+            call.static_arg(0),
+            Some(&StaticArg::String(expected.into()))
+        );
+        assert!(parsed.expressions[0].package_refs.is_empty());
+        assert!(!calls.iter().any(|call| call.callee == "fake"));
+    }
+}
+
+#[test]
+fn declaration_literals_and_callable_names_come_from_nodes() {
+    let parsed = parse_source(
+        r#"f <- function(name, fun) declare(slinker(name = strings(r"(alpha)", r"---(beta)---"), fun = callables(pkg::`odd name`)))"#,
+    );
+    assert!(parsed.issues.is_empty(), "{:?}", parsed.issues);
+    assert!(parsed.declarations.iter().any(|declaration| {
+        matches!(&declaration.domain, DeclaredDomain::Strings(values) if values.iter().map(String::as_str).eq(["alpha", "beta"]))
+    }));
+    assert!(parsed.declarations.iter().any(|declaration| {
+        matches!(&declaration.domain, DeclaredDomain::Callables(values) if values.contains(&DeclaredCallable { package: Some("pkg".into()), name: "odd name".into() }))
+    }));
+}
+
+#[test]
+fn multiline_continuations_and_comments_keep_their_full_syntax() {
+    let source =
+        "f <- function() { x <-\n helper() +\n other(); x %>%\n finish() # phantom::call()\n }";
+    let parsed = parse_source(source);
+    let calls = &parsed.expressions[0].calls;
+    for name in ["helper", "other", "%>%", "finish"] {
+        assert!(calls.iter().any(|call| call.callee == name), "{name}");
+    }
+    assert!(parsed.expressions[0].package_refs.is_empty());
+    let pipe = calls.iter().find(|call| call.callee == "%>%").unwrap();
+    assert_eq!(&source[pipe.span.start..pipe.span.end], "x %>%\n finish()");
+}
 
 #[test]
 fn binary_constant_arguments_are_not_names() {
@@ -320,11 +406,11 @@ fn data_masked_names_may_be_columns() {
 }
 
 #[test]
-fn dispatch_frame_variables_are_never_free_names() {
+fn method_name_does_not_prove_dispatch_only_callers() {
     let parsed = parse_source("Ops.poly <- function(e1, e2) switch(.Generic, `+` = .Class)");
     let names = reference_names(&parsed);
-    assert!(!names.contains(&".Generic"));
-    assert!(!names.contains(&".Class"));
+    assert!(names.contains(&".Generic"));
+    assert!(names.contains(&".Class"));
 }
 
 #[test]
