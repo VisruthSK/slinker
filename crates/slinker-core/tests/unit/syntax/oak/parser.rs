@@ -748,14 +748,9 @@ fn for_variable_is_definitely_bound_inside_body() {
 }
 
 #[test]
-fn for_variable_may_be_unbound_after_zero_iterations() {
+fn for_variable_is_bound_after_zero_iterations() {
     let parsed = parse_source("f <- function(xs) { for (x in xs) {}; print(x) }");
-    let reference = parsed.expressions[0]
-        .references
-        .iter()
-        .find(|reference| reference.name == "x")
-        .expect("post-loop use must preserve the zero-iteration fallthrough");
-    assert_eq!(reference.kind, NameRefKind::ConditionalFallthrough);
+    assert!(!reference_names(&parsed).contains(&"x"));
 }
 
 #[test]

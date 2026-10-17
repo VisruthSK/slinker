@@ -92,8 +92,9 @@ acceptance cases here.
 
 ## Next up
 
-1. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
-2. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
+1. Track I: finish semantic ownership in Air/Oak. Replace the remaining local language-analysis mechanisms, not just the source scanner. The component inventory and API gaps are in `fixes.md` under "Air/Oak ownership inventory".
+2. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
+3. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
 
 ---
 
@@ -111,6 +112,23 @@ Done when:
 - the soundness and installation-independence corpus passes unchanged;
 - any coordination replacement removes its superseded scheduler/locking mechanism, and reports measured tradeoffs without restoring query/allocation interpretation.
 - after sessions and their returned objects are dropped, no process-global interner retains their unique text; repeated-session measurements report both retained memory and runtime cost.
+
+---
+
+## Track I: Air/Oak semantic ownership
+
+- Make Oak the sole owner of generic binding and control-flow facts: later formals in defaults, lazy recursive closure bindings, returning-path binding guarantees, and captured superassignment targets. Preserve the existing R oracles; replace local proofs only when the dependency supplies their contract.
+- Use a complete upstream callable-syntax view for ordinary calls, operators, extraction/subsetting, replacement calls, and language control forms. Delete the competing local call discovery and node census when that API covers the same occurrences and shadowing rules.
+- Put decoded literal/name values and full R argument matching in Air/Oak. Raw strings, escaped names, missing arguments, partial matching, dots, and explicit invalid/unknown outcomes belong to those APIs. The current convenience helpers are not equivalent replacements.
+- Delegate generic assignment alias provenance and required-true branch facts to Oak. Keep namespace retention, package availability/activation, declarations, resource policy, and supported-profile decisions in slinker.
+- Keep the package-image/import snapshot as slinker's input to Oak; remove duplicated generic scope and resolution structures where upstream handles already preserve the required identity.
+
+Done when:
+- slinker consumes generic language facts instead of maintaining a second binding/control/call analysis;
+- each deleted mechanism has an identified upstream owner and an independent behavior oracle;
+- the thin adapter retains no duplicate syntax tree or generic flow engine;
+- source and tarball behavior, blockers, and dependency installation independence remain covered, with every intended analysis-output change explained;
+- report net production deletions separately from code movement, tests, and upstream additions. Do not claim a thousands-line reduction before it is measured.
 
 ---
 

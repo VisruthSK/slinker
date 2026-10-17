@@ -216,6 +216,48 @@ fn external_caller_frame_reflection_blocks_before_removing_its_target() {
 }
 
 #[test]
+fn for_variable_initialization_does_not_retain_a_namespace_fallback() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("loopdep");
+    let source = work.path().join("looproot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "loopdep",
+        "",
+        "export(entry)\n",
+        "x <- function() eval(quote(1L))\nentry <- function(xs) { for (x in xs) {}; x }\n",
+    );
+    package(
+        &source,
+        "looproot",
+        "Imports: loopdep\n",
+        "export(run)\n",
+        "run <- function() list(loopdep::entry(integer()), loopdep::entry(7L))\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(looproot::run(), list(NULL, 7L)))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert_success(&result, "for-variable initialization build");
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('loopdep'); {oracle}"),
+    );
+}
+
+#[test]
 fn namespace_members_and_reflective_generics_keep_their_obligations() {
     let work = tempfile::tempdir().unwrap();
     let dependency = work.path().join("memberdep");

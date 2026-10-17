@@ -6,7 +6,7 @@ use crate::syntax::facts::{CallSite, CalleeKind, StaticArg};
 use crate::syntax::source::TextRange;
 use air_r_syntax::{AnyRExpression, RIfStatement, RRoot};
 use biome_rowan::{AstNode, AstNodeList};
-use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex};
+use oak_semantic::semantic_index::{DefinitionKind, SemanticIndex};
 
 #[derive(Clone, Copy)]
 pub(super) struct ControlRegions<'a> {
@@ -27,30 +27,6 @@ pub(super) fn formal_default_use_is_bound(regions: &[FunctionRegion], live_use: 
     containing
         .into_iter()
         .any(|region| region.parameters.contains(&live_use.name))
-}
-
-pub(super) fn for_body_use_is_bound(
-    index: &SemanticIndex,
-    regions: &[ForRegion],
-    live_use: &LiveUse,
-) -> bool {
-    if !regions.iter().any(|region| {
-        region.variable == live_use.name
-            && region
-                .body
-                .contains_range(TextRange::new(live_use.start, live_use.end))
-    }) {
-        return false;
-    }
-
-    index
-        .reaching_definitions(live_use.scope, live_use.use_id)
-        .any(|(scope, definition_id)| {
-            let definition = &index.definitions(scope)[definition_id];
-            let symbol = index.symbols(scope).symbol(definition.symbol());
-            symbol.name() == live_use.name
-                && matches!(definition.kind(), DefinitionKind::ForVariable(_))
-        })
 }
 
 pub(super) fn recursive_closure_binding_is_initialized(
@@ -78,90 +54,6 @@ pub(super) fn recursive_closure_binding_is_initialized(
                 matches!(&assignment.value, AnyRExpression::RFunctionDefinition(value)
                     if node_range(value).start == function.function_start)
             })
-        })
-}
-
-pub(super) fn post_for_use_may_fall_through(
-    index: &SemanticIndex,
-    regions: &[ForRegion],
-    if_regions: &[IfRegion],
-    live_use: &LiveUse,
-) -> bool {
-    for region in regions.iter().rev() {
-        if region.variable != live_use.name || region.body.end > live_use.start {
-            continue;
-        }
-
-        let has_reaching_for_definition = index
-            .reaching_definitions(live_use.scope, live_use.use_id)
-            .any(|(scope, definition_id)| {
-                if scope != live_use.scope {
-                    return false;
-                }
-                let definition = &index.definitions(scope)[definition_id];
-                let symbol = index.symbols(scope).symbol(definition.symbol());
-                symbol.name() == live_use.name
-                    && matches!(definition.kind(), DefinitionKind::ForVariable(_))
-            });
-        if !has_reaching_for_definition {
-            continue;
-        }
-
-        if scope_has_definite_binding_before(
-            index,
-            live_use.scope,
-            &live_use.name,
-            region.variable_start,
-            live_use.start,
-            ControlRegions {
-                for_regions: regions,
-                if_regions,
-            },
-        ) {
-            return false;
-        }
-
-        return true;
-    }
-
-    false
-}
-
-pub(super) fn scope_has_definite_binding_before(
-    index: &SemanticIndex,
-    scope: ScopeId,
-    name: &str,
-    before: usize,
-    use_position: usize,
-    regions: ControlRegions<'_>,
-) -> bool {
-    let Some(symbol_id) = index.symbols(scope).id(name) else {
-        return false;
-    };
-
-    index
-        .definitions(scope)
-        .iter()
-        .any(|(_definition_id, definition)| {
-            if definition.symbol() != symbol_id {
-                return false;
-            }
-            match definition.kind() {
-                DefinitionKind::Parameter(_) => true,
-                DefinitionKind::Assignment(_) | DefinitionKind::Assign { .. } => {
-                    let definition_start = text_offset(definition.range().start());
-                    definition_start < before
-                        && definition_must_execute_before_position(
-                            definition_start,
-                            use_position,
-                            regions.for_regions,
-                            regions.if_regions,
-                        )
-                }
-                DefinitionKind::ForVariable(_)
-                | DefinitionKind::SuperAssignment(_)
-                | DefinitionKind::Import { .. } => false,
-            }
         })
 }
 

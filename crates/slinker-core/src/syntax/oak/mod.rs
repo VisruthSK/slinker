@@ -46,8 +46,7 @@ use namespace::{
 };
 use proofs::{
     ControlRegions, conditional_fallthrough_proven_bound, definition_must_execute_before_position,
-    for_body_use_is_bound, formal_default_use_is_bound, is_base_call,
-    post_for_use_may_fall_through, recursive_closure_binding_is_initialized,
+    formal_default_use_is_bound, is_base_call, recursive_closure_binding_is_initialized,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -532,18 +531,10 @@ fn refine_callee_kinds(
     census: &Census,
     live_uses: &mut [LiveUse],
 ) {
-    let (function_regions, for_regions, if_regions) =
-        (&census.functions, &census.fors, &census.ifs);
+    let function_regions = &census.functions;
     for live_use in live_uses.iter_mut() {
-        if live_use.callee_kind == CalleeKind::DefinitelyLexical
-            && post_for_use_may_fall_through(index, for_regions, if_regions, live_use)
-        {
-            live_use.callee_kind = CalleeKind::ConditionalFallthrough;
-        }
-
         if live_use.callee_kind != CalleeKind::DefinitelyLexical
             && (formal_default_use_is_bound(function_regions, live_use)
-                || for_body_use_is_bound(index, for_regions, live_use)
                 || recursive_closure_binding_is_initialized(
                     root,
                     index,

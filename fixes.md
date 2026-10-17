@@ -1520,6 +1520,60 @@ Sources inspected directly through GitHub:
 [argument/effect API](https://github.com/posit-dev/ark/blob/eee5d637176aa5d916f73d4c59ac5a3b002bad52/crates/oak_semantic/src/effects.rs),
 [static-value API](https://github.com/posit-dev/ark/blob/eee5d637176aa5d916f73d4c59ac5a3b002bad52/crates/oak_semantic/src/effects/value_eval.rs).
 
+### Air/Oak ownership inventory
+
+The scanner replacement is not completion of language-analysis ownership. Track I remains next. These counts are nonblank production Rust/R lines, including comments, excluding tests, benchmarks, generated output, and dependencies. They describe `d1fca9b` plus the loop-binding correction below. They are size measurements; the complexity column describes mechanisms, not a measured cyclomatic score.
+
+| Component | Lines | Current responsibility and complexity |
+| --- | ---: | --- |
+| Analysis | 11,080 | Retention graph, call/caller obligations, S3/native contracts, namespace activation and finalization. Most is linker policy; generic matching and language facts should come from dependencies. |
+| Syntax | 3,641 | Air/Oak translation plus local language rules and linker annotations. This is the immediate ownership target; breakdown below. |
+| Package images/store | 3,082 | Frozen package identity/location, inspection caching/batching, installed metadata and object images. Package/image policy stays here; generic object access belongs to Harp. |
+| R worker | 2,595 | Target-R observations, payload serialization, native registration and member traversal. Harp owns object access; protocol and supported-profile policy stay here. |
+| Build/materialization | 1,657 | Execute checked IR, emit files, stage and publish output. Separate from Air/Oak ownership. |
+| Sessions/cache/metadata and other core entry points | 1,549 | Session boundaries, cache, target environment and metadata constraints; includes the 100-line generic argument matcher. |
+| Worker client/protocol | 1,239 | Process/epoch management and validated messages. Neither parser nor semantic analysis. |
+| Construction IR | 1,181 | Typed checked construction records. Its redundant tables are Track J, which is not the current task. |
+| CLI | 971 | Arguments, diagnostics and presentation. |
+| Source snapshots | 365 | Frozen source inputs, exclusions and staged installation. |
+| Total | 27,360 | Whole source tree, with each production file counted once. |
+
+#### Remaining syntax ownership
+
+| Current component | Lines | Desired owner | What must change |
+| --- | ---: | --- | --- |
+| `oak/mod.rs` | 1,276 | Mixed: Oak language facts, slinker adapter/policy | It still discovers ordinary/operator/dispatch calls, lowers arguments, classifies uses, checks closure-valued definitions, reconstructs captured superassignment targets and specializes defaults. Oak should expose the generic occurrence/binding facts; slinker should map those into retention obligations. |
+| `oak/namespace.rs` | 511 | Split | Assignment-alias provenance and structural member/call recognition are generic Oak work. Namespace identity, retained member requirements, supported metadata and mutation blockers remain slinker policy. |
+| `oak/proofs.rs` | 338 | Oak for generic proofs | Formal-default binding, lazy recursive closure binding, branch exits and returning-path guarantees remain local. Package/base resolution is a narrow adapter input, not a reason for a second control-flow analysis. |
+| `oak/context.rs` | 302 | Split | Slinker supplies the frozen installed imports/exports and package identities. Generic namespace lookup order, symbol remapping and effect-resolution adapters should use an upstream namespace/import contract. |
+| `oak/census.rs` | 301 | Air/Oak | Syntax node indexing, assignment operands and decoded literal/name values contain no retention policy. A complete upstream callable-syntax view and decoded-literal API should replace these local mechanisms. |
+| `oak/declarations.rs` | 226 | Slinker | Parses the slinker-specific declaration language and creates lexical contracts. Air owns its syntax and Oak owns binding identity. |
+| `oak/guards.rs` | 171 | Split | Oak should supply which condition calls must be true on a branch. Mapping those facts to package availability, loaded state and selected hook activation stays in slinker. |
+| `facts.rs` | 344 | Slinker boundary, minimized | Retention-specific facts and declarations belong here. Repeated generic scopes/call/argument records should shrink as the upstream views become usable. |
+| `source.rs` | 157 | Slinker | Source identity, provenance and diagnostics. |
+| `mod.rs` | 15 | Slinker | Public exports. |
+| Total | 3,641 | | These rows partition syntax; do not add them to the whole-tree table again. |
+
+Other mixed consumers are `arguments.rs` (100 lines), `analysis/arguments.rs` (172), `analysis/invocation.rs` (399), and `analysis/resolution.rs` (502). Their full sizes are not deletion estimates: caller coverage, package roles and retention obligations remain slinker responsibilities. Only generic argument matching, binding resolution and language-value facts should move to Oak.
+
+#### Existing APIs and demonstrated gaps
+
+The pinned Oak already supplies `use_is_bound`, `reaching_definitions`, `enclosing_bindings`, ancestor scopes, namespace accesses, definition AST pointers and evaluation effects. Slinker should consume those facts directly.
+
+An experiment bypassing slinker's binding refinements produced five failing existing syntax cases. Two concern later formals in defaults; one concerns recursive closure initialization; one concerns branches ending in base `stop`; one exposed a wrong local loop correction. Target R establishes a for-variable as `NULL` even when the sequence is empty. Oak already models that. The local loop-body proof, post-loop override and its supporting definite-binding scan were deleted. `resolved_calls.rs::for_variable_initialization_does_not_retain_a_namespace_fallback` first failed because the old override retained an unreachable namespace function containing `eval`; it now compares original/generated results `list(NULL, 7L)` with the Linked dependency absent, installed and loaded. The old unit expectation was corrected to that observed R contract.
+
+Current upstream Ark/Oak was also inspected at `d5e185b279fa136eff3cad3db967e41aba16f23d` (2026-10-17), without changing the dependency pin. It has static-value handlers and callee-import dependencies, but an upgrade alone does not supply the missing contracts:
+
+- `SemanticIndex::semantic_calls` records selected cross-file semantic calls, not every ordinary/operator/subset/control occurrence slinker consumes. A complete typed callable-syntax view is still needed.
+- Function parameters are still walked in order, with each default visited before later parameters are registered. Generic later-formal binding must be fixed upstream before the local workaround disappears.
+- `RStringValueExt::string_text` still strips one character from each end; it neither decodes R escapes nor handles raw delimiters. Replacing the checked local decoder with it changes values.
+- `CallContext` argument binding is not a complete R matcher with partial matching, dots and explicit invalid outcomes. The 100-line local matcher cannot safely disappear against that API.
+- Generic returning-path and captured-binding queries must establish the same conditions as the remaining local proofs, without predicate correlation or helper execution.
+- Generic assignment provenance must preserve aliases, reassignment alternatives and producer identity; slinker then attaches namespace obligations to those producers.
+- The scanner and walker bind a for-variable before visiting its sequence. R evaluates the sequence first: with enclosing `x <- 1:3`, `function() { for (x in x) {}; x }` returns `3`. A direct parser probe currently loses the sequence-side outer reference. Fix this order in Oak's scan and walk passes; do not recreate the flow engine in slinker.
+
+The substantial reduction is to remove the local generic language layer once these contracts have an upstream owner. Moving files, dropping proof obligations or adding an Oak-named wrapper around the same local engine does not achieve that. No thousands-line deletion has been established yet.
+
 ### Flatten the remaining construction IR
 
 This is a concrete model reduction to evaluate against the current profile. The
