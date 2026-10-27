@@ -123,7 +123,7 @@ jobs:
         with:
           key: r-${{ matrix.r }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: target/tmp/cran
           key: cran-${{ runner.os }}-r-${{ matrix.r }}-${{ hashFiles('crates/slinker-cli/tests/cran_packages.rs', 'crates/slinker-cli/tests/common/mod.rs') }}
