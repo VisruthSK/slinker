@@ -1,0 +1,1358 @@
+mod common;
+
+use common::{assert_success, discover_r_home, install_package, install_package_using, run_r};
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+
+fn package(root: &Path, name: &str, imports: &str, exports: &str, code: &str) {
+    fs::create_dir_all(root.join("R")).unwrap();
+    fs::write(root.join("DESCRIPTION"), format!(
+        "Package: {name}\nVersion: 1.0.0\nTitle: Resolved Call Fixture\nDescription: Tests installed callable assumptions.\nAuthors@R: person('A', 'B', email='a@example.com', role=c('aut','cre'))\nLicense: MIT\n{imports}"
+    )).unwrap();
+    fs::write(root.join("NAMESPACE"), exports).unwrap();
+    fs::write(root.join("R/code.R"), code).unwrap();
+}
+
+fn build(source: &Path, output: &Path, library: &Path, cache: &Path, threads: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(source)
+        .arg("--output")
+        .arg(output)
+        .arg("--lib")
+        .arg(library)
+        .args(["--threads", threads])
+        .env("SLINKER_CACHE_DIR", cache)
+        .output()
+        .unwrap()
+}
+
+fn blocked_observation(name: &str, code: &str, oracle: &str, dependency_code: &str) {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("obligationdep");
+    let source = work.path().join(name);
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &dependency,
+        "obligationdep",
+        "",
+        "export(entry)\n",
+        dependency_code,
+    );
+    package(
+        &source,
+        name,
+        "Imports: obligationdep\n",
+        "export(run)\n",
+        code,
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert!(
+        !result.status.success(),
+        "unestablished observation accepted: {code}"
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn base_closure_environments_use_the_runtime_namespace_and_reject_writes() {
+    let r = discover_r_home();
+    for (name, code, expected, blocked) in [
+        (
+            "baseread",
+            "run <- function() environmentName(environment(identity))\nenvironment(run) <- asNamespace('base')\n",
+            "'base'",
+            false,
+        ),
+        (
+            "basewrite",
+            "run <- function() tryCatch(assign('identity', function(x) 7L, envir=environment(identity)), error=function(e) 'protected')\nenvironment(run) <- asNamespace('base')\n",
+            "'protected'",
+            true,
+        ),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join(name);
+        package(&root, name, "", "export(run)\n", code);
+        let library = work.path().join("original");
+        fs::create_dir(&library).unwrap();
+        install_package(&r, &root, &library);
+        let oracle = format!("stopifnot(identical({name}::run(), {expected}))");
+        run_r(&r, &library, &oracle);
+        let output = work.path().join("output");
+        let result = build(&root, &output, &library, &work.path().join("cache"), "1");
+        if blocked {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(!result.status.success());
+            assert!(stderr.contains("writes a platform namespace"), "{stderr}");
+            assert!(!output.exists());
+        } else {
+            assert_success(&result, "base closure environment");
+            let generated = work.path().join("generated-library");
+            fs::create_dir(&generated).unwrap();
+            install_package(&r, &output, &generated);
+            run_r(&r, &generated, &oracle);
+        }
+    }
+}
+
+#[test]
+fn ordinary_external_base_alias_does_not_require_a_base_package_image() {
+    let r = discover_r_home();
+    let work = tempfile::tempdir().unwrap();
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    let external = work.path().join("aliasexternal");
+    package(
+        &external,
+        "aliasexternal",
+        "",
+        "export(invoke)\n",
+        "invoke <- base::identity\n",
+    );
+    install_package(&r, &external, &original);
+    let dep = work.path().join("aliasdep");
+    package(
+        &dep,
+        "aliasdep",
+        "Imports: aliasexternal\n",
+        "export(run)\n",
+        "run <- function() aliasexternal::invoke(42L)\n",
+    );
+    install_package_using(&r, &dep, &original, &original);
+    let root = work.path().join("aliasroot");
+    package(
+        &root,
+        "aliasroot",
+        "Imports: aliasdep\n",
+        "export(run)\n",
+        "run <- function() aliasdep::run()\n",
+    );
+    install_package_using(&r, &root, &original, &original);
+    let oracle = "stopifnot(identical(aliasroot::run(), 42L))";
+    run_r(&r, &original, oracle);
+    let output = work.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(&root)
+        .arg("--lib")
+        .arg(&original)
+        .args(["--external", "aliasexternal"])
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_success(&result, "build ordinary External base alias");
+    let generated = work.path().join("generated-library");
+    fs::create_dir(&generated).unwrap();
+    install_package_using(&r, &output, &generated, &original);
+    let libraries = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r, &libraries, oracle);
+}
+
+#[test]
+fn external_caller_frame_reflection_blocks_before_removing_its_target() {
+    let r = discover_r_home();
+    let work = tempfile::tempdir().unwrap();
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    let external = work.path().join("callerexternal");
+    package(
+        &external,
+        "callerexternal",
+        "",
+        "export(invoke)\n",
+        "invoke <- function(name) get(name, envir=parent.frame())()\n",
+    );
+    install_package(&r, &external, &original);
+    let dep = work.path().join("callerdep");
+    package(
+        &dep,
+        "callerdep",
+        "Imports: callerexternal\n",
+        "export(run)\n",
+        "hidden <- function() 'expected'\nrun <- function() callerexternal::invoke('hidden')\n",
+    );
+    install_package_using(&r, &dep, &original, &original);
+    let root = work.path().join("callerroot");
+    package(
+        &root,
+        "callerroot",
+        "Imports: callerdep\n",
+        "export(run)\n",
+        "run <- function() callerdep::run()\n",
+    );
+    install_package_using(&r, &root, &original, &original);
+    run_r(
+        &r,
+        &original,
+        "stopifnot(identical(callerroot::run(), 'expected'))",
+    );
+    let output = work.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(&root)
+        .arg("--lib")
+        .arg(&original)
+        .args(["--external", "callerexternal"])
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "External caller reflection removed a required binding"
+    );
+    assert!(stderr.contains("caller frame"), "{stderr}");
+    assert!(!output.exists());
+}
+
+#[test]
+fn loop_bindings_with_unproved_evaluation_block_before_publication() {
+    for (entry, expected) in [
+        ("function() { for (values in values) {}; values }", "3L"),
+        (
+            "function() { for (values in (function() values)()) {}; values }",
+            "3L",
+        ),
+        (
+            "function() { try(for (values in stop('failure')) {}, silent=TRUE); values }",
+            "1:3",
+        ),
+        (
+            "function() { ignore <- function(expr) NULL; ignore(for (values in 1:3) {}); values }",
+            "1:3",
+        ),
+        (
+            "function(unused = { for (values in 1:3) {} }) values",
+            "1:3",
+        ),
+        (
+            "function() { FALSE && { for (values in 1:3) {} }; values }",
+            "1:3",
+        ),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let dependency = work.path().join("sequencedep");
+        let source = work.path().join("sequenceroot");
+        let original = work.path().join("original");
+        fs::create_dir(&original).unwrap();
+        package(
+            &dependency,
+            "sequencedep",
+            "",
+            "export(entry)\n",
+            &format!("values <- 1:3\nentry <- {entry}\n"),
+        );
+        package(
+            &source,
+            "sequenceroot",
+            "Imports: sequencedep\n",
+            "export(run)\n",
+            "run <- function() sequencedep::entry()\n",
+        );
+        let r_home = discover_r_home();
+        install_package(&r_home, &dependency, &original);
+        install_package_using(&r_home, &source, &original, &original);
+        let oracle = format!("stopifnot(identical(sequenceroot::run(), {expected}))");
+        run_r(&r_home, &original, &oracle);
+        let output = work.path().join("output");
+        let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+        assert!(
+            !result.status.success(),
+            "unproven loop binding built: {entry}"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("for-loop binding"));
+        assert!(
+            !output.exists(),
+            "unproven loop-sequence build published output"
+        );
+    }
+}
+
+#[test]
+fn for_variable_initialization_does_not_retain_a_namespace_fallback() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("loopdep");
+    let source = work.path().join("looproot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "loopdep",
+        "",
+        "export(entry,wrapped)\n",
+        "x <- function() eval(quote(1L))\nentry <- function(xs) { for (x in xs) {}; x }\nwrapped <- function() { (for (x in 1:3) {}); first <- x; out <- for (x in 4:6) {}; c(first, x) }\n",
+    );
+    package(
+        &source,
+        "looproot",
+        "Imports: loopdep\n",
+        "export(run)\n",
+        "run <- function() list(loopdep::entry(integer()), loopdep::entry(7L), loopdep::wrapped())\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(looproot::run(), list(NULL, 7L, c(3L, 6L))))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert_success(&result, "for-variable initialization build");
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('loopdep'); {oracle}"),
+    );
+}
+
+#[test]
+fn namespace_members_and_reflective_generics_keep_their_obligations() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("memberdep");
+    let source = work.path().join("memberroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "memberdep",
+        "",
+        "export(entry)\nS3method(gen,a)\nS3method(gen,b)\n",
+        "hidden <- 42L\nalias_hidden <- 43L\nchain_hidden <- 44L\nentry <- function() 1L\ngen <- function(x) UseMethod('gen')\ngen.a <- function(x) 'a'\ngen.b <- function(x) 'b'\n",
+    );
+    package(
+        &source,
+        "memberroot",
+        "Imports: memberdep\n",
+        "export(run)\n",
+        "run <- function() { ns <- asNamespace('memberdep'); `ns alias` <- ns; a <- b <- asNamespace('memberdep'); g <- get('gen', envir=ns, inherits=FALSE); c(as.character(ns$hidden), as.character(getNamespace('memberdep')[['hidden']]), g(structure(1, class='a')), g(structure(1, class='b')), as.character(`ns alias`$alias_hidden), as.character(a$chain_hidden)) }\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(memberroot::run(), c('42','42','a','b','43','44')))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert_success(&result, "namespace member and reflective generic build");
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('memberdep'); {oracle}"),
+    );
+}
+
+#[test]
+fn reflective_generic_callers_remain_open() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("reflectdep");
+    let source = work.path().join("reflectroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "reflectdep",
+        "",
+        "export(runner)\n",
+        "g <- function(x) UseMethod('g')\ng.default <- function(x) 'default'\ng.foo <- function(x) 'foo'\nrunner <- function(x) { declare(slinker(x=s3('foo'))); direct <- g(x); f <- get('g'); c(direct, f(structure(1, class='bar'))) }\ng.bar <- function(x) 'bar'\n",
+    );
+    package(
+        &source,
+        "reflectroot",
+        "Imports: reflectdep\n",
+        "export(run)\n",
+        "run <- function() reflectdep::runner(structure(1, class='foo'))\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(reflectroot::run(), c('foo', 'bar')))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert_success(&result, "reflective generic build");
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('reflectdep'); {oracle}"),
+    );
+}
+
+#[test]
+fn retained_primitive_callables_keep_group_methods() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("primitivedep");
+    let source = work.path().join("primitiveroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "primitivedep",
+        "",
+        "export(run)\n",
+        "operations <- list(sum)\nSummary.foo <- function(..., na.rm=FALSE) { NextMethod(); 42L }\nrun <- function(x) operations[[1L]](x)\n",
+    );
+    package(
+        &source,
+        "primitiveroot",
+        "Imports: primitivedep\n",
+        "export(run)\n",
+        "run <- function() primitivedep::run(structure(1, class='foo'))\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(primitiveroot::run(), 42L))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert_success(&result, "primitive callable build");
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('primitivedep'); {oracle}"),
+    );
+}
+
+#[test]
+fn indirect_dispatch_preserves_methods_or_blocks_before_publication() {
+    for (generic_call, imported_method, external) in [
+        ("UseMethod(nm)", false, true),
+        ("UseMethod(object='x', gen=nm)", false, true),
+        ("use <- get('UseMethod'); use(nm)", false, true),
+        ("use <- get('UseMethod'); use(nm)", true, true),
+        ("use <- get(paste0('Use', 'Method')); use(nm)", false, true),
+        ("use <- match.fun('UseMethod'); use(nm)", false, true),
+        ("use <- base::UseMethod; use(nm)", false, true),
+        (
+            "dispatchers <- list(base::UseMethod); dispatchers[[1L]](nm)",
+            false,
+            true,
+        ),
+        ("use <- get('UseMethod'); use(nm)", false, false),
+        (
+            "dispatchers <- list(base::UseMethod); dispatchers[[1L]](nm)",
+            false,
+            false,
+        ),
+        ("use <- .Primitive('UseMethod'); use(nm)", false, false),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let dependency = work.path().join("computeddep");
+        let caller = work.path().join("computedcaller");
+        let methods = work.path().join("computedmethods");
+        let source = work.path().join("computedroot");
+        let original = work.path().join("original");
+        let generated = work.path().join("generated");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&generated).unwrap();
+        package(
+            &dependency,
+            "computeddep",
+            "",
+            "export(g)\n",
+            &format!("g <- function(x) {{ nm <- 'g'; {generic_call} }}\n"),
+        );
+        package(
+            &methods,
+            "computedmethods",
+            "",
+            "export(g.foo)\n",
+            "g.foo <- function(x) 'expected'\n",
+        );
+        package(
+            &caller,
+            "computedcaller",
+            if imported_method {
+                "Imports: computeddep, computedmethods\n"
+            } else {
+                "Imports: computeddep\n"
+            },
+            if imported_method {
+                "importFrom(computedmethods,g.foo)\nexport(run)\n"
+            } else {
+                "export(run)\n"
+            },
+            &format!(
+                "{}g.character <- function(x) 'expected'\nrun <- function(x) computeddep::g(x)\n",
+                if imported_method {
+                    ""
+                } else {
+                    "g.foo <- function(x) 'expected'\n"
+                }
+            ),
+        );
+        package(
+            &source,
+            "computedroot",
+            "Imports: computedcaller\n",
+            "export(run)\n",
+            "run <- function() computedcaller::run(structure(1, class='foo'))\n",
+        );
+        let r_home = discover_r_home();
+        install_package(&r_home, &dependency, &original);
+        if imported_method {
+            install_package(&r_home, &methods, &original);
+        }
+        install_package_using(&r_home, &caller, &original, &original);
+        install_package_using(&r_home, &source, &original, &original);
+        run_r(
+            &r_home,
+            &original,
+            "stopifnot(identical(computedroot::run(), 'expected'))",
+        );
+        let output = work.path().join("output");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_slinker"));
+        command
+            .arg("build")
+            .arg(&source)
+            .arg("--output")
+            .arg(&output)
+            .arg("--lib")
+            .arg(&original)
+            .env("SLINKER_CACHE_DIR", work.path().join("cache"));
+        if external {
+            command.args(["--external", "computeddep"]);
+        }
+        let result = command.output().unwrap();
+        if !result.status.success() {
+            assert!(!output.exists());
+            assert!(
+                String::from_utf8_lossy(&result.stderr)
+                    .contains("could not establish the callee's S3 dispatch generics")
+            );
+            continue;
+        }
+        if external {
+            install_package(&r_home, &dependency, &generated);
+        }
+        install_package(&r_home, &output, &generated);
+        let oracle = "stopifnot(identical(computedroot::run(), 'expected'))";
+        run_r(&r_home, &generated, oracle);
+        let installed = std::env::join_paths([&generated, &original]).unwrap();
+        run_r(&r_home, &installed, oracle);
+        run_r(
+            &r_home,
+            &installed,
+            &format!("loadNamespace('computedcaller'); {oracle}"),
+        );
+    }
+}
+
+#[test]
+fn replaced_platform_callable_blocks_specialization() {
+    blocked_observation(
+        "mutatedroot",
+        "run <- function() { unlockBinding('packageVersion', asNamespace('utils')); assign('packageVersion', function(pkg, lib.loc=NULL) package_version('9.9.9'), envir=asNamespace('utils')); lockBinding('packageVersion', asNamespace('utils')); as.character(utils::packageVersion('obligationdep')) }\n",
+        "stopifnot(identical(mutatedroot::run(), '9.9.9'))",
+        "entry <- function() 42L\n",
+    );
+}
+
+#[test]
+fn raw_namespace_registry_observations_block() {
+    blocked_observation(
+        "registryroot",
+        "run <- function() { obligationdep::entry(); 'obligationdep' %in% grep('obligation', loadedNamespaces(), value=TRUE) }\n",
+        "stopifnot(isTRUE(registryroot::run()))",
+        "entry <- function() 42L\n",
+    );
+}
+
+#[test]
+fn root_namespace_enumeration_and_support_reads_block() {
+    for (name, code, oracle) in [
+        (
+            "namesroot",
+            "run <- function() ls(environment(run), all.names=TRUE)\n",
+            "stopifnot(!any(grepl('slinker', namesroot::run(), fixed=TRUE)))",
+        ),
+        (
+            "supportroot",
+            "run <- function() tryCatch(get('.slinker_runtime', envir=environment(run), inherits=FALSE), error=function(e) 42L)\n",
+            "stopifnot(identical(supportroot::run(), 42L))",
+        ),
+    ] {
+        blocked_observation(name, code, oracle, "entry <- function() 42L\n");
+    }
+}
+
+#[test]
+fn namespace_enumeration_through_closure_and_partial_arguments_blocks() {
+    for (name, code) in [
+        (
+            "closureroot",
+            "run <- function() { obligationdep::entry(); length(as.list(environment(run), all.names=TRUE)) }\n",
+        ),
+        (
+            "partialenvroot",
+            "run <- function() length(eapply(en=asNamespace('obligationdep'), FUN=identity, all.names=TRUE))\n",
+        ),
+    ] {
+        blocked_observation(
+            name,
+            code,
+            &format!("stopifnot({name}::run() > 0L)"),
+            "hidden <- 42L\nentry <- function() 1L\n",
+        );
+    }
+}
+
+#[test]
+fn delayed_load_failure_is_not_moved_to_root_loading() {
+    blocked_observation(
+        "loadfailure",
+        "run <- function() requireNamespace('obligationdep', quietly=TRUE)\n",
+        "stopifnot(identical(loadfailure::run(), FALSE))",
+        "entry <- function() 42L\n.onLoad <- function(libname,pkgname) stop('load failure')\n",
+    );
+}
+
+#[test]
+fn an_unexported_qualified_lookup_blocks_before_publication() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("exportdep");
+    let source = work.path().join("exportroot");
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &dependency,
+        "exportdep",
+        "",
+        "export(run)\n",
+        "hidden <- function() 7L\nrun <- function() 1L\n",
+    );
+    package(
+        &source,
+        "exportroot",
+        "Imports: exportdep\n",
+        "export(run)\n",
+        "run <- function() tryCatch(exportdep::hidden(), error=function(e) 42L)\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    run_r(
+        &r_home,
+        &original,
+        "stopifnot(identical(exportroot::run(), 42L))",
+    );
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert!(!result.status.success(), "unexported lookup was accepted");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("exported"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn external_requirements_include_depends_constraints() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("requireddep");
+    let source = work.path().join("requiredroot");
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &dependency,
+        "requireddep",
+        "",
+        "export(run)\n",
+        "run <- function() 42L\n",
+    );
+    package(
+        &source,
+        "requiredroot",
+        "Depends: requireddep (>= 1.0.0)\n",
+        "export(run)\n",
+        "run <- function() requireddep::run()\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    run_r(
+        &r_home,
+        &original,
+        "stopifnot(identical(requiredroot::run(), 42L))",
+    );
+    let output = work.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(&source)
+        .arg("--output")
+        .arg(&output)
+        .arg("--lib")
+        .arg(&original)
+        .args(["--external", "requireddep"])
+        .env("SLINKER_CACHE_DIR", work.path().join("cache"))
+        .output()
+        .unwrap();
+    assert_success(&result, "Depends requirement build");
+    let description = fs::read_to_string(output.join("DESCRIPTION")).unwrap();
+    assert!(
+        description.contains("requireddep (>= 1.0.0)"),
+        "{description}"
+    );
+}
+
+#[test]
+fn namespace_replacement_does_not_erase_control_argument_evaluation() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("controldep");
+    let source = work.path().join("controlroot");
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &dependency,
+        "controldep",
+        "",
+        "export(run)\n",
+        "run <- function() 1L\n",
+    );
+    package(
+        &source,
+        "controlroot",
+        "Imports: controldep\n",
+        "export(run)\n",
+        "run <- function() { controldep::run(); tryCatch(asNamespace('controldep', base.OK=stop('evaluated control')), error=function(e) 42L) }\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    run_r(
+        &r_home,
+        &original,
+        "stopifnot(identical(controlroot::run(), 42L))",
+    );
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert!(
+        !result.status.success(),
+        "control argument evaluation was erased"
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("arguments"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn replacing_an_installed_stop_helper_preserves_namespace_fallthrough() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("exitdep");
+    let source = work.path().join("exitroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "exitdep",
+        "",
+        "export(main, aaa_stop)\n",
+        "aaa_stop <- function() stop('expected')\nfallback <- function() 42L\nmain <- function(flag) { if (flag) aaa_stop() else fallback <- function() 1L; fallback() }\n",
+    );
+    package(
+        &source,
+        "exitroot",
+        "Imports: exitdep\n",
+        "export(run, probe)\n",
+        "probe <- function() exitdep::aaa_stop()\nrun <- function() { utils::assignInNamespace('aaa_stop', function() NULL, ns='exitdep'); exitdep::main(TRUE) }\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(exitroot::run(), 42L))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(&source)
+        .arg("--output")
+        .arg(&output)
+        .arg("--lib")
+        .arg(&original)
+        .args(["--threads", "1"])
+        .env("SLINKER_CACHE_DIR", work.path().join("cache"))
+        .output()
+        .unwrap();
+    assert_success(&result, "mutable helper build");
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('exitdep'); {oracle}"),
+    );
+}
+
+#[test]
+fn defaulted_resource_lookup_is_independent_of_helper_name_and_discovery_order() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("resourceorderdep");
+    let source = work.path().join("resourceorderroot");
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &dependency,
+        "resourceorderdep",
+        "",
+        "export(runner)\n",
+        "runner <- function(x) x\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    for helper in ["z_path", "A_path"] {
+        package(
+            &source,
+            "resourceorderroot",
+            "Imports: resourceorderdep\n",
+            "export(run)\n",
+            &format!(
+                "{helper} <- function(package = 'resourceorderdep') system.file('DESCRIPTION', package = package)\nrun <- function() {{ resourceorderdep::runner(1); nzchar({helper}()) }}\n"
+            ),
+        );
+        install_package_using(&r_home, &source, &original, &original);
+        let oracle = "stopifnot(identical(resourceorderroot::run(), TRUE))";
+        run_r(&r_home, &original, oracle);
+        for threads in ["1", "2", "5"] {
+            let case = work.path().join(format!("{helper}-{threads}"));
+            let generated = case.join("library");
+            fs::create_dir_all(&generated).unwrap();
+            let output = case.join("output");
+            for _ in 0..2 {
+                let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+                    .arg("build")
+                    .arg(&source)
+                    .arg("--output")
+                    .arg(&output)
+                    .arg("--lib")
+                    .arg(&original)
+                    .args(["--threads", threads])
+                    .env("SLINKER_CACHE_DIR", case.join("cache"))
+                    .output()
+                    .unwrap();
+                assert_success(&result, "defaulted resource build");
+                install_package(&r_home, &output, &generated);
+                run_r(&r_home, &generated, oracle);
+            }
+            let installed = std::env::join_paths([&generated, &original]).unwrap();
+            run_r(&r_home, &installed, oracle);
+            run_r(
+                &r_home,
+                &installed,
+                &format!("loadNamespace('resourceorderdep'); {oracle}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn partial_matching_selects_the_same_s3_method_as_r() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("matchingdep");
+    let source = work.path().join("matchingroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "matchingdep",
+        "",
+        "export(run)\nS3method(gen, a)\nS3method(gen, b)\n",
+        "gen <- function(object, other) UseMethod(obj=object, gen='gen')\ngen.a <- function(object, other) 'a'\ngen.b <- function(object, other) 'b'\nrun <- function(x, y) { declare(slinker(x=s3('a'), y=s3('b'))); gen(ob=y, x) }\n",
+    );
+    package(
+        &source,
+        "matchingroot",
+        "Imports: matchingdep\n",
+        "export(run)\n",
+        "run <- function() matchingdep::run(structure(1, class='a'), structure(2, class='b'))\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(matchingroot::run(), 'b'))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = Command::new(env!("CARGO_BIN_EXE_slinker"))
+        .arg("build")
+        .arg(&source)
+        .arg("--output")
+        .arg(&output)
+        .arg("--lib")
+        .arg(&original)
+        .args(["--threads", "1"])
+        .env("SLINKER_CACHE_DIR", work.path().join("cache"))
+        .output()
+        .unwrap();
+    assert_success(&result, "partial matching build");
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('matchingdep'); {oracle}"),
+    );
+}
+
+#[test]
+fn namespace_replacement_preserves_invisible_success() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("visibilitydep");
+    let source = work.path().join("visibilityroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "visibilitydep",
+        "",
+        "export(run)\n",
+        "run <- function() 1L\n",
+    );
+    package(
+        &source,
+        "visibilityroot",
+        "Imports: visibilitydep\n",
+        "export(run)\n",
+        "run <- function() requireNamespace('visibilitydep', quietly=TRUE)\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle =
+        "stopifnot(identical(withVisible(visibilityroot::run()), list(value=TRUE, visible=FALSE)))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    assert_success(
+        &build(&source, &output, &original, &work.path().join("cache"), "1"),
+        "visibility build",
+    );
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('visibilitydep'); {oracle}"),
+    );
+}
+
+#[test]
+fn namespace_replacement_does_not_erase_duplicate_argument_errors() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("argumentdep");
+    let source = work.path().join("argumentroot");
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &dependency,
+        "argumentdep",
+        "",
+        "export(run)\n",
+        "run <- function() 1L\n",
+    );
+    package(
+        &source,
+        "argumentroot",
+        "Imports: argumentdep\n",
+        "export(run)\n",
+        "run <- function() requireNamespace('argumentdep', quietly=TRUE, quietly=TRUE)\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    run_r(
+        &r_home,
+        &original,
+        "stopifnot(grepl('matched by multiple', tryCatch(argumentroot::run(), error=conditionMessage), fixed=TRUE))",
+    );
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert!(
+        !result.status.success(),
+        "duplicate arguments were silently replaced: {}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn dispatched_and_does_not_prune_a_true_branch() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("guarddep");
+    let source = work.path().join("guardroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "guarddep",
+        "",
+        "export(hidden)\n",
+        "hidden <- function() 42L\n",
+    );
+    package(
+        &source,
+        "guardroot",
+        "Imports: guarddep\n",
+        "export(run)\nS3method(Ops, flag)\n",
+        "Ops.flag <- function(...) TRUE\nrun <- function() { flag <- structure(FALSE, class='flag'); if (flag & requireNamespace('slinkerabsentguardfixture', quietly=TRUE)) guarddep::hidden() else 1L }\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(guardroot::run(), 42L))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    assert_success(
+        &build(&source, &output, &original, &work.path().join("cache"), "1"),
+        "dispatched guard build",
+    );
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('guarddep'); {oracle}"),
+    );
+}
+
+#[test]
+fn shadowed_control_forms_block_before_publication() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("controldep");
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &dependency,
+        "controldep",
+        "",
+        "export(hidden)\n",
+        "hidden <- function() 42L\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    for (name, code) in [
+        (
+            "if",
+            "`if` <- function(condition, yes, no) yes\nrun <- function() if (requireNamespace('slinkerabsentguardfixture', quietly=TRUE)) controldep::hidden() else 1L\n",
+        ),
+        (
+            "return",
+            "`return` <- function(...) NULL\nrun <- function() { return(1L); controldep::hidden() }\n",
+        ),
+        (
+            "for",
+            "`for` <- function(variable, sequence, body) 42L\nrun <- function() for (x in 1:3) break\n",
+        ),
+        (
+            "while",
+            "`while` <- function(condition, body) 42L\nrun <- function() while (TRUE) break\n",
+        ),
+        (
+            "repeat",
+            "`repeat` <- function(body) 42L\nrun <- function() repeat break\n",
+        ),
+        (
+            "braces",
+            "run <- function() { stop('must not run') }\n`{` <- function(...) 42L\n",
+        ),
+        (
+            "parentheses",
+            "`(` <- function(...) 42L\nrun <- function() (stop('must not run'))\n",
+        ),
+    ] {
+        let source = work.path().join("controlroot");
+        package(
+            &source,
+            "controlroot",
+            "Imports: controldep\n",
+            "export(run)\n",
+            code,
+        );
+        install_package_using(&r_home, &source, &original, &original);
+        run_r(
+            &r_home,
+            &original,
+            "stopifnot(identical(controlroot::run(), 42L))",
+        );
+        let output = work.path().join(format!("output-{name}"));
+        let result = build(
+            &source,
+            &output,
+            &original,
+            &work.path().join(format!("cache-{name}")),
+            "1",
+        );
+        assert!(!result.status.success(), "shadowed {name} was accepted");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("shadowed"));
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn a_local_eval_does_not_execute_its_quoted_argument() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("localevalroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &source,
+        "localevalroot",
+        "",
+        "export(run)\n",
+        "run <- function() { eval <- function(expr) 42L; eval(quote(slinkerunavailablequotefixture::hidden())) }\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &source, &original);
+    let oracle = "stopifnot(identical(localevalroot::run(), 42L))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    assert_success(
+        &build(&source, &output, &original, &work.path().join("cache"), "1"),
+        "local eval build",
+    );
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+}
+
+#[test]
+fn base_eval_with_unestablished_code_blocks_before_publication() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("baseevalroot");
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &source,
+        "baseevalroot",
+        "",
+        "export(run)\n",
+        "run <- function() eval(quote(42L))\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &source, &original);
+    run_r(
+        &r_home,
+        &original,
+        "stopifnot(identical(baseevalroot::run(), 42L))",
+    );
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("executable code and environment"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn unused_effective_imports_do_not_silently_drop_unreplayable_effects() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("importorderroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    let r_home = discover_r_home();
+    for (name, marker) in [("zzzimportdep", "zzz"), ("aaaimportdep", "aaa")] {
+        let dependency = work.path().join(name);
+        package(
+            &dependency,
+            name,
+            "",
+            "export(unused)\n",
+            &format!(
+                "unused <- function() NULL\n.onLoad <- function(...) options(tracke.import.order=paste0(getOption('tracke.import.order',''), '{marker}'))\n"
+            ),
+        );
+        install_package(&r_home, &dependency, &original);
+    }
+    package(
+        &source,
+        "importorderroot",
+        "Imports: zzzimportdep, aaaimportdep\n",
+        "import(zzzimportdep)\nimport(aaaimportdep)\nexport(run)\n",
+        "run <- function() getOption('tracke.import.order')\n",
+    );
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(importorderroot::run(), 'zzzaaa'))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("shared process state"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn effective_import_initialization_preserves_namespace_dependencies() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("localimportroot");
+    let first = work.path().join("zzlocaldep");
+    let second = work.path().join("aalocaldep");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &first,
+        "zzlocaldep",
+        "",
+        "export(peek_first)\n",
+        ".state <- NULL\n.onLoad <- function(...) .state <<- 'zzz'\npeek_first <- function() .state\n",
+    );
+    package(
+        &second,
+        "aalocaldep",
+        "Imports: zzlocaldep\n",
+        "importFrom(zzlocaldep, peek_first)\nexport(peek_second)\n",
+        ".state <- NULL\n.onLoad <- function(...) .state <<- paste0(peek_first(), 'aaa')\npeek_second <- function() .state\n",
+    );
+    package(
+        &source,
+        "localimportroot",
+        "Imports: zzlocaldep, aalocaldep\n",
+        "import(zzlocaldep)\nimport(aalocaldep)\nexport(run)\n",
+        "run <- function() peek_second()\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &first, &original);
+    install_package_using(&r_home, &second, &original, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(localimportroot::run(), 'zzzaaa'))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    assert_success(
+        &build(&source, &output, &original, &work.path().join("cache"), "1"),
+        "namespace initialization build",
+    );
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('zzlocaldep'); loadNamespace('aalocaldep'); {oracle}"),
+    );
+}
+
+#[test]
+fn a_linked_namespace_is_loaded_when_its_own_code_runs() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("selfloadeddep");
+    let source = work.path().join("selfloadedroot");
+    let original = work.path().join("original");
+    let generated = work.path().join("generated");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&generated).unwrap();
+    package(
+        &dependency,
+        "selfloadeddep",
+        "",
+        "export(run)\n",
+        "hidden <- function() 42L\nrun <- function() if (isNamespaceLoaded('selfloadeddep')) hidden() else 1L\n",
+    );
+    package(
+        &source,
+        "selfloadedroot",
+        "Imports: selfloadeddep\n",
+        "export(run)\n",
+        "run <- function() selfloadeddep::run()\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    let oracle = "stopifnot(identical(selfloadedroot::run(), 42L))";
+    run_r(&r_home, &original, oracle);
+    let output = work.path().join("output");
+    assert_success(
+        &build(&source, &output, &original, &work.path().join("cache"), "1"),
+        "self loaded build",
+    );
+    install_package(&r_home, &output, &generated);
+    run_r(&r_home, &generated, oracle);
+    let installed = std::env::join_paths([&generated, &original]).unwrap();
+    run_r(&r_home, &installed, oracle);
+    run_r(
+        &r_home,
+        &installed,
+        &format!("loadNamespace('selfloadeddep'); {oracle}"),
+    );
+}
+
+#[test]
+fn an_unestablished_linked_loaded_observation_blocks() {
+    let work = tempfile::tempdir().unwrap();
+    let dependency = work.path().join("observeddep");
+    let source = work.path().join("observedroot");
+    let original = work.path().join("original");
+    fs::create_dir(&original).unwrap();
+    package(
+        &dependency,
+        "observeddep",
+        "",
+        "export(run)\n",
+        "run <- function() NULL\n",
+    );
+    package(
+        &source,
+        "observedroot",
+        "Imports: observeddep\n",
+        "export(run)\n",
+        "run <- function() { observeddep::run(); isNamespaceLoaded('observeddep') }\n",
+    );
+    let r_home = discover_r_home();
+    install_package(&r_home, &dependency, &original);
+    install_package_using(&r_home, &source, &original, &original);
+    run_r(
+        &r_home,
+        &original,
+        "stopifnot(identical(observedroot::run(), TRUE))",
+    );
+    let output = work.path().join("output");
+    let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("loaded-state"));
+    assert!(!output.exists());
+}

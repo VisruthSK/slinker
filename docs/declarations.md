@@ -21,7 +21,7 @@ f <- function(x) {
 
 ## `callables()`
 
-`callables(pkg::f, pkg:::g, h)` declares the exact functions a binding can hold; a bare name resolves where the declared binding is used. A native routine whose audited summary invokes a callback argument links each declared callable when that argument is a declared binding, instead of blocking because the parameter's value is unknown.
+`callables(pkg::f, pkg:::g, h)` declares the exact functions a binding can hold; a bare name resolves where the declared binding is used. A native routine whose audited summary invokes a callback argument links each declared callable when that argument is a declared binding, instead of blocking because the parameter's value is unknown. A declared binding passed as the function to `do.call` or base `lapply`, `sapply`, `vapply`, `Map`, `Filter`, or `Reduce` likewise retains each declared callable.
 
 ## Rules
 

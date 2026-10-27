@@ -24,13 +24,19 @@ Finalization records the foreign namespaces each bundle refers to: Linked ones a
 
 Linked code that names a Linked namespace, including its own (`pkg::f`, `asNamespace("pkg")`, `requireNamespace("pkg")`), is rewritten to the private namespace. A payload closure containing such a site is rebuilt from its rewritten source and replaces the original in its binding before the payload is serialized; the build blocks if the closure sits inside a list or attribute, or if the original is still referenced from anywhere else in a payload. A computed name that resolves to the Linked package itself is a dynamic namespace target.
 
-Static `asNamespace`, `getNamespace`, `loadNamespace`, `requireNamespace`, and `packageVersion` calls on a declared dependency are rewritten: a Linked target to its private namespace, `TRUE`, or its recorded version; an External one stays as written. Naming an installed package that is not a declared dependency blocks, as do `find.package` on a Linked package and arguments the private namespace cannot honor, such as `lib.loc` or `versionCheck`.
+Static `asNamespace`, `getNamespace`, `loadNamespace`, `requireNamespace`, and `packageVersion` calls on a declared dependency are rewritten: a Linked target to its private namespace, invisible `TRUE`, or its recorded version; an External one stays as written. Naming an installed package that is not a declared dependency blocks, as do `find.package` on a Linked package and arguments the private namespace cannot honor, such as `lib.loc` or `versionCheck`. Duplicate, ambiguous, or unsupported arguments block instead of disappearing in a replacement.
+
+Linked `pkg::name` retains the original export name and performs `getExportedValue` on the private namespace. An unexported target blocks before publication. Internal `pkg:::name` remains a binding lookup. Lazy-data access follows its separate checked dataset plan.
 
 `isNamespaceLoaded("pkg")` and `"pkg" %in% loadedNamespaces()` answer `TRUE` for the Linked package itself or one its code imports. `getExportedValue`, `getNamespaceExports`, `getNamespaceName`, `getNamespaceVersion`, `getNamespaceInfo`, `utils::getFromNamespace`, and `utils::assignInNamespace` receive the private namespace, and `utils::packageDescription` reads the Linked copy's installed metadata, which the generated package ships.
 
+A Linked loaded-state query without an established self or effective-import relationship blocks. Guard pruning uses the same relationship. Every effective import requires activation even when none of its exported bindings is retained; dependency initialization preserves installed import order.
+
+Raw `loadedNamespaces()` observations block. Literal membership uses the checked base operations and the same settled loaded-state fact. Linked lifecycle hooks require an established effective-import load boundary; delayed runtime activation with those effects blocks. Shared S3 registrations retain the documented registry exception.
+
 Reading the `exports`, `spec`, `imports`, `dynlibs`, or `S3methods` field of a namespace's `.__NAMESPACE__.` environment, lexically or through `$` or `[[` on `asNamespace("pkg")` or any other namespace value, or through `getNamespaceInfo` and `getNamespaceImports`, answers as the original, since a Linked namespace reproduces them: `imports` lists every original import directive in installed order, including imports the build never reached; `dynlibs` names the loaded native components with their `useDynLib` aliases; and `S3methods` lists the registrations the generated namespace holds, with a delayed generic's column reporting the original package name, never a private key. Any other field, including `path`, blocks on a Linked namespace, and on a computed namespace whenever a Linked package is retained.
 
-`as.list`, `as.list.environment`, `mget`, and `eapply` over a namespace that is statically `asNamespace("pkg")` or `getNamespace("pkg")`, directly or through a local variable assigned from it, block on a Linked package because they would force its removed-binding stubs. An environment that is only known at run time is not detected.
+Namespace-producing expressions carry explicit use obligations. Proven `$` and `[[` reads and literal `get` lookups retain the binding; supported metadata consumers keep their checked operation. Unproved consumers and escapes block. `as.list`, `as.list.environment`, `mget`, and `eapply` over a Linked namespace block because they would force removed-binding stubs. Root namespace enumeration and reads of generated support bindings or the replaced `.onLoad` block. `ls` can read a Linked namespace's complete original name set when lifecycle and native initialization cannot add names.
 
 `attachNamespace`, `unloadNamespace`, `path.package`, `library.dynam`, `citation`, `vignette`, `help`, and `data(package =)` on a Linked package block. utils functions are recognized when called as `utils::f` or imported from utils.
 
@@ -44,21 +50,31 @@ Preflight has the target R check every rewritten code unit before any payload is
 
 R processes the generated `NAMESPACE` before the generated `.onLoad`, so it may name only what exists before Linked activation: External imports, Root functions defined by source, and base. Finalization splits the Root's imports and `S3method()` registrations at that boundary. Linked imports, and registrations whose generic or method is found through a Linked namespace or binding or through a Root binding restored from a payload (`format.cls <- pkg::fn`, `gen <- pkg::gen`), are performed by the generated `.onLoad` after the Linked namespaces activate, so they reach the private copy and register where the original does; the rest stay in the generated `NAMESPACE`. This covers a generic that lives in a Linked namespace, whether imported (`S3method(gen, cls)`) or qualified (`S3method(pkg::gen, cls)`). Registrations a Linked `NAMESPACE` qualifies with a Linked package, and `registerS3method(..., envir = asNamespace("pkg"))`, target the private namespace too. A registration qualified with a Suggests-only package stays keyed by the real package: it registers when that package loads, before or after the generated one, as in the original, and its method is retained without inspecting the optional package.
 
+Dispatch from a namespace's own code also finds an unregistered `generic.class` function defined in that namespace, for any generic: R looks in the calling environment before the registry. A retained call from a Root or Linked namespace to a function whose installed definition dispatches on S3 retains that namespace's `generic.*` bindings, whatever the generic's home (base, an External package, or another Linked package). The target R, not a name pattern, decides what dispatches: a closure dispatches on the literal generics of its `UseMethod` calls and on its own name when it is an internal generic; a primitive dispatches on its own name and on its S3 group (`Ops`, `Math`, `Summary`, `Complex`, `matrixOps`), and `as.numeric` and `seq.int` also on `as.double` and `seq`. An External callee that is a re-export is followed to the namespace that defines it. A method-shaped binding no retained call can dispatch to stays a stub. Call sites are function calls, binary and unary operators, `[`, `[[`, `$`, `@`, and replacement forms, where `names(x)[2] <- v` dispatches `[<-` and `names<-` (and the inner `[`). A lexical method no retained site can reach stays a stub that fails loudly.
+
+## Datasets
+
+Demanded datasets must contain passive data: ordinary vectors, lists, pairlists, matrices, and data frames. Analysis inspects nested members and attributes before construction. Functions, environments, expressions, language objects, promises, external pointers, weak references, unsupported ALTREP classes, and other unsupported objects block before publication, including when hidden in an otherwise ordinary vector's attributes.
+
+A Linked package's lazy-loaded data is carried by demand, per target R. Two static forms reach it: `pkg::name`, which R resolves through the namespace's `lazydata` environment after the exports, and `data(set, package = "pkg")`, which copies every object that data set defines into `envir`. The installed `data/Rdata.rds` index maps data-set names to object names, so `data(multi)` demands every object of `multi` while `pkg::beta` demands only `beta`. Each demanded object enters a lazy-load database built by the target R, one per Linked package, under `inst/slinker/datalib/<pkg>/data/`; objects keep their classes, attributes, and per-access identity because the target R serializes them unchanged. The generated `.onLoad` loads that database into the private namespace's `lazydata` environment, so a `pkg::name` rewritten to `getExportedValue` of the private namespace behaves as `::` does, and a `data()` call gets `lib.loc` appended to point at the carried library, so R's own `data()` supplies its semantics, including copying and the returned name. Datasets nothing reaches are never carried.
+
+These block: a data set named by anything but a bare name or string (`list = nm`, `c("a", "b")`), `data(package = "pkg")` with no names, a `data()` call with no `package`, which searches the attached packages, a `package` naming an unselected Suggests-only package, a dynamic `package`, a `lib.loc` argument, a data set the package does not define, and a package whose data is stored as files (`LazyData: false`), which `::` cannot see and slinker does not carry. Reading a namespace's `lazydata` field still blocks, as every unreproduced namespace field does.
+
 ## Lifecycle
 
-The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then calls the Root's original `.onLoad`. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
+The generated Root `.onLoad` activates Linked namespaces in an order finalization fixes from their imports and activation-time dependencies, running each one's `.onLoad` exactly when the installed package has one, and then restores and calls the Root's original `.onLoad`. A recursive call to the hook reaches that original function and does not repeat bootstrap. An `.onLoad` that slinker did not retain, or a Root `.onLoad` that is not relocatable source, fails the build.
 
 ## Native packages
 
-Native opacity widens the demanded native component, not the package's R namespace. A Linked package's compiled library is copied into the generated package and loaded by its bootstrap, while unrelated R wrappers remain eligible for elimination. A Root keeps and compiles its own native code.
+Native opacity widens the demanded native component, not the package's R namespace. A Linked package's installed `libs` directory is copied into the generated package and its library is loaded by the bootstrap, preserving companion files while unrelated R wrappers remain eligible for elimination. A Root keeps its staged native artifacts.
 
 The worker loads each installed library to read its registered routines, so `useDynLib(pkg, .registration = TRUE)` names resolve; a library that fails to load there, for example because its `R_init` asks a package the worker has not loaded for a C callable, blocks with `NativeLoadFailure` rather than leaving its routines unknown.
 
-A Linked DLL is a separate copy that loads next to any real one, and its namespace records it under `DLLs`. String selectors (`.Call("routine", PACKAGE = "pkg")`) and `getNativeSymbolInfo(name, "pkg")` in Linked code resolve through that copy's `DllInfo`, never by name; when the DLL forces symbols they fail in every copy, as in the original, and stay as written. A string selector that is not a registered routine of its interface, or `getNativeSymbolInfo` without `PACKAGE` on a Linked routine, blocks. Unanalyzed native code blocks.
+A Linked DLL is a separate copy that loads next to any real one, and its namespace records it under `DLLs`. String selectors select the corresponding interface in that copy's registered routine table, preserving R's argument validation. `.External2` uses the `.External` registration table and keeps its own calling convention. `getNativeSymbolInfo(name, "pkg")` resolves through the private copy's `DllInfo`; when the DLL forces symbols, name-based operations fail as in the original and stay as written. A string selector that is not a registered routine of its interface, or `getNativeSymbolInfo` without `PACKAGE` on a Linked routine, blocks. Computed selectors block unless they resolve to an established installed native symbol binding; having only one DLL does not establish a selector's identity. A Linked symbol call whose argument count cannot preserve the installed byte-compiled call's behavior blocks. Unanalyzed native code blocks.
 
 ### Native effect summaries
 
-Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema `1` keys each JSON entry by package name, version, and slinker's installed-image fingerprint, so a summary cannot silently transfer to a different native build. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and block the build with `UnknownNativeEffects`.
+Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES` or a library session's `native_summaries` path. Schema `1` distinguishes installed-image audits from Root-source declarations. Installed entries require an exact package name, version, and image fingerprint. A component may be `safe`, `summarized` with deterministic selectors and one-based R callback argument positions, or `unsupported`. Missing entries remain unanalyzed and block the build with `UnknownNativeEffects`. The session validates and freezes the manifest once.
 
 ```json
 {
@@ -66,6 +82,7 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
   "packages": [{
     "package": "fixture",
     "version": "1.0.0",
+    "origin": "installed",
     "image_fingerprint": "<installed-image fingerprint>",
     "components": [{
       "component": "fixture",
@@ -76,15 +93,36 @@ Native effect summaries can be supplied with `SLINKER_NATIVE_SUMMARIES`. Schema 
 }
 ```
 
+For a source Root, use `"origin": "root_source"` with `"source_fingerprint"` and a `"target"` object containing `"r_version"`, `"os"`, and `"arch"`; omit `"image_fingerprint"`. The native blocker reports these values, and `SourcePackageSnapshot::fingerprint()` exposes the source key. This declaration asserts the callback contract for every native build of that exact frozen source on that target, including configure-generated code and external build inputs. It is bound to the current invocation's staged Root identity and never applies to an installed Linked dependency. Analysis does not infer native safety from source text. Use an installed-image audit when the contract only holds for one particular build.
+
 ## Unproven behavior
+
+Computed `do.call` and `match.fun` targets require a proven local closure or a declared callable/string domain. Passing a string through local assignments, helper calls, recursion, or string operations does not establish its target. Computed namespace names also require explicit declarations; analysis does not execute helpers to infer them. Runtime `environment<-`, `list2env`, and `reg.finalizer` operations block because this static profile does not establish their construction or callback effects.
+
+Closure attributes are retained through serialized payloads. A namespace-enclosed closure with attributes is never regenerated from its body alone. The Root's `.onLoad` still requires relocatable source; an attributed hook blocks. Root names defined, imported, or declared by lifecycle code as `.slinker_runtime` or `.slinker_original_on_load` block before publication because those names belong to generated support.
+
+Target R checks deparsed defaults against the installed function's actual formals. A function whose defaults cannot be represented faithfully blocks, including attributed default values. This check does not establish equivalence of the entire function body; replacing the remaining source restoration path is separate work.
+
+Root and Linked namespace objects hidden in retained payloads block without an established consumer. A retained closure's foreign namespace enclosure instead creates an activation obligation, and its lexical references retain the bindings they require. External namespace references remain installed requirements.
+
+Repeated predicates do not establish binding or assignment. S3 dispatch can change a comparison result, and a called function can mutate a guard binding through its evaluation environment. Analysis retains the possible namespace fallback instead of correlating conditions or inferring exhaustiveness from membership tests.
+
+Analysis indexes the original source without erasing `quote` or `bquote`. Base `eval` blocks because its executable code and environment are not established by the target frontend. The supported `evalq` form uses its calling frame; an explicit unproved environment blocks. A locally defined function named `eval` remains an ordinary lexical call. Shadowed control forms block, and dispatchable `&` does not establish a short-circuit guard.
+
+Linked lifecycle code that reaches known shared process observations or effects, such as global options, environment variables, working directories, clocks, output, or subprocesses, blocks. Replaying those hooks cannot preserve the effects of an already-loaded real dependency. Namespace-local initialization remains executable.
+
+Linked resource selectors must stay relative to their owning package. Absolute paths, parent-directory components, and NUL bytes fail analysis with `UnsupportedResourcePath`. The checked `ResourcePath` type also validates serialized selectors before the provider or IR can use them.
+
+Linked `system.file()` calls require literal unnamed path components and an omitted or literal logical `mustWork`. An explicit `lib.loc`, other named arguments, duplicate arguments, or computed path or `mustWork` arguments block analysis: replacing those calls could discard evaluation or change their library lookup. A proven absent resource with `mustWork = FALSE` (including the default) becomes the empty string in the IR, so a later real installation cannot change its result. An absent resource with `mustWork = TRUE` blocks analysis.
 
 Anything slinker cannot prove blocks the build; there is no mode that accepts a heuristic instead. In particular these block:
 
 - unanalyzed native code, whose C-to-R callbacks are not checked, unless an audited native summary covers it (the blocker names the exact package, version, and image fingerprint to audit);
 - a free name bound nowhere, when retained code can bind names at run time (`assign`, `delayedAssign`, or `makeActiveBinding` of that or a computed name, `list2env`, `environment<-`, `<<-` from an unknown enclosure, or a `useDynLib(.registration = TRUE)` component whose routines the worker could not read). Otherwise the name continues through the same global environment and search path as in the original and is accepted;
 - a dynamic namespace or package name passed to a namespace or package query (`asNamespace`, `requireNamespace`, `getExportedValue`, `isNamespaceLoaded`, `packageDescription`, ...);
+- reachable `requireNamespace()` of an unselected `Suggests` package, and code guarded by whether one is installed or loaded, whose answer would otherwise be frozen or pruned by the build;
 - `get`/`get0`/`exists`/`match.fun`/`do.call` with a computed name or environment;
-- `system.file(package = x)` with a computed `x` while a package is Linked;
+- `system.file(package = x)` with a computed `x` while a package is Linked, unless `x` is a formal of a root-internal function that defaults to a string constant, is never rebound, and no call, base `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` application, or other retention of that function can supply it;
 - `NextMethod()` outside a known method set.
 
 A [declaration](declarations.md) can supply the missing fact where the code is the author's own.

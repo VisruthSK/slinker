@@ -1,7 +1,5 @@
 # slinker plan
 
-Updated: 2026-09-26 (America/Los_Angeles)
-
 This file is the forward plan: what remains and how to know each piece is done. It does not
 describe what the code already does (`docs/` documents behavior). Delete finished items instead
 of turning them into status notes. Breaking changes are always allowed: any item may delete or
@@ -19,9 +17,11 @@ missing fact.
 
 - Soundness first. Coverage work waits until known ways a successful build can diverge are closed.
 - Work is organized as tracks, not a global stage order. "Next up" below is the current pick. Every
-  change in any track also leaves the code it touches cleaner.
-- Retained non-source objects stay R-serialized payload bundles; the IR describes and bounds them
-  instead of modeling their object graphs.
+  change in any track also leaves the code it touches cleaner, including pruning tests that pin
+  obsolete details of the area it reworks.
+- Retained object graphs stay R-serialized payload bundles; the IR describes and bounds them
+  instead of modeling their allocations. Prefer one restoration path for retained functions and
+  values once Track J establishes its load, alias, and rewrite obligations.
 - Linked namespaces are registered under private names, so a slinked package never occupies or
   reaches the real package's name. Slinking testthat stays a later milestone.
 - A Linked namespace reports its original name (`getNamespaceName`, `environmentName`,
@@ -30,9 +30,10 @@ missing fact.
 - Everything linked code addresses by package name is rewired to the private namespace. Registries
   keyed by something else stay shared and the residual divergence is documented in `docs/semantics.md`.
 - In-session serialization of Linked-namespace references is documented, not detected.
-- Linked lazy-loaded datasets are carried into the generated package.
-- Root code stays regenerated from installed closures; original comments and layout are not kept.
-- Declarations grow `strings(...)` and `callables(...)` value domains.
+- Linked lazy-loaded datasets are carried into the generated package only as ordinary data. Saved functions, environments, and unsupported objects, including nested attributes, must block; the missing enforcement is recorded in `fixes.md`.
+- Preserve installed function objects rather than relying on deparse as their construction authority.
+  Analysis still uses Air/Oak syntax facts. Original comments, layout, and srcrefs remain outside the goal.
+- Native linking remains supported. Simplify DLL copying, loading, and symbol handling while preserving private-copy behavior and checked callback obligations.
 - Performance is tracked with benchmarks run in CI, without fixed budgets.
 
 ## Rules
@@ -45,7 +46,7 @@ missing fact.
   heuristic.
 - Delete a replaced API, representation, flag, or format in the same change. Keep tests that prove
   semantic invariants; rewrite tests that pin obsolete details.
-- `PROTOCOL_VERSION` stays `1`. Discover R with `R RHOME` (through `PATHEXT`), `R_HOME` only as a
+- Discover R with `R RHOME` (through `PATHEXT`), `R_HOME` only as a
   fallback, and never pass `R_HOME` to an R frontend.
 - Benchmarks never run in parallel, never use `target-cpu=native` or other `RUSTFLAGS`, and disable
   the analysis cache unless the benchmark is explicitly the warm-cache case.
@@ -55,176 +56,113 @@ missing fact.
 ## Invariants
 
 - One frozen invocation: source snapshot, target R, ordered library universe, exact package images,
-  absence, and Root/Linked/External roles. A changed image aborts the build.
+  absence, native-summary input, and Root/Linked/External roles. A changed image aborts the build.
 - `PackageIdentity`, `PackageLocation`, and `PackageId` stay distinct; location is never identity.
 - Worker-local object labels never escape their inspection epoch.
 - Lifecycle stays executable: `.onLoad` is never precomputed, and no effect runs twice.
+- Retention is not evidence of a complete caller set. S3 narrowing and default specialization consume
+  one settled caller-coverage fact; unknown/unclassified uses keep it open.
+- Every retained namespace/resource use is discharged as a preserved operation, checked relocation,
+  or blocker. Discovery order and cache state cannot silently leave a required rewrite absent.
 - Generated NAMESPACE never imports a Linked package; generated DESCRIPTION declares every External
   requirement as a checked intersection.
 - Linked namespaces reproduce the original name universe and export table; removed bindings are
   stubs that fail loudly.
+- Generated support must not change admitted Root namespace observations. Temporary hooks restore
+  the original state, and persistent support cannot be presumed invisible merely because its names
+  are reserved.
 - Installation independence: a slinked package behaves identically whether its Linked packages are
   absent, installed, or loaded. The only allowed exceptions are the residual divergences
   `docs/semantics.md` documents.
 - A failed build publishes nothing that looks complete.
+- Preflight owns generated syntax and path validation. The writer receives checked artifacts and
+  cannot consult a worker, installed-package state, or inspection/safety records to make decisions.
 
 ## Regression corpus
 
-Keep passing: `tests/build_materializer.rs` (synthetic fixtures, vendored `praise`/`pkgconfig`);
-`tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, `qrcode`, and `here`, each run
-against one build with its Linked dependencies absent, installed, and loaded; `pkgcond`, `doubt`,
-`config`, and `voucher` with cli and fs Linked block with their exact unproven behavior until a sound
-rule covers it); `tests/harp_runtime.rs` (target-R relocation verification accepts exactly the planned
+Keep passing: `crates/slinker-cli/tests/build_materializer.rs` (synthetic fixtures, vendored `praise`/`pkgconfig`);
+`crates/slinker-cli/tests/soundness.rs` (computed call blockers, operator lookup, structural payload members, passive datasets, default fidelity, foreign enclosures, closure attributes, and runtime-support collisions);
+`crates/slinker-cli/tests/cran_packages.rs` (`rebus.numbers`, `represtools`, `rslurm`, and `here` verify their original suites and block on unproven `do.call` targets; restore their generated-package installation-independence checks only after a sound callable proof or declaration covers those targets; `pkgcond`, `doubt`,
+`config`, `qrcode` (unselected optional packages), and `voucher` with cli and fs Linked block with their
+exact unproven behavior until a sound rule covers it); `crates/slinker-cli/tests/harp_runtime.rs` (target-R relocation verification accepts exactly the planned
 replacements and rejects parseable unplanned changes and malformed rewrites). Each item adds its own
 acceptance cases here.
 
+`crates/slinker-cli/tests/source_ownership.rs` covers installation inputs, R exclusions, configure outputs, source-native audits, hook-free inspection, generated paths, publication failures, shadow-proof Root/Linked assignments, and reserved NAMESPACE names through source and tarball installation. `crates/slinker-cli/tests/native_soundness.rs` compares native argument validation, interface identity, registration classes, `.External2` isolation, and companion files against original R; unpreserved compiled pointer arity blocks before publication. `crates/slinker-cli/tests/resolved_calls.rs` also covers the direct External caller-frame reflection blocker. `crates/slinker-core/tests/image_identity.rs` guards fingerprint framing. Preserve repeated-startup and thread/cache determinism regressions alongside these cases.
+
 ## Next up
 
-1. Track C: the type and cleanup items.
-2. Track B.
+1. Track I: finish semantic ownership in Air/Oak. Replace the remaining local language-analysis mechanisms, not just the source scanner. The component inventory and API gaps are in `fixes.md` under "Air/Oak ownership inventory".
+2. Track J: lower checked native/load plans and remove remaining inspection records from execution IR. Preserve native linking and installation independence.
+3. Track H: measure worker phases and semantic coordination after the correctness oracles are fixed. Public explanation simplification is an independent optional schema change.
 
 ---
 
-## Track B: Soundness gaps in the current profile
+## Track H: Static analysis performance
 
-Each item can make a successful build behave differently from the original, and each gets a test
-that fails before its fix.
-
-- Linked datasets: nothing requests `Need::Dataset` today, so `pkg::dataset`,
-  `data(x, package = "pkg")`, and lazy data used inside a Linked package are not carried. Demand the
-  reachable datasets, copy them into a lazy-load database under the generated package, attach them
-  as the package's lazy data environment for `::`, and relocate `data(x, package = )`. A dataset
-  reached only dynamically blocks.
-- An unregistered `g.cls` in a Root/Linked namespace is found lexically by dispatch from that
-  namespace's code, even for base generics; retain it whenever the namespace calls the generic.
-- Optional `Suggests` availability: reachable behavior that depends on whether an unselected
-  Suggests package is installed blocks.
-- Diagnostics: collapse derivative missing-name cascades behind one primary blocker.
-
-## Track C: Rust cleanup, types, and performance
-
-Why: about 23k lines of Rust carry invariants in comments, strings, and `unreachable!`.
-
-Performance:
-- Profile with `cargo bench` before optimizing. Measured: Air plus Oak grows about quadratically
-  with closure size (400 statements 346 ms, 1000 statements 2.1 s); warm rlang analysis takes 18 s
-  of its 31 s cold time, and its roughly 3,500 `normalize_syntax` round trips (two per parsed
-  closure) cost about 4.6 s before the response-polling fix. Unmeasured candidates: one JSON worker
-  round trip per binding (batch per package), a single R worker (several worker processes can
-  inspect different packages in parallel), and string-keyed maps in the analyzer (interning).
-
-Invariants into types:
-- Intern the name newtypes so they hash and compare as integers, but only if a profile shows name
-  hashing matters.
-
-Minimal code:
-- Audit the 544 `.clone()` calls on hot paths once names are interned.
-- Prune tests that pin obsolete details as each area is reworked (`tests/` is about 5,600 lines).
-
-## Track D: Build infrastructure and frontend
-
-- Restore GitHub Actions (billing); until then run the gate in WSL before each push.
-- Linux worker startup: fix `package 'methods' in options("defaultPackages") was not found`;
-  export `R_SHARE_DIR`, `R_INCLUDE_DIR`, `R_DOC_DIR` as Ark does.
-- Source snapshot: honor `.Rbuildignore` and skip `.git`, `target/`, `renv/`. `source_digest` is
-  stored but never checked: detect a source tree changed mid-build, or delete it.
-- One shared `r_executable` helper instead of per-module copies.
-- Cache CRAN downloads and harness libraries in CI.
-- Frontend, documented in `docs/usage.md` as it lands:
-  - `analyze`, `why`, and `path` accept a source package path (staged exactly as `build` does), an
-    installed package name (today's behavior), or an installed package directory, whose parent
-    library goes first in the library order;
-  - `slinker check [PATH]` runs the full build pipeline through preflight, prints the build report,
-    and writes nothing;
-  - `build` takes `--extra-pkgs`;
-  - reports group blockers by root cause, show the owning binding and source line,
-    and have a `--json` form.
-
-## Track E: Retire heuristics
-
-- Invocation model: record every way a retained function is invoked, with its arguments: direct
-  calls; `FUN` of base `lapply`/`sapply`/`vapply`/`Map`/`Filter`/`Reduce` with the call's forwarded
-  `...`; `do.call`; S3 dispatch, including methods found lexically; lifecycle hooks; native
-  callbacks; condition handlers, `on.exit`, and finalizers. Owned by analysis state, never derived
-  from provenance edge kinds. Both items below need it to prove what callers pass.
-- Default-argument specialization: a formal defaulting to a constant that no invocation supplies
-  and the body never rebinds is static (voucher's `find_vouch_workflow_template(action, package =
-  "voucher")`, whose only caller is `vapply(actions, find_vouch_workflow_template, character(1))`).
-- `callables()` for a function-valued binding passed to `do.call` or `lapply`: record an invocation
-  of each declared callable instead of an escape, so a closed S3 generic stays closed.
-
-## Track F: S3 completion
-
-- Retain an installed registration only when reachable dispatch can select it; internal and group
-  generics use the same class domains as `UseMethod` generics.
-- `NextMethod` follows the proven class vector to exact next methods.
-- Constructors with static classes (`class(x) <- "cls"`, `structure(..., class = )`) produce exact
-  domains.
-
-## Track G: Coverage and ecosystem
-
-- Realistic fixture: a vendored root package plus one or two pure-R dependencies that read like
-  ordinary CRAN packages (roxygen NAMESPACE, S3 classes and methods, `NextMethod`, closures and
-  factories, private `.state` environment, `.onLoad`/`.onAttach`, `system.file` resources, a
-  lazy-loaded dataset, `match.arg`/`tryCatch`/`do.call`/`switch`/`eval(bquote())`,
-  `requireNamespace`-guarded Suggests code) with a testthat suite. Done when it builds
-  and passes the three-way installation harness.
-- Lower Linked `.onLoad` `libname` uses to explicit resources instead of blocking them.
-- rlang, cli, glue, vctrs, R6 each link in a CRAN harness case where their code allows;
-  R6 generators and re-enclosed methods are modeled or blocked precisely.
-- Typed blockers for S4/S7, representation introspection, and `eval(parse())`/`source()`.
-- Precision cases from real packages: `globals`, `futile.logger`, `gsubfn`.
-
-Milestone: slink testthat. Baseline on 2026-09-25: testthat's own code has 24 blockers (search-path
-attachment in tests, S4 class objects, native code, dynamic lookups); its dependencies add about
-150 (callr 35, processx 20, cli 15, R6 8, others fewer), and rlang, lifecycle, pkgload, and waldo
-do not finish. callr and processx start child R processes that load packages by name, so linking
-them needs its own design. Reporters are R6. Done when a package's suite runs against a slinked
-testthat with every testthat dependency Linked.
-
-## Track H: Concurrent fixed-point performance
-
-Cold analysis is the priority because it sets worst-case CI and first-run cost. Warm-cache and edit-and-rerun performance must use the same query architecture. No optimization may weaken analysis or make program semantics depend on scheduling.
-
-Baseline on `slinker analyze rlang` on 2026-09-26: about 41 s wall time. Current hot counts are about 323k `evaluate_installed_function`, 833k `resolve_lexical_name`, 107k `parsed_source`, 7.1k `binding_image`, and 1.7k construction evaluations.
-
-Semantic model and scheduler:
-- Make analysis an explicit least-fixed-point computation over finite monotone domains. Add a real bottom/no-information state distinct from `Unknown`/top. Concurrently published semantic facts merge with associative, commutative, idempotent joins. Use bounded exact domains and explicit widening where needed.
-- Facts based on absence or completion are not published until their dependencies are sealed. `.onLoad` and other soundness-critical package activation facts become local readiness dependencies, not global barriers.
-- Replace global frontiers with a concurrent dependency-aware worklist on Rayon's work-stealing runtime. Stable semantic `WorkKey`s deduplicate work, but a transfer may run again when an input fact grows. Coalesce updates and propagate only newly learned deltas.
-- Solve recursive regions with SCC/local fixed-point iteration. Do not seed recursion with semantic `Unknown` or repeatedly reevaluate an entire recursive region when only one fact changed.
-- Workers publish mergeable `AnalysisDelta`s instead of mutating one locked `AnalyzerState`. Keep worker-local buffers, immutable snapshots, atomic scheduling state, and exact quiescence accounting. Do not replace the frontier with `Arc<Mutex<AnalyzerState>>`.
-- Scheduling order is semantically invisible. Different schedules and `--jobs` values must produce the same `ProgramIr` semantics modulo invocation-local IDs, the same diagnostics, and the same provenance graph after canonicalization. Raw numeric IDs, internal table order, and nonsemantic `LinkIr` metrics are not cross-run identities.
-
-Remove repeated semantic work:
-- Intern analyzer names and environment identities. Build immutable indexes for package bindings, imports, native bindings, mutations, and other hot membership queries.
-- Memoize lexical resolution, parsed-source work, parse contexts, and installed-function construction summaries by semantic inputs and epochs. `NodeId` and call-site provenance must never prevent semantic reuse.
-- Separate semantic construction summaries from call-site effects and provenance. Instantiate fresh allocation effects where required.
-- Record query dependencies on the cold path. Recomputed queries whose semantic result is unchanged must stop invalidation propagation. Support stable result fingerprints/backdating and durability so edits to the Root do not force validation of unchanged installed-package work.
-- Persist only reusable semantic summaries keyed by exact source/package inputs, target R identity, analyzer/schema versions, and every semantic context input. Never persist worker-local R object identities.
-
-R/package inspection:
-- Batch binding inspection and syntax-normalization traffic.
-- Use a reusable R worker pool with stable package affinity so one installed package stays on one worker during an inspection epoch and private-environment identity remains valid. Reuse initialized workers across analysis/build phases where their target identity permits it.
-- Keep expensive package inspection demand-driven. Instrument package hashing, bytes read, R startup count, protocol bytes, and accidental full-structure cloning so semantic speedups do not merely expose a new I/O bottleneck.
-
-Profiling and benchmarks:
-- `SLINKER_PROFILE=1` prints deterministic inclusive/exclusive timings, calls versus unique query keys, memo/cache hits, lattice growth/SCC iterations, queue depth/steals, worker utilization, R requests/batch sizes/bytes, package bytes hashed, and R startup count. Detailed tracing remains opt-in.
-- Benchmark cold analysis/build with persistent analysis caches disabled, warm unchanged rerun, and one-source edit rerun. Record before/after numbers; do not add a fixed time threshold.
+- Measure worker startup, IPC, parsing, filesystem fingerprinting, SQLite serialization, and semantic graph work separately. Keep function-level retention and an independent correctness oracle fixed.
+- Measure worker reuse and lane startup before adding workers; small packages may need only one inspection lane.
+- Evaluate a single owner of semantic mutation with immutable parallel observations. Replace semantic-thread claims/waits/locks only after program/blocker/provenance equivalence and sequential measurements justify it.
+- Remove dead interpreter/query counters. Use real semantic work counts, and compare actual cold/warm/edit results outside timed regions; counts alone are not a correctness oracle.
+- Keep SQLite; use structured artifact keys/headers and SQL grouping/filtering to delete the old filename grammar and index-header decoding. Do not introduce an ORM or semantic incrementality for this storage cleanup.
+- Measure retained text across repeated library sessions. Replace the process-global strong interner with ordinary `Arc<str>` or session-owned deduplication, preserving typed names and measuring the tradeoff.
 
 Done when:
-- the global frontier/preparse-frontier scheduler is gone and semantic work uses the monotone query/worklist model;
-- lattice and delta merge laws are tested, including order/permutation tests;
-- adversarial scheduler tests cover cycles, lost wakeups, repeated scheduling, `.onLoad` readiness, private environments, construction recursion, and several `--jobs` values;
-- those schedules produce semantically equivalent `ProgramIr`, diagnostics, and provenance without requiring identical invocation-local IDs;
-- cold `rlang` analysis is materially faster from fewer semantic evaluations plus real CPU/R-worker overlap;
-- warm and one-file edit reruns use the same dependency graph, prune propagation when recomputation is unchanged, and invalidate only semantic dependents;
-- the existing soundness, three-way installation, and build-materializer corpus remains unchanged.
+- cold, warm, and one-file-edit measurements use the same semantic workload;
+- the soundness and installation-independence corpus passes unchanged;
+- any coordination replacement removes its superseded scheduler/locking mechanism, and reports measured tradeoffs without restoring query/allocation interpretation.
+- after sessions and their returned objects are dropped, no process-global interner retains their unique text; repeated-session measurements report both retained memory and runtime cost.
+
+---
+
+## Track I: Air/Oak semantic ownership
+
+Air/Oak changes are natural-language handoffs only; do not make commits in those projects. A coordinated pin update is allowed when validated upstream APIs replace local mechanisms.
+
+- Make Oak the sole owner of generic binding and control-flow facts: for-sequence evaluation order, later formals in defaults, lazy recursive closure bindings, returning-path binding guarantees, and captured superassignment targets. Preserve the existing R oracles; replace local proofs only when the dependency supplies their contract.
+- Use a complete upstream callable-syntax view for ordinary calls, operators, extraction/subsetting, replacement calls, and language control forms. Delete the competing local call discovery and node census when that API covers the same occurrences and shadowing rules.
+- Put decoded literal/name values and full R argument matching in Air/Oak. Raw strings, escaped names, missing arguments, partial matching, dots, and explicit invalid/unknown outcomes belong to those APIs. The current convenience helpers are not equivalent replacements.
+- Delegate generic assignment alias provenance and required-true branch facts to Oak. Keep namespace retention, package availability/activation, declarations, resource policy, and supported-profile decisions in slinker.
+- Keep the package-image/import snapshot as slinker's input to Oak; remove duplicated generic scope and resolution structures where upstream handles already preserve the required identity.
+
+Done when:
+- slinker consumes generic language facts instead of maintaining a second binding/control/call analysis;
+- each deleted mechanism has an identified upstream owner and an independent behavior oracle;
+- the thin adapter retains no duplicate syntax tree or generic flow engine;
+- source and tarball behavior, blockers, and dependency installation independence remain covered, with every intended analysis-output change explained;
+- report net production deletions separately from code movement, tests, and upstream additions. Do not claim a thousands-line reduction before it is measured.
+
+---
+
+## Track J: Checked construction with one restoration path
+
+- Lower native observations into checked Root and Linked load operations. Preserve registration interface, R call form including `.External2`, forced-symbol behavior, argument validation, exact binding maps, callback obligations, and the declared installed native resource tree.
+- Flatten the redundant value/closure/environment construction tables. Namespace parent chains belong to namespace construction; binding initialization directly describes its source/bundle, lifecycle/native operation, or External access. Keep typed code occurrences, relocations, imports, and bundle identities.
+- Evaluate uniform retained-function/value bundles. Preserve untouched installed formals/body/attributes and sharing; verify any actual edited closure sites and reject unsupported aliases/patch homes. Do not assume `body<-` or deparse/reparse preserves metadata.
+- Establish original activation boundaries before using uniform restoration. Root exports/S3 methods and hooks must become available at the correct stage; the original `.onLoad` must replace the bootstrap before recursive invocation. Restore the absent-hook state when appropriate. Preserve supported Root `.onAttach` behavior and the accepted shared-S3-registry exception.
+- Evaluate object-based relocations carrying established namespace references in target-R language objects to remove persistent named Root support state. Preserve original function enclosures, untouched subtrees/attributes, aliases, and private namespace restoration. A real-namespace serialization control is not proof of this migration.
+- When the unified path passes its oracle, delete source/payload classification, ordinary function assignment emission, per-closure `eval(parse(...))`, `.slinker_original_on_load`, obsolete Root load splits, and replaced tables/APIs in the same change.
+- Remove remaining inspection/safety records from execution IR; native load plans must expose only checked operations. Keep metadata and output-layout validation in preflight, with `PureRStatic::check` as the sole buildable constructor.
+
+Done when:
+- direct source and built-tarball installations match the original across defaults, attributes, operators, sharing/cycles, payload patches, imports, hooks, S3, native calls/resources, and all relevant dependency load states;
+- `check` and `build` agree on semantic/representation rejection; publication never precedes validation;
+- the materializer executes checked construction with no alternative semantic authority;
+- obsolete construction paths are deleted and net production-line changes are measured without double counting. A flattening-only step is valid; serialization migration is not complete until its own oracle passes.
 
 ---
 
 ## Deferred
 
+- General External caller-effect analysis. Direct External caller-frame access is blocked; this does not establish general effects through indirect calls or native code. A blanket declaration requirement for External calls is not authorized by the recorded caller-reflection finding.
+- Broader S3 precision: pruning installed registrations, exact `NextMethod` vectors, and inferred constructor classes. Require complete caller knowledge and independent dispatch oracles first.
+- Resource/call coverage: explicit `system.file` `lib.loc` and computed arguments/paths, Linked `.onLoad` `libname` lowering, and dynamic-key private-environment operations. Do not widen the profile to repair an existing soundness failure.
+- A richer realistic CRAN-like fixture and additional S4/S7/introspection/evaluation coverage. Preserve the existing corpus and fail-closed boundaries; any future construction profile must establish lexical sharing, laziness, and identity independently.
+- Optional explanation-schema reduction to deterministic nodes, typed edges, diagnostics, and requested paths. It deliberately removes consumed presentation outputs; preserve the evidence used by `why`/`path` and keep this independent of semantic migrations.
+- Query-level analysis incrementality, only after measurements justify it and explicit input dependencies and invalidation are established. Reuse must preserve the program, provenance, and blockers. Do not restore runtime construction interpretation or allocation summaries.
+- Extending default-argument specialization to S3 methods, lifecycle hooks, native callbacks, condition handlers, `on.exit`, and finalizers. Revisit only for demonstrated coverage needs that justify the added caller tracking.
+- Broad ecosystem milestones: rlang, cli, glue, vctrs, R6, httr, foreach/codetools/iterators, globals, futile.logger, and gsubfn. Keep existing regressions; new package targets do not authorize new semantic machinery by themselves.
+- Slink testthat with all its dependencies Linked. This needs separate decisions about R6 and child R processes in callr/processx; it is not an acceptance gate for the current static profile.
 - Bounded residual runtime over proved finite candidate sets.
 - Namespace unload/reload and Linked `.onUnload`.
 - Stronger External verification (exact fingerprints, ABI checks).
@@ -234,7 +172,6 @@ Done when:
 
 ## Traps
 
-- `TargetUniverse::set_root` and `set_explicit_external` must run before any resolution.
 - Root staging library first, then `--lib` paths or, without `--lib`, the default `.libPaths()`.
   Never drop the user library.
 - Explicit `--external` on a Suggests package is selected optional behavior; its contract is

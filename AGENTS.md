@@ -1,5 +1,7 @@
 # slinker agent instructions
 
+Always use your edit tool instead of trying to rewrite files from memory. Make targeted, clean edits.
+
 ## Project
 
 `slinker` turns an R source package into another source package with selected dependencies linked into it.
@@ -10,7 +12,7 @@ Correctness and semantic soundness come before ecosystem coverage and performanc
 
 ## Sources of truth
 
-`docs/` describes behavior implemented now; `README.md` indexes it.
+`docs/` describes behavior implemented now.
 
 `work to materialize.md` describes unfinished work and intended behavior. Do not assume planned behavior already exists.
 
@@ -24,6 +26,8 @@ When working from the plan, read only:
 The plan may deliberately replace an existing invariant. In that case, implement the plan's acceptance criteria and remove the superseded mechanism.
 
 Breaking changes are allowed. When replacing an API, representation, flag, format, or mechanism, remove the obsolete one in the same change unless coexistence is explicitly required.
+
+Until the first release, all schemas, protocols, and fingerprint formats stay at v1. Changes are breaking; do not bump versions or add compatibility layers.
 
 Delete completed plan items rather than turning the plan into a status log.
 

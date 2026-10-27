@@ -1,0 +1,253 @@
+use crate::package::PackageName;
+use crate::package::{Digest, InstalledPackage, PackageIdentity, PackageLocation};
+use crate::profile::{self, Counter, Probe};
+use crate::{Description, Error, Result, TargetEnvironment};
+use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+#[derive(Debug)]
+pub(crate) struct FrozenPackages {
+    locator: PackageLocator,
+    images: Mutex<HashMap<PackageName, Option<InstalledPackage>>>,
+}
+
+impl FrozenPackages {
+    pub(crate) fn new(target: TargetEnvironment) -> Self {
+        Self {
+            locator: PackageLocator::new(target),
+            images: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn target(&self) -> &TargetEnvironment {
+        self.locator.target()
+    }
+
+    pub(crate) fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
+        let mut images = self.images.lock().expect("frozen package registry");
+        if let Some(image) = images.get(name) {
+            return Ok(image.clone());
+        }
+        let image = self.locator.locate(name)?;
+        images.insert(name.into(), image.clone());
+        Ok(image)
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        for (name, expected) in self.images.lock().expect("frozen package registry").iter() {
+            let actual = self.locator.locate(name)?;
+            let unchanged = match (expected, actual) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => {
+                    expected.identity == actual.identity && expected.location == actual.location
+                }
+                _ => false,
+            };
+            if !unchanged {
+                return Err(Error::Analysis(format!(
+                    "selected package image changed during the invocation: {name}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageLocator {
+    target: TargetEnvironment,
+}
+
+impl PackageLocator {
+    pub fn new(target: TargetEnvironment) -> Self {
+        Self { target }
+    }
+
+    pub fn target(&self) -> &TargetEnvironment {
+        &self.target
+    }
+
+    pub fn locate(&self, name: &str) -> Result<Option<InstalledPackage>> {
+        if name.is_empty() || name.contains(['/', '\\', ':', '\0']) || matches!(name, "." | "..") {
+            return Err(Error::Analysis(format!(
+                "invalid package path component: {name:?}"
+            )));
+        }
+        for candidate_library in &self.target.libraries {
+            let candidate_root = candidate_library.join(name);
+            let description_path = candidate_root.join("DESCRIPTION");
+            if !description_path.is_file() {
+                continue;
+            }
+            let library = dunce::canonicalize(candidate_library)
+                .unwrap_or_else(|_| candidate_library.clone());
+            let root = dunce::canonicalize(&candidate_root).unwrap_or(candidate_root);
+            let description_text =
+                fs::read_to_string(&description_path).map_err(|source| Error::Io {
+                    path: description_path.clone(),
+                    source,
+                })?;
+            let description = Description::parse(&description_text);
+            let declared_name = description.package().ok_or_else(|| Error::Metadata {
+                path: description_path.clone(),
+                message: "missing Package field".to_owned(),
+            })?;
+            if declared_name.as_str() != name {
+                return Err(Error::Metadata {
+                    path: description_path,
+                    message: format!(
+                        "installed directory name `{name}` disagrees with DESCRIPTION Package `{}`",
+                        declared_name.as_str(),
+                    ),
+                });
+            }
+            let version = description
+                .version_parsed()
+                .ok_or_else(|| Error::Metadata {
+                    path: description_path.clone(),
+                    message: "missing Version field".to_owned(),
+                })?
+                .map_err(|error| Error::Metadata {
+                    path: description_path.clone(),
+                    message: format!("invalid Version field: {error}"),
+                })?;
+            let image_fingerprint = fingerprint_image(&root)?;
+            return Ok(Some(InstalledPackage {
+                identity: PackageIdentity {
+                    name: name.into(),
+                    version,
+                    image_fingerprint,
+                },
+                location: PackageLocation { library, root },
+                description,
+            }));
+        }
+        Ok(None)
+    }
+}
+
+pub fn tree_digest(root: &Path) -> Result<Digest> {
+    fingerprint_image(root)
+}
+
+pub(crate) fn fingerprint_image(root: &Path) -> Result<Digest> {
+    let _span = profile::span(Probe::PackageFingerprint);
+    profile::count(Counter::FingerprintOperations);
+    let mut files = Vec::<(String, PathBuf, fs::FileType)>::new();
+    let mut pending = vec![root.to_path_buf()];
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| Error::Io { path, source }
+    };
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(io(&directory))? {
+            let entry = entry.map_err(io(&directory))?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(io(&path))?;
+            if file_type.is_dir() || file_type.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| Error::Analysis(error.to_string()))?
+                    .components()
+                    .map(|component| {
+                        component.as_os_str().to_str().ok_or_else(|| {
+                            Error::Analysis(format!(
+                                "package image path is not UTF-8: {}",
+                                path.display()
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .join("/");
+                if file_type.is_dir() {
+                    pending.push(path.clone());
+                }
+                files.push((relative, path, file_type));
+            } else {
+                return Err(Error::Analysis(format!(
+                    "package image contains an unsupported filesystem entry: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    let mut image = Fingerprint::new("slinker-installed-image-v1");
+    let mut buffer = vec![0u8; 128 * 1024];
+    profile::add(
+        Counter::FingerprintFiles,
+        files.iter().filter(|(_, _, kind)| kind.is_file()).count() as u64,
+    );
+    for (relative, path, kind) in &files {
+        if kind.is_dir() {
+            image = image.field("directory").field(relative);
+            continue;
+        }
+        let mut hash = Sha256::new();
+        let mut reader = BufReader::new(File::open(path).map_err(io(path))?);
+        loop {
+            let read = reader.read(&mut buffer).map_err(io(path))?;
+            if read == 0 {
+                break;
+            }
+            profile::add(Counter::FingerprintBytes, read as u64);
+            hash.update(&buffer[..read]);
+        }
+        image = image
+            .field("file")
+            .field(relative)
+            .field(Digest::finish(hash).as_str());
+    }
+    Ok(image.finish())
+}
+
+pub struct Fingerprint(Sha256);
+
+impl Fingerprint {
+    #[must_use]
+    pub fn new(domain: &str) -> Self {
+        Self(Sha256::new()).field(domain)
+    }
+
+    #[must_use]
+    pub fn field(mut self, value: impl AsRef<[u8]>) -> Self {
+        let value = value.as_ref();
+        self.0.update((value.len() as u64).to_le_bytes());
+        self.0.update(value);
+        self
+    }
+
+    #[must_use]
+    pub fn list<T: AsRef<[u8]>>(mut self, items: impl IntoIterator<Item = T>) -> Self {
+        let items = items.into_iter().collect::<Vec<_>>();
+        self.0.update((items.len() as u64).to_le_bytes());
+        for item in &items {
+            self = self.field(item);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn finish(self) -> Digest {
+        Digest::finish(self.0)
+    }
+}
+
+pub(crate) fn fingerprint_strings(values: impl IntoIterator<Item = impl AsRef<str>>) -> Digest {
+    let mut hash = Sha256::new();
+    hash.update(b"slinker-key-v1\0");
+    for value in values {
+        hash.update(value.as_ref().as_bytes());
+        hash.update([0]);
+    }
+    Digest::finish(hash)
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/package/locator.rs"]
+mod tests;

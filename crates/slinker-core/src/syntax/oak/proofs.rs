@@ -1,0 +1,422 @@
+use super::census::{Census, IfRegion, assignment_of, node_name, node_range, static_arg_of};
+use super::census::{ForRegion, FunctionRegion};
+use super::context::OakParseContext;
+use super::{LiveUse, innermost_function_region, text_offset};
+use crate::syntax::facts::{CallSite, CalleeKind, StaticArg};
+use crate::syntax::source::TextRange;
+use air_r_syntax::{
+    AnyRExpression, RArgument, RFunctionDefinition, RIfStatement, RParameterDefault, RRoot,
+};
+use biome_rowan::{AstNode, AstNodeList};
+use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex, UseId};
+
+#[derive(Clone, Copy)]
+pub(super) struct ControlRegions<'a> {
+    pub(super) for_regions: &'a [ForRegion],
+    pub(super) if_regions: &'a [IfRegion],
+}
+
+pub(super) fn for_binding_is_unproved(
+    root: &RRoot,
+    index: &SemanticIndex,
+    context: &OakParseContext,
+    scope: ScopeId,
+    use_id: UseId,
+) -> bool {
+    let range = index.uses(scope)[use_id].range();
+    index
+        .reaching_definitions(scope, use_id)
+        .any(|(owner, id)| {
+            let DefinitionKind::ForVariable(pointer) = index.definitions(owner)[id].kind() else {
+                return false;
+            };
+            let statement = pointer.to_node(root.syntax());
+            let sequence_use = statement.sequence().ok().is_some_and(|sequence| {
+                sequence.syntax().text_trimmed_range().contains_range(range)
+            });
+            let optional_execution = statement
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .take_while(|node| !RFunctionDefinition::can_cast(node.kind()))
+                .any(|node| {
+                    if node.text_trimmed_range().contains_range(range) {
+                        return false;
+                    }
+                    let stable = |operation: &str| {
+                        let (scope, _) = index.scope_at(node.text_trimmed_range().start());
+                        context.resolves_to_base(operation)
+                            && index.resolve(operation, scope).is_none()
+                    };
+                    match AnyRExpression::cast(node.clone()) {
+                        Some(
+                            AnyRExpression::RBracedExpressions(_)
+                            | AnyRExpression::RIfStatement(_)
+                            | AnyRExpression::RForStatement(_)
+                            | AnyRExpression::RWhileStatement(_)
+                            | AnyRExpression::RRepeatStatement(_),
+                        ) => false,
+                        Some(AnyRExpression::RParenthesizedExpression(_)) => !stable("("),
+                        Some(AnyRExpression::RBinaryExpression(binary)) => {
+                            !binary.operator().ok().is_some_and(|operator| {
+                                matches!(operator.text_trimmed(), "<-" | "=" | "->" | "<<-" | "->>")
+                                    && stable(operator.text_trimmed())
+                            })
+                        }
+                        Some(_) => true,
+                        None => {
+                            RArgument::can_cast(node.kind())
+                                || RParameterDefault::can_cast(node.kind())
+                        }
+                    }
+                });
+            sequence_use || optional_execution
+        })
+}
+
+pub(super) fn formal_default_use_is_bound(regions: &[FunctionRegion], live_use: &LiveUse) -> bool {
+    let mut containing = regions
+        .iter()
+        .filter(|region| {
+            region
+                .formals
+                .contains_range(TextRange::new(live_use.start, live_use.end))
+        })
+        .collect::<Vec<_>>();
+    containing.sort_by_key(|region| region.formals.end.saturating_sub(region.formals.start));
+    containing
+        .into_iter()
+        .any(|region| region.parameters.contains(&live_use.name))
+}
+
+pub(super) fn recursive_closure_binding_is_initialized(
+    root: &RRoot,
+    index: &SemanticIndex,
+    functions: &[FunctionRegion],
+    live_use: &LiveUse,
+) -> bool {
+    let Some(function) = innermost_function_region(functions, live_use.start) else {
+        return false;
+    };
+    index
+        .reaching_definitions(live_use.scope, live_use.use_id)
+        .filter(|(scope, _)| *scope != live_use.scope)
+        .any(|(scope, definition_id)| {
+            let definition = &index.definitions(scope)[definition_id];
+            if !matches!(definition.kind(), DefinitionKind::Assignment(_)) {
+                return false;
+            }
+            let symbol = index.symbols(scope).symbol(definition.symbol());
+            if symbol.name() != live_use.name {
+                return false;
+            }
+            assignment_of(root, definition.kind()).is_some_and(|assignment| {
+                matches!(&assignment.value, AnyRExpression::RFunctionDefinition(value)
+                    if node_range(value).start == function.function_start)
+            })
+        })
+}
+
+pub(super) fn definition_must_execute_before_position(
+    definition_start: usize,
+    position: usize,
+    for_regions: &[ForRegion],
+    if_regions: &[IfRegion],
+) -> bool {
+    if definition_start >= position {
+        return false;
+    }
+
+    for region in for_regions {
+        if definition_start >= region.body.start
+            && definition_start < region.body.end
+            && !(position >= region.body.start && position < region.body.end)
+        {
+            return false;
+        }
+    }
+
+    for region in if_regions {
+        let in_then = definition_start >= region.then_branch.start
+            && definition_start < region.then_branch.end;
+        if in_then && !(position >= region.then_branch.start && position < region.then_branch.end) {
+            return false;
+        }
+        if let Some(TextRange {
+            start: else_start,
+            end: else_end,
+        }) = region.else_branch
+        {
+            let in_else = definition_start >= else_start && definition_start < else_end;
+            if in_else && !(position >= else_start && position < else_end) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+pub(super) fn conditional_fallthrough_proven_bound(
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    census: &Census,
+    live_use: &LiveUse,
+) -> bool {
+    let definitions = index
+        .reaching_definitions(live_use.scope, live_use.use_id)
+        .filter_map(|(scope, definition_id)| {
+            let definition = &index.definitions(scope)[definition_id];
+            (scope == live_use.scope && matches!(definition.kind(), DefinitionKind::Assignment(_)))
+                .then(|| text_offset(definition.range().start()))
+        })
+        .filter(|start| *start < live_use.start)
+        .collect::<Vec<_>>();
+    if definitions.iter().any(|start| {
+        definition_must_execute_before_position(*start, live_use.start, &census.fors, &census.ifs)
+    }) {
+        return true;
+    }
+    census.ifs.iter().any(|region| {
+        region
+            .else_branch
+            .is_some_and(|branch| branch.end <= live_use.start)
+            && definition_must_execute_before_position(
+                region.if_start,
+                live_use.start,
+                &census.fors,
+                &census.ifs,
+            )
+            && if_chain_all_returning_paths_bind(context, index, &census.ifs, region, &definitions)
+    })
+}
+
+pub(super) fn if_chain_all_returning_paths_bind(
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    region: &IfRegion,
+    definition_starts: &[usize],
+) -> bool {
+    if !branch_binds_reaching_definition(
+        regions,
+        region.then_branch.start,
+        region.then_branch.end,
+        definition_starts,
+    ) && !branch_exits_current_function(
+        context,
+        index,
+        regions,
+        region.then_branch.start,
+        region.then_branch.end,
+    ) {
+        return false;
+    }
+
+    let Some(TextRange {
+        start: else_start,
+        end: else_end,
+    }) = region.else_branch
+    else {
+        return false;
+    };
+
+    if let Some(nested) = regions
+        .iter()
+        .find(|candidate| candidate.if_start == else_start)
+    {
+        return if_chain_all_returning_paths_bind(
+            context,
+            index,
+            regions,
+            nested,
+            definition_starts,
+        );
+    }
+
+    branch_binds_reaching_definition(regions, else_start, else_end, definition_starts)
+        || branch_exits_current_function(context, index, regions, else_start, else_end)
+}
+
+pub(super) fn branch_binds_reaching_definition(
+    regions: &[IfRegion],
+    branch_start: usize,
+    branch_end: usize,
+    definition_starts: &[usize],
+) -> bool {
+    definition_starts.iter().copied().any(|definition_start| {
+        definition_start >= branch_start
+            && definition_start < branch_end
+            && definition_is_top_level_in_branch(regions, branch_start, branch_end, definition_start)
+            && !regions.iter().any(|nested| {
+                nested.if_start >= branch_start
+                    && nested.if_start < branch_end
+                    && nested.if_start != branch_start
+                    && ((definition_start >= nested.then_branch.start && definition_start < nested.then_branch.end)
+                        || matches!(nested.else_branch, Some(TextRange { start, end }) if definition_start >= start && definition_start < end))
+            })
+    })
+}
+
+pub(super) fn definition_is_top_level_in_branch(
+    regions: &[IfRegion],
+    branch_start: usize,
+    branch_end: usize,
+    definition_start: usize,
+) -> bool {
+    let Some(expression) = branch_expression(regions, branch_start, branch_end) else {
+        return false;
+    };
+    match expression {
+        AnyRExpression::RBracedExpressions(block) => block
+            .expressions()
+            .iter()
+            .any(|expression| node_range(&expression).start == definition_start),
+        expression => node_range(&expression).start == definition_start,
+    }
+}
+
+fn branch_expression(regions: &[IfRegion], start: usize, end: usize) -> Option<AnyRExpression> {
+    regions.iter().find_map(|region| {
+        let statement = RIfStatement::cast(region.condition.syntax().parent()?)?;
+        let expression = if region.then_branch == TextRange::new(start, end) {
+            statement.consequence().ok()?
+        } else if region.else_branch == Some(TextRange::new(start, end)) {
+            statement.else_clause()?.alternative().ok()?
+        } else {
+            return None;
+        };
+        Some(expression)
+    })
+}
+
+pub(super) fn branch_exits_current_function(
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    start: usize,
+    end: usize,
+) -> bool {
+    let Some(expression) = branch_expression(regions, start, end).and_then(last_expression) else {
+        return false;
+    };
+    let range = node_range(&expression);
+
+    if let Some(region) = regions.iter().find(|region| {
+        region.if_start == range.start
+            && region
+                .else_branch
+                .is_some_and(|branch| branch.end <= range.end)
+    }) {
+        return if_chain_all_paths_exit(context, index, regions, region);
+    }
+
+    let Some((package, callee, callee_start)) = ast_direct_call(&expression) else {
+        return false;
+    };
+    if package.is_none() && callee == "return" {
+        return true;
+    }
+    call_is_non_returning(context, index, package.as_deref(), &callee, callee_start)
+}
+
+fn last_expression(expression: AnyRExpression) -> Option<AnyRExpression> {
+    match expression {
+        AnyRExpression::RBracedExpressions(block) => block.expressions().iter().last(),
+        expression => Some(expression),
+    }
+}
+
+fn ast_direct_call(expression: &AnyRExpression) -> Option<(Option<String>, String, usize)> {
+    let AnyRExpression::RCall(call) = expression else {
+        return None;
+    };
+    let function = call.function().ok()?;
+    match &function {
+        AnyRExpression::RIdentifier(_) => match static_arg_of(&function)? {
+            StaticArg::Symbol(name) => Some((None, name.to_string(), node_range(&function).start)),
+            _ => None,
+        },
+        AnyRExpression::RNamespaceExpression(namespace) => {
+            let (package, callee) = (namespace.left().ok()?, namespace.right().ok()?);
+            Some((
+                Some(node_name(&package)?),
+                node_name(&callee)?,
+                node_range(&callee).start,
+            ))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn if_chain_all_paths_exit(
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    regions: &[IfRegion],
+    region: &IfRegion,
+) -> bool {
+    if !branch_exits_current_function(
+        context,
+        index,
+        regions,
+        region.then_branch.start,
+        region.then_branch.end,
+    ) {
+        return false;
+    }
+    let Some(TextRange {
+        start: else_start,
+        end: else_end,
+    }) = region.else_branch
+    else {
+        return false;
+    };
+    if let Some(nested) = regions
+        .iter()
+        .find(|candidate| candidate.if_start == else_start)
+    {
+        if_chain_all_paths_exit(context, index, regions, nested)
+    } else {
+        branch_exits_current_function(context, index, regions, else_start, else_end)
+    }
+}
+
+pub(super) fn bare_call_is_external(index: &SemanticIndex, callee: &str, start: usize) -> bool {
+    let Ok(offset) = u32::try_from(start) else {
+        return false;
+    };
+    let Some((scope, use_id, use_site)) = index.use_at(offset.into()) else {
+        return false;
+    };
+    text_offset(use_site.range().start()) == start
+        && index.symbols(scope).symbol(use_site.symbol()).name() == callee
+        && !index.use_is_bound(scope, use_id)
+        && index.reaching_definitions(scope, use_id).next().is_none()
+}
+
+pub(super) fn call_is_non_returning(
+    context: &OakParseContext,
+    index: &SemanticIndex,
+    package: Option<&str>,
+    callee: &str,
+    callee_start: usize,
+) -> bool {
+    match package {
+        Some("base") => matches!(callee, "stop" | "q" | "quit"),
+        Some(_) => false,
+        None if !bare_call_is_external(index, callee, callee_start) => false,
+        None if matches!(callee, "stop" | "q" | "quit") => context.resolves_to_base(callee),
+        None => false,
+    }
+}
+
+pub(super) fn is_base_call(context: &OakParseContext, call: &CallSite) -> bool {
+    if call.callee_kind != CalleeKind::DefinitelyExternal {
+        return false;
+    }
+    match call.qualified_package() {
+        Some("base") => true,
+        Some(_) => false,
+        None => context.resolves_to_base(&call.callee),
+    }
+}

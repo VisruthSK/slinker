@@ -1,0 +1,75 @@
+use crate::package::{Digest, PackageId};
+use crate::syntax::{ParsedRFile, SourceId, SourceKey, Sources};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+pub(super) type ParseKey = (PackageId, SourceKey);
+
+#[derive(Clone, Debug)]
+pub(super) enum ParseState {
+    Parsed(Arc<ParsedRFile>),
+    Blocked,
+}
+
+#[derive(Default)]
+pub(super) struct ParseCache {
+    states: HashMap<ParseKey, ParseState>,
+    sources: Sources,
+    source_ids: HashMap<ParseKey, SourceId>,
+    normalized_shapes: HashMap<ParseKey, Digest>,
+}
+
+impl ParseCache {
+    pub(super) fn state(&self, key: &ParseKey) -> Option<&ParseState> {
+        self.states.get(key)
+    }
+
+    pub(super) fn register(&mut self, key: ParseKey, package: &str, text: &Arc<str>) -> SourceId {
+        if let Some(known) = self.source_ids.get(&key) {
+            return *known;
+        }
+        let source = self.sources.add(package, key.1.clone(), Arc::clone(text));
+        self.source_ids.insert(key, source);
+        source
+    }
+
+    pub(super) fn registered(&self, key: &ParseKey) -> Option<(SourceId, Arc<str>)> {
+        let source = self.source_ids.get(key)?;
+        let text = Arc::clone(&self.sources.get(source)?.text);
+        Some((*source, text))
+    }
+
+    pub(super) fn block(&mut self, key: ParseKey) {
+        self.states.insert(key, ParseState::Blocked);
+    }
+
+    pub(super) fn store(&mut self, key: ParseKey, parsed: Arc<ParsedRFile>) {
+        self.states.insert(key, ParseState::Parsed(parsed));
+    }
+
+    pub(super) fn record_shape(&mut self, key: ParseKey, shape: Digest) {
+        self.normalized_shapes.insert(key, shape);
+    }
+
+    pub(super) fn assigned_value_start(&self, key: &ParseKey) -> Option<usize> {
+        match self.states.get(key)? {
+            ParseState::Parsed(parsed) => parsed
+                .expressions
+                .first()
+                .and_then(|expression| expression.assigned_value_start),
+            ParseState::Blocked => None,
+        }
+    }
+
+    pub(super) fn shape(&self, key: &ParseKey) -> Option<&Digest> {
+        self.normalized_shapes.get(key)
+    }
+
+    pub(super) fn sources(&self) -> &Sources {
+        &self.sources
+    }
+
+    pub(super) fn into_sources(self) -> Sources {
+        self.sources
+    }
+}
