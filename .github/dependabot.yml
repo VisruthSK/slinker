@@ -5,6 +5,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      r-package-metadata:
+        patterns:
+          - r-description-parser
+          - r-metadata
 
   - package-ecosystem: github-actions
     directory: /
