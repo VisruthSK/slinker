@@ -216,6 +216,69 @@ fn external_caller_frame_reflection_blocks_before_removing_its_target() {
 }
 
 #[test]
+fn loop_bindings_with_unproved_evaluation_block_before_publication() {
+    for (entry, expected) in [
+        ("function() { for (values in values) {}; values }", "3L"),
+        (
+            "function() { for (values in (function() values)()) {}; values }",
+            "3L",
+        ),
+        (
+            "function() { try(for (values in stop('failure')) {}, silent=TRUE); values }",
+            "1:3",
+        ),
+        (
+            "function() { ignore <- function(expr) NULL; ignore(for (values in 1:3) {}); values }",
+            "1:3",
+        ),
+        (
+            "function(unused = { for (values in 1:3) {} }) values",
+            "1:3",
+        ),
+        (
+            "function() { FALSE && { for (values in 1:3) {} }; values }",
+            "1:3",
+        ),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let dependency = work.path().join("sequencedep");
+        let source = work.path().join("sequenceroot");
+        let original = work.path().join("original");
+        fs::create_dir(&original).unwrap();
+        package(
+            &dependency,
+            "sequencedep",
+            "",
+            "export(entry)\n",
+            &format!("values <- 1:3\nentry <- {entry}\n"),
+        );
+        package(
+            &source,
+            "sequenceroot",
+            "Imports: sequencedep\n",
+            "export(run)\n",
+            "run <- function() sequencedep::entry()\n",
+        );
+        let r_home = discover_r_home();
+        install_package(&r_home, &dependency, &original);
+        install_package_using(&r_home, &source, &original, &original);
+        let oracle = format!("stopifnot(identical(sequenceroot::run(), {expected}))");
+        run_r(&r_home, &original, &oracle);
+        let output = work.path().join("output");
+        let result = build(&source, &output, &original, &work.path().join("cache"), "1");
+        assert!(
+            !result.status.success(),
+            "unproven loop binding built: {entry}"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("for-loop binding"));
+        assert!(
+            !output.exists(),
+            "unproven loop-sequence build published output"
+        );
+    }
+}
+
+#[test]
 fn for_variable_initialization_does_not_retain_a_namespace_fallback() {
     let work = tempfile::tempdir().unwrap();
     let dependency = work.path().join("loopdep");
@@ -228,20 +291,20 @@ fn for_variable_initialization_does_not_retain_a_namespace_fallback() {
         &dependency,
         "loopdep",
         "",
-        "export(entry)\n",
-        "x <- function() eval(quote(1L))\nentry <- function(xs) { for (x in xs) {}; x }\n",
+        "export(entry,wrapped)\n",
+        "x <- function() eval(quote(1L))\nentry <- function(xs) { for (x in xs) {}; x }\nwrapped <- function() { (for (x in 1:3) {}); first <- x; out <- for (x in 4:6) {}; c(first, x) }\n",
     );
     package(
         &source,
         "looproot",
         "Imports: loopdep\n",
         "export(run)\n",
-        "run <- function() list(loopdep::entry(integer()), loopdep::entry(7L))\n",
+        "run <- function() list(loopdep::entry(integer()), loopdep::entry(7L), loopdep::wrapped())\n",
     );
     let r_home = discover_r_home();
     install_package(&r_home, &dependency, &original);
     install_package_using(&r_home, &source, &original, &original);
-    let oracle = "stopifnot(identical(looproot::run(), list(NULL, 7L)))";
+    let oracle = "stopifnot(identical(looproot::run(), list(NULL, 7L, c(3L, 6L))))";
     run_r(&r_home, &original, oracle);
     let output = work.path().join("output");
     let result = build(&source, &output, &original, &work.path().join("cache"), "1");
@@ -1017,6 +1080,26 @@ fn shadowed_control_forms_block_before_publication() {
         (
             "return",
             "`return` <- function(...) NULL\nrun <- function() { return(1L); controldep::hidden() }\n",
+        ),
+        (
+            "for",
+            "`for` <- function(variable, sequence, body) 42L\nrun <- function() for (x in 1:3) break\n",
+        ),
+        (
+            "while",
+            "`while` <- function(condition, body) 42L\nrun <- function() while (TRUE) break\n",
+        ),
+        (
+            "repeat",
+            "`repeat` <- function(body) 42L\nrun <- function() repeat break\n",
+        ),
+        (
+            "braces",
+            "run <- function() { stop('must not run') }\n`{` <- function(...) 42L\n",
+        ),
+        (
+            "parentheses",
+            "`(` <- function(...) 42L\nrun <- function() (stop('must not run'))\n",
         ),
     ] {
         let source = work.path().join("controlroot");

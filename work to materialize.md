@@ -117,7 +117,9 @@ Done when:
 
 ## Track I: Air/Oak semantic ownership
 
-- Make Oak the sole owner of generic binding and control-flow facts: later formals in defaults, lazy recursive closure bindings, returning-path binding guarantees, and captured superassignment targets. Preserve the existing R oracles; replace local proofs only when the dependency supplies their contract.
+Air/Oak changes are natural-language handoffs only; do not make commits in those projects. A coordinated pin update is allowed when validated upstream APIs replace local mechanisms.
+
+- Make Oak the sole owner of generic binding and control-flow facts: for-sequence evaluation order, later formals in defaults, lazy recursive closure bindings, returning-path binding guarantees, and captured superassignment targets. Preserve the existing R oracles; replace local proofs only when the dependency supplies their contract.
 - Use a complete upstream callable-syntax view for ordinary calls, operators, extraction/subsetting, replacement calls, and language control forms. Delete the competing local call discovery and node census when that API covers the same occurrences and shadowing rules.
 - Put decoded literal/name values and full R argument matching in Air/Oak. Raw strings, escaped names, missing arguments, partial matching, dots, and explicit invalid/unknown outcomes belong to those APIs. The current convenience helpers are not equivalent replacements.
 - Delegate generic assignment alias provenance and required-true branch facts to Oak. Keep namespace retention, package availability/activation, declarations, resource policy, and supported-profile decisions in slinker.

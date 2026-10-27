@@ -50,6 +50,8 @@ Analysis runs on one Rayon pool (`--threads`, default 4). Each reachable need is
 
 Branch conditions stay as Air expressions in the syntax census. Namespace availability guards accept a query only when the condition's syntax requires its truth. Binding proofs use structural execution paths; they do not correlate repeated predicates or infer membership exhaustiveness. These paths do not canonicalize condition text or reparse string fragments.
 
+The frontend rejects loop-binding facts that depend on reading the loop's own sequence or crossing an unproved evaluation context, including unforced arguments/defaults, short-circuit operands and caught sequence errors. It validates this dependency gap without reconstructing missing bindings or inferring timing from a function-scope label. Eager parentheses and assignment wrappers remain supported when they resolve to base; shadowed control forms block.
+
 ## Cache
 
 Disposable typed artifacts use schema `slinker-analysis-v1` and a SQLite database per schema directory. Keys include the installed image and target R. Reads verify the serialized bytes against their SHA-256 digest before decoding them. Corrupt entries or an unavailable database are cache misses. SQLite owns indexing and atomic publication; each invocation commits its artifact transaction when the cache closes. WAL permits readers alongside a writer. Serialization and deserialization run outside the connection lock. Installed-package fingerprints frame entry kinds, relative paths, and content digests, including empty directories; unsupported filesystem entries are rejected. `slinker cache` inspects and clears these artifacts.

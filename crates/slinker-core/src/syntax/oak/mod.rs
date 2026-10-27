@@ -46,7 +46,8 @@ use namespace::{
 };
 use proofs::{
     ControlRegions, conditional_fallthrough_proven_bound, definition_must_execute_before_position,
-    formal_default_use_is_bound, is_base_call, recursive_closure_binding_is_initialized,
+    for_binding_is_unproved, formal_default_use_is_bound, is_base_call,
+    recursive_closure_binding_is_initialized,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -344,7 +345,7 @@ fn translate_index(
     let declarations = profile::scoped(Probe::ParseDeclarations, || {
         collect_declarations(&source, &census, context, index, &scopes)
     });
-    let mut live_uses = collect_live_uses(index, &declarations);
+    let mut live_uses = collect_live_uses(root, index, context, &declarations)?;
 
     let (function_regions, for_regions, if_regions) =
         (&census.functions, &census.fors, &census.ifs);
@@ -439,6 +440,11 @@ fn translate_index(
         let name = match &expression {
             AnyRExpression::RIfStatement(_) => "if",
             AnyRExpression::RReturnExpression(_) => "return",
+            AnyRExpression::RForStatement(_) => "for",
+            AnyRExpression::RWhileStatement(_) => "while",
+            AnyRExpression::RRepeatStatement(_) => "repeat",
+            AnyRExpression::RBracedExpressions(_) => "{",
+            AnyRExpression::RParenthesizedExpression(_) => "(",
             _ => continue,
         };
         let (scope, _) = index.scope_at(expression.syntax().text_trimmed_range().start());
@@ -482,7 +488,12 @@ fn exact<T>(mut values: Vec<T>) -> Vec<T> {
     values
 }
 
-fn collect_live_uses(index: &SemanticIndex, declarations: &Declarations) -> Vec<LiveUse> {
+fn collect_live_uses(
+    root: &RRoot,
+    index: &SemanticIndex,
+    context: &OakParseContext,
+    declarations: &Declarations,
+) -> Result<Vec<LiveUse>, String> {
     let mut live_uses = Vec::new();
 
     for scope in index.scope_ids() {
@@ -497,6 +508,11 @@ fn collect_live_uses(index: &SemanticIndex, declarations: &Declarations) -> Vec<
                 continue;
             }
             let range = use_site.range();
+            if for_binding_is_unproved(root, index, context, scope, use_id) {
+                return Err(format!(
+                    "Oak cannot establish the for-loop binding of `{name}` across this evaluation context"
+                ));
+            }
             let start = text_offset(range.start());
             let end = text_offset(range.end());
             let bound = index.use_is_bound(scope, use_id);
@@ -521,7 +537,7 @@ fn collect_live_uses(index: &SemanticIndex, declarations: &Declarations) -> Vec<
             });
         }
     }
-    live_uses
+    Ok(live_uses)
 }
 
 fn refine_callee_kinds(

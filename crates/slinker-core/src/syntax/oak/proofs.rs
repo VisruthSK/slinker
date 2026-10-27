@@ -4,14 +4,74 @@ use super::context::OakParseContext;
 use super::{LiveUse, innermost_function_region, text_offset};
 use crate::syntax::facts::{CallSite, CalleeKind, StaticArg};
 use crate::syntax::source::TextRange;
-use air_r_syntax::{AnyRExpression, RIfStatement, RRoot};
+use air_r_syntax::{
+    AnyRExpression, RArgument, RFunctionDefinition, RIfStatement, RParameterDefault, RRoot,
+};
 use biome_rowan::{AstNode, AstNodeList};
-use oak_semantic::semantic_index::{DefinitionKind, SemanticIndex};
+use oak_semantic::semantic_index::{DefinitionKind, ScopeId, SemanticIndex, UseId};
 
 #[derive(Clone, Copy)]
 pub(super) struct ControlRegions<'a> {
     pub(super) for_regions: &'a [ForRegion],
     pub(super) if_regions: &'a [IfRegion],
+}
+
+pub(super) fn for_binding_is_unproved(
+    root: &RRoot,
+    index: &SemanticIndex,
+    context: &OakParseContext,
+    scope: ScopeId,
+    use_id: UseId,
+) -> bool {
+    let range = index.uses(scope)[use_id].range();
+    index
+        .reaching_definitions(scope, use_id)
+        .any(|(owner, id)| {
+            let DefinitionKind::ForVariable(pointer) = index.definitions(owner)[id].kind() else {
+                return false;
+            };
+            let statement = pointer.to_node(root.syntax());
+            let sequence_use = statement.sequence().ok().is_some_and(|sequence| {
+                sequence.syntax().text_trimmed_range().contains_range(range)
+            });
+            let optional_execution = statement
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .take_while(|node| !RFunctionDefinition::can_cast(node.kind()))
+                .any(|node| {
+                    if node.text_trimmed_range().contains_range(range) {
+                        return false;
+                    }
+                    let stable = |operation: &str| {
+                        let (scope, _) = index.scope_at(node.text_trimmed_range().start());
+                        context.resolves_to_base(operation)
+                            && index.resolve(operation, scope).is_none()
+                    };
+                    match AnyRExpression::cast(node.clone()) {
+                        Some(
+                            AnyRExpression::RBracedExpressions(_)
+                            | AnyRExpression::RIfStatement(_)
+                            | AnyRExpression::RForStatement(_)
+                            | AnyRExpression::RWhileStatement(_)
+                            | AnyRExpression::RRepeatStatement(_),
+                        ) => false,
+                        Some(AnyRExpression::RParenthesizedExpression(_)) => !stable("("),
+                        Some(AnyRExpression::RBinaryExpression(binary)) => {
+                            !binary.operator().ok().is_some_and(|operator| {
+                                matches!(operator.text_trimmed(), "<-" | "=" | "->" | "<<-" | "->>")
+                                    && stable(operator.text_trimmed())
+                            })
+                        }
+                        Some(_) => true,
+                        None => {
+                            RArgument::can_cast(node.kind())
+                                || RParameterDefault::can_cast(node.kind())
+                        }
+                    }
+                });
+            sequence_use || optional_execution
+        })
 }
 
 pub(super) fn formal_default_use_is_bound(regions: &[FunctionRegion], live_use: &LiveUse) -> bool {
